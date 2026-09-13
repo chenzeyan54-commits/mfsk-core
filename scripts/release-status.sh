@@ -160,10 +160,23 @@ file_date=$(git log -1 --format=%cs -- "$baseline")
 # conversely a docs commit touching the file aged nothing but still
 # reset the comparison. Falls back to the file date when `_meta` is
 # absent or python3 isn't available, which is the old behaviour.
+#
+# The commit is read alongside the date and preferred when it resolves,
+# because a date is only accurate to the day and this repo works in
+# bursts. On 2026-09-14 the date comparison listed ten commits as
+# outstanding for FST4 when nine were the sweep's own ancestors -- the
+# sweep and the code it covered landed the same afternoon. A script
+# that over-reports trains its reader to skim it, which is the
+# hand-reconstruction this whole section exists to remove.
 declare -A base_dates=()
+declare -A base_commits=()
 if command -v python3 >/dev/null 2>&1; then
     while IFS='=' read -r k v; do
-        [[ -n "$k" ]] && base_dates["$k"]="$v"
+        [[ -z "$k" ]] && continue
+        case "$k" in
+            *.commit) base_commits["${k%.commit}"]="$v" ;;
+            *)        base_dates["$k"]="$v" ;;
+        esac
     done < <(python3 - "$baseline" <<'PY' 2>/dev/null
 import json, sys
 try:
@@ -173,6 +186,12 @@ except (OSError, ValueError):
 for proto, m in meta.get("protocols", {}).items():
     if m.get("date"):
         print(f"{proto}={m['date']}")
+    c = m.get("commit")
+    if c:
+        # `--update-baseline` records a `-dirty` suffix when the tree
+        # had uncommitted changes; the commit is still the right
+        # ancestor to compare against.
+        print(f"{proto}.commit={c.split('-dirty')[0]}")
 PY
     )
 fi
@@ -198,7 +217,19 @@ for proto in ft8 ft4 fst4 wspr jt65 jt9 q65 msk144; do
     # Subjects, not just a count. A count sends the reader off to look
     # them up, which is the hand-reconstruction this script exists to
     # remove — and a clippy sweep counts the same as a decoder change.
-    mapfile -t subjects < <(git log --since="$since" --format='%h %s' -- "$d")
+    #
+    # Prefer the recorded commit: exact, where a date is only accurate
+    # to the day. Falls back to the date when there is no commit, or
+    # when it does not resolve in this clone (a shallow checkout, or
+    # history rewritten since the stamp).
+    base_commit="${base_commits[$proto]:-}"
+    if [[ -n "$base_commit" ]] && git cat-file -e "${base_commit}^{commit}" 2>/dev/null; then
+        since_desc="$base_commit"
+        mapfile -t subjects < <(git log "${base_commit}..HEAD" --format='%h %s' -- "$d")
+    else
+        since_desc="$since"
+        mapfile -t subjects < <(git log --since="$since" --format='%h %s' -- "$d")
+    fi
     (( ${#subjects[@]} > 0 )) || continue
     code=0
     rendered=()
@@ -211,7 +242,7 @@ for proto in ft8 ft4 fst4 wspr jt65 jt9 q65 msk144; do
         fi
     done
     printf '    %-8s since %s: %d commit(s), %d touching code\n' \
-        "$proto" "$since" "${#subjects[@]}" "$code"
+        "$proto" "$since_desc" "${#subjects[@]}" "$code"
     printf '%s\n' "${rendered[@]}"
     # Prose-only commits are printed, not hidden — "nothing to sweep"
     # should be visibly derived rather than silently assumed.
