@@ -184,13 +184,27 @@ macro_rules! impl_frame_decodable {
                 let on_result: Option<&(dyn Fn(&DecodeResult) + Sync)> = filtered_cb
                     .as_ref()
                     .map(|f| f as &(dyn Fn(&DecodeResult) + Sync));
-                // AP bits, if the caller supplied a hint. Built here because
-                // `ApHint` is a `msg` type and the engine takes plain slices.
-                let ap_bits = req
+                // Every a-priori hypothesis WSJT-X would try from this hint,
+                // not just the caller's literal one — see `ap_passes`. Built
+                // here because `ApHint` is a `msg` type and the engine takes
+                // plain slices.
+                let ap_owned: Vec<(Vec<u8>, Vec<u8>, u8)> = req
                     .ap_hint
                     .filter(|h| h.has_info())
-                    .map(crate::msg::pipeline_ap::ap_bits_for::<$proto>);
-                let ap = ap_bits.as_ref().map(|(m, v)| (m.as_slice(), v.as_slice()));
+                    .map(|h| {
+                        crate::msg::pipeline_ap::ap_passes(h)
+                            .into_iter()
+                            .map(|(cfg, pid)| {
+                                let (m, v) = crate::msg::pipeline_ap::ap_bits_for::<$proto>(&cfg);
+                                (m, v, pid)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let ap: Vec<(&[u8], &[u8], u8)> = ap_owned
+                    .iter()
+                    .map(|(m, v, pid)| (m.as_slice(), v.as_slice(), *pid))
+                    .collect();
                 let (raw, fft_cache, budget) = pipeline::decode_frame_budgeted::<$proto>(
                     req.audio,
                     &$cfg,
@@ -206,7 +220,7 @@ macro_rules! impl_frame_decodable {
                     req.fft_cache.as_ref().map(FftCache::as_slice),
                     on_result,
                     req.budget,
-                    ap,
+                    &ap,
                 );
                 DecodeOutcome {
                     results: pipeline::dedup_known(raw, req.known),

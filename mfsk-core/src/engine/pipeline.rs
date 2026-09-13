@@ -695,7 +695,17 @@ where
     P::Fec: BpPooledFec,
 {
     process_candidate_basic_impl::<P>(
-        cand, fft_cache, cfg, depth, strictness, known, eq_mode, sync_q_min, None, None, false,
+        cand,
+        fft_cache,
+        cfg,
+        depth,
+        strictness,
+        known,
+        eq_mode,
+        sync_q_min,
+        &[],
+        None,
+        false,
         false,
     )
 }
@@ -719,7 +729,17 @@ where
     P::Fec: BpPooledFec,
 {
     process_candidate_basic_impl::<P>(
-        cand, fft_cache, cfg, depth, strictness, known, eq_mode, sync_q_min, None, None, false,
+        cand,
+        fft_cache,
+        cfg,
+        depth,
+        strictness,
+        known,
+        eq_mode,
+        sync_q_min,
+        &[],
+        None,
+        false,
         false,
     )
 }
@@ -794,7 +814,7 @@ where
         known,
         eq_mode,
         sync_q_min,
-        None,
+        &[],
         Some(precomputed_refine),
         skip_snr,
         skip_llr_nsym_max,
@@ -869,7 +889,7 @@ pub(crate) fn process_candidate_basic_ap<P: GenericPipelineProtocol>(
     known: &[DecodeResult],
     eq_mode: EqMode,
     sync_q_min: u32,
-    ap: Option<(&[u8], &[u8])>,
+    ap: &[(&[u8], &[u8], u8)],
 ) -> Option<DecodeResult>
 where
     P::Fec: BpPooledFec,
@@ -888,12 +908,20 @@ fn process_candidate_basic_impl<P: GenericPipelineProtocol>(
     known: &[DecodeResult],
     eq_mode: EqMode,
     sync_q_min: u32,
-    // A-priori bit locking, as `(mask, values)` over the codeword —
-    // `FecOpts::ap_mask`'s own shape. Plain slices rather than an
-    // `ApHint` because that lives in `msg`, and `engine` never depends
-    // on `msg`. Applied as the ladder's final rung, so it can only add
-    // decodes; see there for why it is not a parallel path.
-    ap: Option<(&[u8], &[u8])>,
+    // A-priori bit locking: one entry per hypothesis, as
+    // `(mask, values, pass_id)` over the codeword — `FecOpts::ap_mask`'s
+    // own shape. Plain slices rather than `ApHint`s because that type
+    // lives in `msg` and `engine` never depends on `msg`.
+    //
+    // A *list*, because WSJT-X tries several a-priori hypotheses from
+    // one hint rather than one: the bare hint, the hint with each of
+    // RRR / RR73 / 73 substituted, and a CQ completion when only the
+    // other callsign is known (`msg::pipeline_ap::ap_passes`). Trying
+    // only the caller's literal hint would decode a QSO's exchange
+    // frames and miss its closing ones.
+    //
+    // Applied as the ladder's final rung, so it can only add decodes.
+    ap: &[(&[u8], &[u8], u8)],
     // When `Some`, reuses a refine result [`dedup_refined_candidates`]
     // already computed for this candidate — downsample + RMS-normalise
     // + `fst4_sync_search`/`ft4_sync_search` — instead of recomputing
@@ -1323,13 +1351,13 @@ where
             // bits "are". `strictness.ap_max_errors(locked)` is the
             // ceiling that keeps it honest, and it tightens as more bits
             // are locked.
-            if let Some((mask, values)) = ap {
+            for (mask, values, ap_pass_id) in ap {
                 // `ap_bits_for` has already put these in codeword space
                 // (scrambled where the protocol scrambles), because the
                 // hint describes the message and the decoder does not.
                 let locked = mask.iter().filter(|&&m| m != 0).count();
                 let max_errors = strictness.ap_max_errors(locked);
-                for (llr, pass_id) in &variants {
+                for (llr, _) in &variants {
                     let ap_opts = FecOpts {
                         bp_max_iter,
                         osd_depth: 0,
@@ -1360,11 +1388,12 @@ where
                             dt_sec: refined.dt_sec,
                             hard_errors: r.hard_errors,
                             sync_score: refined.score,
-                            // AP passes keep their own pass ids, offset
-                            // from the plain ladder's so a caller can
-                            // tell an AP-assisted decode from an earned
-                            // one.
-                            pass: 20 + pass_id,
+                            // The hypothesis' own pass id, matching
+                            // the ids `msg::pipeline_ap` reports, so an
+                            // AP-assisted decode is distinguishable
+                            // from an earned one and says which
+                            // hypothesis carried it.
+                            pass: *ap_pass_id,
                             sync_cv,
                             snr_db,
                         });
@@ -1696,7 +1725,7 @@ where
         precomputed_fft,
         on_result,
         None,
-        None,
+        &[],
     );
     (results, fft_cache)
 }
@@ -1725,7 +1754,7 @@ pub(crate) fn decode_frame_budgeted<P: GenericPipelineProtocol>(
     precomputed_fft: Option<&[Complex<f32>]>,
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
     budget: Option<BudgetCheck<'_>>,
-    ap: Option<(&[u8], &[u8])>,
+    ap: &[(&[u8], &[u8], u8)],
 ) -> (Vec<DecodeResult>, FftCache, BudgetReport)
 where
     P::Fec: BpPooledFec,
@@ -1787,7 +1816,7 @@ where
         precomputed_fft,
         on_result,
         None,
-        None,
+        &[],
     );
     (results, fft_cache)
 }
@@ -1987,7 +2016,7 @@ fn decode_frame_impl<P: GenericPipelineProtocol>(
     budget: Option<BudgetCheck<'_>>,
     // A-priori bit locking, applied as the final rung of each
     // candidate's ladder. See `process_candidate_basic_impl`.
-    ap: Option<(&[u8], &[u8])>,
+    ap: &[(&[u8], &[u8], u8)],
 ) -> (Vec<DecodeResult>, FftCache, BudgetReport)
 where
     P::Fec: BpPooledFec,
