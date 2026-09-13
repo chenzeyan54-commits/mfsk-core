@@ -817,9 +817,16 @@ it returns nothing while still spending its time. Measured through
 `max_cand` is the knob for the floor; `.budget(..)` spends what is
 above it.
 
-Implemented for FT8. FT4 and FST4 accept `.budget(..)` and ignore it,
-reporting `BudgetReport::default()`. The plain `decode_block` FT8 API
-(§4, what the embedded boards call) is unaffected.
+Implemented for FT8, FT4 and every FST4 sub-mode, on every strategy.
+The ranking key differs by protocol because each already computes a
+different one for free: FT8 ranks by the Costas sync quality its triage
+produces; FT4 needs no reordering (`ft4_coarse_sync` already returns
+candidates ranked by score); FST4 ranks by the refined
+`fst4_sync_search` score that `dedup_refined_candidates` computed for
+every candidate. FT4's `.sic_rounds(n)` declines whole *rounds* — that
+engine subtracts a round's decodes as one batch, so a round is the
+granularity it can offer. The plain `decode_block` FT8 API (§4, what the
+embedded boards call) is unaffected.
 
 #### Streaming delivery: `.on_result(cb)`
 

@@ -26,6 +26,7 @@
 use alloc::vec::Vec;
 
 use crate::engine::equalize::EqMode;
+pub use crate::engine::pipeline::{BudgetCheck, BudgetReport};
 use crate::engine::pipeline::{DecodeDepth, DecodeStrictness, FftCache, LlrEffort};
 use crate::engine::protocol::Protocol;
 
@@ -105,59 +106,6 @@ pub trait SupportsWideBandAp: FrameDecodable {}
 /// quiet at the two struct-field sites; see `on_result`'s own doc comment
 /// for the actual delivery contract.
 type OnResultCallback<'a, P> = &'a (dyn Fn(&<P as FrameDecodable>::DecodeResult) + Sync);
-
-/// Wall-clock budget predicate for [`DecodeRequest::budget`] /
-/// [`SniperRequest::budget`] — returns `false` once the caller's
-/// allowance is spent.
-///
-/// `&dyn Fn(…) + Sync` rather than a bare `fn() -> bool`, for two
-/// reasons this crate has already paid for once each:
-///
-/// - a `fn` pointer cannot capture, so
-///   `fst4::rung_major::decode_phase_split_timed`'s `budget_ok: Option<fn() -> bool>`
-///   forced its only real consumer
-///   (`embedded-shared::fst4_monitor`) to route the deadline through a
-///   per-core `UnsafeCell<[i64; 2]>` global. A closure capturing an
-///   absolute deadline needs none of that.
-/// - `Sync`, not `FnMut`: the predicate is built from a *fixed*
-///   captured deadline, so one of them can be shared as-is across a
-///   `rayon` batch instead of needing an exclusive borrow per
-///   candidate. Same shape, same reasoning as `wspr::decode`'s own
-///   `budget` parameter.
-///
-/// `mfsk-core` deliberately contains no clock: `std::time::Instant::now`
-/// is unimplemented on `wasm32-unknown-unknown` and absent on `no_std`.
-/// The caller supplies one — host `Instant`, browser
-/// `performance.now()`, embedded `esp_timer_get_time`.
-pub type BudgetCheck<'a> = &'a (dyn Fn() -> bool + Sync);
-
-/// What a budgeted decode left undone. All-zero (`Default`) means no
-/// budget was set, or it was never reached.
-///
-/// Returned per call rather than accumulated in a global counter (the
-/// shape `wspr::instrument` uses) because a per-slot number is exactly
-/// what a caller adapting to a deadline needs, and a process-global one
-/// cannot give it.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct BudgetReport {
-    /// The predicate returned `false` at least once — work was left
-    /// undone.
-    pub exhausted: bool,
-    /// Candidates that passed the cheap sync triage but whose decode
-    /// ladder was never started.
-    pub candidates_skipped: u32,
-    /// Ladder stages actually executed.
-    pub stages_run: u32,
-    /// `nsync` of the best skipped candidate. Since that is the key the
-    /// scheduler orders by, it says directly whether the cut took noise
-    /// or signal.
-    pub cut_at_sync: Option<u32>,
-    /// …and that candidate's coarse sync score, baseline-normalised so
-    /// it is comparable to the protocol's own `sync_min`. Named after
-    /// the embedded FT4 receiver's `SlotOutcome::cut_at_score`, which is
-    /// the number that turned out to be worth surfacing to an operator.
-    pub cut_at_score: Option<f32>,
-}
 
 /// Decoded messages plus the FFT cache built along the way, reusable by a
 /// follow-up pipelined [`DecodeRequest::fft_cache`] call. The cache is
@@ -393,8 +341,15 @@ impl<'a, P: FrameDecodable> DecodeRequest<'a, P> {
     /// returns every station. `max_cand` is the knob that moves the
     /// floor; this one only spends what is above it.
     ///
-    /// Implemented for FT8. FT4 and FST4 accept the call and ignore it
-    /// for now, reporting `BudgetReport::default()`.
+    /// Implemented for FT8, FT4 and FST4, on every strategy. What the
+    /// ordering key is differs by protocol, because each already
+    /// computes a different one for free: FT8 ranks by the Costas sync
+    /// quality its triage produces, FT4 needs no reordering at all
+    /// (`ft4_coarse_sync` hands back candidates already ranked by
+    /// score), and FST4 ranks by the refined `fst4_sync_search` score
+    /// that `dedup_refined_candidates` has already computed for every
+    /// candidate. FT8's own `decode_block` API — what the embedded
+    /// boards call — is not affected and keeps its app-level deadline.
     pub fn budget(mut self, check: BudgetCheck<'a>) -> Self {
         self.budget = Some(check);
         self

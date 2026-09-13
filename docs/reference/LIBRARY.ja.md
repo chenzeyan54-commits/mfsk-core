@@ -789,9 +789,16 @@ sync 品質順に並べ、その順にラダーを回して予算が尽きた時
 ~13 ms — 予算 5/10 ms は 0 局、20 ms で全 14 局。下限そのものを
 動かす knob は `max_cand` であり、`.budget(..)` はその上を配分する。
 
-実装済みはFT8。FT4/FST4 は `.budget(..)` を受け取るが無視し、
-`BudgetReport::default()` を返す。プレーンな `decode_block` FT8 API
-(§4、組込みボードが呼ぶ方) は影響を受けない。
+FT8・FT4・FST4 全サブモードの全戦略で実装済み。並べ替えの鍵は
+プロトコルごとに違うが、これはどれも既に別の鍵をタダで計算して
+いるからである: FT8 はトリアージが出す Costas sync 品質、FT4 は
+そもそも並べ替え不要 (`ft4_coarse_sync` が既にスコア順で返す)、
+FST4 は `dedup_refined_candidates` が全候補について計算済みの
+refine 後 `fst4_sync_search` スコア。FT4 の `.sic_rounds(n)` は
+候補ではなく**ラウンド**単位で断る — このエンジンは 1 ラウンド分の
+デコードをまとめて減算するので、ラウンドが正直に提供できる粒度
+だから。プレーンな `decode_block` FT8 API (§4、組込みボードが
+呼ぶ方) は影響を受けない。
 
 `DecodeDepth` (`llr_effort`/`osd`) という型自体は残っている ——
 `decode_block`/`decode_block_into` (embedded/host共通のプレーン関数

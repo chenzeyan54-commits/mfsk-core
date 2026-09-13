@@ -127,9 +127,19 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
   unsubtracted signal for the next round's `coarse_sync` to re-find as
   a duplicate. `tests/ft8_budget_scheduler.rs` asserts that directly.
 
-  **FT4 and FST4 accept `.budget(..)` and ignore it** for now, reporting
-  `BudgetReport::default()`. FT8's own `decode_block` driver — what the
-  ESP32 boards run — is untouched and keeps its app-level deadline.
+  **FT4 and FST4 honour it too**, on every strategy, through the shared
+  generic engine. Neither needed a new sweep: `ft4_coarse_sync` already
+  returns candidates ranked by sync score, so FT4 declines the weakest
+  by polling in the order it already had; and FST4's
+  `dedup_refined_candidates` has already run `fst4_sync_search` over
+  every candidate to suppress near-duplicates, so a *refined* score —
+  sharper than the coarse one, and free — is in hand to rank by. FT4's
+  `.sic_rounds(n)` declines whole rounds rather than candidates: that
+  engine subtracts a round's decodes as one batch, so a round is the
+  granularity it can honestly offer.
+
+  FT8's own `decode_block` driver — what the ESP32 boards run — is
+  untouched and keeps its app-level deadline.
 
   Because the API takes a closure and not a clock, the tests get a
   device-independent unit for free: a predicate backed by a counter

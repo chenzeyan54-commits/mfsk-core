@@ -119,6 +119,74 @@ pub enum LlrEffort {
     Full,
 }
 
+/// Wall-clock budget predicate for `DecodeRequest::budget` /
+/// `SniperRequest::budget` — returns `false` once the caller's
+/// allowance is spent.
+///
+/// Declared here rather than beside those builders because `engine`
+/// never depends on `msg` (the direction is fixed crate-wide), and the
+/// generic pipeline below has to name the type. `msg::decode_request`
+/// re-exports it, so callers see it where they use it.
+///
+/// `&dyn Fn(…) + Sync` rather than a bare `fn() -> bool`, for two
+/// reasons this crate has already paid for once each:
+///
+/// - a `fn` pointer cannot capture, so
+///   `fst4::rung_major::decode_phase_split_timed`'s `budget_ok: Option<fn() -> bool>`
+///   forced its only real consumer
+///   (`embedded-shared::fst4_monitor`) to route the deadline through a
+///   per-core `UnsafeCell<[i64; 2]>` global. A closure capturing an
+///   absolute deadline needs none of that.
+/// - `Sync`, not `FnMut`: the predicate is built from a *fixed*
+///   captured deadline, so one of them can be shared as-is across a
+///   `rayon` batch instead of needing an exclusive borrow per
+///   candidate. Same shape, same reasoning as `wspr::decode`'s own
+///   `budget` parameter.
+///
+/// `mfsk-core` deliberately contains no clock: `std::time::Instant::now`
+/// is unimplemented on `wasm32-unknown-unknown` and absent on `no_std`.
+/// The caller supplies one — host `Instant`, browser
+/// `performance.now()`, embedded `esp_timer_get_time`.
+pub type BudgetCheck<'a> = &'a (dyn Fn() -> bool + Sync);
+
+/// What a budgeted decode left undone. All-zero (`Default`) means no
+/// budget was set, or it was never reached.
+///
+/// Returned per call rather than accumulated in a global counter (the
+/// shape `wspr::instrument` uses) because a per-slot number is exactly
+/// what a caller adapting to a deadline needs, and a process-global one
+/// cannot give it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BudgetReport {
+    /// The predicate returned `false` at least once — work was left
+    /// undone.
+    pub exhausted: bool,
+    /// Units of work declined. A candidate on FT8's and FT4's
+    /// single-pass engines and on every sniper; a whole SIC *round* on
+    /// FT4's `.sic_rounds(n)`, which subtracts a round's decodes as one
+    /// batch and so cannot be cut inside one.
+    pub candidates_skipped: u32,
+    /// Units of work actually run, counted the same way.
+    pub stages_run: u32,
+    /// Costas sync quality (0..=`N_SYNC`) of the best skipped
+    /// candidate. **FT8 only** — that triage number is the key FT8's
+    /// scheduler orders by, so it says directly whether the cut took
+    /// noise or a station. `None` on FT4 and FST4, which rank by score.
+    pub cut_at_sync: Option<u32>,
+    /// Sync score of the best skipped candidate, on the scale that
+    /// protocol's own search works in: the coarse, baseline-normalised
+    /// score on FT8 and FT4 (so FT4's is directly comparable to its
+    /// `sync_min`, WSJT-X's own 1.2), and the refined `fst4_sync_search`
+    /// score on FST4, which is what its scheduler ranks by. Named after
+    /// the embedded FT4 receiver's `SlotOutcome::cut_at_score`, which is
+    /// the number that turned out to be worth surfacing to an operator.
+    ///
+    /// It falls as the budget grows on FT4 and FST4, where it *is* the
+    /// ranking key. On FT8 it does not — there `cut_at_sync` is the key
+    /// and this is supplementary.
+    pub cut_at_score: Option<f32>,
+}
+
 /// Decode cost/recall configuration: [`LlrEffort`] plus whether to escalate
 /// to OSD when the BP staircase fails.
 ///
@@ -1506,6 +1574,53 @@ pub fn decode_frame<P: GenericPipelineProtocol>(
 where
     P::Fec: BpPooledFec,
 {
+    let (results, fft_cache, _) = decode_frame_impl::<P>(
+        audio,
+        cfg,
+        freq_min,
+        freq_max,
+        sync_min,
+        freq_hint,
+        depth,
+        max_cand,
+        strictness,
+        eq_mode,
+        sync_q_min,
+        precomputed_fft,
+        on_result,
+        None,
+    );
+    (results, fft_cache)
+}
+
+/// [`decode_frame`] plus a caller's wall-clock budget, and the report of
+/// what it cut. The entry point `DecodeRequest::budget` uses; every
+/// other caller goes through `decode_frame` and gets today's behaviour.
+///
+/// Separate rather than a 14th parameter on `decode_frame` because that
+/// one is `pub` under `internal-testing` and a dozen sweep/probe
+/// binaries call it — none of which has an opinion about a budget.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_frame_budgeted<P: GenericPipelineProtocol>(
+    audio: &[i16],
+    cfg: &DownsampleCfg,
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    freq_hint: Option<f32>,
+    depth: DecodeDepth,
+    max_cand: usize,
+    strictness: DecodeStrictness,
+    eq_mode: EqMode,
+    sync_q_min: u32,
+    precomputed_fft: Option<&[Complex<f32>]>,
+    on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
+    budget: Option<BudgetCheck<'_>>,
+) -> (Vec<DecodeResult>, FftCache, BudgetReport)
+where
+    P::Fec: BpPooledFec,
+{
     decode_frame_impl::<P>(
         audio,
         cfg,
@@ -1520,6 +1635,7 @@ where
         sync_q_min,
         precomputed_fft,
         on_result,
+        budget,
     )
 }
 
@@ -1546,7 +1662,7 @@ pub(crate) fn decode_frame<P: GenericPipelineProtocol>(
 where
     P::Fec: BpPooledFec,
 {
-    decode_frame_impl::<P>(
+    let (results, fft_cache, _) = decode_frame_impl::<P>(
         audio,
         cfg,
         freq_min,
@@ -1560,7 +1676,9 @@ where
         sync_q_min,
         precomputed_fft,
         on_result,
-    )
+        None,
+    );
+    (results, fft_cache)
 }
 
 /// Cheap refine-only step for [`dedup_refined_candidates`]: downsample +
@@ -1752,10 +1870,15 @@ fn decode_frame_impl<P: GenericPipelineProtocol>(
     // not the sequential exact-match one. See `DecodeRequest::on_result`'s
     // doc comment for the full delivery-order writeup.
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
-) -> (Vec<DecodeResult>, FftCache)
+    // Caller's wall-clock budget; see `DecodeRequest::budget`. `None`
+    // (every path but the builder's budgeted one) leaves every loop
+    // below exactly as it was.
+    budget: Option<BudgetCheck<'_>>,
+) -> (Vec<DecodeResult>, FftCache, BudgetReport)
 where
     P::Fec: BpPooledFec,
 {
+    let mut budget_report = BudgetReport::default();
     // FT4's own coarse-candidate stage (`engine::ft4_coarse::ft4_coarse_sync`,
     // a faithful `getcandidates4.f90` port) replaces the generic 2-D
     // (freq × lag) Costas-correlation search: WSJT-X's FT4 candidate
@@ -1797,7 +1920,7 @@ where
         None => build_fft_cache(audio, cfg),
     });
     if candidates.is_empty() {
-        return (Vec::new(), fft_cache);
+        return (Vec::new(), fft_cache, budget_report);
     }
     #[cfg(feature = "std")]
     if trace {
@@ -1817,11 +1940,27 @@ where
     let raw: Vec<DecodeResult> = if P::ID == super::ProtocolId::Ft4 {
         #[cfg(feature = "std")]
         let __trace_t1 = trace.then(std::time::Instant::now);
-        #[cfg(feature = "parallel")]
-        let raw: Vec<DecodeResult> = candidates
-            .par_iter()
-            .filter_map(|cand| {
-                let r = process_candidate_basic::<P>(
+        // Budgeted: sequential, polled before each candidate. No
+        // reordering is needed to make that cheapest-first —
+        // `ft4_coarse_sync` already hands back candidates ranked by
+        // sync score (`engine::sync::rank_candidates`), so declining
+        // the tail declines the weakest, not the top of the band. A
+        // `freq_hint`'s promoted candidates stay first, which is the
+        // caller's own priority and is respected rather than sorted
+        // away.
+        if let Some(check) = budget {
+            let mut raw: Vec<DecodeResult> = Vec::new();
+            let mut it = candidates.iter().enumerate();
+            for (icand, cand) in it.by_ref() {
+                if !check() {
+                    budget_report.exhausted = true;
+                    budget_report.candidates_skipped = 1;
+                    budget_report.cut_at_score = Some(cand.score);
+                    let _ = icand;
+                    break;
+                }
+                budget_report.stages_run += 1;
+                if let Some(r) = process_candidate_basic::<P>(
                     cand,
                     fft_cache.as_slice(),
                     cfg,
@@ -1830,45 +1969,79 @@ where
                     &[],
                     eq_mode,
                     sync_q_min,
-                )?;
-                if let Some(cb) = on_result {
-                    cb(&r);
+                ) {
+                    if let Some(cb) = on_result {
+                        cb(&r);
+                    }
+                    raw.push(r);
                 }
-                Some(r)
-            })
-            .collect();
-        #[cfg(not(feature = "parallel"))]
-        let raw: Vec<DecodeResult> = candidates
-            .iter()
-            .filter_map(|cand| {
-                let r = process_candidate_basic::<P>(
-                    cand,
-                    fft_cache.as_slice(),
-                    cfg,
-                    depth,
-                    strictness,
-                    &[],
-                    eq_mode,
-                    sync_q_min,
-                )?;
-                if let Some(cb) = on_result {
-                    cb(&r);
-                }
-                Some(r)
-            })
-            .collect();
-        #[cfg(feature = "std")]
-        if let Some(t1) = __trace_t1 {
-            eprintln!(
-                "TRACE_STAGE decode_loop={:.1}ms nsync_fail={} nsync_pass={} osd_attempt={} n_decoded={}",
-                t1.elapsed().as_secs_f64() * 1000.0,
-                TRACE_NSYNC_FAIL.load(core::sync::atomic::Ordering::Relaxed),
-                TRACE_NSYNC_PASS.load(core::sync::atomic::Ordering::Relaxed),
-                TRACE_OSD_ATTEMPT.load(core::sync::atomic::Ordering::Relaxed),
-                raw.len()
-            );
+            }
+            budget_report.candidates_skipped += it.count() as u32;
+            #[cfg(feature = "std")]
+            if let Some(t1) = __trace_t1 {
+                eprintln!(
+                    "TRACE_STAGE decode_loop={:.1}ms budget_ran={} budget_skipped={} n_decoded={}",
+                    t1.elapsed().as_secs_f64() * 1000.0,
+                    budget_report.stages_run,
+                    budget_report.candidates_skipped,
+                    raw.len()
+                );
+            }
+            raw
+        } else {
+            #[cfg(feature = "parallel")]
+            let raw: Vec<DecodeResult> = candidates
+                .par_iter()
+                .filter_map(|cand| {
+                    let r = process_candidate_basic::<P>(
+                        cand,
+                        fft_cache.as_slice(),
+                        cfg,
+                        depth,
+                        strictness,
+                        &[],
+                        eq_mode,
+                        sync_q_min,
+                    )?;
+                    if let Some(cb) = on_result {
+                        cb(&r);
+                    }
+                    Some(r)
+                })
+                .collect();
+            #[cfg(not(feature = "parallel"))]
+            let raw: Vec<DecodeResult> = candidates
+                .iter()
+                .filter_map(|cand| {
+                    let r = process_candidate_basic::<P>(
+                        cand,
+                        fft_cache.as_slice(),
+                        cfg,
+                        depth,
+                        strictness,
+                        &[],
+                        eq_mode,
+                        sync_q_min,
+                    )?;
+                    if let Some(cb) = on_result {
+                        cb(&r);
+                    }
+                    Some(r)
+                })
+                .collect();
+            #[cfg(feature = "std")]
+            if let Some(t1) = __trace_t1 {
+                eprintln!(
+                    "TRACE_STAGE decode_loop={:.1}ms nsync_fail={} nsync_pass={} osd_attempt={} n_decoded={}",
+                    t1.elapsed().as_secs_f64() * 1000.0,
+                    TRACE_NSYNC_FAIL.load(core::sync::atomic::Ordering::Relaxed),
+                    TRACE_NSYNC_PASS.load(core::sync::atomic::Ordering::Relaxed),
+                    TRACE_OSD_ATTEMPT.load(core::sync::atomic::Ordering::Relaxed),
+                    raw.len()
+                );
+            }
+            raw
         }
-        raw
     } else {
         #[cfg(feature = "std")]
         let __trace_t1 = trace.then(std::time::Instant::now);
@@ -1888,6 +2061,67 @@ where
         }
         #[cfg(feature = "std")]
         let __trace_t2 = trace.then(std::time::Instant::now);
+        // Budgeted: FST4 already has its cheap sweep. `dedup_refined_
+        // candidates` ran `fst4_sync_search` over every candidate to
+        // suppress near-duplicates, so a refined sync score is already
+        // in hand for all of them — a sharper priority key than the
+        // coarse score, and free. It returns survivors in the original
+        // candidate order (the score sort inside it only drives the
+        // greedy suppression), so order them here and spend the budget
+        // strongest-first. The cross-candidate dedup below keeps the
+        // highest `sync_score` per message rather than the first, so
+        // unlike FT8 this reordering cannot change which candidate's
+        // measurements survive.
+        if let Some(check) = budget {
+            let mut ordered = deduped;
+            ordered.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(core::cmp::Ordering::Equal));
+            let mut raw: Vec<DecodeResult> = Vec::new();
+            let mut it = ordered.into_iter();
+            for (cand, cd0, freq_hz, i0, score) in it.by_ref() {
+                if !check() {
+                    budget_report.exhausted = true;
+                    budget_report.candidates_skipped = 1;
+                    // The *refined* score, not `cand.score`: it is what
+                    // this loop ordered by, so it is the number that
+                    // says how good the best declined candidate was.
+                    // Reporting the coarse one here would wander up and
+                    // down as the budget grows.
+                    budget_report.cut_at_score = Some(score);
+                    break;
+                }
+                budget_report.stages_run += 1;
+                if let Some(r) = process_candidate_basic_impl::<P>(
+                    &cand,
+                    fft_cache.as_slice(),
+                    cfg,
+                    depth,
+                    strictness,
+                    &[],
+                    eq_mode,
+                    sync_q_min,
+                    Some((cd0, freq_hz, i0, score)),
+                    false,
+                    false,
+                ) {
+                    if let Some(cb) = on_result {
+                        cb(&r);
+                    }
+                    raw.push(r);
+                }
+            }
+            budget_report.candidates_skipped += it.count() as u32;
+            #[cfg(feature = "std")]
+            if let Some(t2) = __trace_t2 {
+                eprintln!(
+                    "TRACE_STAGE decode_loop={:.1}ms budget_ran={} budget_skipped={} n_decoded={}",
+                    t2.elapsed().as_secs_f64() * 1000.0,
+                    budget_report.stages_run,
+                    budget_report.candidates_skipped,
+                    raw.len()
+                );
+            }
+            return finish_frame(raw, fft_cache, budget_report);
+        }
         #[cfg(feature = "parallel")]
         let raw: Vec<DecodeResult> = deduped
             .into_par_iter()
@@ -1959,6 +2193,17 @@ where
     // not the raw candidate, so duplicates converge on nearly the same
     // reported values) but keeps the tie-break meaningful for the rare
     // case where refinement doesn't fully converge.
+    finish_frame(raw, fft_cache, budget_report)
+}
+
+/// The cross-candidate dedup every arm of [`decode_frame_impl`] ends in,
+/// factored out so the budgeted FST4 arm can return through it too
+/// rather than keeping a second copy of the rule.
+fn finish_frame(
+    raw: Vec<DecodeResult>,
+    fft_cache: FftCache,
+    budget_report: BudgetReport,
+) -> (Vec<DecodeResult>, FftCache, BudgetReport) {
     let mut results: Vec<DecodeResult> = Vec::new();
     for r in raw {
         match results.iter_mut().find(|x| x.info == r.info) {
@@ -1967,7 +2212,7 @@ where
             None => results.push(r),
         }
     }
-    (results, fft_cache)
+    (results, fft_cache, budget_report)
 }
 
 /// Multi-pass decode with successive signal subtraction. Each pass decodes
@@ -2022,10 +2267,21 @@ pub(crate) fn decode_frame_subtract<P: GenericPipelineProtocol>(
     // is an exact match against the returned `Vec`, same order, same
     // contract as FT8's `.sic_rounds()`/`.sic_early()` strategies.
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
-) -> Vec<DecodeResult>
+    // Caller's wall-clock budget (`DecodeRequest::budget`), polled at
+    // round boundaries only. A SIC round subtracts each accepted decode
+    // from the residual before the next round's coarse sync runs, so
+    // its candidate order is the algorithm and cannot be reordered the
+    // way `decode_frame`'s can — and the poll must not land between
+    // accepting a decode and subtracting it, which here is a per-round
+    // batch (`subtract_tones_lpf` below), not a per-candidate step.
+    // Declining to start a round is therefore the granularity this
+    // engine actually offers.
+    budget: Option<BudgetCheck<'_>>,
+) -> (Vec<DecodeResult>, BudgetReport)
 where
     P::Fec: BpPooledFec,
 {
+    let mut budget_report = BudgetReport::default();
     #[cfg(feature = "std")]
     let trace = stage_trace_enabled::<P>();
     #[cfg(not(feature = "std"))]
@@ -2044,6 +2300,13 @@ where
     let fec = P::Fec::default();
 
     for (pass_idx, &factor) in passes.iter().enumerate() {
+        if let Some(check) = budget
+            && !check()
+        {
+            budget_report.exhausted = true;
+            break;
+        }
+        budget_report.stages_run += 1;
         #[cfg(feature = "std")]
         let __trace_tp = trace.then(std::time::Instant::now);
         // See the identical `P::ID == Ft4` branch in `decode_frame` above.
@@ -2212,5 +2475,5 @@ where
         all_results.extend(deduped);
     }
 
-    all_results
+    (all_results, budget_report)
 }
