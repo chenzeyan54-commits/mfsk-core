@@ -1548,6 +1548,83 @@ const char*       mfsk_last_error(void);
 * デコーダはキャッシュとエラー報告にスレッドローカルを使うので、
   複数スレッドそれぞれが自分のハンドルを持つコストは小さい
 
+### イントロスペクション: 行列をハードコードせず、ライブラリに聞く
+
+2026-09-13 まで、C から見えるイントロスペクションは `mfsk_version()`
+だけだった。一方 `registry::PROTOCOLS` は全 wired モードのジオメトリを
+知っているのに、まったく公開されていなかった。したがって「このモードは
+何ができるか」を知る必要のある C 側の消費者には、行列をハードコードして
+腐らせる以外の選択肢が無かった。上の `MfskProtocol` 列挙こそがその腐敗の
+可視化で、**FST4 のエントリが1つしか無い** — wired な5つのサブモードの
+うち4つが、デコードもエンコードも C から到達不能だった。
+
+```c
+uint32_t    mfsk_mode_count(void);                    /* このビルドのモード数 */
+MfskStatus  mfsk_mode_at(uint32_t index, MfskMode* out);
+const char* mfsk_mode_name(MfskMode mode);            /* static、free 不要 */
+MfskStatus  mfsk_mode_from_name(const char* name, MfskMode* out);
+MfskStatus  mfsk_mode_info(MfskMode mode, MfskModeInfo* out);
+uint64_t    mfsk_mode_caps(MfskMode mode);            /* MFSK_CAP_* ビット */
+MfskStatus  mfsk_mode_defaults(MfskMode mode, MfskDecodeDefaults* out);
+```
+
+**`MfskMode` は全モードを指し、その discriminant は ABI である。**
+registry エントリ1つにつき1つ、プラス MSK144。一度割り当てたら二度と
+並べ替えない。これは意図的に registry のインデックスでは**ない** —
+registry のメンバーシップは feature gate されているので、`q65` 無しの
+ビルドではそれ以降のインデックスが全部ずれる。このビルドが実際にどれを
+持っているかは `mfsk_mode_count` / `mfsk_mode_at` が答える。この ABI は
+`MfskQ65SubMode` で一度この教訓を学んでおり、学び直すコストは C 境界での
+サイレントな誤ディスパッチである。
+
+**能力は推測させず公表する。** 要となるのは `MFSK_CAP_DECODE_HANDLE` で、
+`mfsk_decode_i16` 系がそもそも適用できるかを表す。Q65 は公称開始サンプル
+と時間許容幅を取り、`dt` ではなく `start_sample` を返す。WSPR/JT9/JT65 に
+ビルダーは無い。これらは劣っているのではなく形が違うのであって、それが
+「呼び出し側が知っているべき事実」ではなく「読めるビット」になった。
+
+ビットは `mfsk_core::registry::caps` を写したもので、そちらは
+`mfsk-core/tests/registry_caps.rs` が双方向でトレイト実装に結び付けて
+いる — トレイトを持たないプロトコルを並べれば*コンパイル*エラー、
+トレイトを実装してビットを立て忘れれば実行時失敗。最後の環は
+`mfsk-ffi/tests/mode_introspection.rs` が閉じ、各 `MFSK_CAP_*` を対応する
+registry 定数と突き合わせる。この鎖があるのは、手書きの能力表は2リリース
+以内に嘘になるからである。
+
+**`mfsk_mode_defaults` は ABI 最悪の罠を取り除く。** 以前は1つの関数の中に
+プロトコル別の NULL オプション既定値が3種類あり、そのうち FT8 の
+`sync_min = 2.0` はツリー内のどのテストも使っていない値だった。既定値は
+データになり、`MfskDecodeDefaults::sync_scale` が「2つのモードの数値が
+そもそも比較可能か」を答える:
+
+```c
+MfskDecodeDefaults d = {0};
+d.size = sizeof d;
+mfsk_mode_defaults(MFSK_MODE_FT4, &d);
+/* d.sync_min == 1.2, d.sync_scale == MFSK_SYNC_SCALE_BASELINE_NORMALISED */
+```
+
+FT4 はスコアリング前にスペクトルをフィット済みベースラインで割るので、
+雑音は**構造上** ~1.0 に座る。つまり本家の 1.2 (`ft4_decode.f90:195`) は
+好みではなく床である。FT8 と FST4 は絶対 Costas スコア。モード間でこの値を
+コピーするのは誤りだが、このフィールドが無いうちは誰もそう言わなかった。
+
+**予算を立てる前に読むべきは `MfskModeInfo::decode_fft1_size`。**
+デコーダがスロット全体に対して取る前方 FFT の点数で、FT4 は 92 160、
+FST4-300 は **4 194 304** — 45 倍の開きがあり、他のどのフィールドからも
+示唆されない。スマートフォンで「全モード同じ呼び出し形」がメモリの話と
+して誤りになる理由がこれである。
+
+**サイズバージョニング。** `MfskModeInfo` と `MfskDecodeDefaults` は
+どちらも `size` で始まる。自分の `sizeof` を入れる（または構造体をゼロ
+クリアすればライブラリが埋める）。ヘッダより新しいライブラリは、呼び出し
+側が宣言した接頭部分だけを書き、`size` を実際に書いた量に書き換える。
+`MfskResult` は 0.8.1 で `snr_db` が生えたのに何の印も無く、それを
+繰り返さないためにある。
+
+`mfsk_abi_version()` が `mfsk_version()` と別なのも同じ理由で、
+クレートのバージョンは境界と無関係な理由で動く。
+
 ## 9. Kotlin / Android
 
 `mfsk-ffi/examples/kotlin_jni/` にそのまま使える雛形:

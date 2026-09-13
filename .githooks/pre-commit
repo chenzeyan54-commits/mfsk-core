@@ -23,4 +23,11 @@ cargo clippy --workspace --all-targets --features full,internal-testing --no-dep
 echo "==> RUSTDOCFLAGS=-D warnings cargo doc -p mfsk-core --features full --no-deps"
 RUSTDOCFLAGS="-D warnings" cargo doc -p mfsk-core --features full --no-deps
 
+# The FFI crates too. They were outside this gate until 2026-09-13, and
+# a broken intra-doc link shipped to main through the gap — their doc
+# comments are also the source cbindgen copies into the committed C
+# headers, so a bad link there is user-visible twice over.
+echo "==> RUSTDOCFLAGS=-D warnings cargo doc -p mfsk-ffi -p mfsk-ffi-abi -p mfsk-ffi-ft8 --no-deps"
+RUSTDOCFLAGS="-D warnings" cargo doc -p mfsk-ffi -p mfsk-ffi-abi -p mfsk-ffi-ft8 --no-deps
+
 echo "==> pre-commit OK"

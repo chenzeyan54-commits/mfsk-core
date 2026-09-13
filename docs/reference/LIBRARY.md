@@ -1562,6 +1562,7 @@ enum MfskQ65FadingModel {
 };
 
 uint32_t          mfsk_version(void);           // major<<16 | minor<<8 | patch
+uint32_t          mfsk_abi_version(void);       // the boundary's own revision
 MfskDecoder*      mfsk_decoder_new(MfskProtocol protocol);
 void              mfsk_decoder_free(MfskDecoder* dec);
 
@@ -1683,6 +1684,86 @@ See `mfsk-ffi/examples/cpp_smoke/` for a minimal end-to-end demo.
 * An `MfskDecoder` is `!Sync`: one handle per concurrent thread.
 * The decoder uses thread-local state for caching and error reporting,
   so spawning multiple threads each with its own handle is cheap.
+
+### Introspection: ask the library, don't hardcode a matrix
+
+Until 2026-09-13 `mfsk_version()` was the entire introspection surface,
+while `registry::PROTOCOLS` — which knows every wired mode with full
+geometry — was not exposed at all. So a C consumer that needed to know
+what a mode supports had one option: hardcode the matrix and let it rot.
+The `MfskProtocol` enum above is that rot made visible — it has **one**
+FST4 entry, so four of the five wired FST4 sub-modes were unreachable
+from C for decode and encode alike.
+
+```c
+uint32_t    mfsk_mode_count(void);                    /* modes in THIS build */
+MfskStatus  mfsk_mode_at(uint32_t index, MfskMode* out);
+const char* mfsk_mode_name(MfskMode mode);            /* static, do not free */
+MfskStatus  mfsk_mode_from_name(const char* name, MfskMode* out);
+MfskStatus  mfsk_mode_info(MfskMode mode, MfskModeInfo* out);
+uint64_t    mfsk_mode_caps(MfskMode mode);            /* MFSK_CAP_* bits */
+MfskStatus  mfsk_mode_defaults(MfskMode mode, MfskDecodeDefaults* out);
+```
+
+**`MfskMode` addresses every mode, and its discriminants are ABI.** One
+per registry entry plus MSK144, assigned once and never reordered — they
+are deliberately *not* registry indices, because registry membership is
+feature-gated and a build without `q65` would shift every index after
+it. `mfsk_mode_count` / `mfsk_mode_at` say which of them this particular
+build actually has. This ABI already learned the lesson once, in
+`MfskQ65SubMode`; the cost of relearning it is silent misdispatch.
+
+**Capabilities are published, not inferred.** `MFSK_CAP_DECODE_HANDLE`
+is the load-bearing one: it says whether `mfsk_decode_i16` and friends
+apply at all. Q65 takes a nominal start sample and a time tolerance and
+reports `start_sample` rather than `dt`; WSPR/JT9/JT65 have no builder.
+They are not lesser, they are shaped differently, and that is now a bit
+a caller can read rather than a fact it has to know.
+
+The bits mirror `mfsk_core::registry::caps`, which
+`mfsk-core/tests/registry_caps.rs` ties to the trait impls in both
+directions — naming a protocol that lacks a trait is a *compile* error
+there, and implementing one without setting the bit is a runtime
+failure. `mfsk-ffi/tests/mode_introspection.rs` closes the last link by
+comparing each `MFSK_CAP_*` against the registry constant it mirrors.
+That chain exists because a hand-written capability table lies within
+two releases.
+
+**`mfsk_mode_defaults` removes the ABI's worst trap.** Three different
+per-protocol NULL-option defaults used to live inside one function, one
+of them an FT8 `sync_min` of 2.0 that no test in the tree uses. Defaults
+are data now — and `MfskDecodeDefaults::sync_scale` says whether two
+modes' numbers are even comparable:
+
+```c
+MfskDecodeDefaults d = {0};
+d.size = sizeof d;
+mfsk_mode_defaults(MFSK_MODE_FT4, &d);
+/* d.sync_min == 1.2, d.sync_scale == MFSK_SYNC_SCALE_BASELINE_NORMALISED */
+```
+
+FT4's spectrum is divided by a fitted baseline before scoring, so noise
+sits at ~1.0 **by construction** and WSJT-X's own 1.2
+(`ft4_decode.f90:195`) is a floor rather than a preference. FT8's and
+FST4's are absolute Costas scores. Copying one across modes is wrong,
+and before this field nothing said so.
+
+**`MfskModeInfo::decode_fft1_size` is the field to read before
+budgeting.** It is the forward FFT the decoder takes over the whole
+slot: FT4 92 160 points, FST4-300 **4 194 304** — a factor of 45 that no
+other field hints at, and the reason "one call shape for every mode" is
+wrong as a memory story on a phone.
+
+**Size versioning.** `MfskModeInfo` and `MfskDecodeDefaults` both lead
+with `size`. Set it to your `sizeof` (or zero the struct and the library
+fills it in); a library newer than your header writes only the prefix
+you declared and rewrites `size` to what it actually wrote.
+`MfskResult` grew `snr_db` in 0.8.1 with nothing marking it, and that
+must not be repeatable.
+
+`mfsk_abi_version()` is separate from `mfsk_version()` for the same
+reason: the crate version moves for reasons that have nothing to do with
+the boundary.
 
 ## 9. Kotlin / Android consumers
 

@@ -281,6 +281,98 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
 
 ### Added
 
+- **The C ABI can be asked what it supports, instead of being guessed
+  at.** `mfsk_version()` was the entire introspection surface, while
+  `registry::PROTOCOLS` — which knows every wired mode with full
+  geometry — was not exposed at all, so every C consumer that needed to
+  know what a mode supports hardcoded a matrix. The existing
+  `MfskProtocol` enum *is* that rot made visible: it has one FST4 entry,
+  so four of the five wired FST4 sub-modes were unreachable from C for
+  decode and encode alike.
+
+  ```c
+  uint32_t    mfsk_mode_count(void);                 /* modes in THIS build */
+  MfskStatus  mfsk_mode_at(uint32_t i, MfskMode* out);
+  const char* mfsk_mode_name(MfskMode);
+  MfskStatus  mfsk_mode_from_name(const char*, MfskMode* out);
+  MfskStatus  mfsk_mode_info(MfskMode, MfskModeInfo* out);
+  uint64_t    mfsk_mode_caps(MfskMode);
+  MfskStatus  mfsk_mode_defaults(MfskMode, MfskDecodeDefaults* out);
+  uint32_t    mfsk_abi_version(void);
+  ```
+
+  `MfskMode` addresses all 25 modes — every registry entry plus MSK144 —
+  with **discriminants that are ABI and are never reordered**. They are
+  deliberately not registry indices: registry membership is
+  feature-gated, so a build without `q65` would shift every index after
+  it while these stay put. `mfsk_mode_count`/`mfsk_mode_at` report what
+  a given build actually has (21 for the default `desktop` feature set).
+  This ABI already learned that lesson in `MfskQ65SubMode`; relearning
+  it costs silent misdispatch at a C boundary.
+
+  Additive: no existing symbol changed, and `MfskStatus` gained
+  `MFSK_STATUS_UNSUPPORTED = -6` without touching the values before it.
+
+- **Capabilities cross the boundary as named bits, and cannot drift.**
+  Fifteen `MFSK_CAP_*` `#define`s, of which `MFSK_CAP_DECODE_HANDLE` is
+  load-bearing: it says whether `mfsk_decode_i16` applies at all. Q65
+  takes a nominal start sample and a time tolerance and reports
+  `start_sample` rather than `dt`; WSPR/JT9/JT65 have no builder. They
+  are not lesser, they are shaped differently, and that is now a bit a
+  caller reads rather than a fact it has to know.
+
+  The drift chain is closed at both ends. `mfsk-core`'s
+  `tests/registry_caps.rs` ties the registry bits to the trait impls in
+  both directions — naming a protocol that lacks a trait is a *compile*
+  error, implementing one without setting the bit fails at runtime — and
+  `mfsk-ffi/tests/mode_introspection.rs` compares each `MFSK_CAP_*`
+  against the registry constant it mirrors, stated one pair at a time so
+  a loop built from the same source cannot make it vacuous. Verified by
+  moving a bit and watching it fail.
+
+  The constants are literals in `mfsk-ffi` rather than re-exported from
+  the shared ABI crate because cbindgen emits a root-level literal
+  `pub const` from the crate it generates from and **cannot evaluate one
+  that references another crate's path** — measured, not assumed. Left
+  in the dependency they reach C as an unnamed `uint64_t`, which is the
+  failure this surface exists to end.
+
+- **`mfsk_mode_defaults` removes the ABI's worst trap.** Three different
+  per-protocol NULL-option defaults lived inside one function, one of
+  them an FT8 `sync_min` of 2.0 that no test in the tree uses. Defaults
+  are data now, published per mode — and `MfskDecodeDefaults::sync_scale`
+  says whether two modes' numbers are comparable at all. FT4's spectrum
+  is divided by a fitted baseline before scoring, so noise sits at ~1.0
+  **by construction** and WSJT-X's own 1.2 (`ft4_decode.f90:195`) is a
+  floor rather than a preference; FT8's and FST4's are absolute Costas
+  scores. Copying one across modes is wrong and nothing said so.
+
+- **`Protocol::DECODE_FFT1_SIZE`, published as
+  `MfskModeInfo::decode_fft1_size`.** The forward FFT the decoder takes
+  over the whole slot — FT4 92 160 points, FST4-300 **4 194 304**. A
+  factor of 45 that no other registry field hints at, and the reason
+  "one call shape for every mode" is wrong as a memory story on a phone.
+  A host deciding which modes it can afford could not previously ask.
+
+  Written as a literal on each `impl Protocol` rather than read from the
+  `DownsampleCfg`, because those consts sit behind an FFT backend
+  feature while the trait does not — a `--features fst4` build has the
+  protocol and no downsampler. `tests/registry_fft_size.rs` is what
+  stops the two drifting, and also pins that a mode with its own front
+  end publishes 0 rather than a plausible-looking guess.
+
+- **Size versioning, so the next field is not another `snr_db`.**
+  `MfskModeInfo` and `MfskDecodeDefaults` lead with `size`: the caller
+  sets its own `sizeof` (or zeroes the struct), and a newer library
+  writes only the declared prefix and rewrites `size` to what it wrote.
+  `MfskResult` grew `snr_db` in 0.8.1 with no marker at all. Exercised
+  from both Rust and the C++ driver with a deliberately short struct and
+  a 0xAA-filled tail.
+
+  `mfsk_abi_version()` is separate from `mfsk_version()` for the same
+  reason: the crate version moves for reasons that have nothing to do
+  with the boundary.
+
 - **The registry describes capability, not just geometry.**
   `ProtocolMeta` gains `profile: DecodeProfile` — a capability bitmask, a
   default search (band, `sync_min`, `max_cand`), the *scale* that
@@ -498,6 +590,18 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
   other protocol.
 
 ### Fixed
+
+- **The FFI crates' rustdoc was never checked, and a broken intra-doc
+  link had already shipped through the gap.** Both the pre-commit hook
+  and CI's `docs` job ran `cargo doc` for `mfsk-core` only, so
+  `mfsk_decode_i16_sniper`'s doc comment could reference a private item
+  and reach `main` unremarked. Both now cover `mfsk-ffi`,
+  `mfsk-ffi-abi` and `mfsk-ffi-ft8`.
+
+  This matters twice over in these crates specifically: their doc
+  comments are also the text cbindgen copies into the committed C
+  headers, so a bad link is wrong in the rustdoc *and* in `mfsk.h`.
+  Found by running the gate that did not exist yet.
 
 - **The FFI crates' hand-written version pins can no longer go stale.**
   `mfsk-ffi` and `mfsk-ffi-ft8` each required `mfsk-core` and

@@ -65,9 +65,69 @@ use mfsk_core::ft4::decode as ft4;
 use mfsk_core::ft8::decode as ft8;
 
 pub use mfsk_ffi_abi::{
-    MfskDecodeDepth, MfskDecodeOptions, MfskEqMode, MfskResult, MfskResultList, MfskStatus,
-    MfskStrictness,
+    MfskDecodeDefaults, MfskDecodeDepth, MfskDecodeOptions, MfskEqMode, MfskMode, MfskModeInfo,
+    MfskResult, MfskResultList, MfskStatus, MfskStrictness, MfskSyncScale,
 };
+// ──────────────────────────────────────────────────────────────────────────
+// Capability bits
+//
+// These mirror `mfsk_core::registry::caps` and are written here as
+// literals rather than re-exported from it, because cbindgen emits a
+// root-level literal `pub const` from *this* crate as a `#define` and
+// cannot evaluate one that references another crate's path (verified:
+// `pub const X: u64 = mfsk_ffi_abi::caps::AP_WIDEBAND;` produces
+// nothing). Without them in the header a C caller gets `caps` as a bare
+// `uint64_t` and re-derives every bit position by hand — the exact
+// failure this surface exists to end.
+//
+// `tests/mode_introspection.rs::abi_caps_match_the_registry` is what
+// keeps the copy honest; it compares each one against the registry
+// constant it mirrors, and mfsk-core's own `registry_caps.rs` ties
+// those to the trait impls in both directions.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Drives the `DecodeRequest` builder, i.e. `mfsk_decode_i16` and
+/// friends apply. Modes without this bit decode through their own
+/// entry point (Q65 takes a nominal start sample and a tolerance;
+/// WSPR/JT9/JT65 have no builder at all). They are not lesser, they
+/// are shaped differently — this is the bit that says which is
+/// which.
+pub const MFSK_CAP_DECODE_HANDLE: u64 = 1 << 0;
+/// Narrow-band single-target search. **FT8 only, by design**: it is
+/// the receive-side half of narrowing a transceiver's *analogue*
+/// roofing filter, not a general "hunt one known station" feature.
+pub const MFSK_CAP_SNIPER: u64 = 1 << 1;
+/// A-priori hint on a targeted search (FT8's sniper, Q65's decode).
+pub const MFSK_CAP_AP_NARROW: u64 = 1 << 2;
+/// A-priori hint on the wide-band search. FT8, FT4 and every FST4
+/// sub-mode.
+pub const MFSK_CAP_AP_WIDEBAND: u64 = 1 << 3;
+/// Flat successive-interference cancellation.
+pub const MFSK_CAP_SIC_ROUNDS: u64 = 1 << 4;
+/// Checkpoint-emulation early decode. FT8 only.
+pub const MFSK_CAP_SIC_EARLY: u64 = 1 << 5;
+/// The OSD *switch* is honoured. Absent means "cannot be turned
+/// off", not "does not have it" — FT4 and FST4 run OSD by default.
+pub const MFSK_CAP_OSD: u64 = 1 << 6;
+/// Equalisation mode reaches the decoder.
+pub const MFSK_CAP_EQ_MODE: u64 = 1 << 7;
+/// The strictness profile is honoured rather than accepted and
+/// dropped.
+pub const MFSK_CAP_STRICTNESS: u64 = 1 << 8;
+/// A caller-supplied budget predicate is polled.
+pub const MFSK_CAP_BUDGET: u64 = 1 << 9;
+/// Known signals can be excluded from the reported results.
+pub const MFSK_CAP_KNOWN_FILTER: u64 = 1 << 10;
+/// Known signals are subtracted from the audio, not merely filtered
+/// out of the output. Strictly stronger than [`MFSK_CAP_KNOWN_FILTER`].
+pub const MFSK_CAP_KNOWN_SUBTRACT: u64 = 1 << 11;
+/// A slot FFT can be handed back for a second pass over the same
+/// audio.
+pub const MFSK_CAP_FFT_CACHE: u64 = 1 << 12;
+/// Results can be delivered through a callback as they are found.
+pub const MFSK_CAP_ON_RESULT: u64 = 1 << 13;
+/// The mode can synthesise as well as decode.
+pub const MFSK_CAP_ENCODE: u64 = 1 << 14;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Public C types
@@ -1201,8 +1261,8 @@ fn decode_i16_sniper(
 ///   `SniperRequest`'s own defaults (`sync_min` 0.8, 8 candidates, OSD
 ///   on). `sync_min`, `max_cand`, `depth`, `strictness`, `eq_mode` and
 ///   the AP hint apply; `freq_min_hz`/`freq_max_hz`, `freq_hint` and
-///   `sic_rounds`/`sic_early` do not — see [`decode_i16_sniper`] for
-///   why each is in the list it is in.
+///   `sic_rounds`/`sic_early` do not — see [`mfsk_decode_i16_sniper`]
+///   for why each is in the list it is in.
 /// - `out` — caller-allocated [`MfskResultList`], freed with
 ///   [`mfsk_result_list_free`].
 ///
@@ -2223,6 +2283,417 @@ pub unsafe extern "C" fn mfsk_q65_decode_with_ap_list(
     }
     finalise(vec, out);
     MfskStatus::Ok
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Mode addressing and introspection (FFI v2 slice 1)
+//
+// `mfsk_version()` was the entire introspection surface, while
+// `registry::PROTOCOLS` — which knows every wired mode with full
+// geometry — was not exposed at all. So every consumer that needed to
+// know what a mode supports hardcoded a matrix, and the differences
+// between FT8, FT4 and the FST4 sub-modes were invisible from C rather
+// than merely inconvenient.
+//
+// The bridge is the registry's own stable display name, not an index:
+// `MfskMode` discriminants are ABI and fixed forever, while registry
+// membership is feature-gated and shifts between builds.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Every `MfskMode`, with the name it is known by and whether that name
+/// is a `registry::PROTOCOLS` key.
+///
+/// MSK144 is the one entry with no registry key: it is deliberately
+/// outside the `Protocol` trait — not FSK, and its decoder bypasses the
+/// shared pipeline by design — so it is addressed here and described
+/// from the constants below.
+///
+/// Declaration order is the order `mfsk_mode_at` reports, which is
+/// deliberately the enum's order rather than the registry's: it is the
+/// one a caller can reason about from the header alone.
+///
+/// Names carry an explicit NUL so `mfsk_mode_name` can hand out a
+/// `const char*` with no allocation and no lifetime question.
+const MODE_TABLE: &[(MfskMode, &str, bool)] = &[
+    (MfskMode::Ft8, "FT8\0", true),
+    (MfskMode::Ft4, "FT4\0", true),
+    (MfskMode::Fst4s15, "FST4-15\0", true),
+    (MfskMode::Fst4s30, "FST4-30\0", true),
+    (MfskMode::Fst4s60, "FST4-60A\0", true),
+    (MfskMode::Fst4s120, "FST4-120\0", true),
+    (MfskMode::Fst4s300, "FST4-300\0", true),
+    (MfskMode::Wspr, "WSPR\0", true),
+    (MfskMode::Jt9, "JT9\0", true),
+    (MfskMode::Jt65, "JT65\0", true),
+    (MfskMode::Q65a15, "Q65-15A\0", true),
+    (MfskMode::Q65a30, "Q65-30A\0", true),
+    (MfskMode::Q65a60, "Q65-60A\0", true),
+    (MfskMode::Q65b60, "Q65-60B\0", true),
+    (MfskMode::Q65c60, "Q65-60C\0", true),
+    (MfskMode::Q65d60, "Q65-60D\0", true),
+    (MfskMode::Q65e60, "Q65-60E\0", true),
+    (MfskMode::Q65d120, "Q65-120D\0", true),
+    (MfskMode::Q65e120, "Q65-120E\0", true),
+    (MfskMode::Q65a300, "Q65-300A\0", true),
+    (MfskMode::Msk144, "MSK144\0", false),
+    (MfskMode::UvRobust, "UvRobust\0", true),
+    (MfskMode::UvStandard, "UvStandard\0", true),
+    (MfskMode::UvUltraRobust, "UvUltraRobust\0", true),
+    (MfskMode::UvExpress, "UvExpress\0", true),
+];
+
+/// MSK144's geometry, which no registry entry carries. Reported rather
+/// than omitted so a C caller enumerating modes sees a complete list;
+/// the capability word is what says the decode handle does not drive it.
+struct Msk144Geometry;
+impl Msk144Geometry {
+    const NTONES: u32 = 2; // MSK is binary
+    const BITS_PER_SYMBOL: u32 = 1;
+    const NSPS: u32 = 6; // at 12 kHz
+    const SYMBOL_DT: f32 = 0.0005;
+    const TONE_SPACING_HZ: f32 = 1_000.0; // 1/(2*T) for T = 0.5 ms
+    const N_DATA: u32 = 128;
+    const N_SYNC: u32 = 16;
+    const N_SYMBOLS: u32 = 144;
+    const T_FRAME_S: f32 = 0.072;
+    const FEC_K: u32 = 90; // LDPC(128,90)
+    const FEC_N: u32 = 128;
+    const PAYLOAD_BITS: u32 = 77;
+}
+
+fn mode_index(mode: MfskMode) -> Option<usize> {
+    MODE_TABLE.iter().position(|(m, _, _)| *m == mode)
+}
+
+/// The display name with its trailing NUL stripped — what a Rust-side
+/// comparison wants.
+fn mode_name_str(i: usize) -> &'static str {
+    MODE_TABLE[i].1.trim_end_matches('\0')
+}
+
+/// Registry entry for `mode`, or `None` if this build was compiled
+/// without that protocol's feature (or the mode has no entry at all).
+fn mode_meta(mode: MfskMode) -> Option<&'static mfsk_core::ProtocolMeta> {
+    let i = mode_index(mode)?;
+    if !MODE_TABLE[i].2 {
+        return None;
+    }
+    let name = mode_name_str(i);
+    mfsk_core::PROTOCOLS.iter().find(|p| p.name == name)
+}
+
+/// Number of modes **this build** actually supports, which is not the
+/// number of `MfskMode` discriminants: protocols are feature-gated.
+/// Pair with `mfsk_mode_at` to enumerate.
+#[unsafe(no_mangle)]
+pub extern "C" fn mfsk_mode_count() -> u32 {
+    MODE_TABLE
+        .iter()
+        .filter(|(m, _, _)| mode_is_present(*m))
+        .count() as u32
+}
+
+fn mode_is_present(mode: MfskMode) -> bool {
+    if mode == MfskMode::Msk144 {
+        return cfg!(feature = "protocols");
+    }
+    mode_meta(mode).is_some()
+}
+
+/// The `index`-th mode this build supports, `0 <= index < mfsk_mode_count()`.
+///
+/// Writes the mode to `out` and returns `MFSK_STATUS_OK`; returns
+/// `MFSK_STATUS_INVALID_ARGUMENT` for a null `out` or an index past the
+/// end. A status rather than a returned enum because C has no way to
+/// spell "no such mode" inside an enum whose every value is legal.
+///
+/// # Safety
+/// `out` must be null or point to a writable `MfskMode`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_mode_at(index: u32, out: *mut MfskMode) -> MfskStatus {
+    if out.is_null() {
+        set_error("mfsk_mode_at: out is NULL");
+        return MfskStatus::InvalidArg;
+    }
+    match MODE_TABLE
+        .iter()
+        .filter(|(m, _, _)| mode_is_present(*m))
+        .nth(index as usize)
+    {
+        Some((m, _, _)) => {
+            unsafe { *out = *m };
+            MfskStatus::Ok
+        }
+        None => {
+            set_error("mfsk_mode_at: index past the end of this build's mode list");
+            MfskStatus::InvalidArg
+        }
+    }
+}
+
+/// Stable display name for `mode` (`"FT8"`, `"FST4-120"`), or NULL if
+/// `mode` is not a value this library knows.
+///
+/// The returned pointer is a static NUL-terminated string with the
+/// lifetime of the library; do not free it. It is also the key
+/// [`mfsk_mode_from_name`] accepts, so the two round-trip.
+///
+/// Answers for a mode this build lacks — the name is a property of the
+/// mode, not of the build.
+#[unsafe(no_mangle)]
+pub extern "C" fn mfsk_mode_name(mode: MfskMode) -> *const c_char {
+    match mode_index(mode) {
+        // The literal carries its own NUL, so this is a valid C string.
+        Some(i) => MODE_TABLE[i].1.as_ptr() as *const c_char,
+        None => ptr::null(),
+    }
+}
+
+/// Look `name` up as a mode. Case-sensitive, matching the registry's own
+/// display strings exactly.
+///
+/// Writes the mode to `out` and returns `MFSK_STATUS_OK`;
+/// `MFSK_STATUS_INVALID_ARGUMENT` for a null argument or a name that is
+/// not a mode, `MFSK_STATUS_UNKNOWN_PROTOCOL` for a real mode this build
+/// was compiled without — the distinction a caller needs in order to
+/// tell a typo from a missing feature.
+///
+/// # Safety
+/// `name` must be a valid NUL-terminated C string; `out` must point to a
+/// writable `MfskMode`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_mode_from_name(
+    name: *const c_char,
+    out: *mut MfskMode,
+) -> MfskStatus {
+    if name.is_null() || out.is_null() {
+        set_error("mfsk_mode_from_name: NULL argument");
+        return MfskStatus::InvalidArg;
+    }
+    let Ok(name) = (unsafe { CStr::from_ptr(name) }).to_str() else {
+        set_error("mfsk_mode_from_name: name is not valid UTF-8");
+        return MfskStatus::InvalidArg;
+    };
+    let found = MODE_TABLE
+        .iter()
+        .enumerate()
+        .find(|(i, _)| mode_name_str(*i) == name);
+    match found {
+        Some((_, (m, _, _))) if mode_is_present(*m) => {
+            unsafe { *out = *m };
+            MfskStatus::Ok
+        }
+        Some(_) => {
+            set_error("mfsk_mode_from_name: this build was compiled without that mode");
+            MfskStatus::UnknownProtocol
+        }
+        None => {
+            set_error("mfsk_mode_from_name: not a mode name");
+            MfskStatus::InvalidArg
+        }
+    }
+}
+
+/// Geometry and capability for `mode`.
+///
+/// **Set `out->size = sizeof(MfskModeInfo)` before calling**, or zero
+/// the struct and the library fills it in. Only the prefix the caller
+/// declared is written, so a newer library stays usable from an older
+/// header.
+///
+/// Returns `MFSK_STATUS_UNKNOWN_PROTOCOL` if this build lacks `mode`.
+///
+/// # Safety
+/// `out` must point to at least `out->size` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_mode_info(mode: MfskMode, out: *mut MfskModeInfo) -> MfskStatus {
+    if out.is_null() {
+        set_error("mfsk_mode_info: out is NULL");
+        return MfskStatus::InvalidArg;
+    }
+    let Some(i) = mode_index(mode) else {
+        set_error("mfsk_mode_info: not a mode this library knows");
+        return MfskStatus::InvalidArg;
+    };
+    if !mode_is_present(mode) {
+        set_error("mfsk_mode_info: this build was compiled without that mode");
+        return MfskStatus::UnknownProtocol;
+    }
+
+    let mut info = MfskModeInfo {
+        size: core::mem::size_of::<MfskModeInfo>() as u32,
+        mode,
+        name: [0; 16],
+        ntones: 0,
+        bits_per_symbol: 0,
+        nsps: 0,
+        symbol_dt: 0.0,
+        tone_spacing_hz: 0.0,
+        gfsk_bt: 0.0,
+        gfsk_hmod: 0.0,
+        n_data: 0,
+        n_sync: 0,
+        n_symbols: 0,
+        t_slot_s: 0.0,
+        slot_samples_12k: 0,
+        tx_start_offset_s: 0.0,
+        fec_k: 0,
+        fec_n: 0,
+        payload_bits: 0,
+        decode_fft1_size: 0,
+        caps: 0,
+    };
+    copy_name(&mut info.name, mode_name_str(i));
+
+    match mode_meta(mode) {
+        Some(m) => {
+            info.ntones = m.ntones;
+            info.bits_per_symbol = m.bits_per_symbol;
+            info.nsps = m.nsps;
+            info.symbol_dt = m.symbol_dt;
+            info.tone_spacing_hz = m.tone_spacing_hz;
+            info.gfsk_bt = m.gfsk_bt;
+            info.gfsk_hmod = m.gfsk_hmod;
+            info.n_data = m.n_data;
+            info.n_sync = m.n_sync;
+            info.n_symbols = m.n_symbols;
+            info.t_slot_s = m.t_slot_s;
+            info.slot_samples_12k = m.slot_samples_12k;
+            info.tx_start_offset_s = m.tx_start_offset_s;
+            info.fec_k = m.fec_k as u32;
+            info.fec_n = m.fec_n as u32;
+            info.payload_bits = m.payload_bits;
+            info.decode_fft1_size = m.decode_fft1_size;
+            info.caps = u64::from(m.profile.caps);
+        }
+        None => {
+            // MSK144: no registry entry by design.
+            info.ntones = Msk144Geometry::NTONES;
+            info.bits_per_symbol = Msk144Geometry::BITS_PER_SYMBOL;
+            info.nsps = Msk144Geometry::NSPS;
+            info.symbol_dt = Msk144Geometry::SYMBOL_DT;
+            info.tone_spacing_hz = Msk144Geometry::TONE_SPACING_HZ;
+            info.n_data = Msk144Geometry::N_DATA;
+            info.n_sync = Msk144Geometry::N_SYNC;
+            info.n_symbols = Msk144Geometry::N_SYMBOLS;
+            info.t_slot_s = Msk144Geometry::T_FRAME_S;
+            info.slot_samples_12k = (Msk144Geometry::T_FRAME_S * 12_000.0) as u32;
+            info.fec_k = Msk144Geometry::FEC_K;
+            info.fec_n = Msk144Geometry::FEC_N;
+            info.payload_bits = Msk144Geometry::PAYLOAD_BITS;
+            info.caps = MFSK_CAP_ENCODE;
+        }
+    }
+
+    unsafe { write_size_versioned(out, &info) };
+    MfskStatus::Ok
+}
+
+/// Capability bitmask for `mode` — the same word `mfsk_mode_info` puts
+/// in `caps`, for callers that want only that. Returns 0 for a mode this
+/// build lacks, which is also a legal "supports nothing" answer; use
+/// `mfsk_mode_info` when the difference matters.
+#[unsafe(no_mangle)]
+pub extern "C" fn mfsk_mode_caps(mode: MfskMode) -> u64 {
+    match mode_meta(mode) {
+        Some(m) => u64::from(m.profile.caps),
+        None if mode == MfskMode::Msk144 && mode_is_present(mode) => MFSK_CAP_ENCODE,
+        None => 0,
+    }
+}
+
+/// Default search parameters for `mode`.
+///
+/// This is what removes the ABI's worst trap: three different
+/// per-protocol NULL-option defaults lived inside one function, one of
+/// them a `sync_min` of 2.0 that no test in the tree uses. Defaults are
+/// data now, published per mode, and `sync_scale` says which of them are
+/// even comparable.
+///
+/// Size-versioned on the same contract as `mfsk_mode_info`. Returns
+/// `MFSK_STATUS_UNSUPPORTED` for a mode with no wide-band search to
+/// describe.
+///
+/// # Safety
+/// `out` must point to at least `out->size` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_mode_defaults(
+    mode: MfskMode,
+    out: *mut MfskDecodeDefaults,
+) -> MfskStatus {
+    if out.is_null() {
+        set_error("mfsk_mode_defaults: out is NULL");
+        return MfskStatus::InvalidArg;
+    }
+    let Some(m) = mode_meta(mode) else {
+        set_error("mfsk_mode_defaults: no such mode in this build");
+        return MfskStatus::UnknownProtocol;
+    };
+    let d = m.profile.defaults;
+    if !(d.freq_max_hz > d.freq_min_hz && d.max_cand > 0) {
+        set_error("mfsk_mode_defaults: this mode publishes no searchable band");
+        return MfskStatus::Unsupported;
+    }
+    let defaults = MfskDecodeDefaults {
+        size: core::mem::size_of::<MfskDecodeDefaults>() as u32,
+        freq_min_hz: d.freq_min_hz,
+        freq_max_hz: d.freq_max_hz,
+        sync_min: d.sync_min,
+        max_cand: d.max_cand,
+        sync_scale: match m.profile.sync_scale {
+            mfsk_core::registry::SyncScale::CostasAbsolute => MfskSyncScale::CostasAbsolute,
+            mfsk_core::registry::SyncScale::BaselineNormalised => MfskSyncScale::BaselineNormalised,
+        },
+    };
+    unsafe { write_size_versioned(out, &defaults) };
+    MfskStatus::Ok
+}
+
+/// ABI revision, distinct from [`mfsk_version`].
+///
+/// `mfsk_version` tracks the crate's release number and moves for
+/// reasons that have nothing to do with the boundary. This moves only
+/// when the C surface changes shape, so it is the one to check before
+/// deciding a header and a library agree.
+#[unsafe(no_mangle)]
+pub extern "C" fn mfsk_abi_version() -> u32 {
+    2
+}
+
+/// Copy a `size`-versioned struct into caller memory, writing only the
+/// prefix the caller declared.
+///
+/// The caller sets `out->size` to its own `sizeof`. A zero (or
+/// oversized) value means "I have the same header you do", so the whole
+/// struct is written. A smaller value means an older header, and only
+/// that many bytes are copied — with `size` itself rewritten to what was
+/// actually written, so the caller can tell.
+///
+/// # Safety
+/// `out` must point to at least `min(out->size, sizeof(T))` writable
+/// bytes, and `T` must be `#[repr(C)]` with `size: u32` first.
+unsafe fn write_size_versioned<T: Copy>(out: *mut T, value: &T) {
+    let full = core::mem::size_of::<T>();
+    // `size` is the first field of every struct this is used with.
+    let declared = unsafe { core::ptr::read_unaligned(out as *const u32) } as usize;
+    let n = if declared == 0 || declared > full {
+        full
+    } else {
+        declared
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(value as *const T as *const u8, out as *mut u8, n);
+        core::ptr::write_unaligned(out as *mut u32, n as u32);
+    }
+}
+
+fn copy_name(dst: &mut [c_char; 16], src: &str) {
+    let b = src.as_bytes();
+    let n = b.len().min(dst.len() - 1);
+    for (d, &s) in dst.iter_mut().zip(&b[..n]) {
+        *d = s as c_char;
+    }
+    dst[n] = 0;
 }
 
 /// Library version, major.minor.patch packed into a 32-bit integer (8

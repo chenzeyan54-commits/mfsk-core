@@ -135,6 +135,7 @@ macro_rules! fst4_submode {
         tr_period_s = $period:literal,
         tx_start_offset_s = $tx_start:literal,
         snr_calfac = $snr_calfac:literal,
+        decode_fft1_size = $fft1:literal,
     ) => {
         $(#[$attr])*
         #[derive(Copy, Clone, Debug, Default)]
@@ -204,6 +205,8 @@ macro_rules! fst4_submode {
             const ID: ProtocolId = ProtocolId::Fst4;
             /// `fst4_decode.f90:418` — `apmag = maxval(abs(llrs(:,4))) * 1.1`.
             const AP_MAG_SCALE: f32 = 1.1;
+            /// This sub-mode's `fst4::decode::FST4_*_DOWNSAMPLE`.
+            const DECODE_FFT1_SIZE: u32 = $fft1;
         }
     };
 }
@@ -222,6 +225,7 @@ fst4_submode! {
     tr_period_s = 15,
     tx_start_offset_s = 0.5,
     snr_calfac = 800.0,
+    decode_fft1_size = 180_000,
 }
 
 fst4_submode! {
@@ -234,6 +238,7 @@ fst4_submode! {
     tr_period_s = 30,
     tx_start_offset_s = 1.0,
     snr_calfac = 600.0,
+    decode_fft1_size = 362_880,
 }
 
 fst4_submode! {
@@ -247,6 +252,7 @@ fst4_submode! {
     tr_period_s = 60,
     tx_start_offset_s = 1.0,
     snr_calfac = 430.0,
+    decode_fft1_size = 746_496,
 }
 
 fst4_submode! {
@@ -259,6 +265,7 @@ fst4_submode! {
     tr_period_s = 120,
     tx_start_offset_s = 1.0,
     snr_calfac = 390.0,
+    decode_fft1_size = 1_443_200,
 }
 
 fst4_submode! {
@@ -272,6 +279,7 @@ fst4_submode! {
     tr_period_s = 300,
     tx_start_offset_s = 1.0,
     snr_calfac = 340.0,
+    decode_fft1_size = 4_194_304,
 }
 
 #[cfg(test)]

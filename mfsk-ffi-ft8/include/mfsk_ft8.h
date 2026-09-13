@@ -71,6 +71,16 @@ typedef enum MfskStatus {
    * violated. Always a bug; please report it.
    */
   MFSK_STATUS_INTERNAL = -5,
+  /**
+   * The mode exists in this build but does not offer what was asked
+   * for — distinct from [`Self::UnknownProtocol`], which means the
+   * mode is not here at all.
+   *
+   * Added for the v2 introspection surface. Existing discriminants
+   * are unchanged, so this is additive: a caller switching on the
+   * values it knows falls through to its default case.
+   */
+  MFSK_STATUS_UNSUPPORTED = -6,
 } MfskStatus;
 
 /**

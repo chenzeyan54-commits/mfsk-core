@@ -118,6 +118,8 @@ impl FrameLayout for Ft4 {
 }
 
 impl Protocol for Ft4 {
+    /// `ft4::decode::FT4_DOWNSAMPLE`.
+    const DECODE_FFT1_SIZE: u32 = 92_160;
     type Fec = Ldpc174_91;
     type Msg = Wsjt77Message;
     const ID: ProtocolId = ProtocolId::Ft4;

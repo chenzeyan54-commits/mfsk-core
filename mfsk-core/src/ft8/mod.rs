@@ -119,6 +119,8 @@ impl FrameLayout for Ft8 {
 }
 
 impl Protocol for Ft8 {
+    /// `ft8::downsample::FT8_CFG`.
+    const DECODE_FFT1_SIZE: u32 = 192_000;
     type Fec = Ldpc174_91;
     type Msg = Wsjt77Message;
     const ID: ProtocolId = ProtocolId::Ft8;

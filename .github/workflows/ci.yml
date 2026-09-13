@@ -648,6 +648,13 @@ jobs:
       - name: Build docs (features = full)
         run: cargo doc -p mfsk-core --features full --no-deps
 
+      # The FFI crates were outside this job until 2026-09-13 and a
+      # broken intra-doc link reached main through the gap. Their doc
+      # comments are also what cbindgen copies into the committed C
+      # headers, so a bad link there is wrong in two places at once.
+      - name: "Build docs (FFI crates)"
+        run: cargo doc -p mfsk-ffi -p mfsk-ffi-abi -p mfsk-ffi-ft8 --no-deps
+
   # ───────────────────────────────────────────────────────────────
   # MSRV gate. `[workspace.package] rust-version` is a claim about
   # what the source needs, and without this job it is only ever

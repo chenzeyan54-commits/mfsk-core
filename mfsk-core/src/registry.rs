@@ -271,6 +271,12 @@ pub struct ProtocolMeta {
     /// made exact, so a caller sizes a buffer without repeating the
     /// multiply. FT4 90 000, FT8 180 000, FST4-300 3 600 000.
     pub slot_samples_12k: u32,
+    /// Length of the forward FFT the decoder takes over the whole slot
+    /// (`Protocol::DECODE_FFT1_SIZE`), or 0 for a mode with its own
+    /// front end. FT4 92 160, FT8 192 000, **FST4-300 4 194 304** — the
+    /// number that makes "one call shape for every mode" wrong as a
+    /// memory story, and which a host could not previously ask for.
+    pub decode_fft1_size: u32,
     /// What the decode API can be asked to do, and what it defaults to.
     pub profile: DecodeProfile,
 }
@@ -304,6 +310,7 @@ macro_rules! protocol_meta {
             payload_bits: <<$ty as Protocol>::Msg as MessageCodec>::PAYLOAD_BITS,
             tx_start_offset_s: <$ty as FrameLayout>::TX_START_OFFSET_S,
             slot_samples_12k: (<$ty as FrameLayout>::T_SLOT_S * 12_000.0) as u32,
+            decode_fft1_size: <$ty as Protocol>::DECODE_FFT1_SIZE,
             profile: $profile,
         }
     };

@@ -713,6 +713,25 @@ pub trait Protocol: ModulationParams + FrameLayout + 'static {
     /// Defaults to FT8's, the value both codecs previously hardcoded.
     const AP_MAG_SCALE: f32 = 1.01;
 
+    /// Length of the forward FFT the decoder takes over the whole slot
+    /// — `DownsampleCfg::fft1_size` — or `0` for a protocol that does
+    /// not go through the shared two-FFT downsampler (WSPR, JT9, JT65,
+    /// Q65, uvpacket all have their own front ends).
+    ///
+    /// It is here so the registry can publish it, because it is the
+    /// number that makes "one call shape for every mode" wrong as a
+    /// memory story: FT4 takes 92 160 points and **FST4-300 takes
+    /// 4 194 304**, a factor of 45. A C or mobile caller sizing a
+    /// buffer, or deciding which modes it can afford to run at all,
+    /// could not previously ask.
+    ///
+    /// The value is written here rather than derived from the
+    /// `DownsampleCfg` itself because those consts live behind an FFT
+    /// backend feature while this trait does not; a build with
+    /// `--features fst4` alone has the protocol and no downsampler.
+    /// `tests/registry_fft_size.rs` is what stops the two drifting.
+    const DECODE_FFT1_SIZE: u32 = 0;
+
     /// FEC codec carrying `N_DATA * BITS_PER_SYMBOL` coded bits.
     type Fec: FecCodec;
 

@@ -66,6 +66,14 @@ pub enum MfskStatus {
     /// Internal error: an invariant of the Rust implementation was
     /// violated. Always a bug; please report it.
     Internal = -5,
+    /// The mode exists in this build but does not offer what was asked
+    /// for — distinct from [`Self::UnknownProtocol`], which means the
+    /// mode is not here at all.
+    ///
+    /// Added for the v2 introspection surface. Existing discriminants
+    /// are unchanged, so this is additive: a caller switching on the
+    /// values it knows falls through to its default case.
+    Unsupported = -6,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -239,4 +247,196 @@ impl MfskResultList {
 /// this as. Binary-compatible: the handle only ever crosses as a pointer.
 pub struct MfskDecodeOptions {
     _marker: PhantomData<*mut ()>,
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Mode addressing and introspection (FFI v2 slice 1)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Every mode this library knows how to address, one per
+/// `mfsk_core::registry::PROTOCOLS` entry plus MSK144.
+///
+/// **The discriminants are ABI and are never reordered or reused.**
+/// They are deliberately *not* registry indices: registry membership is
+/// feature-gated, so a build without `q65` shifts every index after it
+/// while these numbers stay put. Ask `mfsk_mode_count` /
+/// `mfsk_mode_at` which of them this particular build actually has.
+///
+/// The lesson is one this ABI already learned once — `MfskQ65SubMode`
+/// carries explicit discriminants for exactly this reason — and the
+/// cost of relearning it is silent misdispatch at a C boundary, so the
+/// full list is assigned here in one go, including modes that are not
+/// wired yet.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MfskMode {
+    /// FT8 — 15 s slot, 8-GFSK, LDPC(174,91).
+    Ft8 = 0,
+    /// FT4 — 7.5 s slot, 4-GFSK, LDPC(174,91).
+    Ft4 = 1,
+    /// FST4-15 — 15 s period. The one FST4 sub-mode that starts 0.5 s
+    /// into the slot rather than 1.0 s.
+    Fst4s15 = 2,
+    /// FST4-30 — 30 s period.
+    Fst4s30 = 3,
+    /// FST4-60A — 60 s period. The only FST4 sub-mode the pre-v2 ABI
+    /// could reach.
+    Fst4s60 = 4,
+    /// FST4-120 — 120 s period.
+    Fst4s120 = 5,
+    /// FST4-300 — 300 s period. Its slot transform is 4 194 304 points;
+    /// see `MfskModeInfo::decode_fft1_size` before budgeting for it.
+    Fst4s300 = 6,
+    /// WSPR — 120 s slot, 4-FSK, convolutional r=½ K=32 + Fano.
+    Wspr = 7,
+    /// JT9 — 60 s slot, 9-FSK.
+    Jt9 = 8,
+    /// JT65 — 60 s slot, 65-FSK, Reed-Solomon(63,12).
+    Jt65 = 9,
+    /// Q65-15A.
+    Q65a15 = 10,
+    /// Q65-30A.
+    Q65a30 = 11,
+    /// Q65-60A.
+    Q65a60 = 12,
+    /// Q65-60B.
+    Q65b60 = 13,
+    /// Q65-60C.
+    Q65c60 = 14,
+    /// Q65-60D.
+    Q65d60 = 15,
+    /// Q65-60E.
+    Q65e60 = 16,
+    /// Q65-120D.
+    Q65d120 = 17,
+    /// Q65-120E.
+    Q65e120 = 18,
+    /// Q65-300A.
+    Q65a300 = 19,
+    /// MSK144 — addressed here for completeness and dispatched
+    /// specially. It is not FSK, has no `Protocol` marker type and no
+    /// registry entry, so `mfsk_mode_info` reports what is knowable and
+    /// its capability word is narrow. That is an architectural fact
+    /// about MSK144, not a gap to be closed.
+    Msk144 = 20,
+    /// uvpacket, robust profile — experimental, not a WSJT mode.
+    UvRobust = 21,
+    /// uvpacket, standard profile.
+    UvStandard = 22,
+    /// uvpacket, ultra-robust profile.
+    UvUltraRobust = 23,
+    /// uvpacket, express profile.
+    UvExpress = 24,
+}
+
+/// How a mode's `sync_min` is measured — the trap this table exists to
+/// defuse.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MfskSyncScale {
+    /// Absolute Costas correlation score. Noise has no fixed value, so
+    /// a threshold is empirical. FT8, FST4.
+    CostasAbsolute = 0,
+    /// The spectrum is divided by a fitted baseline before scoring, so
+    /// **noise sits at ~1.0 by construction** and any threshold at or
+    /// below that admits every peak in the band. FT4 only — and it is
+    /// why WSJT-X's own 1.2 (`ft4_decode.f90:195`) is a floor rather
+    /// than a preference, not a number to copy to another mode.
+    BaselineNormalised = 1,
+}
+
+/// Geometry and capability for one mode. **Size-versioned**: set
+/// `size = sizeof(MfskModeInfo)` before the call, or pass a zeroed
+/// struct and the library fills `size` in. A library newer than the
+/// header writes only the prefix the caller declared.
+///
+/// `MfskResult` grew a field in 0.8.1 with nothing marking it; that
+/// must not be repeatable.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct MfskModeInfo {
+    /// `sizeof(MfskModeInfo)` as the caller understands it.
+    pub size: u32,
+    /// The mode this describes — echoed back so a caller can pass the
+    /// struct around on its own.
+    pub mode: MfskMode,
+    /// Stable display name, NUL-terminated (`"FT8"`, `"FST4-120"`).
+    /// Also the key `mfsk_mode_from_name` accepts.
+    pub name: [core::ffi::c_char; 16],
+    /// Number of FSK tones.
+    pub ntones: u32,
+    /// Information bits per modulated symbol.
+    pub bits_per_symbol: u32,
+    /// Samples per symbol at 12 kHz.
+    pub nsps: u32,
+    /// Symbol duration, seconds.
+    pub symbol_dt: f32,
+    /// Tone-to-tone spacing, Hz.
+    pub tone_spacing_hz: f32,
+    /// Gaussian bandwidth-time product; 0 for plain FSK.
+    pub gfsk_bt: f32,
+    /// FSK modulation index.
+    pub gfsk_hmod: f32,
+    /// Data symbols per frame.
+    pub n_data: u32,
+    /// Sync symbols per frame; 0 for interleaved-sync protocols.
+    pub n_sync: u32,
+    /// Total channel symbols per frame.
+    pub n_symbols: u32,
+    /// Nominal slot length, seconds.
+    pub t_slot_s: f32,
+    /// Slot length in samples at 12 kHz — `t_slot_s` made exact, so a
+    /// caller sizes a buffer without repeating the multiply. FT4
+    /// 90 000, FT8 180 000, FST4-300 3 600 000.
+    pub slot_samples_12k: u32,
+    /// Seconds from the start of the slot buffer to the first frame
+    /// symbol — the `dt = 0` reference. 0.5 for FT8, FT4 and FST4-15;
+    /// 1.0 for the other FST4 sub-modes. A host that synthesises a slot
+    /// has to know this and previously could not ask.
+    pub tx_start_offset_s: f32,
+    /// FEC information bits — 91 (CRC-14) or 101 (CRC-24).
+    pub fec_k: u32,
+    /// FEC codeword length in bits.
+    pub fec_n: u32,
+    /// Message-codec payload width in bits.
+    pub payload_bits: u32,
+    /// Length of the forward FFT the decoder takes over the whole slot,
+    /// or 0 for a mode with its own front end.
+    ///
+    /// **This is the field that makes "one call shape for every mode"
+    /// wrong as a memory story.** FT4 takes 92 160 points and FST4-300
+    /// takes 4 194 304 — a factor of 45 that no other field here hints
+    /// at. A mobile caller deciding which modes it can afford should
+    /// read this one.
+    pub decode_fft1_size: u32,
+    /// Bitwise OR of the `MFSK_CAP_*` constants, which `mfsk-ffi`
+    /// defines — they have to live in the crate cbindgen generates
+    /// from, or they reach C as an unnamed `uint64_t` and every caller
+    /// re-derives the bit positions by hand, which is the failure this
+    /// whole surface exists to end.
+    pub caps: u64,
+}
+
+/// A mode's default search parameters, published per mode instead of
+/// hidden in three incompatible branches of one function.
+///
+/// Size-versioned on the same contract as [`MfskModeInfo`].
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct MfskDecodeDefaults {
+    /// `sizeof(MfskDecodeDefaults)` as the caller understands it.
+    pub size: u32,
+    /// Low edge of the default search band, Hz.
+    pub freq_min_hz: f32,
+    /// High edge of the default search band, Hz.
+    pub freq_max_hz: f32,
+    /// Default sync threshold — **read `sync_scale` before copying this
+    /// number anywhere.**
+    pub sync_min: f32,
+    /// Default candidate budget.
+    pub max_cand: u32,
+    /// What scale `sync_min` is measured on. FT4's is not comparable
+    /// with FT8's or FST4's, and a caller that copies one across modes
+    /// is wrong with nothing to tell it so.
+    pub sync_scale: MfskSyncScale,
 }

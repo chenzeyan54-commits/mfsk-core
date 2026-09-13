@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cstddef>
 #include <string>
 #include <thread>
 #include <vector>
@@ -52,6 +53,167 @@ void print_decodes(const char* proto, const MfskResultList& list) {
                     m.hard_errors, m.pass,
                     m.text);
     }
+}
+
+// ── Mode introspection (FFI v2 slice 1) ─────────────────────────────
+//
+// The point of this surface is that a C consumer stops hardcoding a
+// capability matrix, so the test has to be written the way a consumer
+// would: enumerate what the build has, ask each mode what it supports,
+// and act on the answer. Anything asserted from a list written here
+// would be testing this file, not the library.
+void test_mode_introspection() {
+    std::printf("\n— Mode introspection\n");
+
+    const uint32_t abi = mfsk_abi_version();
+    std::printf("  abi version: %u\n", abi);
+    if (abi < 2) {
+        fail("introspect", "mfsk_abi_version() predates the introspection surface");
+        return;
+    }
+
+    const uint32_t n = mfsk_mode_count();
+    if (n == 0) {
+        fail("introspect", "this build claims to support no modes at all");
+        return;
+    }
+    std::printf("  %u mode(s) in this build\n", n);
+
+    // Walk every mode the way a UI populating a picker would.
+    int with_handle = 0, fst4_submodes = 0, snipers = 0;
+    uint32_t widest_fft = 0;
+    char widest_name[16] = {0};
+
+    for (uint32_t i = 0; i < n; ++i) {
+        MfskMode m;
+        if (mfsk_mode_at(i, &m) != MFSK_STATUS_OK) {
+            fail("introspect", "mfsk_mode_at failed inside 0..count");
+            return;
+        }
+
+        MfskModeInfo info;
+        std::memset(&info, 0, sizeof info);
+        info.size = sizeof info;
+        if (mfsk_mode_info(m, &info) != MFSK_STATUS_OK) {
+            fail("introspect", "mfsk_mode_info failed for an enumerated mode");
+            return;
+        }
+
+        // The name must round-trip through the string form, which is
+        // what a config file or a CLI flag will carry.
+        const char* name = mfsk_mode_name(m);
+        if (name == nullptr || std::strcmp(name, info.name) != 0) {
+            fail("introspect", "mfsk_mode_name disagrees with MfskModeInfo::name");
+            return;
+        }
+        MfskMode back;
+        if (mfsk_mode_from_name(name, &back) != MFSK_STATUS_OK || back != m) {
+            fail(name, "did not round-trip through mfsk_mode_from_name");
+            return;
+        }
+
+        if (info.caps & MFSK_CAP_DECODE_HANDLE) {
+            with_handle++;
+            // Anything the decode handle drives must publish a usable
+            // default search, or a caller has nothing to start from.
+            MfskDecodeDefaults d;
+            std::memset(&d, 0, sizeof d);
+            d.size = sizeof d;
+            if (mfsk_mode_defaults(m, &d) != MFSK_STATUS_OK) {
+                fail(name, "drives the decode handle but publishes no defaults");
+                return;
+            }
+            if (!(d.freq_max_hz > d.freq_min_hz) || d.max_cand == 0) {
+                fail(name, "publishes an unusable default search");
+                return;
+            }
+            // The trap this field exists for: FT4's threshold is on a
+            // different scale from everyone else's.
+            if (d.sync_scale == MFSK_SYNC_SCALE_BASELINE_NORMALISED && !(d.sync_min > 1.0f)) {
+                fail(name, "baseline-normalised sync_min is at or below the noise floor");
+                return;
+            }
+            if (info.decode_fft1_size == 0) {
+                fail(name, "drives the decode handle but reports no slot transform size");
+                return;
+            }
+            if (info.decode_fft1_size > widest_fft) {
+                widest_fft = info.decode_fft1_size;
+                std::snprintf(widest_name, sizeof widest_name, "%s", name);
+            }
+        }
+
+        if (info.caps & MFSK_CAP_SNIPER) {
+            snipers++;
+            if (m != MFSK_MODE_FT8) {
+                fail(name, "advertises a sniper, which is an FT8-only mode");
+                return;
+            }
+        }
+        if (std::strncmp(name, "FST4-", 5) == 0) {
+            fst4_submodes++;
+        }
+    }
+
+    // The equivalence this whole redesign is named for: the pre-v2 ABI
+    // could address exactly one FST4 sub-mode (`Fst4s60 = 5`), so the
+    // other four were unreachable from C for decode and encode alike.
+    if (fst4_submodes != 5) {
+        fail("introspect", "expected all five FST4 sub-modes to be addressable");
+        return;
+    }
+    if (with_handle < 7) {
+        fail("introspect", "FT8 + FT4 + five FST4 should all drive the decode handle");
+        return;
+    }
+    if (snipers != 1) {
+        fail("introspect", "exactly one mode should claim the sniper");
+        return;
+    }
+    std::printf("  %d mode(s) drive the decode handle, %d FST4 sub-mode(s) addressable\n",
+                with_handle, fst4_submodes);
+    std::printf("  largest slot transform: %s at %u points\n", widest_name, widest_fft);
+
+    // A mode this build lacks and a name that is not a mode must be
+    // distinguishable — a typo is not the same problem as a missing
+    // feature, and today a caller cannot tell.
+    MfskMode dummy;
+    if (mfsk_mode_from_name("FT9", &dummy) != MFSK_STATUS_INVALID_ARG) {
+        fail("introspect", "a nonsense mode name should be INVALID_ARG");
+    }
+    if (mfsk_mode_at(n, &dummy) != MFSK_STATUS_INVALID_ARG) {
+        fail("introspect", "one past the end should fail rather than wrap");
+    }
+    if (mfsk_mode_info(MFSK_MODE_FT8, nullptr) != MFSK_STATUS_INVALID_ARG) {
+        fail("introspect", "a NULL out pointer should be rejected");
+    }
+
+    // Size versioning: an older caller declares a smaller struct and
+    // must get only its prefix written. Emulated by declaring a size
+    // that stops before the geometry fields.
+    {
+        unsigned char buf[sizeof(MfskModeInfo)];
+        std::memset(buf, 0xAA, sizeof buf);
+        const uint32_t shortSize = offsetof(MfskModeInfo, ntones);
+        std::memcpy(buf, &shortSize, sizeof shortSize);
+        if (mfsk_mode_info(MFSK_MODE_FT8, reinterpret_cast<MfskModeInfo*>(buf)) != MFSK_STATUS_OK) {
+            fail("introspect", "size-versioned call with an older header failed");
+        } else {
+            uint32_t written = 0;
+            std::memcpy(&written, buf, sizeof written);
+            if (written != shortSize) {
+                fail("introspect", "size was not rewritten to what was actually written");
+            }
+            for (size_t i = shortSize; i < sizeof buf; ++i) {
+                if (buf[i] != 0xAA) {
+                    fail("introspect", "wrote past the caller's declared struct size");
+                    break;
+                }
+            }
+        }
+    }
+
+    std::printf("  OK\n");
 }
 
 // ── FT8 ──────────────────────────────────────────────────────────────
@@ -208,7 +370,7 @@ void test_builder_options() {
 // FT4's sniper reports the mode unsupported, and the same hint decodes
 // through the ordinary entry point.
 void test_sniper() {
-    std::printf("— FFI sniper: mfsk_decode_i16_sniper on FT4 at 1200 Hz, with an AP hint\n");
+    std::printf("— FFI sniper: FT8 is the only mode that has one; FT4/WSPR must refuse\n");
     MfskSamples pcm{};
     if (mfsk_encode_ft4("CQ", "JA1ABC", "PM95", 1200.0f, &pcm) != MFSK_STATUS_OK) {
         fail("sniper", mfsk_last_error());
@@ -251,12 +413,44 @@ void test_sniper() {
     if (wst != MFSK_STATUS_OK) {
         fail("sniper", mfsk_last_error() ? mfsk_last_error() : "wide-band AP decode failed");
     } else {
-        print_decodes("sniper", wide);
+        print_decodes("FT4 wide-band + AP hint", wide);
         if (!any_contains(wide, "JA1ABC")) {
             fail("sniper", "wide-band decode with an AP hint did not find the signal");
         }
     }
     mfsk_result_list_free(&wide);
+
+    // And the mode that *does* have a sniper must still work through
+    // it. Nothing else covers this entry point from C now that the
+    // FT4 arm is a refusal, so without this the only compiled-C
+    // exercise of the sniper would be two error paths.
+    {
+        MfskSamples ft8pcm{};
+        if (mfsk_encode_ft8("CQ", "JA1ABC", "PM95", 1500.0f, &ft8pcm) != MFSK_STATUS_OK) {
+            fail("sniper", "mfsk_encode_ft8 failed");
+        } else {
+            std::vector<int16_t> ft8audio(ft8pcm.len);
+            for (size_t i = 0; i < ft8pcm.len; ++i) {
+                ft8audio[i] = static_cast<int16_t>(ft8pcm.samples[i] * 32767.0f);
+            }
+            mfsk_samples_free(&ft8pcm);
+
+            MfskDecoder* ft8dec = mfsk_decoder_new(MFSK_PROTOCOL_FT8);
+            MfskResultList hit{};
+            const MfskStatus fst = mfsk_decode_i16_sniper(
+                ft8dec, ft8audio.data(), ft8audio.size(), 12000, 1500.0f, nullptr, &hit);
+            if (fst != MFSK_STATUS_OK) {
+                fail("sniper", mfsk_last_error() ? mfsk_last_error() : "FT8 sniper failed");
+            } else {
+                print_decodes("FT8 sniper", hit);
+                if (!any_contains(hit, "JA1ABC")) {
+                    fail("sniper", "FT8 sniper did not find the signal it was aimed at");
+                }
+            }
+            mfsk_result_list_free(&hit);
+            mfsk_decoder_free(ft8dec);
+        }
+    }
 
     // A protocol with no single-frequency mode must say so rather than
     // decode something else.
@@ -554,6 +748,7 @@ int main() {
                 (ver >> 8) & 0xff,
                 ver & 0xff);
 
+    test_mode_introspection();
     test_ft8();
     test_ft8_streaming();
     test_builder_options();

@@ -11,6 +11,93 @@
 #include <stdlib.h>
 
 /**
+ * Drives the `DecodeRequest` builder, i.e. `mfsk_decode_i16` and
+ * friends apply. Modes without this bit decode through their own
+ * entry point (Q65 takes a nominal start sample and a tolerance;
+ * WSPR/JT9/JT65 have no builder at all). They are not lesser, they
+ * are shaped differently — this is the bit that says which is
+ * which.
+ */
+#define MFSK_CAP_DECODE_HANDLE (1 << 0)
+
+/**
+ * Narrow-band single-target search. **FT8 only, by design**: it is
+ * the receive-side half of narrowing a transceiver's *analogue*
+ * roofing filter, not a general "hunt one known station" feature.
+ */
+#define MFSK_CAP_SNIPER (1 << 1)
+
+/**
+ * A-priori hint on a targeted search (FT8's sniper, Q65's decode).
+ */
+#define MFSK_CAP_AP_NARROW (1 << 2)
+
+/**
+ * A-priori hint on the wide-band search. FT8, FT4 and every FST4
+ * sub-mode.
+ */
+#define MFSK_CAP_AP_WIDEBAND (1 << 3)
+
+/**
+ * Flat successive-interference cancellation.
+ */
+#define MFSK_CAP_SIC_ROUNDS (1 << 4)
+
+/**
+ * Checkpoint-emulation early decode. FT8 only.
+ */
+#define MFSK_CAP_SIC_EARLY (1 << 5)
+
+/**
+ * The OSD *switch* is honoured. Absent means "cannot be turned
+ * off", not "does not have it" — FT4 and FST4 run OSD by default.
+ */
+#define MFSK_CAP_OSD (1 << 6)
+
+/**
+ * Equalisation mode reaches the decoder.
+ */
+#define MFSK_CAP_EQ_MODE (1 << 7)
+
+/**
+ * The strictness profile is honoured rather than accepted and
+ * dropped.
+ */
+#define MFSK_CAP_STRICTNESS (1 << 8)
+
+/**
+ * A caller-supplied budget predicate is polled.
+ */
+#define MFSK_CAP_BUDGET (1 << 9)
+
+/**
+ * Known signals can be excluded from the reported results.
+ */
+#define MFSK_CAP_KNOWN_FILTER (1 << 10)
+
+/**
+ * Known signals are subtracted from the audio, not merely filtered
+ * out of the output. Strictly stronger than [`MFSK_CAP_KNOWN_FILTER`].
+ */
+#define MFSK_CAP_KNOWN_SUBTRACT (1 << 11)
+
+/**
+ * A slot FFT can be handed back for a second pass over the same
+ * audio.
+ */
+#define MFSK_CAP_FFT_CACHE (1 << 12)
+
+/**
+ * Results can be delivered through a callback as they are found.
+ */
+#define MFSK_CAP_ON_RESULT (1 << 13)
+
+/**
+ * The mode can synthesise as well as decode.
+ */
+#define MFSK_CAP_ENCODE (1 << 14)
+
+/**
  * Protocol tag selecting which decoder / synth family this handle
  * (or encode call) drives.
  */
@@ -111,6 +198,16 @@ typedef enum MfskStatus {
      * violated. Always a bug; please report it.
      */
     MFSK_STATUS_INTERNAL = -5,
+    /**
+     * The mode exists in this build but does not offer what was asked
+     * for — distinct from [`Self::UnknownProtocol`], which means the
+     * mode is not here at all.
+     *
+     * Added for the v2 introspection surface. Existing discriminants
+     * are unchanged, so this is additive: a caller switching on the
+     * values it knows falls through to its default case.
+     */
+    MFSK_STATUS_UNSUPPORTED = -6,
 } MfskStatus;
 
 /**
@@ -228,6 +325,152 @@ typedef enum MfskQ65FadingModel {
      */
     MFSK_Q65_FADING_MODEL_LORENTZIAN = 1,
 } MfskQ65FadingModel;
+
+/**
+ * Every mode this library knows how to address, one per
+ * `mfsk_core::registry::PROTOCOLS` entry plus MSK144.
+ *
+ * **The discriminants are ABI and are never reordered or reused.**
+ * They are deliberately *not* registry indices: registry membership is
+ * feature-gated, so a build without `q65` shifts every index after it
+ * while these numbers stay put. Ask `mfsk_mode_count` /
+ * `mfsk_mode_at` which of them this particular build actually has.
+ *
+ * The lesson is one this ABI already learned once — `MfskQ65SubMode`
+ * carries explicit discriminants for exactly this reason — and the
+ * cost of relearning it is silent misdispatch at a C boundary, so the
+ * full list is assigned here in one go, including modes that are not
+ * wired yet.
+ */
+typedef enum MfskMode {
+    /**
+     * FT8 — 15 s slot, 8-GFSK, LDPC(174,91).
+     */
+    MFSK_MODE_FT8 = 0,
+    /**
+     * FT4 — 7.5 s slot, 4-GFSK, LDPC(174,91).
+     */
+    MFSK_MODE_FT4 = 1,
+    /**
+     * FST4-15 — 15 s period. The one FST4 sub-mode that starts 0.5 s
+     * into the slot rather than 1.0 s.
+     */
+    MFSK_MODE_FST4S15 = 2,
+    /**
+     * FST4-30 — 30 s period.
+     */
+    MFSK_MODE_FST4S30 = 3,
+    /**
+     * FST4-60A — 60 s period. The only FST4 sub-mode the pre-v2 ABI
+     * could reach.
+     */
+    MFSK_MODE_FST4S60 = 4,
+    /**
+     * FST4-120 — 120 s period.
+     */
+    MFSK_MODE_FST4S120 = 5,
+    /**
+     * FST4-300 — 300 s period. Its slot transform is 4 194 304 points;
+     * see `MfskModeInfo::decode_fft1_size` before budgeting for it.
+     */
+    MFSK_MODE_FST4S300 = 6,
+    /**
+     * WSPR — 120 s slot, 4-FSK, convolutional r=½ K=32 + Fano.
+     */
+    MFSK_MODE_WSPR = 7,
+    /**
+     * JT9 — 60 s slot, 9-FSK.
+     */
+    MFSK_MODE_JT9 = 8,
+    /**
+     * JT65 — 60 s slot, 65-FSK, Reed-Solomon(63,12).
+     */
+    MFSK_MODE_JT65 = 9,
+    /**
+     * Q65-15A.
+     */
+    MFSK_MODE_Q65A15 = 10,
+    /**
+     * Q65-30A.
+     */
+    MFSK_MODE_Q65A30 = 11,
+    /**
+     * Q65-60A.
+     */
+    MFSK_MODE_Q65A60 = 12,
+    /**
+     * Q65-60B.
+     */
+    MFSK_MODE_Q65B60 = 13,
+    /**
+     * Q65-60C.
+     */
+    MFSK_MODE_Q65C60 = 14,
+    /**
+     * Q65-60D.
+     */
+    MFSK_MODE_Q65D60 = 15,
+    /**
+     * Q65-60E.
+     */
+    MFSK_MODE_Q65E60 = 16,
+    /**
+     * Q65-120D.
+     */
+    MFSK_MODE_Q65D120 = 17,
+    /**
+     * Q65-120E.
+     */
+    MFSK_MODE_Q65E120 = 18,
+    /**
+     * Q65-300A.
+     */
+    MFSK_MODE_Q65A300 = 19,
+    /**
+     * MSK144 — addressed here for completeness and dispatched
+     * specially. It is not FSK, has no `Protocol` marker type and no
+     * registry entry, so `mfsk_mode_info` reports what is knowable and
+     * its capability word is narrow. That is an architectural fact
+     * about MSK144, not a gap to be closed.
+     */
+    MFSK_MODE_MSK144 = 20,
+    /**
+     * uvpacket, robust profile — experimental, not a WSJT mode.
+     */
+    MFSK_MODE_UV_ROBUST = 21,
+    /**
+     * uvpacket, standard profile.
+     */
+    MFSK_MODE_UV_STANDARD = 22,
+    /**
+     * uvpacket, ultra-robust profile.
+     */
+    MFSK_MODE_UV_ULTRA_ROBUST = 23,
+    /**
+     * uvpacket, express profile.
+     */
+    MFSK_MODE_UV_EXPRESS = 24,
+} MfskMode;
+
+/**
+ * How a mode's `sync_min` is measured — the trap this table exists to
+ * defuse.
+ */
+typedef enum MfskSyncScale {
+    /**
+     * Absolute Costas correlation score. Noise has no fixed value, so
+     * a threshold is empirical. FT8, FST4.
+     */
+    MFSK_SYNC_SCALE_COSTAS_ABSOLUTE = 0,
+    /**
+     * The spectrum is divided by a fitted baseline before scoring, so
+     * **noise sits at ~1.0 by construction** and any threshold at or
+     * below that admits every peak in the band. FT4 only — and it is
+     * why WSJT-X's own 1.2 (`ft4_decode.f90:195`) is a floor rather
+     * than a preference, not a number to copy to another mode.
+     */
+    MFSK_SYNC_SCALE_BASELINE_NORMALISED = 1,
+} MfskSyncScale;
 
 /**
  * Opaque callsign hash-table handle. Resolves `<...>` Type-4
@@ -410,6 +653,156 @@ typedef struct MfskSamples {
  */
 typedef void (*MfskResultCallback)(const struct MfskResult *result,
                                    void *user_data);
+
+/**
+ * Geometry and capability for one mode. **Size-versioned**: set
+ * `size = sizeof(MfskModeInfo)` before the call, or pass a zeroed
+ * struct and the library fills `size` in. A library newer than the
+ * header writes only the prefix the caller declared.
+ *
+ * `MfskResult` grew a field in 0.8.1 with nothing marking it; that
+ * must not be repeatable.
+ */
+typedef struct MfskModeInfo {
+    /**
+     * `sizeof(MfskModeInfo)` as the caller understands it.
+     */
+    uint32_t size;
+    /**
+     * The mode this describes — echoed back so a caller can pass the
+     * struct around on its own.
+     */
+    enum MfskMode mode;
+    /**
+     * Stable display name, NUL-terminated (`"FT8"`, `"FST4-120"`).
+     * Also the key `mfsk_mode_from_name` accepts.
+     */
+    char name[16];
+    /**
+     * Number of FSK tones.
+     */
+    uint32_t ntones;
+    /**
+     * Information bits per modulated symbol.
+     */
+    uint32_t bits_per_symbol;
+    /**
+     * Samples per symbol at 12 kHz.
+     */
+    uint32_t nsps;
+    /**
+     * Symbol duration, seconds.
+     */
+    float symbol_dt;
+    /**
+     * Tone-to-tone spacing, Hz.
+     */
+    float tone_spacing_hz;
+    /**
+     * Gaussian bandwidth-time product; 0 for plain FSK.
+     */
+    float gfsk_bt;
+    /**
+     * FSK modulation index.
+     */
+    float gfsk_hmod;
+    /**
+     * Data symbols per frame.
+     */
+    uint32_t n_data;
+    /**
+     * Sync symbols per frame; 0 for interleaved-sync protocols.
+     */
+    uint32_t n_sync;
+    /**
+     * Total channel symbols per frame.
+     */
+    uint32_t n_symbols;
+    /**
+     * Nominal slot length, seconds.
+     */
+    float t_slot_s;
+    /**
+     * Slot length in samples at 12 kHz — `t_slot_s` made exact, so a
+     * caller sizes a buffer without repeating the multiply. FT4
+     * 90 000, FT8 180 000, FST4-300 3 600 000.
+     */
+    uint32_t slot_samples_12k;
+    /**
+     * Seconds from the start of the slot buffer to the first frame
+     * symbol — the `dt = 0` reference. 0.5 for FT8, FT4 and FST4-15;
+     * 1.0 for the other FST4 sub-modes. A host that synthesises a slot
+     * has to know this and previously could not ask.
+     */
+    float tx_start_offset_s;
+    /**
+     * FEC information bits — 91 (CRC-14) or 101 (CRC-24).
+     */
+    uint32_t fec_k;
+    /**
+     * FEC codeword length in bits.
+     */
+    uint32_t fec_n;
+    /**
+     * Message-codec payload width in bits.
+     */
+    uint32_t payload_bits;
+    /**
+     * Length of the forward FFT the decoder takes over the whole slot,
+     * or 0 for a mode with its own front end.
+     *
+     * **This is the field that makes "one call shape for every mode"
+     * wrong as a memory story.** FT4 takes 92 160 points and FST4-300
+     * takes 4 194 304 — a factor of 45 that no other field here hints
+     * at. A mobile caller deciding which modes it can afford should
+     * read this one.
+     */
+    uint32_t decode_fft1_size;
+    /**
+     * Bitwise OR of the `MFSK_CAP_*` constants, which `mfsk-ffi`
+     * defines — they have to live in the crate cbindgen generates
+     * from, or they reach C as an unnamed `uint64_t` and every caller
+     * re-derives the bit positions by hand, which is the failure this
+     * whole surface exists to end.
+     */
+    uint64_t caps;
+} MfskModeInfo;
+
+/**
+ * A mode's default search parameters, published per mode instead of
+ * hidden in three incompatible branches of one function.
+ *
+ * Size-versioned on the same contract as [`MfskModeInfo`].
+ */
+typedef struct MfskDecodeDefaults {
+    /**
+     * `sizeof(MfskDecodeDefaults)` as the caller understands it.
+     */
+    uint32_t size;
+    /**
+     * Low edge of the default search band, Hz.
+     */
+    float freq_min_hz;
+    /**
+     * High edge of the default search band, Hz.
+     */
+    float freq_max_hz;
+    /**
+     * Default sync threshold — **read `sync_scale` before copying this
+     * number anywhere.**
+     */
+    float sync_min;
+    /**
+     * Default candidate budget.
+     */
+    uint32_t max_cand;
+    /**
+     * What scale `sync_min` is measured on. FT4's is not comparable
+     * with FT8's or FST4's, and a caller that copies one across modes
+     * is wrong with nothing to tell it so.
+     */
+    enum MfskSyncScale sync_scale;
+} MfskDecodeDefaults;
 
 #ifdef __cplusplus
 extern "C" {
@@ -727,8 +1120,8 @@ enum MfskStatus mfsk_decode_i16_streaming(const struct MfskDecoder *dec,
  *   `SniperRequest`'s own defaults (`sync_min` 0.8, 8 candidates, OSD
  *   on). `sync_min`, `max_cand`, `depth`, `strictness`, `eq_mode` and
  *   the AP hint apply; `freq_min_hz`/`freq_max_hz`, `freq_hint` and
- *   `sic_rounds`/`sic_early` do not — see [`decode_i16_sniper`] for
- *   why each is in the list it is in.
+ *   `sic_rounds`/`sic_early` do not — see [`mfsk_decode_i16_sniper`]
+ *   for why each is in the list it is in.
  * - `out` — caller-allocated [`MfskResultList`], freed with
  *   [`mfsk_result_list_free`].
  *
@@ -987,6 +1380,110 @@ enum MfskStatus mfsk_q65_decode_with_ap_list(enum MfskQ65SubMode submode,
                                              const char *his_grid,
                                              const struct MfskCallsignHashTable *hash_table,
                                              struct MfskResultList *out);
+
+/**
+ * Number of modes **this build** actually supports, which is not the
+ * number of `MfskMode` discriminants: protocols are feature-gated.
+ * Pair with `mfsk_mode_at` to enumerate.
+ */
+uint32_t mfsk_mode_count(void);
+
+/**
+ * The `index`-th mode this build supports, `0 <= index < mfsk_mode_count()`.
+ *
+ * Writes the mode to `out` and returns `MFSK_STATUS_OK`; returns
+ * `MFSK_STATUS_INVALID_ARGUMENT` for a null `out` or an index past the
+ * end. A status rather than a returned enum because C has no way to
+ * spell "no such mode" inside an enum whose every value is legal.
+ *
+ * # Safety
+ * `out` must be null or point to a writable `MfskMode`.
+ */
+enum MfskStatus mfsk_mode_at(uint32_t index,
+                             enum MfskMode *out);
+
+/**
+ * Stable display name for `mode` (`"FT8"`, `"FST4-120"`), or NULL if
+ * `mode` is not a value this library knows.
+ *
+ * The returned pointer is a static NUL-terminated string with the
+ * lifetime of the library; do not free it. It is also the key
+ * [`mfsk_mode_from_name`] accepts, so the two round-trip.
+ *
+ * Answers for a mode this build lacks — the name is a property of the
+ * mode, not of the build.
+ */
+const char *mfsk_mode_name(enum MfskMode mode);
+
+/**
+ * Look `name` up as a mode. Case-sensitive, matching the registry's own
+ * display strings exactly.
+ *
+ * Writes the mode to `out` and returns `MFSK_STATUS_OK`;
+ * `MFSK_STATUS_INVALID_ARGUMENT` for a null argument or a name that is
+ * not a mode, `MFSK_STATUS_UNKNOWN_PROTOCOL` for a real mode this build
+ * was compiled without — the distinction a caller needs in order to
+ * tell a typo from a missing feature.
+ *
+ * # Safety
+ * `name` must be a valid NUL-terminated C string; `out` must point to a
+ * writable `MfskMode`.
+ */
+enum MfskStatus mfsk_mode_from_name(const char *name,
+                                    enum MfskMode *out);
+
+/**
+ * Geometry and capability for `mode`.
+ *
+ * **Set `out->size = sizeof(MfskModeInfo)` before calling**, or zero
+ * the struct and the library fills it in. Only the prefix the caller
+ * declared is written, so a newer library stays usable from an older
+ * header.
+ *
+ * Returns `MFSK_STATUS_UNKNOWN_PROTOCOL` if this build lacks `mode`.
+ *
+ * # Safety
+ * `out` must point to at least `out->size` writable bytes.
+ */
+enum MfskStatus mfsk_mode_info(enum MfskMode mode,
+                               struct MfskModeInfo *out);
+
+/**
+ * Capability bitmask for `mode` — the same word `mfsk_mode_info` puts
+ * in `caps`, for callers that want only that. Returns 0 for a mode this
+ * build lacks, which is also a legal "supports nothing" answer; use
+ * `mfsk_mode_info` when the difference matters.
+ */
+uint64_t mfsk_mode_caps(enum MfskMode mode);
+
+/**
+ * Default search parameters for `mode`.
+ *
+ * This is what removes the ABI's worst trap: three different
+ * per-protocol NULL-option defaults lived inside one function, one of
+ * them a `sync_min` of 2.0 that no test in the tree uses. Defaults are
+ * data now, published per mode, and `sync_scale` says which of them are
+ * even comparable.
+ *
+ * Size-versioned on the same contract as `mfsk_mode_info`. Returns
+ * `MFSK_STATUS_UNSUPPORTED` for a mode with no wide-band search to
+ * describe.
+ *
+ * # Safety
+ * `out` must point to at least `out->size` writable bytes.
+ */
+enum MfskStatus mfsk_mode_defaults(enum MfskMode mode,
+                                   struct MfskDecodeDefaults *out);
+
+/**
+ * ABI revision, distinct from [`mfsk_version`].
+ *
+ * `mfsk_version` tracks the crate's release number and moves for
+ * reasons that have nothing to do with the boundary. This moves only
+ * when the C surface changes shape, so it is the one to check before
+ * deciding a header and a library agree.
+ */
+uint32_t mfsk_abi_version(void);
 
 /**
  * Library version, major.minor.patch packed into a 32-bit integer (8
