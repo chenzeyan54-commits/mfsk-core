@@ -38,11 +38,19 @@ use super::ap::{ApHint, WsjtApCompatible};
 /// bespoke decode API shape (Q65, WSPR, JT65, JT9, uvpacket) — those keep
 /// their existing entry points untouched by this redesign.
 pub trait FrameDecodable: Protocol {
-    /// Result type this protocol's decode engine produces. FT8's is a
-    /// 77-bit post-CRC payload (`ft8::decode::DecodeResult`); FT4/FST4's
-    /// carries the full K-bit FEC info with CRC bits retained
-    /// (`engine::pipeline::DecodeResult`) — genuinely different bit ranges
-    /// (issue #194), not force-unified here.
+    /// Result type this protocol's decode engine produces.
+    ///
+    /// **The same concrete type for all three**, since 0.8.0:
+    /// `engine::pipeline::DecodeResult`, which `ft8::decode` re-exports.
+    /// It carries the full `Fec::K` info bits with the CRC retained —
+    /// 91 for FT8 and FT4 (CRC-14), 101 for FST4 (CRC-24) — and
+    /// `message77()` slices the leading 77 identically for each. That is
+    /// what lets a caller generic over `DecodeRequest<P>` read every
+    /// protocol's results the same way.
+    ///
+    /// This doc used to say the types were "genuinely different bit
+    /// ranges (issue #194), not force-unified here". They were unified
+    /// by that issue; the sentence outlived the divergence it described.
     type DecodeResult;
 
     #[doc(hidden)]
@@ -378,9 +386,24 @@ impl<'a, P: SupportsWideBandAp> DecodeRequest<'a, P> {
 impl<'a, P: SupportsSicRounds> DecodeRequest<'a, P> {
     /// One round = coarse-sync + per-candidate decode + subtract, over the
     /// (shrinking) residual buffer. `n` is clamped to 1..=3 — WSJT-X's own
-    /// `npass`/`nsp` never exceeds 3. Fixed `sync_min` across rounds,
-    /// sequential subtract (each accepted decode is subtracted before the
-    /// next candidate in the same round is tried).
+    /// `npass`/`nsp` never exceeds 3.
+    ///
+    /// **The two implementors differ in two ways this doc used to paper
+    /// over**, and a caller comparing them will see both:
+    ///
+    /// - *Threshold schedule.* FT8 holds `sync_min` fixed across rounds.
+    ///   FT4 **relaxes** it — the generic engine multiplies by
+    ///   `[1.0, 0.75, 0.5]`, one factor per round, so a later round looks
+    ///   deeper into the noise on a residual that has had the strong
+    ///   signals removed.
+    /// - *Termination.* FT8 stops early once a round adds nothing. FT4
+    ///   runs every round it was given.
+    ///
+    /// Both subtract sequentially on FT8 (each accepted decode is removed
+    /// before the next candidate in the same round is tried); FT4's
+    /// generic engine subtracts a round's accepted decodes as one batch
+    /// at the end of the round, which is also why a budget can decline a
+    /// whole FT4 round but never cut inside one.
     ///
     /// Corresponds to WSJT-X FT8 `ft8_decode.f90:176` `ipass`/`npass` and
     /// FT4 `ft4_decode.f90` `isp`/`nsp` — **not** FT4's separate
