@@ -1,34 +1,48 @@
 # Changelog
 
-## 0.10.2 — the M5StickS3 USB-host claim said more than the measurement did
+## 0.11.0 — a new C ABI for every mode (breaking), FT4/FST4 a-priori decoding fixed (−1.1 dB AWGN), the sniper becomes FT8-only (breaking), a caller-supplied decode budget, `mfsk-ffi-ft8` retired
 
-**This section no longer describes a patch.** It opened as one —
-additive API, an embedded-only fix, documentation and release tooling,
-with no host decoder behaviour change and no measured sensitivity
-movement. Two later batches changed that and the heading has to say so
-before this is tagged:
-
-- **The public API breaks.** `SniperRequest` is gated on a new
-  `SupportsSniper`, implemented for `Ft8` alone, so
-  `DecodeRequest::<Ft4>::sniper` and the five FST4 equivalents no
-  longer exist and `mfsk_decode_{i16,f32}_sniper` returns
-  `MFSK_STATUS_UNKNOWN_PROTOCOL` for those protocols.
-- **Host decode behaviour and sensitivity both move.** FT4 and FST4
-  a-priori decoding was locking about half its bits to the opposite of
-  the truth, and neither ran the blind CQ pass upstream runs on every
-  decode. FT4's AWGN threshold goes −16.89 → −18.00 dB. FST4's is
-  unchanged across all twenty sweep cells, measured, for a reason
-  recorded in `FST4_BENCHMARK.md` §16.
-
-By this crate's own convention that makes the next tag a **minor** bump
-rather than a patch — the precedent is `0.7.0` (the generic
-`decode_frame_for::<P>` API) and `0.10.0` (three public
+**Why a minor bump.** Two independent reasons, either of which would be
+enough by this crate's own convention — the precedent is `0.7.0` (the
+generic `decode_frame_for::<P>` API) and `0.10.0` (three public
 search-parameter type changes), both structural or breaking rather than
-merely capable. The version in `Cargo.toml` has not been moved yet;
-that is a release decision, not a merge one.
+merely capable.
 
-This section accumulates until the next tag — see `CLAUDE.md`'s
-"Release cadence".
+**1. The public API breaks**, and the two halves break very
+differently:
+
+*`mfsk-core` (the crates.io crate) breaks narrowly.* `SniperRequest` is
+gated on a new `SupportsSniper`, implemented for `Ft8` alone, so
+`DecodeRequest::<Ft4>::sniper` and the five FST4 equivalents no longer
+exist; `SniperRequest` itself is `ft8`-gated. `ProtocolMeta` gained
+fields, which breaks a struct literal but not a read. **A consumer that
+does not use the sniper on FT4 or FST4 sees no change at all** — the
+wide-band decode API, every protocol's entry points and the message
+codecs are untouched.
+
+*`mfsk-ffi` is rewritten.* Every pre-v2 decode symbol is gone, along
+with `MfskProtocol`, `MfskResult`, `MfskResultList`, `MfskSamples` and
+the opaque options handle with its eight setters. It is `publish =
+false` and its only exercised consumer was the in-repo C++ driver, so
+the blast radius is smaller than the diff suggests — but a C consumer
+porting across will rewrite, not adjust. `docs/reference/LIBRARY.md` §8
+is the map. `mfsk-ffi-ft8` is retired outright.
+
+**2. Sensitivity moves, for the first time in several releases.** FT4
+and FST4 a-priori decoding had been locking about half its bits to the
+*opposite* of the truth since it was written, and neither ran the blind
+CQ pass WSJT-X runs on every decode. FT4's AWGN threshold goes
+**−16.89 → −18.00 dB**, from 0.6 dB behind WSJT-X's published figure to
+0.5 dB ahead. FST4 is unchanged across all twenty sweep cells and FT8
+across all four — both measured rather than assumed, with the reasons
+recorded in `FST4_BENCHMARK.md` §16 and `FT4_BENCHMARK.md` §48-49.
+
+**What is new rather than changed**, in one line each: a C ABI where
+FT8, FT4 and all five FST4 sub-modes are addressed, configured and
+reported identically, with capabilities published rather than guessed;
+a caller-supplied wall-clock budget for FT8/FT4/FST4; a maintained
+Kotlin binding; and Windows/Android cross-compilation checked on every
+PR. Swift is not here yet — it needs a macOS runner.
 
 ### Fixed
 
