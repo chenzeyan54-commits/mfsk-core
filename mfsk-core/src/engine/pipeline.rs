@@ -1369,6 +1369,7 @@ where
                         bp_max_iter,
                         osd_depth: 0,
                         ap_mask: Some((mask, values)),
+                        ap_mag_scale: <P as Protocol>::AP_MAG_SCALE,
                         verify_info: Some(<P::Msg as MessageCodec>::verify_info),
                         ..FecOpts::default()
                     };

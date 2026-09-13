@@ -342,7 +342,7 @@ fn prepare_ap_llr(llr: &[f32], opts: &FecOpts<'_>) -> (Vec<f32>, Option<Vec<bool
         Some((mask, values)) => {
             assert_eq!(mask.len(), LDPC_N, "ap mask must be {} bits", LDPC_N);
             assert_eq!(values.len(), LDPC_N, "ap values must be {} bits", LDPC_N);
-            let apmag = llr_arr.iter().map(|x| x.abs()).fold(0.0f32, f32::max) * 1.01;
+            let apmag = llr_arr.iter().map(|x| x.abs()).fold(0.0f32, f32::max) * opts.ap_mag_scale;
             let mut a = vec![false; LDPC_N];
             for i in 0..LDPC_N {
                 if mask[i] != 0 {

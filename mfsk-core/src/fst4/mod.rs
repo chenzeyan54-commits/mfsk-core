@@ -202,6 +202,8 @@ macro_rules! fst4_submode {
             /// Same 77-bit WSJT message layout as FT8 / FT4 — fully reused.
             type Msg = Wsjt77Message;
             const ID: ProtocolId = ProtocolId::Fst4;
+            /// `fst4_decode.f90:418` — `apmag = maxval(abs(llrs(:,4))) * 1.1`.
+            const AP_MAG_SCALE: f32 = 1.1;
         }
     };
 }

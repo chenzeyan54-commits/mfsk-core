@@ -59,6 +59,21 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
 
 ### Fixed
 
+- **The AP magnitude is upstream's per-protocol value, not one constant.**
+  `apmag = max(|llr|) * scale` decides how far above the strongest
+  channel observation an AP-locked bit is clamped. Both LDPC codecs
+  hardcoded `1.01` and the doc called it "matching WSJT-X convention" —
+  true of FT8 (`ft8b.f90:303`) and wrong for FT4
+  (`ft4_decode.f90:327`) and FST4 (`fst4_decode.f90:418`), both of
+  which use `1.1`. FT8 and FT4 share `Ldpc174_91`, so the codec cannot
+  tell which protocol it is serving; the value is now
+  `Protocol::AP_MAG_SCALE`, defaulting to FT8's.
+
+  **Measured neutral**: the FT4 sweep is unchanged on three channels and
+  −0.07 dB on the fourth, within sampling noise at 180 trials per point.
+  A faithfulness fix, not a sensitivity one — worth having because the
+  next person reading that constant would have believed the comment.
+
 - **FT4's residual sensitivity gap against WSJT-X was a missing
   a-priori pass: −16.89 dB → −18.00 dB AWGN.** WSJT-X runs AP passes on
   *every* FT4 and FST4 decode — `ft4_decode.f90:328`'s

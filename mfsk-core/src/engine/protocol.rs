@@ -418,6 +418,20 @@ pub struct FecOpts<'a> {
     /// duration of this decode — typical usage builds a `Vec<u8>` from an
     /// `ApHint` and borrows into `FecOpts` for a single `decode_soft` call.
     pub ap_mask: Option<(&'a [u8], &'a [u8])>,
+    /// How far above the strongest channel observation an AP-locked bit
+    /// is clamped: `apmag = max(|llr|) * ap_mag_scale`.
+    ///
+    /// **Upstream uses a different value per protocol**, which this was
+    /// previously blind to: `1.01` for FT8 (`ft8b.f90:303`) and `1.1`
+    /// for FT4 (`ft4_decode.f90:327`) and FST4 (`fst4_decode.f90:418`).
+    /// Both codecs here hardcoded 1.01, so FT8 was faithful and the
+    /// other two gave their AP bits a weaker vote than WSJT-X gives
+    /// them — and FT8/FT4 share `Ldpc174_91`, so the codec cannot know
+    /// which it is serving. The caller does.
+    ///
+    /// Default 1.01, i.e. FT8's, so an unset caller keeps the previous
+    /// behaviour.
+    pub ap_mag_scale: f32,
     /// Optional integrity verifier called when the FEC reaches a
     /// parity-converged candidate. Returning `false` rejects the
     /// candidate and BP keeps iterating; returning `true` accepts.
@@ -446,6 +460,7 @@ impl<'a> Default for FecOpts<'a> {
     fn default() -> Self {
         Self {
             bp_max_iter: 30,
+            ap_mag_scale: 1.01,
             osd_depth: 0,
             ap_mask: None,
             verify_info: None,
@@ -685,6 +700,19 @@ pub struct DecodeContext {
 /// FEC codec and a message codec together under one trait for ergonomic
 /// `<P: Protocol>` bounds.
 pub trait Protocol: ModulationParams + FrameLayout + 'static {
+    /// How far above the strongest channel observation an AP-locked bit
+    /// is clamped — `apmag = max(|llr|) * AP_MAG_SCALE`. See
+    /// [`FecOpts::ap_mag_scale`].
+    ///
+    /// Upstream sets this per protocol and the values differ: `1.01`
+    /// for FT8 (`ft8b.f90:303`), `1.1` for FT4 (`ft4_decode.f90:327`)
+    /// and FST4 (`fst4_decode.f90:418`). It lives here rather than on
+    /// the codec because FT8 and FT4 share `Ldpc174_91`, so the codec
+    /// cannot tell which protocol it is serving.
+    ///
+    /// Defaults to FT8's, the value both codecs previously hardcoded.
+    const AP_MAG_SCALE: f32 = 1.01;
+
     /// FEC codec carrying `N_DATA * BITS_PER_SYMBOL` coded bits.
     type Fec: FecCodec;
 

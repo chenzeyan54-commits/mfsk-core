@@ -121,6 +121,10 @@ impl Protocol for Ft4 {
     type Fec = Ldpc174_91;
     type Msg = Wsjt77Message;
     const ID: ProtocolId = ProtocolId::Ft4;
+    /// `ft4_decode.f90:327` — `apmag = maxval(abs(llra)) * 1.1`, where
+    /// FT8 uses 1.01. The two share `Ldpc174_91`, so this cannot live
+    /// on the codec.
+    const AP_MAG_SCALE: f32 = 1.1;
 }
 
 /// FT4-specific 77-bit pre-LDPC scrambler. WSJT-X `genft4.f90:33-35,64`

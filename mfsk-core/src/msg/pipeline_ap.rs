@@ -278,6 +278,7 @@ where
                         bp_max_iter: 30,
                         osd_depth: 0,
                         ap_mask: Some((&mask, &values)),
+                        ap_mag_scale: <P as Protocol>::AP_MAG_SCALE,
                         verify_info: Some(<P::Msg as crate::engine::MessageCodec>::verify_info),
                         ..FecOpts::default()
                     };
@@ -310,6 +311,7 @@ where
                                 bp_max_iter: 30,
                                 osd_depth: od,
                                 ap_mask: Some((&mask, &values)),
+                                ap_mag_scale: <P as Protocol>::AP_MAG_SCALE,
                                 verify_info: Some(
                                     <P::Msg as crate::engine::MessageCodec>::verify_info,
                                 ),

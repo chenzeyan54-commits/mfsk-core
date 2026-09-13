@@ -146,8 +146,11 @@ impl BpPooledFec for Ldpc174_91 {
 /// Shared AP-hint LLR preparation for [`Ldpc174_91`]'s pooled and
 /// unpooled `decode_soft`: for every `mask[i] == 1`, clamps LLR to
 /// ±apmag according to `values[i]` (1 → +apmag, 0 → −apmag);
-/// `apmag = max(|llr|) · 1.01` gives the AP bits a stronger vote than
-/// any channel observation, matching WSJT-X convention. Returns an
+/// `apmag = max(|llr|) · opts.ap_mag_scale` gives the AP bits a
+/// stronger vote than any channel observation. The scale is upstream's
+/// and differs by protocol — 1.01 for FT8, 1.1 for FT4/FST4 — which is
+/// why it is a caller option rather than the constant this used to
+/// hardcode while claiming to match "WSJT-X convention" generally. Returns an
 /// owned array (not a borrow tied to `opts`) so both callers can build
 /// their own `Option<&[bool; N]>`/`Option<&[bool]>` view over it.
 fn prepare_ap_llr(llr: &[f32], opts: &FecOpts<'_>) -> ([f32; LDPC_N], Option<[bool; LDPC_N]>) {
@@ -159,7 +162,7 @@ fn prepare_ap_llr(llr: &[f32], opts: &FecOpts<'_>) -> ([f32; LDPC_N], Option<[bo
         Some((mask, values)) => {
             assert_eq!(mask.len(), LDPC_N, "ap mask must be {} bits", LDPC_N);
             assert_eq!(values.len(), LDPC_N, "ap values must be {} bits", LDPC_N);
-            let apmag = llr_arr.iter().map(|x| x.abs()).fold(0.0f32, f32::max) * 1.01;
+            let apmag = llr_arr.iter().map(|x| x.abs()).fold(0.0f32, f32::max) * opts.ap_mag_scale;
             let mut a = [false; LDPC_N];
             for i in 0..LDPC_N {
                 if mask[i] != 0 {
