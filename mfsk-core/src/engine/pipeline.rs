@@ -695,7 +695,8 @@ where
     P::Fec: BpPooledFec,
 {
     process_candidate_basic_impl::<P>(
-        cand, fft_cache, cfg, depth, strictness, known, eq_mode, sync_q_min, None, false, false,
+        cand, fft_cache, cfg, depth, strictness, known, eq_mode, sync_q_min, None, None, false,
+        false,
     )
 }
 
@@ -718,7 +719,8 @@ where
     P::Fec: BpPooledFec,
 {
     process_candidate_basic_impl::<P>(
-        cand, fft_cache, cfg, depth, strictness, known, eq_mode, sync_q_min, None, false, false,
+        cand, fft_cache, cfg, depth, strictness, known, eq_mode, sync_q_min, None, None, false,
+        false,
     )
 }
 
@@ -792,6 +794,7 @@ where
         known,
         eq_mode,
         sync_q_min,
+        None,
         Some(precomputed_refine),
         skip_snr,
         skip_llr_nsym_max,
@@ -849,6 +852,33 @@ pub(crate) fn ft4_snr_db(cand_score: f32) -> f32 {
     }
 }
 
+/// [`process_candidate_basic`] with a-priori bit locking available as
+/// the ladder's last rung.
+///
+/// Separate rather than a parameter on that function because it is
+/// `pub` under `internal-testing` and a dozen sweep binaries call it;
+/// moving its signature to serve one new caller is not worth it.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(crate) fn process_candidate_basic_ap<P: GenericPipelineProtocol>(
+    cand: &SyncCandidate,
+    fft_cache: &[Complex<f32>],
+    cfg: &DownsampleCfg,
+    depth: DecodeDepth,
+    strictness: DecodeStrictness,
+    known: &[DecodeResult],
+    eq_mode: EqMode,
+    sync_q_min: u32,
+    ap: Option<(&[u8], &[u8])>,
+) -> Option<DecodeResult>
+where
+    P::Fec: BpPooledFec,
+{
+    process_candidate_basic_impl::<P>(
+        cand, fft_cache, cfg, depth, strictness, known, eq_mode, sync_q_min, ap, None, false, false,
+    )
+}
+
 fn process_candidate_basic_impl<P: GenericPipelineProtocol>(
     cand: &SyncCandidate,
     fft_cache: &[Complex<f32>],
@@ -858,6 +888,12 @@ fn process_candidate_basic_impl<P: GenericPipelineProtocol>(
     known: &[DecodeResult],
     eq_mode: EqMode,
     sync_q_min: u32,
+    // A-priori bit locking, as `(mask, values)` over the codeword —
+    // `FecOpts::ap_mask`'s own shape. Plain slices rather than an
+    // `ApHint` because that lives in `msg`, and `engine` never depends
+    // on `msg`. Applied as the ladder's final rung, so it can only add
+    // decodes; see there for why it is not a parallel path.
+    ap: Option<(&[u8], &[u8])>,
     // When `Some`, reuses a refine result [`dedup_refined_candidates`]
     // already computed for this candidate — downsample + RMS-normalise
     // + `fst4_sync_search`/`ft4_sync_search` — instead of recomputing
@@ -1265,6 +1301,77 @@ where
                 }
             }
 
+            // ── Final rung: a-priori bit locking ─────────────────
+            //
+            // Additive by construction. Everything above has already
+            // run and failed, so this can only add decodes — which is
+            // the whole reason it sits here rather than replacing the
+            // ladder. `msg::pipeline_ap` reaches the same technique
+            // through a *parallel* per-candidate path whose OSD stops
+            // at depth 2, and routing a wide-band decode through that
+            // was measured at 4 decodes against this ladder's 11 on the
+            // WSJT-X FT4 golden. AP was never the weak part; the ladder
+            // around it was.
+            //
+            // The mask/values arrive as plain slices rather than as an
+            // `ApHint`, because that is a `msg` type and `engine` does
+            // not depend on `msg` (the direction is fixed crate-wide).
+            // `FecOpts::ap_mask` already speaks exactly this shape.
+            //
+            // Risk here is false decodes, not recall: locking bits tells
+            // every candidate — including the noise — what some of its
+            // bits "are". `strictness.ap_max_errors(locked)` is the
+            // ceiling that keeps it honest, and it tightens as more bits
+            // are locked.
+            if let Some((mask, values)) = ap {
+                // `ap_bits_for` has already put these in codeword space
+                // (scrambled where the protocol scrambles), because the
+                // hint describes the message and the decoder does not.
+                let locked = mask.iter().filter(|&&m| m != 0).count();
+                let max_errors = strictness.ap_max_errors(locked);
+                for (llr, pass_id) in &variants {
+                    let ap_opts = FecOpts {
+                        bp_max_iter,
+                        osd_depth: 0,
+                        ap_mask: Some((mask, values)),
+                        verify_info: Some(<P::Msg as MessageCodec>::verify_info),
+                        ..FecOpts::default()
+                    };
+                    if let Some(mut r) = fec.decode_soft_pooled(llr, &ap_opts, &mut bp_scratch)
+                        && r.hard_errors <= max_errors
+                    {
+                        let itone = encode_tones_for_snr::<P>(&r.info, &fec);
+                        let snr_db = P::snr_db(SnrCtx {
+                            cs,
+                            itone: &itone,
+                            cd0: &cd0,
+                            ds_rate_hz: ds_rate,
+                            cand_score: cand.score,
+                            cand_freq_hz: cand.freq_hz,
+                            fft_cache,
+                            ds_cfg: cfg,
+                            refined_freq_hz: refined.freq_hz,
+                            i_start: i0,
+                        });
+                        descramble_info::<P>(&mut r.info);
+                        return Some(DecodeResult {
+                            info: r.info.into_boxed_slice(),
+                            freq_hz: refined.freq_hz,
+                            dt_sec: refined.dt_sec,
+                            hard_errors: r.hard_errors,
+                            sync_score: refined.score,
+                            // AP passes keep their own pass ids, offset
+                            // from the plain ladder's so a caller can
+                            // tell an AP-assisted decode from an earned
+                            // one.
+                            pass: 20 + pass_id,
+                            sync_cv,
+                            snr_db,
+                        });
+                    }
+                }
+            }
+
             None
         };
 
@@ -1589,6 +1696,7 @@ where
         precomputed_fft,
         on_result,
         None,
+        None,
     );
     (results, fft_cache)
 }
@@ -1617,6 +1725,7 @@ pub(crate) fn decode_frame_budgeted<P: GenericPipelineProtocol>(
     precomputed_fft: Option<&[Complex<f32>]>,
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
     budget: Option<BudgetCheck<'_>>,
+    ap: Option<(&[u8], &[u8])>,
 ) -> (Vec<DecodeResult>, FftCache, BudgetReport)
 where
     P::Fec: BpPooledFec,
@@ -1636,6 +1745,7 @@ where
         precomputed_fft,
         on_result,
         budget,
+        ap,
     )
 }
 
@@ -1676,6 +1786,7 @@ where
         sync_q_min,
         precomputed_fft,
         on_result,
+        None,
         None,
     );
     (results, fft_cache)
@@ -1874,6 +1985,9 @@ fn decode_frame_impl<P: GenericPipelineProtocol>(
     // (every path but the builder's budgeted one) leaves every loop
     // below exactly as it was.
     budget: Option<BudgetCheck<'_>>,
+    // A-priori bit locking, applied as the final rung of each
+    // candidate's ladder. See `process_candidate_basic_impl`.
+    ap: Option<(&[u8], &[u8])>,
 ) -> (Vec<DecodeResult>, FftCache, BudgetReport)
 where
     P::Fec: BpPooledFec,
@@ -1960,7 +2074,7 @@ where
                     break;
                 }
                 budget_report.stages_run += 1;
-                if let Some(r) = process_candidate_basic::<P>(
+                if let Some(r) = process_candidate_basic_ap::<P>(
                     cand,
                     fft_cache.as_slice(),
                     cfg,
@@ -1969,6 +2083,7 @@ where
                     &[],
                     eq_mode,
                     sync_q_min,
+                    ap,
                 ) {
                     if let Some(cb) = on_result {
                         cb(&r);
@@ -1993,7 +2108,7 @@ where
             let raw: Vec<DecodeResult> = candidates
                 .par_iter()
                 .filter_map(|cand| {
-                    let r = process_candidate_basic::<P>(
+                    let r = process_candidate_basic_ap::<P>(
                         cand,
                         fft_cache.as_slice(),
                         cfg,
@@ -2002,6 +2117,7 @@ where
                         &[],
                         eq_mode,
                         sync_q_min,
+                        ap,
                     )?;
                     if let Some(cb) = on_result {
                         cb(&r);
@@ -2013,7 +2129,7 @@ where
             let raw: Vec<DecodeResult> = candidates
                 .iter()
                 .filter_map(|cand| {
-                    let r = process_candidate_basic::<P>(
+                    let r = process_candidate_basic_ap::<P>(
                         cand,
                         fft_cache.as_slice(),
                         cfg,
@@ -2022,6 +2138,7 @@ where
                         &[],
                         eq_mode,
                         sync_q_min,
+                        ap,
                     )?;
                     if let Some(cb) = on_result {
                         cb(&r);
@@ -2099,6 +2216,7 @@ where
                     &[],
                     eq_mode,
                     sync_q_min,
+                    ap,
                     Some((cd0, freq_hz, i0, score)),
                     false,
                     false,
@@ -2135,6 +2253,7 @@ where
                     &[],
                     eq_mode,
                     sync_q_min,
+                    ap,
                     Some((cd0, freq_hz, i0, score)),
                     false,
                     false,
@@ -2158,6 +2277,7 @@ where
                     &[],
                     eq_mode,
                     sync_q_min,
+                    ap,
                     Some((cd0, freq_hz, i0, score)),
                     false,
                     false,

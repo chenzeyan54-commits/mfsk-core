@@ -169,6 +169,8 @@ macro_rules! impl_frame_decodable {
             }
         }
 
+        impl crate::msg::decode_request::SupportsWideBandAp for $proto {}
+
         impl FrameDecodable for $proto {
             type DecodeResult = DecodeResult;
 
@@ -182,6 +184,13 @@ macro_rules! impl_frame_decodable {
                 let on_result: Option<&(dyn Fn(&DecodeResult) + Sync)> = filtered_cb
                     .as_ref()
                     .map(|f| f as &(dyn Fn(&DecodeResult) + Sync));
+                // AP bits, if the caller supplied a hint. Built here because
+                // `ApHint` is a `msg` type and the engine takes plain slices.
+                let ap_bits = req
+                    .ap_hint
+                    .filter(|h| h.has_info())
+                    .map(crate::msg::pipeline_ap::ap_bits_for::<$proto>);
+                let ap = ap_bits.as_ref().map(|(m, v)| (m.as_slice(), v.as_slice()));
                 let (raw, fft_cache, budget) = pipeline::decode_frame_budgeted::<$proto>(
                     req.audio,
                     &$cfg,
@@ -197,6 +206,7 @@ macro_rules! impl_frame_decodable {
                     req.fft_cache.as_ref().map(FftCache::as_slice),
                     on_result,
                     req.budget,
+                    ap,
                 );
                 DecodeOutcome {
                     results: pipeline::dedup_known(raw, req.known),

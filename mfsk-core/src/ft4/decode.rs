@@ -75,6 +75,13 @@ impl FrameDecodable for Ft4 {
         let on_result: Option<&(dyn Fn(&DecodeResult) + Sync)> = filtered_cb
             .as_ref()
             .map(|f| f as &(dyn Fn(&DecodeResult) + Sync));
+        // AP bits, if the caller supplied a hint. Built here because
+        // `ApHint` is a `msg` type and the engine takes plain slices.
+        let ap_bits = req
+            .ap_hint
+            .filter(|h| h.has_info())
+            .map(crate::msg::pipeline_ap::ap_bits_for::<Ft4>);
+        let ap = ap_bits.as_ref().map(|(m, v)| (m.as_slice(), v.as_slice()));
         let (raw, fft_cache, budget) = pipeline::decode_frame_budgeted::<Ft4>(
             req.audio,
             &FT4_DOWNSAMPLE,
@@ -90,6 +97,7 @@ impl FrameDecodable for Ft4 {
             req.fft_cache.as_ref().map(FftCache::as_slice),
             on_result,
             req.budget,
+            ap,
         );
         DecodeOutcome {
             results: pipeline::dedup_known(raw, req.known),
@@ -138,6 +146,8 @@ impl FrameDecodable for Ft4 {
         }
     }
 }
+
+impl crate::msg::decode_request::SupportsWideBandAp for Ft4 {}
 
 impl SupportsSicRounds for Ft4 {
     fn __flat_sic(req: &DecodeRequest<'_, Self>) -> DecodeOutcome<Self> {

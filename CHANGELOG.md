@@ -59,6 +59,41 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
 
 ### Fixed
 
+- **FT4 and FST4 a-priori decoding locked about half its bits to the
+  wrong value, and had done so for as long as it existed.** An `ApHint`
+  describes the *message*; FT4 and FST4 XOR that message with their own
+  RVEC before CRC and FEC encode, so the info bits inside the codeword —
+  what the decoder actually works on — are the *scrambled* message.
+  `ap_bits_for` handed the decoder message-space values, so wherever the
+  RVEC bit was 1 the hint pinned a bit, with high confidence, to the
+  opposite of the truth.
+
+  That is worse than not hinting at all, and it showed: AP-hinted FT4
+  decoding measured **worse than plain decoding**. On an AWGN sweep at
+  12 trials per point, hinting the CQ the decoder was looking for:
+
+  | SNR | plain | AP, before | AP, after |
+  |---:|---:|---:|---:|
+  | −17 dB | 8/12 | 3/12 | 12/12 |
+  | −18 dB | 2/12 | 0/12 | 11/12 |
+  | −19 dB | 0/12 | 0/12 | 8/12 |
+
+  About 3 dB at threshold, which is what this crate's own documentation
+  has always claimed AP is worth ("1-3 dB when the hint matches a
+  station actually on air"). The claim was right; the implementation
+  was not.
+
+  **FT8 was never affected** — it has no RVEC — and that is the other
+  reason this survived: the protocol where AP is most used is the one
+  where it happened to work. It also explains why the sniper, whose
+  entire premise is trading bandwidth for AP gain, had been losing to a
+  plain wide-band decode on the same audio.
+
+  `tests/ft4_ap_scramble.rs` pins gain at threshold and, on the axis AP
+  can actually hurt, that a hint naming a station which is not
+  transmitting does not produce that station — checked at three SNRs and
+  against pure noise.
+
 - **An AP hint, not a narrow search, was what ended the search.** The
   shared AP engine broke out of its candidate loop on `if has_ap`, so
   supplying a hint made the search single-target regardless of how wide

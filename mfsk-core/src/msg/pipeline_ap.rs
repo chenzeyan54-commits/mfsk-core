@@ -45,7 +45,30 @@ pub(crate) fn ap_bits_for<P: Protocol>(hint: &ApHint) -> (Vec<u8>, Vec<u8>)
 where
     P::Msg: WsjtApCompatible,
 {
-    hint.build_bits(P::Fec::N)
+    let (mask, mut values) = hint.build_bits(P::Fec::N);
+    // **The hint describes the message; the decoder works on the
+    // codeword.** FT4 and FST4 XOR the 77-bit message with their own
+    // RVEC before CRC and FEC encode (`ModulationParams::INFO_SCRAMBLE_RVEC`),
+    // so the info bits inside the codeword are the *scrambled* message.
+    // A value locked in message space is therefore the wrong value
+    // wherever the RVEC bit is 1 — which is about half of them, i.e. AP
+    // was locking roughly half its bits to the opposite of the truth.
+    //
+    // Measured on an FT4 AWGN sweep at 12 trials per point, hinting a
+    // CQ the decoder is trying to find: 2/12 → 10/12 at −18 dB and
+    // 0/12 → 5/12 at −19 dB once the values are scrambled. Before this,
+    // AP-hinted decoding on FT4 was not merely weak, it was actively
+    // worse than plain decoding.
+    //
+    // The mask is untouched: an XOR moves no positions. FT8 has no
+    // RVEC and is unaffected.
+    if let Some(rvec) = <P as crate::engine::ModulationParams>::INFO_SCRAMBLE_RVEC {
+        let n = rvec.len().min(values.len());
+        for (b, &r) in values[..n].iter_mut().zip(rvec.iter()) {
+            *b = (*b ^ r) & 1;
+        }
+    }
+    (mask, values)
 }
 
 /// Enumerate the multi-pass AP configurations WSJT-X cycles through in
