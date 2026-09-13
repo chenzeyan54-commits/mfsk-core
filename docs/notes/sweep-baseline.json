@@ -11,15 +11,15 @@
         "groups": 20
       },
       "ft4": {
-        "date": "2026-09-13",
-        "commit": "89fa0532-dirty",
+        "date": "2026-09-14",
+        "commit": "0e925be5",
         "machine": "AMD Ryzen 9 9900X 12-Core Processor",
-        "trials": 640,
+        "trials": 720,
         "groups": 4
       },
       "ft8": {
-        "date": "2026-09-12",
-        "commit": "ce9affcf",
+        "date": "2026-09-14",
+        "commit": "0e925be5",
         "machine": "AMD Ryzen 9 9900X 12-Core Processor",
         "trials": 720,
         "groups": 4
@@ -86,7 +86,7 @@
   "fst4/60/ccir_poor": -24.545454545454547,
   "ft4/awgn": -18.0,
   "ft4/ccir_good": -17.615384615384617,
-  "ft4/ccir_moderate": -16.333333333333332,
+  "ft4/ccir_moderate": -16.4,
   "ft4/ccir_poor": -16.25,
   "ft8/awgn": -21.6,
   "ft8/ccir_good": -21.11111111111111,

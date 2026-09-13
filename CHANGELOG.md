@@ -319,6 +319,29 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
 
 ### Added
 
+- **The tier-C sweeps every decode-path change in this section asked
+  for, run before the tag.** `scripts/release-status.sh` named FT8, FT4
+  and FST4; FST4 was already covered (its sweep ran after the AP-engine
+  deletion), so FT8 and FT4 were the outstanding pair.
+
+  Both were run against specific hypotheses rather than as a formality.
+  **FT4**: `apmag` going per-protocol (1.01 → 1.1, touching both LDPC
+  codecs) and the parallel AP engine being deleted in favour of a rung
+  on the shared ladder — 89 lines out of `ft4/decode.rs`, a different
+  code path reaching the same decodes. **FT8**: the budget scheduler's
+  candidate reordering, which re-sorts to coarse order before the
+  first-wins dedup and so can change a dedup outcome even with no budget
+  set.
+
+  Eight cells: seven bit-identical, one (FT4 CCIR-moderate) 0.07 dB
+  better, which at 180 trials per cell is interpolation granularity.
+  Both hypotheses negative. Written up in `FT4_BENCHMARK.md` §49,
+  including the correction that §48's "`apmag` measured neutral" was a
+  spot check and this is the sweep that agrees with it — the change is
+  still right, because it is what upstream does, but it buys nothing
+  measurable and saying so beats letting "we matched WSJT-X" imply a
+  gain.
+
 - **`bindings/kotlin/` — a maintained Kotlin binding, built and run on a
   desktop JVM by CI on every source change.** It replaces
   `mfsk-ffi/examples/kotlin_jni/`, which was written against the pre-v2

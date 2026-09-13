@@ -3504,3 +3504,48 @@ AWGN files — it simply almost never wins, because FST4's nsym=4 ladder
 and zsum-OSD have already converged by the time it is reached. FT4's
 ladder had a real gap there; FST4's does not. Worst-case cost measured
 at 1.5% wall clock. Full write-up in `FST4_BENCHMARK.md` §16.
+
+## 49. Two changes that could have moved FT4 and did not (2026-09-14)
+
+The blind CQ pass (§48) was measured with the change in the working
+tree, so the baseline it set carries it. Two things landed *after* that
+measurement and both touch FT4's decode path, so both were re-swept
+before tagging rather than reasoned about.
+
+**`apmag` became per-protocol.** `apmag = max(|llr|) * scale` decides
+how far above the strongest channel observation an AP-locked bit is
+clamped. Both LDPC codecs hardcoded `1.01` — true of FT8
+(`ft8b.f90:303`) and wrong for FT4 (`ft4_decode.f90:327`), which uses
+`1.1`. The value is now `Protocol::AP_MAG_SCALE`.
+
+**The parallel AP engine was deleted.** `msg::pipeline_ap`'s
+`decode_band_ap` / `process_candidate_ap` are gone and AP is a rung at
+the end of `process_candidate_basic`'s own ladder, which removed 89
+lines from `ft4/decode.rs`. That is a different code path reaching the
+same decodes, which is exactly the shape of change that moves a curve
+by accident.
+
+| channel | before | after |
+|---|---:|---:|
+| AWGN | −18.00 dB | −18.00 dB |
+| CCIR good | −17.62 dB | −17.62 dB |
+| CCIR moderate | −16.33 dB | **−16.40 dB** |
+| CCIR poor | −16.25 dB | −16.25 dB |
+
+Three cells bit-identical, one 0.07 dB better — interpolation
+granularity at 180 trials per cell, not a gain. Both hypotheses tested
+and negative.
+
+**The `apmag` result is worth reading precisely.** It was recorded in
+§48 as "measured neutral", but that was a spot check rather than a
+sweep. This is the sweep, and it agrees: raising FT4's clamp from 1.01
+to 1.1 changes no threshold on this corpus. It remains the right change
+— it is what upstream does, and divergence from WSJT-X needs a reason —
+but it buys nothing measurable here, and saying so is more useful than
+letting "we matched upstream" imply a gain.
+
+FT8 was re-swept in the same run for the budget scheduler's
+candidate reordering (cheapest-first, re-sorted to coarse order before
+the first-wins dedup, which can change a dedup outcome even with no
+budget set). All four channels bit-identical: −21.60 / −21.11 / −20.00
+/ −19.67 dB.
