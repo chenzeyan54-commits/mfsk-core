@@ -23,48 +23,56 @@ mod common;
 use common::*;
 use mfsk::*;
 
-fn empty_samples() -> MfskSamples {
-    MfskSamples {
-        samples: ptr::null_mut(),
-        len: 0,
-        _cap: 0,
-    }
-}
-
-/// Rows the Q65 calls will fill in, plus the count they wrote.
-fn q65_rows() -> Vec<MfskDecode> {
-    vec![blank_row(); 16]
-}
-
-/// Build a `Q65a30` message via the FFI encoder, returning the
-/// resulting samples buffer. Panics if the encoder reports failure
-/// (means the test's call/grid are malformed, which is a test-side
-/// bug not a library one).
-fn encode_q65a30(call1: &str, call2: &str, report: &str) -> MfskSamples {
+/// Synthesise a Q65 frame into a buffer this test owns.
+fn encode_q65(sub: MfskQ65SubMode, call1: &str, call2: &str, report: &str) -> Vec<f32> {
     let c1 = CString::new(call1).unwrap();
     let c2 = CString::new(call2).unwrap();
     let r = CString::new(report).unwrap();
-    let mut out = empty_samples();
-    let st = unsafe {
-        mfsk_encode_q65(
-            MfskQ65SubMode::A30,
-            c1.as_ptr(),
-            c2.as_ptr(),
-            r.as_ptr(),
-            1500.0,
-            &mut out,
-        )
-    };
-    assert_eq!(st, MfskStatus::Ok, "mfsk_encode_q65 failed");
-    out
+    let mut need = 0usize;
+    assert_eq!(
+        unsafe {
+            mfsk_encode_q65(
+                sub as u32,
+                c1.as_ptr(),
+                c2.as_ptr(),
+                r.as_ptr(),
+                1500.0,
+                std::ptr::null_mut(),
+                0,
+                &mut need,
+            )
+        },
+        MfskStatus::InvalidArg,
+        "a zero-capacity call should report the size it needs"
+    );
+    let mut pcm = vec![0.0f32; need];
+    let mut got = 0usize;
+    assert_eq!(
+        unsafe {
+            mfsk_encode_q65(
+                sub as u32,
+                c1.as_ptr(),
+                c2.as_ptr(),
+                r.as_ptr(),
+                1500.0,
+                pcm.as_mut_ptr(),
+                pcm.len(),
+                &mut got,
+            )
+        },
+        MfskStatus::Ok,
+        "mfsk_encode_q65 failed for {sub:?}"
+    );
+    pcm.truncate(got);
+    pcm
+}
+
+fn encode_q65a30(call1: &str, call2: &str, report: &str) -> Vec<f32> {
+    encode_q65(MfskQ65SubMode::A30, call1, call2, report)
 }
 
 #[test]
 fn encode_q65_roundtrips_for_every_submode() {
-    let c1 = CString::new("CQ").unwrap();
-    let c2 = CString::new("K1ABC").unwrap();
-    let g = CString::new("FN42").unwrap();
-
     for &sm in &[
         MfskQ65SubMode::A15,
         MfskQ65SubMode::A30,
@@ -77,18 +85,9 @@ fn encode_q65_roundtrips_for_every_submode() {
         MfskQ65SubMode::E120,
         MfskQ65SubMode::A300,
     ] {
-        let mut out = empty_samples();
-        let st =
-            unsafe { mfsk_encode_q65(sm, c1.as_ptr(), c2.as_ptr(), g.as_ptr(), 1500.0, &mut out) };
-        assert_eq!(st, MfskStatus::Ok, "encode failed for sub-mode {sm:?}");
-        assert!(!out.samples.is_null(), "null PCM for sub-mode {sm:?}");
-        // Q65 frames are 85 symbols × NSPS samples. Q65-15A:
-        // NSPS=1800 → 153 000 samples (12.75 s). Q65-30A: NSPS=3600
-        // → 306 000 samples (25.5 s). Q65-60A..E: NSPS=7200 →
-        // 612 000 samples (51 s). Q65-120D/E: NSPS=16000 →
-        // 1 360 000 samples (113.3 s). Q65-300A: NSPS=41472 →
-        // 3 525 120 samples (293.8 s). Encoder returns the
-        // frame-length PCM, not the slot-length PCM.
+        let pcm = encode_q65(sm, "CQ", "JA1ABC", "PM95");
+        // Q65 frames are 85 symbols × NSPS samples, and the encoder
+        // returns frame-length PCM rather than slot-length.
         let expected = match sm {
             MfskQ65SubMode::A15 => 85 * 1_800,
             MfskQ65SubMode::A30 => 85 * 3_600,
@@ -97,26 +96,23 @@ fn encode_q65_roundtrips_for_every_submode() {
             _ => 85 * 7_200,
         };
         assert_eq!(
-            out.len, expected,
-            "unexpected PCM length for sub-mode {sm:?}: got {} expected {expected}",
-            out.len
+            pcm.len(),
+            expected,
+            "unexpected PCM length for sub-mode {sm:?}"
         );
-        unsafe {
-            mfsk_samples_free(&mut out);
-        }
     }
 }
 
 #[test]
 fn q65_plain_decode_recovers_clean_signal() {
-    let mut pcm = encode_q65a30("CQ", "K1ABC", "FN42");
-    let mut rows = q65_rows();
+    let pcm = encode_q65a30("CQ", "K1ABC", "FN42");
+    let mut rows = vec![blank_row(); 16];
     let mut n = 0usize;
     let st = unsafe {
         mfsk_q65_decode(
             MfskQ65SubMode::A30 as u32,
-            pcm.samples,
-            pcm.len,
+            pcm.as_ptr(),
+            pcm.len(),
             12_000,
             ptr::null(),
             rows.as_mut_ptr(),
@@ -129,23 +125,20 @@ fn q65_plain_decode_recovers_clean_signal() {
         any_contains(&rows[..n], "K1ABC") && any_contains(&rows[..n], "FN42"),
         "expected K1ABC + FN42 in plain Q65 decode output"
     );
-    unsafe {
-        mfsk_samples_free(&mut pcm);
-    }
 }
 
 #[test]
 fn q65_decode_with_ap_handles_null_hints() {
     // All four AP hint strings NULL → must behave like the plain
     // path (no false rejects, no crashes).
-    let mut pcm = encode_q65a30("CQ", "JA1ABC", "PM95");
-    let mut rows = q65_rows();
+    let pcm = encode_q65a30("CQ", "JA1ABC", "PM95");
+    let mut rows = vec![blank_row(); 16];
     let mut n = 0usize;
     let st = unsafe {
         mfsk_q65_decode_with_ap(
             MfskQ65SubMode::A30 as u32,
-            pcm.samples,
-            pcm.len,
+            pcm.as_ptr(),
+            pcm.len(),
             12_000,
             ptr::null(),
             ptr::null(),
@@ -159,22 +152,19 @@ fn q65_decode_with_ap_handles_null_hints() {
     };
     assert_eq!(st, MfskStatus::Ok);
     assert!(any_contains(&rows[..n], "JA1ABC"));
-    unsafe {
-        mfsk_samples_free(&mut pcm);
-    }
 }
 
 #[test]
 fn q65_decode_with_ap_uses_call1_hint() {
-    let mut pcm = encode_q65a30("CQ", "JA1ABC", "PM95");
-    let mut rows = q65_rows();
+    let pcm = encode_q65a30("CQ", "JA1ABC", "PM95");
+    let mut rows = vec![blank_row(); 16];
     let mut n = 0usize;
     let cq = CString::new("CQ").unwrap();
     let st = unsafe {
         mfsk_q65_decode_with_ap(
             MfskQ65SubMode::A30 as u32,
-            pcm.samples,
-            pcm.len,
+            pcm.as_ptr(),
+            pcm.len(),
             12_000,
             cq.as_ptr(),
             ptr::null(),
@@ -188,21 +178,18 @@ fn q65_decode_with_ap_uses_call1_hint() {
     };
     assert_eq!(st, MfskStatus::Ok);
     assert!(any_contains(&rows[..n], "JA1ABC"));
-    unsafe {
-        mfsk_samples_free(&mut pcm);
-    }
 }
 
 #[test]
 fn q65_decode_fading_recovers_clean_signal() {
-    let mut pcm = encode_q65a30("CQ", "K1ABC", "FN42");
-    let mut rows = q65_rows();
+    let pcm = encode_q65a30("CQ", "K1ABC", "FN42");
+    let mut rows = vec![blank_row(); 16];
     let mut n = 0usize;
     let st = unsafe {
         mfsk_q65_decode_fading(
             MfskQ65SubMode::A30 as u32,
-            pcm.samples,
-            pcm.len,
+            pcm.as_ptr(),
+            pcm.len(),
             12_000,
             0.05, // tight spread → near-AWGN
             MfskQ65FadingModel::Gaussian as u32,
@@ -217,17 +204,14 @@ fn q65_decode_fading_recovers_clean_signal() {
         any_contains(&rows[..n], "K1ABC"),
         "fast-fading FFI path must decode a clean signal"
     );
-    unsafe {
-        mfsk_samples_free(&mut pcm);
-    }
 }
 
 #[test]
 fn q65_decode_with_ap_list_picks_matching_template() {
     // Encode "K1ABC JA1ABC PM95" — that exact template lives in
     // the 206-candidate set generated for (K1ABC, JA1ABC, PM95).
-    let mut pcm = encode_q65a30("K1ABC", "JA1ABC", "PM95");
-    let mut rows = q65_rows();
+    let pcm = encode_q65a30("K1ABC", "JA1ABC", "PM95");
+    let mut rows = vec![blank_row(); 16];
     let mut n = 0usize;
     let mc = CString::new("K1ABC").unwrap();
     let hc = CString::new("JA1ABC").unwrap();
@@ -235,8 +219,8 @@ fn q65_decode_with_ap_list_picks_matching_template() {
     let st = unsafe {
         mfsk_q65_decode_with_ap_list(
             MfskQ65SubMode::A30 as u32,
-            pcm.samples,
-            pcm.len,
+            pcm.as_ptr(),
+            pcm.len(),
             12_000,
             mc.as_ptr(),
             hc.as_ptr(),
@@ -252,25 +236,22 @@ fn q65_decode_with_ap_list_picks_matching_template() {
         any_contains(&rows[..n], "K1ABC JA1ABC PM95"),
         "AP-list FFI path must pick the matching template"
     );
-    unsafe {
-        mfsk_samples_free(&mut pcm);
-    }
 }
 
 #[test]
 fn q65_decode_with_ap_list_returns_decode_failed_on_bad_calls() {
     // `standard_qso_codewords` rejects garbage callsigns →
     // empty candidate set → DecodeFailed status.
-    let mut pcm = encode_q65a30("CQ", "K1ABC", "FN42");
-    let mut rows = q65_rows();
+    let pcm = encode_q65a30("CQ", "K1ABC", "FN42");
+    let mut rows = vec![blank_row(); 16];
     let mut n = 0usize;
     let bad = CString::new("!!!").unwrap();
     let hc = CString::new("K1ABC").unwrap();
     let st = unsafe {
         mfsk_q65_decode_with_ap_list(
             MfskQ65SubMode::A30 as u32,
-            pcm.samples,
-            pcm.len,
+            pcm.as_ptr(),
+            pcm.len(),
             12_000,
             bad.as_ptr(),
             hc.as_ptr(),
@@ -287,9 +268,6 @@ fn q65_decode_with_ap_list_returns_decode_failed_on_bad_calls() {
         "garbage calls should yield DecodeFailed without aborting"
     );
     assert_eq!(n, 0);
-    unsafe {
-        mfsk_samples_free(&mut pcm);
-    }
 }
 
 /// Proves the FFI `hash_table` parameter reaches
@@ -314,7 +292,7 @@ fn q65_decode_hash_table_resolves_hashed_callsign() {
     let audio = synthesize_audio_for::<Q65a30>(&tones, 12_000, 1500.0, 0.3);
 
     // Without a hash table: unresolved placeholder.
-    let mut rows = q65_rows();
+    let mut rows = vec![blank_row(); 16];
     let mut n = 0usize;
     let st = unsafe {
         mfsk_q65_decode(
@@ -341,7 +319,7 @@ fn q65_decode_hash_table_resolves_hashed_callsign() {
     let ins_st = unsafe { mfsk_callsign_hash_table_insert(ht, ja1abc.as_ptr()) };
     assert_eq!(ins_st, MfskStatus::Ok);
 
-    let mut rows2 = q65_rows();
+    let mut rows2 = vec![blank_row(); 16];
     let mut n2 = 0usize;
     let st2 = unsafe {
         mfsk_q65_decode(

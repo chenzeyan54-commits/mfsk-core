@@ -32,6 +32,16 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
 
 ### Fixed
 
+- **A macro-generated `extern "C"` function never reaches the header.**
+  The packers and the two synthesis calls were written as
+  `macro_rules!`, which cbindgen — parsing this crate syntactically —
+  cannot expand, so six functions existed in the library and were absent
+  from `mfsk.h`. A C consumer cannot call what is not declared.
+
+  Found by the C++ driver failing to compile, which is the reason it is
+  a real translation unit rather than a Rust test. They are written out
+  explicitly now, with a comment at the site saying why.
+
 - **FT4's slot grid was steered from the wrong reference frame, and now
   has tests (#354).** `apps/ft4.rs` read "samples to the next UTC
   boundary" from the clock and handed it straight to
@@ -280,6 +290,29 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
   could merge green.
 
 ### Added
+
+- **Transmit is the same shape as receive: nothing crosses the boundary
+  as an allocation.** `mfsk_pack77` / `_type1` / `_type4` /
+  `_free_text` → `mfsk_message_to_tones` → `mfsk_tones_to_i16` /
+  `_to_f32`, each stage writing into a buffer you sized with
+  `mfsk_symbol_count` and `mfsk_synth_output_len`, plus `mfsk_unpack77`
+  to read a packed message back.
+
+  `mfsk-ffi-ft8` already had the better of this repo's two TX designs;
+  `mfsk-ffi` had seven heap-allocating `mfsk_encode_*` functions that
+  accepted only the three-string `call1 call2 report` path — so a caller
+  with a type-4 or free-text message had no way in, and FST4 reached 60A
+  alone. The pipeline now generalises over `MfskMode` and covers FT8,
+  FT4 and all five FST4 sub-modes.
+
+  **Ask for the size rather than baking it.** The FST4 sub-modes differ
+  by a factor of 30 in samples per symbol (720 → 21 504), so a constant
+  taken from 60A is silently wrong for the other four.
+
+  The `mfsk_encode_*` convenience calls stay for the modes with no
+  exposed tone stage (WSPR, JT9, JT65, Q65) and now write into a caller
+  buffer too, which retires `MfskSamples` and `mfsk_samples_free`.
+  `mfsk_symbol_count` returning 0 is how a caller asks which is which.
 
 - **A decode session: one struct of parameters, rows into caller memory,
   and a callsign table that survives the slot.** `mfsk_session_open` /

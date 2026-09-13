@@ -171,66 +171,6 @@ typedef enum MfskStatus {
 } MfskStatus;
 
 /**
- * Q65 sub-mode selector for the dedicated `mfsk_q65_*` function
- * family. All sub-modes share the same FEC, sync layout and
- * message format — only the T/R period and tone spacing change.
- *
- * Picked from the type-level `Q65a30 / Q65a60 / Q65b60 / Q65c60 /
- * Q65d60 / Q65e60` ZSTs in `mfsk_core::q65`.
- */
-typedef enum MfskQ65SubMode {
-    /**
-     * Q65-30A — 30 s slot, ×1 spacing. Terrestrial weak-signal
-     * HF/VHF and ionoscatter; the most common Q65 sub-mode.
-     */
-    MFSK_Q65_SUB_MODE_A30 = 0,
-    /**
-     * Q65-60A — 60 s slot, ×1 spacing. 6 m EME.
-     */
-    MFSK_Q65_SUB_MODE_A60 = 1,
-    /**
-     * Q65-60B — 60 s slot, ×2 spacing. 70 cm / 23 cm EME.
-     */
-    MFSK_Q65_SUB_MODE_B60 = 2,
-    /**
-     * Q65-60C — 60 s slot, ×4 spacing. ~3 GHz microwave EME.
-     */
-    MFSK_Q65_SUB_MODE_C60 = 3,
-    /**
-     * Q65-60D — 60 s slot, ×8 spacing. 5.7 / 10 GHz EME (libration
-     * spread requires the fast-fading metric).
-     */
-    MFSK_Q65_SUB_MODE_D60 = 4,
-    /**
-     * Q65-60E — 60 s slot, ×16 spacing. 24 GHz+ / extreme spread.
-     */
-    MFSK_Q65_SUB_MODE_E60 = 5,
-    /**
-     * Q65-15A — 15 s slot, ×1 spacing. Fastest wired Q65 sub-mode;
-     * stable terrestrial HF/VHF paths that prefer a shorter T/R
-     * period over Q65-30A's extra sensitivity margin. Appended
-     * after `E60` (rather than inserted before `A30`) to keep the
-     * existing discriminant values stable for this `#[repr(C)]` ABI.
-     */
-    MFSK_Q65_SUB_MODE_A15 = 6,
-    /**
-     * Q65-120D — 120 s slot, ×8 spacing. 10 GHz rainscatter/
-     * troposcatter.
-     */
-    MFSK_Q65_SUB_MODE_D120 = 7,
-    /**
-     * Q65-120E — 120 s slot, ×16 spacing. 6 m ionoscatter with
-     * wider Doppler than Q65-30A/60A comfortably tolerate.
-     */
-    MFSK_Q65_SUB_MODE_E120 = 8,
-    /**
-     * Q65-300A — 300 s slot, ×1 spacing. The deepest wired Q65
-     * sub-mode (~-34 dB AWGN threshold); optical (laser) scatter.
-     */
-    MFSK_Q65_SUB_MODE_A300 = 9,
-} MfskQ65SubMode;
-
-/**
  * Every mode this library knows how to address, one per
  * `mfsk_core::registry::PROTOCOLS` entry plus MSK144.
  *
@@ -489,28 +429,6 @@ typedef struct MfskCallsignHashTable MfskCallsignHashTable;
  * both of which only mean anything across more than one call.
  */
 typedef struct MfskDecodeSession MfskDecodeSession;
-
-/**
- * A buffer of synthesised f32 PCM samples returned by `mfsk_encode_*`.
- * Caller should zero-initialise before the call and free with
- * [`mfsk_samples_free`] when done reading.
- */
-typedef struct MfskSamples {
-    /**
-     * Contiguous f32 PCM at the protocol's native sample rate
-     * (12 000 Hz for all currently-supported modes). Owned by the
-     * list; free with [`mfsk_samples_free`].
-     */
-    float *samples;
-    /**
-     * Number of f32 entries in `samples`.
-     */
-    uintptr_t len;
-    /**
-     * Internal: total allocation (reserved for future growth).
-     */
-    uintptr_t _cap;
-} MfskSamples;
 
 /**
  * One decoded transmission, written into caller memory.
@@ -851,18 +769,6 @@ extern "C" {
 const char *mfsk_last_error(void);
 
 /**
- * Free a [`MfskSamples`] buffer populated by a `mfsk_encode_*` call.
- * Passing NULL or an already-freed buffer is safe.
- *
- * # Safety
- *
- * `s` must point to a [`MfskSamples`] written by one of the
- * `mfsk_encode_*` functions, or be NULL. After this call, `samples`
- * is NULL and `len` is 0.
- */
-void mfsk_samples_free(struct MfskSamples *s);
-
-/**
  * Construct an empty callsign hash table. Free with
  * [`mfsk_callsign_hash_table_free`].
  */
@@ -898,13 +804,16 @@ enum MfskStatus mfsk_callsign_hash_table_insert(struct MfskCallsignHashTable *ht
  * # Safety
  *
  * `call1`/`call2`/`report` must be NUL-terminated UTF-8 strings.
- * `out` must be a writable `MfskSamples` (zero-initialise).
+ * `out` must be `cap` writable `f32`; `*out_len` receives the
+ * sample count (or the count needed, if `cap` was too small).
  */
 enum MfskStatus mfsk_encode_ft8(const char *call1,
                                 const char *call2,
                                 const char *report,
                                 float freq_hz,
-                                struct MfskSamples *out);
+                                float *out,
+                                uintptr_t cap,
+                                uintptr_t *out_len);
 
 /**
  * Synthesise a standard FT4 message at `freq_hz`. 12 kHz f32 PCM.
@@ -917,7 +826,9 @@ enum MfskStatus mfsk_encode_ft4(const char *call1,
                                 const char *call2,
                                 const char *report,
                                 float freq_hz,
-                                struct MfskSamples *out);
+                                float *out,
+                                uintptr_t cap,
+                                uintptr_t *out_len);
 
 /**
  * Synthesise a standard FST4-60A message at `freq_hz`. 12 kHz f32 PCM.
@@ -930,7 +841,9 @@ enum MfskStatus mfsk_encode_fst4s60(const char *call1,
                                     const char *call2,
                                     const char *report,
                                     float freq_hz,
-                                    struct MfskSamples *out);
+                                    float *out,
+                                    uintptr_t cap,
+                                    uintptr_t *out_len);
 
 /**
  * Synthesise a Type-1 WSPR message (`call grid power_dbm`).
@@ -943,7 +856,9 @@ enum MfskStatus mfsk_encode_wspr(const char *call,
                                  const char *grid,
                                  int32_t power_dbm,
                                  float freq_hz,
-                                 struct MfskSamples *out);
+                                 float *out,
+                                 uintptr_t cap,
+                                 uintptr_t *out_len);
 
 /**
  * Synthesise a standard JT9 message at `freq_hz`.
@@ -956,7 +871,9 @@ enum MfskStatus mfsk_encode_jt9(const char *call1,
                                 const char *call2,
                                 const char *grid_or_report,
                                 float freq_hz,
-                                struct MfskSamples *out);
+                                float *out,
+                                uintptr_t cap,
+                                uintptr_t *out_len);
 
 /**
  * Synthesise a standard JT65 message at `freq_hz`.
@@ -969,7 +886,9 @@ enum MfskStatus mfsk_encode_jt65(const char *call1,
                                  const char *call2,
                                  const char *grid_or_report,
                                  float freq_hz,
-                                 struct MfskSamples *out);
+                                 float *out,
+                                 uintptr_t cap,
+                                 uintptr_t *out_len);
 
 /**
  * Synthesise a standard Q65 message at `freq_hz` for the requested
@@ -981,12 +900,14 @@ enum MfskStatus mfsk_encode_jt65(const char *call1,
  *
  * See [`mfsk_encode_ft8`].
  */
-enum MfskStatus mfsk_encode_q65(enum MfskQ65SubMode submode,
+enum MfskStatus mfsk_encode_q65(uint32_t submode,
                                 const char *call1,
                                 const char *call2,
                                 const char *grid_or_report,
                                 float freq_hz,
-                                struct MfskSamples *out);
+                                float *out,
+                                uintptr_t cap,
+                                uintptr_t *out_len);
 
 /**
  * Plain AWGN Q65 scan-and-decode for any sub-mode. The default
@@ -1397,6 +1318,148 @@ enum MfskStatus mfsk_jt65_decode_at(const int16_t *samples,
                                     struct MfskDecode *out,
                                     uintptr_t cap,
                                     uintptr_t *out_len);
+
+/**
+ * Channel symbols per frame, or 0 for a mode with no exposed tone
+ * stage.
+ *
+ * A non-zero answer is what says [`mfsk_message_to_tones`] and
+ * [`mfsk_tones_to_i16`] apply. WSPR, JT9, JT65 and Q65 synthesise from
+ * their own message codecs in one step and report 0 here.
+ */
+uintptr_t mfsk_symbol_count(uint32_t mode);
+
+/**
+ * Samples a full frame synthesises to at 12 kHz — the buffer size
+ * [`mfsk_tones_to_i16`] needs. 0 if the mode has no tone stage.
+ *
+ * **Ask rather than assume.** The five FST4 sub-modes differ by a
+ * factor of 30 here (720 → 21 504 samples per symbol), so a constant
+ * baked for 60A is silently wrong for the other four — which is
+ * exactly the trap the old `tones_to_f32` wrapper carried.
+ */
+uintptr_t mfsk_synth_output_len(uint32_t mode);
+
+/**
+ * Pack a standard exchange: `call1 call2 report` (WSJT type 1/2).
+ *
+ * Writes 77 bytes, one bit per byte, to `out_message77` — the form
+ * every stage-2 call takes.
+ *
+ * # Safety
+ * Strings must be NUL-terminated; `out_message77` must be 77 writable
+ * bytes.
+ */
+enum MfskStatus mfsk_pack77(const char *call1,
+                            const char *call2,
+                            const char *report,
+                            uint8_t *out_message77);
+
+/**
+ * Pack a type-1 message: `call1 call2 grid`.
+ *
+ * # Safety
+ * As [`mfsk_pack77`].
+ */
+enum MfskStatus mfsk_pack77_type1(const char *call1,
+                                  const char *call2,
+                                  const char *grid,
+                                  uint8_t *out_message77);
+
+/**
+ * Pack up to 13 characters of free text.
+ *
+ * # Safety
+ * As [`mfsk_pack77`].
+ */
+enum MfskStatus mfsk_pack77_free_text(const char *text,
+                                      uint8_t *out_message77);
+
+/**
+ * Pack a type-4 message: one non-standard callsign in full, plus a
+ * **hashed** reference to the standard one.
+ *
+ * The hashed half decodes as `<...>` unless the receiving session has
+ * seen that callsign — see [`mfsk_session_add_callsign`].
+ *
+ * # Safety
+ * Strings must be NUL-terminated; `out_message77` must be 77 writable
+ * bytes.
+ */
+enum MfskStatus mfsk_pack77_type4(const char *nonstd_call,
+                                  const char *std_call,
+                                  const char *report,
+                                  bool is_cq,
+                                  uint8_t *out_message77);
+
+/**
+ * Render a packed 77-bit message as text.
+ *
+ * Pass a session to resolve hashed `<...>` callsigns from its table;
+ * `session` may be NULL, in which case they stay unresolved. Writes at
+ * most `cap` bytes including the NUL, and reports the size needed if
+ * that is not enough.
+ *
+ * # Safety
+ * `message77` must be 77 readable bytes; `out` must be `cap` writable
+ * bytes; `session`, if non-null, must be a live session.
+ */
+enum MfskStatus mfsk_unpack77(const struct MfskDecodeSession *session,
+                              const uint8_t *message77,
+                              char *out,
+                              uintptr_t cap,
+                              uintptr_t *out_len);
+
+/**
+ * Stage 2: a packed message becomes this mode's channel symbols.
+ *
+ * `mfsk_symbol_count(mode)` is the required capacity; 0 means the mode
+ * has no tone stage.
+ *
+ * # Safety
+ * `message77` must be 77 readable bytes; `out_itone` must be `cap`
+ * writable bytes.
+ */
+enum MfskStatus mfsk_message_to_tones(uint32_t mode,
+                                      const uint8_t *message77,
+                                      uint8_t *out_itone,
+                                      uintptr_t cap,
+                                      uintptr_t *out_len);
+
+/**
+ * Stage 3: channel symbols become 16-bit PCM at 12 kHz.
+ *
+ * `mfsk_synth_output_len(mode)` is the required capacity. The
+ * synthesis writes straight into your buffer — nothing is allocated
+ * and nothing has to be freed.
+ *
+ * # Safety
+ * `itone` must be `n_tones` readable bytes; `out` must be `cap`
+ * writable `int16_t`.
+ */
+enum MfskStatus mfsk_tones_to_i16(uint32_t mode,
+                                  const uint8_t *itone,
+                                  uintptr_t n_tones,
+                                  float freq_hz,
+                                  int16_t amplitude,
+                                  int16_t *out,
+                                  uintptr_t cap,
+                                  uintptr_t *out_len);
+
+/**
+ * Stage 3: channel symbols become 32-bit float PCM at 12 kHz.
+ *
+ * # Safety
+ * As [`mfsk_tones_to_i16`], with `out` as `float`.
+ */
+enum MfskStatus mfsk_tones_to_f32(uint32_t mode,
+                                  const uint8_t *itone,
+                                  uintptr_t n_tones,
+                                  float freq_hz,
+                                  float amplitude,
+                                  float *out,
+                                  uintptr_t cap,
+                                  uintptr_t *out_len);
 
 /**
  * Library version, major.minor.patch packed into a 32-bit integer (8

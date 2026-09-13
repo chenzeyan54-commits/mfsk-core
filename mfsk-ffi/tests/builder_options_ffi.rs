@@ -13,13 +13,11 @@
 
 mod common;
 
-use std::ffi::CString;
-
 use common::*;
 use mfsk::*;
 
 fn synth_ft8_i16(call1: &str, call2: &str, report: &str, freq_hz: f32) -> Vec<i16> {
-    synth_ft8_i16_scaled(call1, call2, report, freq_hz, 32_767.0)
+    synth_slot_i16(MfskMode::Ft8, call1, call2, report, freq_hz)
 }
 
 fn synth_ft8_i16_scaled(
@@ -29,27 +27,10 @@ fn synth_ft8_i16_scaled(
     freq_hz: f32,
     scale: f32,
 ) -> Vec<i16> {
-    let (c1, c2, r) = (
-        CString::new(call1).unwrap(),
-        CString::new(call2).unwrap(),
-        CString::new(report).unwrap(),
-    );
-    let mut pcm = MfskSamples {
-        samples: std::ptr::null_mut(),
-        len: 0,
-        _cap: 0,
-    };
-    assert_eq!(
-        unsafe { mfsk_encode_ft8(c1.as_ptr(), c2.as_ptr(), r.as_ptr(), freq_hz, &mut pcm) },
-        MfskStatus::Ok
-    );
-    let f = unsafe { std::slice::from_raw_parts(pcm.samples, pcm.len) };
-    let out: Vec<i16> = f
+    synth_ft8_i16(call1, call2, report, freq_hz)
         .iter()
-        .map(|&s| (s * scale).clamp(-32_768.0, 32_767.0) as i16)
-        .collect();
-    unsafe { mfsk_samples_free(&mut pcm) };
-    out
+        .map(|&s| ((s as f32) * scale / 32_767.0) as i16)
+        .collect()
 }
 
 fn mix(a: &[i16], b: &[i16]) -> Vec<i16> {

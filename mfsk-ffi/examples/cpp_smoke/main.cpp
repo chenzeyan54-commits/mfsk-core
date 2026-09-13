@@ -62,19 +62,74 @@ void print_rows(const char* tag, const Rows& r) {
     }
 }
 
-using Encoder = MfskStatus (*)(const char*, const char*, const char*, float, MfskSamples*);
+using Encoder = MfskStatus (*)(const char*, const char*, const char*, float,
+                               float*, size_t, size_t*);
 
+/// The convenience encoder, for modes with no tone stage. Writes into a
+/// buffer this file owns — ask for the size first.
 std::vector<int16_t> encode_i16(Encoder enc, const char* a, const char* b,
                                 const char* c, float freq) {
-    MfskSamples pcm{};
     std::vector<int16_t> out;
-    if (enc(a, b, c, freq, &pcm) != MFSK_STATUS_OK) return out;
-    out.resize(pcm.len);
-    for (size_t i = 0; i < pcm.len; ++i) {
-        out[i] = static_cast<int16_t>(pcm.samples[i] * 32767.0f);
+    size_t need = 0;
+    enc(a, b, c, freq, nullptr, 0, &need);
+    if (need == 0) return out;
+    std::vector<float> pcm(need);
+    size_t got = 0;
+    if (enc(a, b, c, freq, pcm.data(), pcm.size(), &got) != MFSK_STATUS_OK) return out;
+    out.resize(got);
+    for (size_t i = 0; i < got; ++i) {
+        out[i] = static_cast<int16_t>(pcm[i] * 32767.0f);
     }
-    mfsk_samples_free(&pcm);
     return out;
+}
+
+/// The three-stage pipeline: pack → tones → PCM, each into a buffer the
+/// caller sized from `mfsk_symbol_count` / `mfsk_synth_output_len`.
+/// Nothing is allocated across the boundary and nothing is freed.
+std::vector<int16_t> synth_frame(MfskMode mode, const char* a, const char* b,
+                                 const char* c, float freq) {
+    std::vector<int16_t> out;
+    uint8_t msg[77];
+    if (mfsk_pack77(a, b, c, msg) != MFSK_STATUS_OK) {
+        fail(mfsk_mode_name(mode), "mfsk_pack77 failed");
+        return out;
+    }
+    const size_t n_tones = mfsk_symbol_count(mode);
+    if (n_tones == 0) {
+        fail(mfsk_mode_name(mode), "no tone stage");
+        return out;
+    }
+    std::vector<uint8_t> tones(n_tones);
+    size_t got = 0;
+    if (mfsk_message_to_tones(mode, msg, tones.data(), tones.size(), &got) != MFSK_STATUS_OK) {
+        fail(mfsk_mode_name(mode), mfsk_last_error());
+        return out;
+    }
+    const size_t n_pcm = mfsk_synth_output_len(mode);
+    out.resize(n_pcm);
+    size_t wrote = 0;
+    if (mfsk_tones_to_i16(mode, tones.data(), tones.size(), freq, 8000,
+                          out.data(), out.size(), &wrote) != MFSK_STATUS_OK) {
+        fail(mfsk_mode_name(mode), mfsk_last_error());
+        out.clear();
+    }
+    return out;
+}
+
+/// A frame placed in a full slot at that mode's TX offset.
+std::vector<int16_t> synth_slot(MfskMode mode, const char* a, const char* b,
+                                const char* c, float freq) {
+    MfskModeInfo info;
+    std::memset(&info, 0, sizeof info);
+    info.size = sizeof info;
+    if (mfsk_mode_info(mode, &info) != MFSK_STATUS_OK) return {};
+    const std::vector<int16_t> frame = synth_frame(mode, a, b, c, freq);
+    std::vector<int16_t> slot(info.slot_samples_12k, 0);
+    const size_t start = static_cast<size_t>(info.tx_start_offset_s * 12000.0f);
+    for (size_t i = 0; i < frame.size() && start + i < slot.size(); ++i) {
+        slot[start + i] = frame[i];
+    }
+    return slot;
 }
 
 MfskDecodeParams defaults_for(MfskMode mode) {
@@ -281,16 +336,8 @@ void test_mode_introspection() {
 void test_session_decode() {
     std::printf("\n— v2 decode session: params → open → rows into caller memory\n");
 
-    MfskSamples pcm{};
-    if (mfsk_encode_ft8("CQ", "JA1ABC", "PM95", 1500.0f, &pcm) != MFSK_STATUS_OK) {
-        fail("session", "mfsk_encode_ft8 failed");
-        return;
-    }
-    std::vector<int16_t> audio(pcm.len);
-    for (size_t i = 0; i < pcm.len; ++i) {
-        audio[i] = static_cast<int16_t>(pcm.samples[i] * 32767.0f);
-    }
-    mfsk_samples_free(&pcm);
+    const std::vector<int16_t> audio =
+        synth_slot(MFSK_MODE_FT8, "CQ", "JA1ABC", "PM95", 1500.0f);
 
     MfskDecodeParams p;
     std::memset(&p, 0, sizeof p);
@@ -416,14 +463,14 @@ void test_session_decode() {
 void test_ft8() {
     std::printf("\n— FT8 roundtrip: encode 'CQ JA1ABC PM95' at 1500 Hz → decode\n");
     session_roundtrip("FT8", MFSK_MODE_FT8,
-                      encode_i16(mfsk_encode_ft8, "CQ", "JA1ABC", "PM95", 1500.0f),
+                      synth_slot(MFSK_MODE_FT8, "CQ", "JA1ABC", "PM95", 1500.0f),
                       "JA1ABC");
 }
 
 void test_ft4() {
     std::printf("\n— FT4 roundtrip: encode 'CQ JA1ABC PM95' at 1500 Hz → decode\n");
     session_roundtrip("FT4", MFSK_MODE_FT4,
-                      encode_i16(mfsk_encode_ft4, "CQ", "JA1ABC", "PM95", 1500.0f),
+                      synth_slot(MFSK_MODE_FT4, "CQ", "JA1ABC", "PM95", 1500.0f),
                       "JA1ABC");
 }
 
@@ -433,15 +480,9 @@ void test_fst4() {
         return;
     }
     std::printf("\n— FST4-60A roundtrip, and all five sub-modes addressable\n");
-    std::vector<int16_t> frame =
-        encode_i16(mfsk_encode_fst4s60, "CQ", "JA1ABC", "PM95", 1500.0f);
-
-    constexpr size_t kSlot = 60 * 12000;
-    constexpr size_t kOffset = 12000;
-    std::vector<int16_t> slot(kSlot, 0);
-    const size_t n = frame.size() < kSlot - kOffset ? frame.size() : kSlot - kOffset;
-    for (size_t i = 0; i < n; ++i) slot[kOffset + i] = frame[i];
-    session_roundtrip("FST4-60A", MFSK_MODE_FST4S60, slot, "JA1ABC");
+    session_roundtrip("FST4-60A", MFSK_MODE_FST4S60,
+                      synth_slot(MFSK_MODE_FST4S60, "CQ", "JA1ABC", "PM95", 1500.0f),
+                      "JA1ABC");
 
     // The four sub-modes the pre-v2 ABI could not address at all:
     // MfskProtocol had one FST4 entry, so 15/30/120/300 were
@@ -469,16 +510,19 @@ void test_fst4() {
 
 void test_wspr() {
     std::printf("\n— WSPR: its own entry point (no decode handle)\n");
-    MfskSamples pcm{};
-    if (mfsk_encode_wspr("K1ABC", "FN42", 37, 1500.0f, &pcm) != MFSK_STATUS_OK) {
+    size_t need = 0;
+    mfsk_encode_wspr("K1ABC", "FN42", 37, 1500.0f, nullptr, 0, &need);
+    std::vector<float> pcm(need);
+    size_t got = 0;
+    if (mfsk_encode_wspr("K1ABC", "FN42", 37, 1500.0f, pcm.data(), pcm.size(), &got)
+            != MFSK_STATUS_OK) {
         fail("WSPR", mfsk_last_error());
         return;
     }
-    std::vector<int16_t> audio(pcm.len);
-    for (size_t i = 0; i < pcm.len; ++i) {
-        audio[i] = static_cast<int16_t>(pcm.samples[i] * 32767.0f);
+    std::vector<int16_t> audio(got);
+    for (size_t i = 0; i < got; ++i) {
+        audio[i] = static_cast<int16_t>(pcm[i] * 32767.0f);
     }
-    mfsk_samples_free(&pcm);
 
     Rows rows;
     if (mfsk_wspr_decode(audio.data(), audio.size(), 12000,
@@ -535,7 +579,7 @@ extern "C" void streaming_collect(const MfskDecode* row, void* user_data) {
 void test_ft8_streaming() {
     std::printf("\n— streaming: mfsk_session_set_on_decode fires as decodes are found\n");
     std::vector<int16_t> audio =
-        encode_i16(mfsk_encode_ft8, "CQ", "JA1ABC", "PM95", 1650.0f);
+        synth_slot(MFSK_MODE_FT8, "CQ", "JA1ABC", "PM95", 1650.0f);
 
     MfskStatus st = MFSK_STATUS_INTERNAL;
     MfskDecodeSession* s = mfsk_session_open(MFSK_MODE_FT8, nullptr, &st);
@@ -572,7 +616,7 @@ void test_ft8_streaming() {
 void test_params() {
     std::printf("\n— params: strictness / eq_mode / freq_hint / sic / ap all reach the decoder\n");
     std::vector<int16_t> audio =
-        encode_i16(mfsk_encode_ft8, "CQ", "JA1ABC", "PM95", 1500.0f);
+        synth_slot(MFSK_MODE_FT8, "CQ", "JA1ABC", "PM95", 1500.0f);
 
     MfskDecodeParams p = defaults_for(MFSK_MODE_FT8);
     p.strictness   = MFSK_STRICTNESS_DEEP;
@@ -621,7 +665,7 @@ void test_params() {
 void test_sniper() {
     std::printf("\n— narrow-band search: FT8 only; FT4 refuses and gets AP wide-band instead\n");
 
-    std::vector<int16_t> ft8 = encode_i16(mfsk_encode_ft8, "CQ", "JA1ABC", "PM95", 1500.0f);
+    std::vector<int16_t> ft8 = synth_slot(MFSK_MODE_FT8, "CQ", "JA1ABC", "PM95", 1500.0f);
     MfskDecodeParams p = defaults_for(MFSK_MODE_FT8);
     p.freq_hint_hz = 1500.0f;
     p.search_hz    = 250.0f;
@@ -657,7 +701,7 @@ void test_sniper() {
     // And the AP hint the sniper looked like it was *for* reaches FT4
     // anyway, through the ordinary wide-band decode. That coupling was
     // an accident; this is the line that says it is over.
-    std::vector<int16_t> ft4 = encode_i16(mfsk_encode_ft4, "CQ", "JA1ABC", "PM95", 1200.0f);
+    std::vector<int16_t> ft4 = synth_slot(MFSK_MODE_FT4, "CQ", "JA1ABC", "PM95", 1200.0f);
     MfskDecodeParams w = defaults_for(MFSK_MODE_FT4);
     w.has_ap_hint = true;
     std::snprintf(w.ap_call1, MFSK_AP_FIELD_LEN, "%s", "JA1ABC");
@@ -694,7 +738,7 @@ void test_threads_one_session_per_thread() {
     for (int t = 0; t < kThreads; ++t) {
         ts.emplace_back([&ok_count, t]() {
             std::vector<int16_t> audio =
-                encode_i16(mfsk_encode_ft8, "CQ", "JA1ABC", "PM95", 1500.0f + t * 20.0f);
+                synth_slot(MFSK_MODE_FT8, "CQ", "JA1ABC", "PM95", 1500.0f + t * 20.0f);
             MfskStatus st = MFSK_STATUS_INTERNAL;
             MfskDecodeSession* s = mfsk_session_open(MFSK_MODE_FT8, nullptr, &st);
             if (s == nullptr) return;
@@ -717,17 +761,14 @@ void test_threads_mixed_modes() {
     std::printf("\n— threads × mixed modes (FT8 + FT4 concurrently)\n");
     std::atomic<int> ok_count{0};
     std::vector<std::thread> ts;
-    const struct { MfskMode mode; Encoder enc; } work[] = {
-        {MFSK_MODE_FT8, mfsk_encode_ft8},
-        {MFSK_MODE_FT4, mfsk_encode_ft4},
-        {MFSK_MODE_FT8, mfsk_encode_ft8},
-        {MFSK_MODE_FT4, mfsk_encode_ft4},
+    const struct { MfskMode mode; } work[] = {
+        {MFSK_MODE_FT8}, {MFSK_MODE_FT4}, {MFSK_MODE_FT8}, {MFSK_MODE_FT4},
     };
     constexpr int kJobs = 4;
     for (const auto& w : work) {
         ts.emplace_back([&ok_count, w]() {
             std::vector<int16_t> audio =
-                encode_i16(w.enc, "CQ", "JA1ABC", "PM95", 1500.0f);
+                synth_slot(w.mode, "CQ", "JA1ABC", "PM95", 1500.0f);
             MfskStatus st = MFSK_STATUS_INTERNAL;
             MfskDecodeSession* s = mfsk_session_open(w.mode, nullptr, &st);
             if (s == nullptr) return;
@@ -796,14 +837,19 @@ void test_null_handling() {
         fail("null", "q65_decode with a bogus sub-mode should be INVALID_ARG");
     }
 
-    MfskSamples pcm{};
-    if (mfsk_encode_ft8("XXX", "Y2Z", "FN42", 1500.0f, &pcm) != MFSK_STATUS_INVALID_ARG) {
+    if (mfsk_pack77("XXX", "Y2Z", "FN42", nullptr) != MFSK_STATUS_INVALID_ARG) {
+        fail("null", "pack77 into a NULL buffer should be INVALID_ARG");
+    }
+    uint8_t m77[77];
+    if (mfsk_pack77("XXX", "Y2Z", "FN42", m77) != MFSK_STATUS_INVALID_ARG) {
         fail("null", "an unpackable callsign should fail rather than emit garbage");
+    }
+    if (mfsk_symbol_count(9999u) != 0 || mfsk_synth_output_len(9999u) != 0) {
+        fail("null", "a bogus mode should report no geometry");
     }
 
     // Freeing null is a no-op, not a crash.
     mfsk_session_close(nullptr);
-    mfsk_samples_free(nullptr);
     std::printf("  OK\n");
 }
 

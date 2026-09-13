@@ -134,3 +134,151 @@ pub fn with_ap(p: &mut MfskDecodeParams, call1: &str, call2: &str, grid: &str) {
     put(&mut p.ap_call2, call2);
     put(&mut p.ap_grid, grid);
 }
+
+/// Synthesise a frame through the three-stage TX pipeline, as i16 PCM.
+///
+/// Replaces the `mfsk_encode_* → MfskSamples → free` dance every test
+/// used to open with. Nothing is allocated across the boundary.
+pub fn synth_frame_i16(
+    mode: MfskMode,
+    call1: &str,
+    call2: &str,
+    report: &str,
+    freq_hz: f32,
+) -> Vec<i16> {
+    use std::ffi::CString;
+    let (a, b, c) = (
+        CString::new(call1).unwrap(),
+        CString::new(call2).unwrap(),
+        CString::new(report).unwrap(),
+    );
+    let mut msg = [0u8; 77];
+    assert_eq!(
+        unsafe { mfsk_pack77(a.as_ptr(), b.as_ptr(), c.as_ptr(), msg.as_mut_ptr()) },
+        MfskStatus::Ok,
+        "pack77({call1}, {call2}, {report})"
+    );
+    let mut tones = vec![0u8; mfsk_symbol_count(mode as u32)];
+    let mut n = 0usize;
+    assert_eq!(
+        unsafe {
+            mfsk_message_to_tones(
+                mode as u32,
+                msg.as_ptr(),
+                tones.as_mut_ptr(),
+                tones.len(),
+                &mut n,
+            )
+        },
+        MfskStatus::Ok
+    );
+    let mut pcm = vec![0i16; mfsk_synth_output_len(mode as u32)];
+    let mut w = 0usize;
+    assert_eq!(
+        unsafe {
+            mfsk_tones_to_i16(
+                mode as u32,
+                tones.as_ptr(),
+                tones.len(),
+                freq_hz,
+                8_000,
+                pcm.as_mut_ptr(),
+                pcm.len(),
+                &mut w,
+            )
+        },
+        MfskStatus::Ok
+    );
+    pcm
+}
+
+/// The same frame placed in a full slot, at that mode's TX offset.
+pub fn synth_slot_i16(
+    mode: MfskMode,
+    call1: &str,
+    call2: &str,
+    report: &str,
+    freq_hz: f32,
+) -> Vec<i16> {
+    let mut info = std::mem::MaybeUninit::<MfskModeInfo>::zeroed();
+    assert_eq!(
+        unsafe { mfsk_mode_info(mode as u32, info.as_mut_ptr()) },
+        MfskStatus::Ok
+    );
+    let info = unsafe { info.assume_init() };
+    let frame = synth_frame_i16(mode, call1, call2, report, freq_hz);
+    let mut slot = vec![0i16; info.slot_samples_12k as usize];
+    let start = (info.tx_start_offset_s * FS as f32) as usize;
+    for (i, s) in frame.iter().enumerate() {
+        if let Some(d) = slot.get_mut(start + i) {
+            *d = d.saturating_add(*s);
+        }
+    }
+    slot
+}
+
+/// f32 PCM from one of the `mfsk_encode_*` convenience calls, for the
+/// modes with no tone stage.
+pub fn encode_f32(
+    enc: unsafe extern "C" fn(
+        *const std::ffi::c_char,
+        *const std::ffi::c_char,
+        *const std::ffi::c_char,
+        f32,
+        *mut f32,
+        usize,
+        *mut usize,
+    ) -> MfskStatus,
+    a: &str,
+    b: &str,
+    c: &str,
+    freq: f32,
+) -> Vec<f32> {
+    use std::ffi::CString;
+    let (a, b, c) = (
+        CString::new(a).unwrap(),
+        CString::new(b).unwrap(),
+        CString::new(c).unwrap(),
+    );
+    let mut need = 0usize;
+    let st = unsafe {
+        enc(
+            a.as_ptr(),
+            b.as_ptr(),
+            c.as_ptr(),
+            freq,
+            std::ptr::null_mut(),
+            0,
+            &mut need,
+        )
+    };
+    assert_eq!(
+        st,
+        MfskStatus::InvalidArg,
+        "a zero-capacity call should report the size"
+    );
+    let mut pcm = vec![0.0f32; need];
+    let mut got = 0usize;
+    assert_eq!(
+        unsafe {
+            enc(
+                a.as_ptr(),
+                b.as_ptr(),
+                c.as_ptr(),
+                freq,
+                pcm.as_mut_ptr(),
+                pcm.len(),
+                &mut got,
+            )
+        },
+        MfskStatus::Ok
+    );
+    pcm.truncate(got);
+    pcm
+}
+
+pub fn f32_to_i16(pcm: &[f32]) -> Vec<i16> {
+    pcm.iter()
+        .map(|&s| (s * 32767.0).clamp(-32_768.0, 32_767.0) as i16)
+        .collect()
+}

@@ -34,9 +34,11 @@
 //! - [`mfsk_session_open`] / [`mfsk_session_close`]: the decode
 //!   session, which owns the callsign hash table, the previous slot's
 //!   rows and its own error slot.
-//! - `mfsk_encode_*`: still populate a caller-supplied zero-initialised
-//!   [`MfskSamples`] with synthesised f32 PCM; free with
-//!   [`mfsk_samples_free`]. That half has not been redesigned yet.
+//! - Transmit is the same shape: `mfsk_pack77*` → [`mfsk_message_to_tones`]
+//!   → [`mfsk_tones_to_i16`]/[`mfsk_tones_to_f32`], each stage writing
+//!   into a buffer you sized with [`mfsk_symbol_count`] and
+//!   [`mfsk_synth_output_len`]. The `mfsk_encode_*` convenience calls
+//!   write PCM into your buffer too.
 //! - [`MfskDecode::text`] is a fixed inline buffer, so a row is plain
 //!   data you can copy and keep.
 //!
@@ -219,22 +221,6 @@ pub enum MfskQ65FadingModel {
     Lorentzian = 1,
 }
 
-/// A buffer of synthesised f32 PCM samples returned by `mfsk_encode_*`.
-/// Caller should zero-initialise before the call and free with
-/// [`mfsk_samples_free`] when done reading.
-#[repr(C)]
-#[derive(Debug)]
-pub struct MfskSamples {
-    /// Contiguous f32 PCM at the protocol's native sample rate
-    /// (12 000 Hz for all currently-supported modes). Owned by the
-    /// list; free with [`mfsk_samples_free`].
-    pub samples: *mut f32,
-    /// Number of f32 entries in `samples`.
-    pub len: usize,
-    /// Internal: total allocation (reserved for future growth).
-    pub _cap: usize,
-}
-
 // ──────────────────────────────────────────────────────────────────────────
 // Error handling (thread-local last message)
 // ──────────────────────────────────────────────────────────────────────────
@@ -289,30 +275,6 @@ fn map_eq_mode(e: MfskEqMode) -> mfsk_core::engine::equalize::EqMode {
     match e {
         MfskEqMode::Off => E::Off,
         MfskEqMode::Local => E::Local,
-    }
-}
-
-/// Free a [`MfskSamples`] buffer populated by a `mfsk_encode_*` call.
-/// Passing NULL or an already-freed buffer is safe.
-///
-/// # Safety
-///
-/// `s` must point to a [`MfskSamples`] written by one of the
-/// `mfsk_encode_*` functions, or be NULL. After this call, `samples`
-/// is NULL and `len` is 0.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_samples_free(s: *mut MfskSamples) {
-    if s.is_null() {
-        return;
-    }
-    unsafe {
-        let s = &mut *s;
-        if !s.samples.is_null() {
-            let _ = Vec::from_raw_parts(s.samples, s.len, s._cap);
-        }
-        s.samples = ptr::null_mut();
-        s.len = 0;
-        s._cap = 0;
     }
 }
 
@@ -691,30 +653,23 @@ unsafe fn build_ap_hint_from_cstrs(
     Ok(hint)
 }
 
-fn finalise_samples(mut v: Vec<f32>, out: &mut MfskSamples) {
-    let len = v.len();
-    let cap = v.capacity();
-    let ptr = v.as_mut_ptr();
-    std::mem::forget(v);
-    out.samples = ptr;
-    out.len = len;
-    out._cap = cap;
-}
-
 /// Synthesise a standard FT8 message ("CALL1 CALL2 REPORT") at `freq_hz`
 /// carrier. Writes 12 kHz f32 PCM into `out`.
 ///
 /// # Safety
 ///
 /// `call1`/`call2`/`report` must be NUL-terminated UTF-8 strings.
-/// `out` must be a writable `MfskSamples` (zero-initialise).
+/// `out` must be `cap` writable `f32`; `*out_len` receives the
+/// sample count (or the count needed, if `cap` was too small).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mfsk_encode_ft8(
     call1: *const c_char,
     call2: *const c_char,
     report: *const c_char,
     freq_hz: f32,
-    out: *mut MfskSamples,
+    out: *mut f32,
+    cap: usize,
+    out_len: *mut usize,
 ) -> MfskStatus {
     let Ok(c1) = cstr_to_str(call1) else {
         return MfskStatus::InvalidArg;
@@ -725,18 +680,13 @@ pub unsafe extern "C" fn mfsk_encode_ft8(
     let Ok(rep) = cstr_to_str(report) else {
         return MfskStatus::InvalidArg;
     };
-    if out.is_null() {
-        set_error("mfsk_encode_ft8: null out");
-        return MfskStatus::InvalidArg;
-    }
     let Some(msg77) = mfsk_core::msg::wsjt77::pack77(c1, c2, rep) else {
         set_error("FT8 pack77 failed");
         return MfskStatus::InvalidArg;
     };
     let tones = mfsk_core::ft8::wave_gen::message_to_tones(&msg77);
     let pcm = mfsk_core::ft8::wave_gen::tones_to_f32(&tones, freq_hz, 1.0);
-    finalise_samples(pcm, unsafe { &mut *out });
-    MfskStatus::Ok
+    unsafe { emit_pcm(&pcm, out, cap, out_len, "encode") }
 }
 
 /// Synthesise a standard FT4 message at `freq_hz`. 12 kHz f32 PCM.
@@ -750,7 +700,9 @@ pub unsafe extern "C" fn mfsk_encode_ft4(
     call2: *const c_char,
     report: *const c_char,
     freq_hz: f32,
-    out: *mut MfskSamples,
+    out: *mut f32,
+    cap: usize,
+    out_len: *mut usize,
 ) -> MfskStatus {
     let Ok(c1) = cstr_to_str(call1) else {
         return MfskStatus::InvalidArg;
@@ -761,18 +713,13 @@ pub unsafe extern "C" fn mfsk_encode_ft4(
     let Ok(rep) = cstr_to_str(report) else {
         return MfskStatus::InvalidArg;
     };
-    if out.is_null() {
-        set_error("mfsk_encode_ft4: null out");
-        return MfskStatus::InvalidArg;
-    }
     let Some(msg77) = mfsk_core::msg::wsjt77::pack77(c1, c2, rep) else {
         set_error("FT4 pack77 failed");
         return MfskStatus::InvalidArg;
     };
     let tones = mfsk_core::ft4::encode::message_to_tones(&msg77);
     let pcm = mfsk_core::ft4::encode::tones_to_f32(&tones, freq_hz, 1.0);
-    finalise_samples(pcm, unsafe { &mut *out });
-    MfskStatus::Ok
+    unsafe { emit_pcm(&pcm, out, cap, out_len, "encode") }
 }
 
 /// Synthesise a standard FST4-60A message at `freq_hz`. 12 kHz f32 PCM.
@@ -786,7 +733,9 @@ pub unsafe extern "C" fn mfsk_encode_fst4s60(
     call2: *const c_char,
     report: *const c_char,
     freq_hz: f32,
-    out: *mut MfskSamples,
+    out: *mut f32,
+    cap: usize,
+    out_len: *mut usize,
 ) -> MfskStatus {
     let Ok(c1) = cstr_to_str(call1) else {
         return MfskStatus::InvalidArg;
@@ -797,18 +746,13 @@ pub unsafe extern "C" fn mfsk_encode_fst4s60(
     let Ok(rep) = cstr_to_str(report) else {
         return MfskStatus::InvalidArg;
     };
-    if out.is_null() {
-        set_error("mfsk_encode_fst4s60: null out");
-        return MfskStatus::InvalidArg;
-    }
     let Some(msg77) = mfsk_core::msg::wsjt77::pack77(c1, c2, rep) else {
         set_error("FST4 pack77 failed");
         return MfskStatus::InvalidArg;
     };
     let tones = mfsk_core::fst4::encode::message_to_tones(&msg77);
     let pcm = mfsk_core::fst4::encode::tones_to_f32(&tones, freq_hz, 1.0);
-    finalise_samples(pcm, unsafe { &mut *out });
-    MfskStatus::Ok
+    unsafe { emit_pcm(&pcm, out, cap, out_len, "encode") }
 }
 
 /// Synthesise a Type-1 WSPR message (`call grid power_dbm`).
@@ -822,7 +766,9 @@ pub unsafe extern "C" fn mfsk_encode_wspr(
     grid: *const c_char,
     power_dbm: i32,
     freq_hz: f32,
-    out: *mut MfskSamples,
+    out: *mut f32,
+    cap: usize,
+    out_len: *mut usize,
 ) -> MfskStatus {
     let Ok(c1) = cstr_to_str(call) else {
         return MfskStatus::InvalidArg;
@@ -830,17 +776,12 @@ pub unsafe extern "C" fn mfsk_encode_wspr(
     let Ok(g) = cstr_to_str(grid) else {
         return MfskStatus::InvalidArg;
     };
-    if out.is_null() {
-        set_error("mfsk_encode_wspr: null out");
-        return MfskStatus::InvalidArg;
-    }
     let Some(pcm) = mfsk_core::wspr::synthesize_type1(c1, g, power_dbm, 12_000, freq_hz, 0.3)
     else {
         set_error("WSPR synth failed (bad call/grid/power)");
         return MfskStatus::InvalidArg;
     };
-    finalise_samples(pcm, unsafe { &mut *out });
-    MfskStatus::Ok
+    unsafe { emit_pcm(&pcm, out, cap, out_len, "encode") }
 }
 
 /// Synthesise a standard JT9 message at `freq_hz`.
@@ -854,7 +795,9 @@ pub unsafe extern "C" fn mfsk_encode_jt9(
     call2: *const c_char,
     grid_or_report: *const c_char,
     freq_hz: f32,
-    out: *mut MfskSamples,
+    out: *mut f32,
+    cap: usize,
+    out_len: *mut usize,
 ) -> MfskStatus {
     let Ok(c1) = cstr_to_str(call1) else {
         return MfskStatus::InvalidArg;
@@ -865,16 +808,11 @@ pub unsafe extern "C" fn mfsk_encode_jt9(
     let Ok(gr) = cstr_to_str(grid_or_report) else {
         return MfskStatus::InvalidArg;
     };
-    if out.is_null() {
-        set_error("mfsk_encode_jt9: null out");
-        return MfskStatus::InvalidArg;
-    }
     let Some(pcm) = mfsk_core::jt9::synthesize_standard(c1, c2, gr, 12_000, freq_hz, 0.3) else {
         set_error("JT9 synth failed (bad pack)");
         return MfskStatus::InvalidArg;
     };
-    finalise_samples(pcm, unsafe { &mut *out });
-    MfskStatus::Ok
+    unsafe { emit_pcm(&pcm, out, cap, out_len, "encode") }
 }
 
 /// Synthesise a standard JT65 message at `freq_hz`.
@@ -888,7 +826,9 @@ pub unsafe extern "C" fn mfsk_encode_jt65(
     call2: *const c_char,
     grid_or_report: *const c_char,
     freq_hz: f32,
-    out: *mut MfskSamples,
+    out: *mut f32,
+    cap: usize,
+    out_len: *mut usize,
 ) -> MfskStatus {
     let Ok(c1) = cstr_to_str(call1) else {
         return MfskStatus::InvalidArg;
@@ -899,16 +839,11 @@ pub unsafe extern "C" fn mfsk_encode_jt65(
     let Ok(gr) = cstr_to_str(grid_or_report) else {
         return MfskStatus::InvalidArg;
     };
-    if out.is_null() {
-        set_error("mfsk_encode_jt65: null out");
-        return MfskStatus::InvalidArg;
-    }
     let Some(pcm) = mfsk_core::jt65::synthesize_standard(c1, c2, gr, 12_000, freq_hz, 0.3) else {
         set_error("JT65 synth failed (bad pack)");
         return MfskStatus::InvalidArg;
     };
-    finalise_samples(pcm, unsafe { &mut *out });
-    MfskStatus::Ok
+    unsafe { emit_pcm(&pcm, out, cap, out_len, "encode") }
 }
 
 /// Synthesise a standard Q65 message at `freq_hz` for the requested
@@ -921,13 +856,19 @@ pub unsafe extern "C" fn mfsk_encode_jt65(
 /// See [`mfsk_encode_ft8`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mfsk_encode_q65(
-    submode: MfskQ65SubMode,
+    submode: u32,
     call1: *const c_char,
     call2: *const c_char,
     grid_or_report: *const c_char,
     freq_hz: f32,
-    out: *mut MfskSamples,
+    out: *mut f32,
+    cap: usize,
+    out_len: *mut usize,
 ) -> MfskStatus {
+    let Some(submode) = q65_submode_of(submode) else {
+        set_error("mfsk_encode_q65: not a Q65 sub-mode");
+        return MfskStatus::InvalidArg;
+    };
     use mfsk_core::q65::{
         Q65a15, Q65a30, Q65a60, Q65a300, Q65b60, Q65c60, Q65d60, Q65d120, Q65e60, Q65e120,
         synthesize_standard_for,
@@ -942,10 +883,6 @@ pub unsafe extern "C" fn mfsk_encode_q65(
     let Ok(gr) = cstr_to_str(grid_or_report) else {
         return MfskStatus::InvalidArg;
     };
-    if out.is_null() {
-        set_error("mfsk_encode_q65: null out");
-        return MfskStatus::InvalidArg;
-    }
     let pcm_opt = match submode {
         MfskQ65SubMode::A15 => synthesize_standard_for::<Q65a15>(c1, c2, gr, 12_000, freq_hz, 0.3),
         MfskQ65SubMode::A30 => synthesize_standard_for::<Q65a30>(c1, c2, gr, 12_000, freq_hz, 0.3),
@@ -968,8 +905,7 @@ pub unsafe extern "C" fn mfsk_encode_q65(
         set_error("Q65 synth failed (bad pack)");
         return MfskStatus::InvalidArg;
     };
-    finalise_samples(pcm, unsafe { &mut *out });
-    MfskStatus::Ok
+    unsafe { emit_pcm(&pcm, out, cap, out_len, "encode") }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -2699,6 +2635,523 @@ fn q65_rows(sub: MfskQ65SubMode, ds: &[mfsk_core::q65::Q65Result]) -> Vec<MfskDe
             )
         })
         .collect()
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Transmit: the three-stage zero-allocation pipeline (FFI v2 slice 4)
+//
+// `mfsk-ffi-ft8` already had the better of this repo's two TX designs —
+// pack → tones → PCM, each stage writing into a buffer the caller owns.
+// The `mfsk-ffi` side had seven heap-allocating `mfsk_encode_*`
+// functions that accepted only the three-string convenience path, so a
+// caller with a message that is not "call1 call2 report" had no way in,
+// and FST4 reached 60A alone.
+//
+// Both are replaced by one pipeline over `MfskMode`. Stage 2 and 3 exist
+// for the modes whose message codec is WSJT-77 — FT8, FT4 and all five
+// FST4 sub-modes — because those are the protocols that expose a tone
+// sequence at all; `mfsk_symbol_count` returns 0 for the rest, which is
+// how a caller asks.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// The GFSK shaping a mode synthesises with, for the FST4 family.
+fn fst4_gfsk(mode: MfskMode) -> Option<&'static mfsk_core::engine::dsp::gfsk::GfskCfg> {
+    use mfsk_core::fst4::encode as f;
+    Some(match mode {
+        MfskMode::Fst4s15 => &f::FST4_15_GFSK,
+        MfskMode::Fst4s30 => &f::FST4_30_GFSK,
+        MfskMode::Fst4s60 => &f::FST4_60A_GFSK,
+        MfskMode::Fst4s120 => &f::FST4_120_GFSK,
+        MfskMode::Fst4s300 => &f::FST4_300_GFSK,
+        _ => return None,
+    })
+}
+
+/// Channel symbols per frame, or 0 for a mode with no exposed tone
+/// stage.
+///
+/// A non-zero answer is what says [`mfsk_message_to_tones`] and
+/// [`mfsk_tones_to_i16`] apply. WSPR, JT9, JT65 and Q65 synthesise from
+/// their own message codecs in one step and report 0 here.
+#[unsafe(no_mangle)]
+pub extern "C" fn mfsk_symbol_count(mode: u32) -> usize {
+    let Some(mode) = mode_of(mode) else {
+        return 0;
+    };
+    if !mode_has_tone_stage(mode) {
+        return 0;
+    }
+    mode_meta(mode).map(|m| m.n_symbols as usize).unwrap_or(0)
+}
+
+fn mode_has_tone_stage(mode: MfskMode) -> bool {
+    matches!(
+        mode,
+        MfskMode::Ft8
+            | MfskMode::Ft4
+            | MfskMode::Fst4s15
+            | MfskMode::Fst4s30
+            | MfskMode::Fst4s60
+            | MfskMode::Fst4s120
+            | MfskMode::Fst4s300
+    )
+}
+
+/// Samples a full frame synthesises to at 12 kHz — the buffer size
+/// [`mfsk_tones_to_i16`] needs. 0 if the mode has no tone stage.
+///
+/// **Ask rather than assume.** The five FST4 sub-modes differ by a
+/// factor of 30 here (720 → 21 504 samples per symbol), so a constant
+/// baked for 60A is silently wrong for the other four — which is
+/// exactly the trap the old `tones_to_f32` wrapper carried.
+#[unsafe(no_mangle)]
+pub extern "C" fn mfsk_synth_output_len(mode: u32) -> usize {
+    let Some(mode) = mode_of(mode) else {
+        return 0;
+    };
+    match mode {
+        MfskMode::Ft8 => mfsk_core::ft8::wave_gen::TONES_OUTPUT_LEN,
+        MfskMode::Ft4 => mfsk_core::ft4::encode::TONES_OUTPUT_LEN,
+        _ => match fst4_gfsk(mode) {
+            Some(cfg) => mfsk_core::fst4::encode::synth_sample_count(cfg),
+            None => 0,
+        },
+    }
+}
+
+/// Copy a packed 77-bit message into caller memory.
+///
+/// # Safety
+/// `out` must be 77 writable bytes.
+unsafe fn put_message77(msg: &[u8; 77], out: *mut u8) {
+    unsafe { ptr::copy_nonoverlapping(msg.as_ptr(), out, 77) };
+}
+
+unsafe fn arg_str(p: *const c_char, what: &str) -> Result<&'static str, MfskStatus> {
+    if p.is_null() {
+        set_error(format!("{what}: null string argument"));
+        return Err(MfskStatus::InvalidArg);
+    }
+    match unsafe { CStr::from_ptr(p) }.to_str() {
+        Ok(s) => Ok(s),
+        Err(_) => {
+            set_error(format!("{what}: not valid UTF-8"));
+            Err(MfskStatus::InvalidArg)
+        }
+    }
+}
+
+// Written out rather than generated by a macro, and that is not a
+// style preference: cbindgen parses this crate syntactically and
+// **cannot expand `macro_rules!`**, so a macro-generated
+// `extern "C"` function exists in the library and never reaches
+// `mfsk.h`. A C consumer cannot call what the header does not declare.
+// Caught by the C++ driver failing to compile.
+
+/// Pack a standard exchange: `call1 call2 report` (WSJT type 1/2).
+///
+/// Writes 77 bytes, one bit per byte, to `out_message77` — the form
+/// every stage-2 call takes.
+///
+/// # Safety
+/// Strings must be NUL-terminated; `out_message77` must be 77 writable
+/// bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_pack77(
+    call1: *const c_char,
+    call2: *const c_char,
+    report: *const c_char,
+    out_message77: *mut u8,
+) -> MfskStatus {
+    if out_message77.is_null() {
+        set_error("mfsk_pack77: out_message77 is NULL");
+        return MfskStatus::InvalidArg;
+    }
+    let a = match unsafe { arg_str(call1, "mfsk_pack77") } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let b = match unsafe { arg_str(call2, "mfsk_pack77") } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let c = match unsafe { arg_str(report, "mfsk_pack77") } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let Some(msg) = mfsk_core::msg::wsjt77::pack77(a, b, c) else {
+        set_error("mfsk_pack77: the message does not fit this format");
+        return MfskStatus::InvalidArg;
+    };
+    unsafe { put_message77(&msg, out_message77) };
+    MfskStatus::Ok
+}
+
+/// Pack a type-1 message: `call1 call2 grid`.
+///
+/// # Safety
+/// As [`mfsk_pack77`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_pack77_type1(
+    call1: *const c_char,
+    call2: *const c_char,
+    grid: *const c_char,
+    out_message77: *mut u8,
+) -> MfskStatus {
+    if out_message77.is_null() {
+        set_error("mfsk_pack77_type1: out_message77 is NULL");
+        return MfskStatus::InvalidArg;
+    }
+    let a = match unsafe { arg_str(call1, "mfsk_pack77_type1") } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let b = match unsafe { arg_str(call2, "mfsk_pack77_type1") } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let g = match unsafe { arg_str(grid, "mfsk_pack77_type1") } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let Some(msg) = mfsk_core::msg::wsjt77::pack77_type1(a, b, g) else {
+        set_error("mfsk_pack77_type1: the message does not fit this format");
+        return MfskStatus::InvalidArg;
+    };
+    unsafe { put_message77(&msg, out_message77) };
+    MfskStatus::Ok
+}
+
+/// Pack up to 13 characters of free text.
+///
+/// # Safety
+/// As [`mfsk_pack77`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_pack77_free_text(
+    text: *const c_char,
+    out_message77: *mut u8,
+) -> MfskStatus {
+    if out_message77.is_null() {
+        set_error("mfsk_pack77_free_text: out_message77 is NULL");
+        return MfskStatus::InvalidArg;
+    }
+    let t = match unsafe { arg_str(text, "mfsk_pack77_free_text") } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let Some(msg) = mfsk_core::msg::wsjt77::pack77_free_text(t) else {
+        set_error("mfsk_pack77_free_text: the message does not fit this format");
+        return MfskStatus::InvalidArg;
+    };
+    unsafe { put_message77(&msg, out_message77) };
+    MfskStatus::Ok
+}
+
+/// Pack a type-4 message: one non-standard callsign in full, plus a
+/// **hashed** reference to the standard one.
+///
+/// The hashed half decodes as `<...>` unless the receiving session has
+/// seen that callsign — see [`mfsk_session_add_callsign`].
+///
+/// # Safety
+/// Strings must be NUL-terminated; `out_message77` must be 77 writable
+/// bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_pack77_type4(
+    nonstd_call: *const c_char,
+    std_call: *const c_char,
+    report: *const c_char,
+    is_cq: bool,
+    out_message77: *mut u8,
+) -> MfskStatus {
+    if out_message77.is_null() {
+        set_error("mfsk_pack77_type4: out_message77 is NULL");
+        return MfskStatus::InvalidArg;
+    }
+    let nonstd = match unsafe { arg_str(nonstd_call, "mfsk_pack77_type4") } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    // `std_call` and `report` may legitimately be empty for a CQ.
+    let std_s = if std_call.is_null() {
+        ""
+    } else {
+        match unsafe { arg_str(std_call, "mfsk_pack77_type4") } {
+            Ok(s) => s,
+            Err(e) => return e,
+        }
+    };
+    let rep = if report.is_null() {
+        ""
+    } else {
+        match unsafe { arg_str(report, "mfsk_pack77_type4") } {
+            Ok(s) => s,
+            Err(e) => return e,
+        }
+    };
+    let Some(msg) = mfsk_core::msg::wsjt77::pack77_type4(nonstd, std_s, rep, is_cq) else {
+        set_error("mfsk_pack77_type4: the message does not fit this format");
+        return MfskStatus::InvalidArg;
+    };
+    unsafe { put_message77(&msg, out_message77) };
+    MfskStatus::Ok
+}
+
+/// Render a packed 77-bit message as text.
+///
+/// Pass a session to resolve hashed `<...>` callsigns from its table;
+/// `session` may be NULL, in which case they stay unresolved. Writes at
+/// most `cap` bytes including the NUL, and reports the size needed if
+/// that is not enough.
+///
+/// # Safety
+/// `message77` must be 77 readable bytes; `out` must be `cap` writable
+/// bytes; `session`, if non-null, must be a live session.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_unpack77(
+    session: *const MfskDecodeSession,
+    message77: *const u8,
+    out: *mut c_char,
+    cap: usize,
+    out_len: *mut usize,
+) -> MfskStatus {
+    if message77.is_null() {
+        set_error("mfsk_unpack77: message77 is NULL");
+        return MfskStatus::InvalidArg;
+    }
+    let bits = unsafe { slice::from_raw_parts(message77, 77) };
+    let text = match v2_ref(session) {
+        Some(d) => mfsk_core::msg::wsjt77::unpack77_with_hash(bits, &d.hashes),
+        None => mfsk_core::msg::wsjt77::unpack77(bits),
+    };
+    let Some(text) = text else {
+        set_error("mfsk_unpack77: not a decodable 77-bit message");
+        return MfskStatus::DecodeFailed;
+    };
+    let needed = text.len() + 1;
+    if !out_len.is_null() {
+        unsafe { *out_len = needed };
+    }
+    if out.is_null() || cap < needed {
+        set_error("mfsk_unpack77: buffer too small; *out_len is the size needed");
+        return MfskStatus::InvalidArg;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(text.as_ptr() as *const c_char, out, text.len());
+        *out.add(text.len()) = 0;
+    }
+    MfskStatus::Ok
+}
+
+/// Stage 2: a packed message becomes this mode's channel symbols.
+///
+/// `mfsk_symbol_count(mode)` is the required capacity; 0 means the mode
+/// has no tone stage.
+///
+/// # Safety
+/// `message77` must be 77 readable bytes; `out_itone` must be `cap`
+/// writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_message_to_tones(
+    mode: u32,
+    message77: *const u8,
+    out_itone: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> MfskStatus {
+    let Some(m) = mode_of(mode) else {
+        set_error("mfsk_message_to_tones: not a mode this library knows");
+        return MfskStatus::InvalidArg;
+    };
+    if !mode_has_tone_stage(m) {
+        set_error("mfsk_message_to_tones: this mode has no tone stage — see mfsk_symbol_count");
+        return MfskStatus::Unsupported;
+    }
+    if message77.is_null() {
+        set_error("mfsk_message_to_tones: message77 is NULL");
+        return MfskStatus::InvalidArg;
+    }
+    let bits = unsafe { slice::from_raw_parts(message77, 77) };
+    let mut msg = [0u8; 77];
+    msg.copy_from_slice(bits);
+
+    let tones: Vec<u8> = match m {
+        MfskMode::Ft8 => mfsk_core::ft8::wave_gen::message_to_tones(&msg).to_vec(),
+        MfskMode::Ft4 => mfsk_core::ft4::encode::message_to_tones(&msg),
+        _ => mfsk_core::fst4::encode::message_to_tones(&msg),
+    };
+    if !out_len.is_null() {
+        unsafe { *out_len = tones.len() };
+    }
+    if out_itone.is_null() || cap < tones.len() {
+        set_error("mfsk_message_to_tones: buffer too small; *out_len is the size needed");
+        return MfskStatus::InvalidArg;
+    }
+    unsafe { ptr::copy_nonoverlapping(tones.as_ptr(), out_itone, tones.len()) };
+    MfskStatus::Ok
+}
+
+/// Shared body for the two stage-3 calls.
+///
+/// Validates the mode, the tone count and the buffer, then hands back
+/// the destination slice. Written as a helper with the two public
+/// functions spelled out, because cbindgen cannot expand
+/// `macro_rules!` — a macro-generated `extern "C"` function never
+/// reaches the header, and a C consumer cannot call what is not
+/// declared.
+fn synth_check(mode: u32, n_tones: usize, cap: usize, what: &str) -> Result<usize, MfskStatus> {
+    let Some(m) = mode_of(mode) else {
+        set_error(format!("{what}: not a mode this library knows"));
+        return Err(MfskStatus::InvalidArg);
+    };
+    if !mode_has_tone_stage(m) {
+        set_error(format!(
+            "{what}: this mode has no tone stage — see mfsk_symbol_count"
+        ));
+        return Err(MfskStatus::Unsupported);
+    }
+    let want = mfsk_symbol_count(mode);
+    if n_tones != want {
+        set_error(format!(
+            "{what}: this mode has {want} channel symbols, got {n_tones}"
+        ));
+        return Err(MfskStatus::InvalidArg);
+    }
+    let need = mfsk_synth_output_len(mode);
+    if cap < need {
+        set_error(format!(
+            "{what}: buffer too small; *out_len is the size needed"
+        ));
+        return Err(MfskStatus::InvalidArg);
+    }
+    Ok(need)
+}
+
+/// Stage 3: channel symbols become 16-bit PCM at 12 kHz.
+///
+/// `mfsk_synth_output_len(mode)` is the required capacity. The
+/// synthesis writes straight into your buffer — nothing is allocated
+/// and nothing has to be freed.
+///
+/// # Safety
+/// `itone` must be `n_tones` readable bytes; `out` must be `cap`
+/// writable `int16_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_tones_to_i16(
+    mode: u32,
+    itone: *const u8,
+    n_tones: usize,
+    freq_hz: f32,
+    amplitude: i16,
+    out: *mut i16,
+    cap: usize,
+    out_len: *mut usize,
+) -> MfskStatus {
+    if !out_len.is_null() {
+        unsafe { *out_len = mfsk_synth_output_len(mode) };
+    }
+    if itone.is_null() || out.is_null() {
+        set_error("mfsk_tones_to_i16: null pointer");
+        return MfskStatus::InvalidArg;
+    }
+    let need = match synth_check(mode, n_tones, cap, "mfsk_tones_to_i16") {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let tones = unsafe { slice::from_raw_parts(itone, n_tones) };
+    let dst = unsafe { slice::from_raw_parts_mut(out, need) };
+    match mode_of(mode).expect("checked") {
+        MfskMode::Ft8 => {
+            let mut fixed = [0u8; 79]; // FT8 N_SYMBOLS, pinned by synth_check
+            fixed.copy_from_slice(tones);
+            mfsk_core::ft8::wave_gen::tones_to_i16_into(dst, &fixed, freq_hz, amplitude);
+        }
+        MfskMode::Ft4 => mfsk_core::ft4::encode::tones_to_i16_into(dst, tones, freq_hz, amplitude),
+        m => mfsk_core::fst4::encode::tones_to_i16_into(
+            dst,
+            tones,
+            freq_hz,
+            amplitude,
+            fst4_gfsk(m).expect("checked"),
+        ),
+    }
+    MfskStatus::Ok
+}
+
+/// Stage 3: channel symbols become 32-bit float PCM at 12 kHz.
+///
+/// # Safety
+/// As [`mfsk_tones_to_i16`], with `out` as `float`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_tones_to_f32(
+    mode: u32,
+    itone: *const u8,
+    n_tones: usize,
+    freq_hz: f32,
+    amplitude: f32,
+    out: *mut f32,
+    cap: usize,
+    out_len: *mut usize,
+) -> MfskStatus {
+    if !out_len.is_null() {
+        unsafe { *out_len = mfsk_synth_output_len(mode) };
+    }
+    if itone.is_null() || out.is_null() {
+        set_error("mfsk_tones_to_f32: null pointer");
+        return MfskStatus::InvalidArg;
+    }
+    let need = match synth_check(mode, n_tones, cap, "mfsk_tones_to_f32") {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let tones = unsafe { slice::from_raw_parts(itone, n_tones) };
+    let dst = unsafe { slice::from_raw_parts_mut(out, need) };
+    match mode_of(mode).expect("checked") {
+        MfskMode::Ft8 => {
+            let mut fixed = [0u8; 79];
+            fixed.copy_from_slice(tones);
+            mfsk_core::ft8::wave_gen::tones_to_f32_into(dst, &fixed, freq_hz, amplitude);
+        }
+        MfskMode::Ft4 => mfsk_core::ft4::encode::tones_to_f32_into(dst, tones, freq_hz, amplitude),
+        m => mfsk_core::fst4::encode::tones_to_f32_into(
+            dst,
+            tones,
+            freq_hz,
+            amplitude,
+            fst4_gfsk(m).expect("checked"),
+        ),
+    }
+    MfskStatus::Ok
+}
+
+/// Write synthesised f32 PCM into caller memory.
+///
+/// The seven `mfsk_encode_*` functions used to hand back a heap
+/// `MfskSamples` the caller had to free. That is the same "a Rust
+/// global-allocator pointer crosses the boundary" category the decode
+/// rows shed, and it bites the same way: a wrapper that throws between
+/// the call and the free leaks.
+///
+/// # Safety
+/// `out` must be `cap` writable `f32`, or null when `cap` is 0.
+unsafe fn emit_pcm(
+    pcm: &[f32],
+    out: *mut f32,
+    cap: usize,
+    out_len: *mut usize,
+    what: &str,
+) -> MfskStatus {
+    if !out_len.is_null() {
+        unsafe { *out_len = pcm.len() };
+    }
+    if out.is_null() || cap < pcm.len() {
+        set_error(format!(
+            "{what}: buffer too small; *out_len is the sample count needed"
+        ));
+        return MfskStatus::InvalidArg;
+    }
+    unsafe { ptr::copy_nonoverlapping(pcm.as_ptr(), out, pcm.len()) };
+    MfskStatus::Ok
 }
 
 /// Library version, major.minor.patch packed into a 32-bit integer (8

@@ -17,45 +17,18 @@
 
 mod common;
 
-use std::ffi::CString;
-use std::ptr;
-
 use common::*;
 use mfsk::*;
 
 fn synth(
-    enc: unsafe extern "C" fn(
-        *const std::ffi::c_char,
-        *const std::ffi::c_char,
-        *const std::ffi::c_char,
-        f32,
-        *mut MfskSamples,
-    ) -> MfskStatus,
+    mode: MfskMode,
     call1: &str,
     call2: &str,
     report: &str,
     freq_hz: f32,
 ) -> (Vec<i16>, Vec<f32>) {
-    let (c1, c2, r) = (
-        CString::new(call1).unwrap(),
-        CString::new(call2).unwrap(),
-        CString::new(report).unwrap(),
-    );
-    let mut pcm = MfskSamples {
-        samples: ptr::null_mut(),
-        len: 0,
-        _cap: 0,
-    };
-    assert_eq!(
-        unsafe { enc(c1.as_ptr(), c2.as_ptr(), r.as_ptr(), freq_hz, &mut pcm) },
-        MfskStatus::Ok
-    );
-    let f = unsafe { std::slice::from_raw_parts(pcm.samples, pcm.len) }.to_vec();
-    let i = f
-        .iter()
-        .map(|&s| (s * 32767.0).clamp(-32_768.0, 32_767.0) as i16)
-        .collect();
-    unsafe { mfsk_samples_free(&mut pcm) };
+    let i = synth_slot_i16(mode, call1, call2, report, freq_hz);
+    let f = i.iter().map(|&s| s as f32 / 32768.0).collect();
     (i, f)
 }
 
@@ -68,7 +41,7 @@ fn sniper_params(target_hz: f32, width_hz: f32) -> MfskDecodeParams {
 
 #[test]
 fn ft8_decodes_at_the_target_frequency() {
-    let (audio, _) = synth(mfsk_encode_ft8, "CQ", "JA1ABC", "PM95", 1200.0);
+    let (audio, _) = synth(MfskMode::Ft8, "CQ", "JA1ABC", "PM95", 1200.0);
     let p = sniper_params(1200.0, 250.0);
     let dec = open(MfskMode::Ft8, Some(&p));
     let rows = decode_i16(dec, &audio);
@@ -83,7 +56,7 @@ fn ft8_decodes_at_the_target_frequency() {
 
 #[test]
 fn f32_and_i16_agree() {
-    let (i16s, f32s) = synth(mfsk_encode_ft8, "CQ", "JA1ABC", "PM95", 1200.0);
+    let (i16s, f32s) = synth(MfskMode::Ft8, "CQ", "JA1ABC", "PM95", 1200.0);
     let p = sniper_params(1200.0, 250.0);
 
     let a = open(MfskMode::Ft8, Some(&p));
@@ -102,8 +75,8 @@ fn f32_and_i16_agree() {
 /// is what says `search_hz` is a parameter rather than a literal.
 #[test]
 fn the_window_width_is_honoured() {
-    let (a, _) = synth(mfsk_encode_ft8, "CQ", "JA1ABC", "PM95", 1500.0);
-    let (b, _) = synth(mfsk_encode_ft8, "CQ", "VK3NV", "QF22", 2100.0);
+    let (a, _) = synth(MfskMode::Ft8, "CQ", "JA1ABC", "PM95", 1500.0);
+    let (b, _) = synth(MfskMode::Ft8, "CQ", "VK3NV", "QF22", 2100.0);
     let mixed: Vec<i16> = a
         .iter()
         .zip(b.iter())
@@ -131,7 +104,7 @@ fn the_window_width_is_honoured() {
 /// reaches FT4 through the ordinary wide-band decode.
 #[test]
 fn ft4_has_no_sniper_but_does_have_ap() {
-    let (audio, _) = synth(mfsk_encode_ft4, "CQ", "JA1ABC", "PM95", 1200.0);
+    let (audio, _) = synth(MfskMode::Ft4, "CQ", "JA1ABC", "PM95", 1200.0);
 
     let mut narrow = params(MfskMode::Ft4);
     narrow.freq_hint_hz = 1200.0;
