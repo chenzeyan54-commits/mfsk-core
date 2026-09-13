@@ -75,7 +75,7 @@ async function main() {
     process.env.MFSK_BENCH_WAV ??
     path.join(__dirname, "../../embedded-poc/assets/qso3_busy.wav");
 
-  const { decode_wav, decode_wav_subtract } = await import(
+  const { decode_wav, decode_wav_subtract, decode_wav_budget } = await import(
     path.join(__dirname, "pkg/mfsk_wasm_bench.js")
   );
 
@@ -112,6 +112,28 @@ async function main() {
   console.log(
     `\nratio (${labels[1]} / ${labels[0]}): ${(medians[labels[1]] / medians[labels[0]]).toFixed(2)}x`,
   );
+
+  // Graceful degradation, if asked for: decode the same WAV under a
+  // wall-clock budget and show what a short one costs. A browser tab
+  // has a frame to keep; this is the knob for it.
+  const budgets = (process.env.MFSK_BENCH_BUDGET_MS ?? "")
+    .split(",")
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  if (budgets.length) {
+    console.log(`\n=== decode_wav_budget ===`);
+    for (const ms of budgets) {
+      const t0 = performance.now();
+      const out = decode_wav_budget(audio, ms);
+      const elapsed = performance.now() - t0;
+      const lines = out ? out.split("\n") : [];
+      const report = lines.shift() ?? "";
+      console.log(
+        `budget ${String(ms).padStart(4)} ms -> ${String(lines.length).padStart(2)} station(s) in ` +
+          `${elapsed.toFixed(1)} ms   ${report}`,
+      );
+    }
+  }
 }
 
 main().catch((err) => {
