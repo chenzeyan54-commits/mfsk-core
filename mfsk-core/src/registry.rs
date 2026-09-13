@@ -95,12 +95,18 @@ pub mod caps {
     /// protocols. The shared AP engine breaks out of its candidate loop
     /// on `if has_ap`, i.e. **the presence of a hint is what makes the
     /// search single-target**, so handing one to a wide-band search
-    /// would stop it after the first decode. FT8 escapes because it has
-    /// its own AP path and never enters that engine. Gating the
-    /// early-exit on "this is a narrow-band single-target search"
-    /// instead of on "a hint was supplied" is what would let FT4 and
-    /// FST4 take a hint over the whole band — new, and needing a
-    /// false-decode measurement before it could be claimed here.
+    /// would stop it after the first decode. That gating is fixed, but
+    /// it was not the whole blocker: AP lives in a **parallel,
+    /// shallower per-candidate ladder** (`msg::pipeline_ap`'s
+    /// `process_candidate_ap`, OSD at depth 2 with no depth-3/4
+    /// escalation and no Top-K rescue) rather than in the wide-band
+    /// engine's. Driving a wide-band decode through it returns 4 of the
+    /// 11 decodes the plain path finds on the FT4 golden, losing the
+    /// hinted station itself, and returns the same set for a present
+    /// and an absent hint — so the cost is the ladder, not AP.
+    ///
+    /// Wide-band AP therefore means giving `process_candidate_basic` an
+    /// AP option, not reusing the sniper's engine.
     pub const AP_WIDEBAND: u32 = 1 << 3;
     /// Flat successive-interference cancellation (`SupportsSicRounds`).
     pub const SIC_ROUNDS: u32 = 1 << 4;

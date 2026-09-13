@@ -108,7 +108,7 @@ impl FrameDecodable for Ft4 {
             req.audio,
             &FT4_DOWNSAMPLE,
             req.target_freq,
-            250.0,
+            req.search_hz,
             req.sync_min,
             req.depth,
             max_cand,

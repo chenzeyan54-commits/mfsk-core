@@ -59,6 +59,43 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
 
 ### Fixed
 
+- **An AP hint, not a narrow search, was what ended the search.** The
+  shared AP engine broke out of its candidate loop on `if has_ap`, so
+  supplying a hint made the search single-target regardless of how wide
+  it was. That is why `SupportsWideBandAp` is FT8-only — FT8 has its own
+  AP path and never enters that engine — and it is why a generally
+  useful option was reachable for FT4 and FST4 only through the sniper,
+  a path that exists for a specific piece of radio hardware.
+
+  The engine is now `decode_band_ap`, taking a band, an optional
+  ranking hint, and an explicit `stop_after_first`; the sniper is one of
+  its callers and passes the same condition it used to apply
+  internally, so that path is unchanged.
+
+  **Decoupling it does not deliver wide-band AP, and the measurement
+  says why.** Routing FT4's wide-band decode through that engine returns
+  4 decodes where the plain path returns 11 on the WSJT-X golden — and
+  loses the hinted station itself. It returns the *identical* set for a
+  hint naming a present station and one naming an absent station, so AP
+  is changing nothing; the loss is entirely the different ladder. It
+  invents nothing, so this is recall, not false decodes:
+  `process_candidate_ap` offers OSD at depth 2 only, with no depth-3/4
+  escalation and no Top-K rescue, and most of that recording's decodes
+  come from exactly those. Wide-band AP means giving the wide-band
+  engine's own ladder an AP option — not reusing the sniper's.
+
+- **`SniperRequest::search_hz`** — the ±250 Hz window is a parameter
+  rather than a literal at each dispatch site. It is the one
+  candidate-population lever the FST4 embedded work has never been able
+  to measure (issue #306: a real decode costs ~55 ms against ~14 s for a
+  pathological false survivor, and every optimisation so far has reduced
+  cost *per* survivor rather than their number). Default unchanged, and
+  a test pins that the default reproduces the old literal exactly.
+
+  Note the caveat raised on that issue and not yet answered: this path
+  also runs a halved sync gate, so a narrower band does not automatically
+  mean fewer expensive candidates.
+
 - **`.eq_mode()` was silently dropped on FT4's SIC path**, and the docs
   around it, `SniperRequest` and AP said things that are not true.
 

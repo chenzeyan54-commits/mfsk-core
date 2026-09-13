@@ -403,27 +403,31 @@ where
     })
 }
 
-/// Sniper-mode decode with AP hints: search within `±search_hz` of
-/// `target_freq`, with optional AP bit-locking applied per candidate.
+/// AP-capable candidate loop over a frequency band.
+///
+/// Despite its former name this was never sniper-specific: every
+/// narrow-band assumption it appeared to carry was supplied by its
+/// callers (`search_hz = 250.0`, `SYNC_Q_MIN / 2`, `REFINE_STEPS`).
+/// What *was* baked in was the early exit, which tested for an AP hint
+/// rather than for a single-target search — see `stop_after_first`.
+///
+/// Driving it with a full band and `stop_after_first = false` is how a
+/// wide-band decode takes an AP hint.
 ///
 /// `P::Msg: WsjtApCompatible` mirrors [`process_candidate_ap`]'s bound:
 /// the underlying AP path writes to Wsjt77 bit positions and only makes
 /// sense for protocols whose 77-bit message field shares that layout.
 ///
-/// **`search_hz` is load-bearing for reported SNR, not just for
-/// recall.** Both callers pass `250.0`, so the search spans 500 Hz —
-/// and `coarse_sync` draws its 40th-percentile noise reference from
-/// exactly this window, which is what `SyncCandidate::score`, and
-/// therefore `Ft4`'s `snr_db`, is normalised against. 500 Hz centred
-/// on the operator's aim point is also the roofing-filter passband a
-/// sniper deployment is premised on (the operator tuned the rig so the
-/// target sits in it), so the noise floor gets estimated over real
-/// noise rather than over filter stopband. Widening this would start
-/// averaging in stopband and bias SNR high; narrowing it would let
-/// FT4's own 83.3 Hz occupied bandwidth contaminate the percentile.
-/// Measured both directions in `docs/notes/SNR_FORMULAS.md`
-/// ("Band-limited (roofing-filtered) input") — change it only with
-/// that table re-measured.
+/// **The band is load-bearing for reported SNR, not just for recall.**
+/// `coarse_sync` draws its 40th-percentile noise reference from exactly
+/// the window given here, and that reference is what
+/// `SyncCandidate::score` — and therefore `Ft4`'s `snr_db` — is
+/// normalised against. The number is only meaningful when the window
+/// matches the audio: a wide band over unfiltered audio estimates the
+/// floor over real noise, and so does a 500 Hz window over
+/// roofing-filtered audio. Mixing them does not work in either
+/// direction. See `docs/notes/SNR_FORMULAS.md` ("Band-limited
+/// (roofing-filtered) input").
 #[allow(clippy::too_many_arguments)]
 // Only `ft4::decode`/`fst4::decode` call this (issue #203's pub(crate)
 // demotion made that reachability-dependent-on-feature visible to
@@ -434,11 +438,20 @@ where
 // which would otherwise separately warn once this entry point is
 // unreachable.
 #[allow(dead_code)]
-pub(crate) fn decode_sniper_ap<P: GenericPipelineProtocol>(
+pub(crate) fn decode_band_ap<P: GenericPipelineProtocol>(
     audio: &[i16],
     ds_cfg: &DownsampleCfg,
-    target_freq: f32,
-    search_hz: f32,
+    freq_min: f32,
+    freq_max: f32,
+    // Ranks candidates near this frequency first (`coarse_sync`'s own
+    // promotion). `Some` for a single-target search, `None` for a band
+    // sweep with no preferred position.
+    freq_hint: Option<f32>,
+    // Stop once one decode is accepted. **Not** derived from `ap_hint`
+    // any more: a hint says "I know who", a single-target search says
+    // "I know where", and conflating them is what made AP unreachable
+    // from the wide-band path for FT4 and FST4.
+    stop_after_first: bool,
     sync_min: f32,
     depth: DecodeDepth,
     max_cand: usize,
@@ -463,21 +476,18 @@ where
     P::Fec: crate::engine::protocol::BpPooledFec,
     P::Msg: WsjtApCompatible,
 {
-    let freq_min = (target_freq - search_hz).max(100.0);
-    let freq_max = (target_freq + search_hz).min(5_900.0);
     let candidates = coarse_sync::<P>(
         AudioSource::Real(audio),
         freq_min,
         freq_max,
         sync_min,
-        Some(target_freq),
+        freq_hint,
         max_cand,
         RxGrid::real(12_000.0),
     );
     if candidates.is_empty() {
         return (Vec::new(), Default::default());
     }
-    let has_ap = ap_hint.is_some_and(|h| h.has_info());
     let fft_cache = build_fft_cache(audio, ds_cfg);
 
     let mut results: Vec<DecodeResult> = Vec::new();
@@ -510,10 +520,18 @@ where
                     cb(&r);
                 }
                 results.push(r);
-                // Early-exit: in sniper+AP mode we're hunting ONE target.
-                // Once any AP-verified decode lands, further candidates are
-                // almost certainly spurious — cut the remaining work.
-                if has_ap {
+                // Early exit for a single-target search: the caller
+                // said it knows where the station is, so once a decode
+                // lands the remaining candidates in that window are
+                // almost certainly spurious.
+                //
+                // This used to read `if has_ap`, which made *the
+                // presence of a hint* the thing that ended the search.
+                // A wide-band caller supplying a hint therefore got one
+                // decode and stopped — which is the whole reason
+                // `SupportsWideBandAp` was FT8-only, FT8 having its own
+                // AP path that never enters this engine.
+                if stop_after_first {
                     break;
                 }
             }
@@ -521,4 +539,61 @@ where
     }
     budget_report.candidates_skipped += remaining.count() as u32;
     (results, budget_report)
+}
+
+/// Narrow-band single-target decode: search `target_freq ± search_hz`,
+/// ranking candidates nearest the target first, and stop once one
+/// decode lands if an AP hint was supplied.
+///
+/// A thin wrapper over [`decode_band_ap`] — the sniper is a *caller* of
+/// the AP engine, not the owner of it. See [`SniperRequest`] for what
+/// this path is actually for: the receive-side half of narrowing a
+/// transceiver's analogue roofing filter, and (on FST4) a lever on
+/// candidate population rather than on per-candidate cost.
+///
+/// `stop_after_first` is `ap_hint.is_some_and(has_info)` here, which is
+/// exactly the condition the engine used to apply internally — so this
+/// path behaves as it always has.
+///
+/// [`SniperRequest`]: crate::msg::decode_request::SniperRequest
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(crate) fn decode_sniper_ap<P: GenericPipelineProtocol>(
+    audio: &[i16],
+    ds_cfg: &DownsampleCfg,
+    target_freq: f32,
+    search_hz: f32,
+    sync_min: f32,
+    depth: DecodeDepth,
+    max_cand: usize,
+    strictness: DecodeStrictness,
+    eq_mode: EqMode,
+    refine_steps: i32,
+    sync_q_min: u32,
+    ap_hint: Option<&ApHint>,
+    on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
+    budget: Option<&(dyn Fn() -> bool + Sync)>,
+) -> (Vec<DecodeResult>, crate::engine::pipeline::BudgetReport)
+where
+    P::Fec: crate::engine::protocol::BpPooledFec,
+    P::Msg: WsjtApCompatible,
+{
+    decode_band_ap::<P>(
+        audio,
+        ds_cfg,
+        (target_freq - search_hz).max(100.0),
+        (target_freq + search_hz).min(5_900.0),
+        Some(target_freq),
+        ap_hint.is_some_and(|h| h.has_info()),
+        sync_min,
+        depth,
+        max_cand,
+        strictness,
+        eq_mode,
+        refine_steps,
+        sync_q_min,
+        ap_hint,
+        on_result,
+        budget,
+    )
 }

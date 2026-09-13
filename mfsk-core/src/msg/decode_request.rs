@@ -390,8 +390,8 @@ impl<'a, P: FrameDecodable> DecodeRequest<'a, P> {
 impl<'a, P: SupportsWideBandAp> DecodeRequest<'a, P> {
     /// A-priori callsign/grid/report hint applied to every candidate.
     ///
-    /// `Ft8` only today — and that restriction is an **artefact of one
-    /// line**, not a property of the other protocols. A priori decoding
+    /// `Ft8` only today — and that restriction is an **artefact of the
+    /// implementation**, not a property of the other protocols. A priori decoding
     /// is a general technique: it locks high-confidence bits and lowers
     /// the threshold by 1-3 dB, and there is nothing about FT4 or FST4
     /// that makes it inapplicable across a whole band.
@@ -404,11 +404,23 @@ impl<'a, P: SupportsWideBandAp> DecodeRequest<'a, P> {
     /// stops after the first decode. FT8 escapes only because it has its
     /// own AP path and never enters it.
     ///
-    /// Gating that early exit on "this is a narrow-band single-target
-    /// search" rather than on "a hint was supplied" is what would
-    /// decouple the two. It is a small change and an unvalidated one:
-    /// wide-band AP on FT4/FST4 needs a false-decode measurement before
-    /// it can be offered. Until then, FT4/FST4/Q65 reach AP through
+    /// That gating is now fixed (the engine is `decode_band_ap`; the
+    /// sniper is one of its callers). It was not the whole blocker.
+    /// Measured 2026-09-13, and the correction matters: the early exit is *a*
+    /// blocker, not *the* blocker. Routing FT4's wide-band decode through the
+    /// AP engine returns 4 decodes where the plain path returns 11 on the
+    /// WSJT-X golden, losing the hinted station itself — and returns the
+    /// identical set whether the hint names a station that is present or one
+    /// that is absent, i.e. AP changes nothing and the loss is entirely the
+    /// different ladder. It invents nothing (zero decodes outside the plain
+    /// set), so this is a recall problem, not a false-decode one:
+    /// `process_candidate_ap`'s per-candidate ladder offers OSD at depth 2
+    /// only, with no depth-3/4 escalation and no Top-K rescue, and most of
+    /// this recording's decodes come from exactly those.
+    ///
+    /// So wide-band AP means giving `process_candidate_basic` — the
+    /// ladder the wide-band engine actually uses — an AP option, rather
+    /// than reusing the sniper's engine. Until then, FT4/FST4/Q65 reach AP through
     /// [`SniperRequest::ap_hint`], which is validated — but note that
     /// this couples a generally-useful option to a path that exists for
     /// a specific piece of radio hardware. See [`SniperRequest`].
@@ -557,6 +569,9 @@ pub struct SniperRequest<'a, P: FrameDecodable> {
     pub(crate) on_result: Option<OnResultCallback<'a, P>>,
     /// Set via [`SniperRequest::budget`].
     pub(crate) budget: Option<BudgetCheck<'a>>,
+    /// Half-width of the search window, Hz. Set via
+    /// [`SniperRequest::search_hz`].
+    pub(crate) search_hz: f32,
     _protocol: core::marker::PhantomData<P>,
 }
 
@@ -573,8 +588,37 @@ impl<'a, P: FrameDecodable> SniperRequest<'a, P> {
             ap_hint: None,
             on_result: None,
             budget: None,
+            search_hz: 250.0,
             _protocol: core::marker::PhantomData,
         }
+    }
+
+    /// Half-width of the search window in Hz, centred on the target.
+    /// Default 250.0, i.e. the 500 Hz span both callers have always
+    /// hardcoded.
+    ///
+    /// **Changing this changes reported SNR, not just recall.**
+    /// `coarse_sync` estimates its noise floor from the 40th percentile
+    /// of exactly this window, and that estimate is what candidate
+    /// scores — and FT4's `snr_db` — are normalised against. The 500 Hz
+    /// default is matched to the roofing-filter passband this path is
+    /// premised on: wide enough to sample real noise rather than filter
+    /// stopband, narrow enough that FT4's own 83.3 Hz occupied
+    /// bandwidth does not contaminate the percentile. See
+    /// `docs/notes/SNR_FORMULAS.md`.
+    ///
+    /// Exposed because the width is a **candidate-population lever**
+    /// worth measuring, and could not be measured while it was a
+    /// literal at the dispatch site (issue #306). On FST4 the embedded
+    /// runtime is dominated by false survivors reaching deep decoding —
+    /// a real decode costs ~55 ms against ~14 s for a pathological
+    /// false one — and narrowing the band is the one multiplier that
+    /// the per-candidate cost work never touched. Whether it actually
+    /// reduces the false-survivor count is unmeasured: this path also
+    /// runs a halved sync gate, which may offset the narrower band.
+    pub fn search_hz(mut self, hz: f32) -> Self {
+        self.search_hz = hz;
+        self
     }
 
     pub fn sync_min(mut self, v: f32) -> Self {

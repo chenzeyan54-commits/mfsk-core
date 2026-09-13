@@ -1400,11 +1400,12 @@ fn decode_sniper_inner(
     eq_mode: EqMode,
     ap_hint: Option<&ApHint>,
     sync_min: f32,
+    search_hz: f32,
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
     budget: &mut BudgetState<'_>,
 ) -> (Vec<DecodeResult>, FftCache) {
-    let freq_min = (target_freq - 250.0).max(100.0);
-    let freq_max = (target_freq + 250.0).min(5900.0);
+    let freq_min = (target_freq - search_hz).max(100.0);
+    let freq_max = (target_freq + search_hz).min(5900.0);
 
     // Sniper-mode: freq_hint (=target_freq) used to promote candidates
     // near the target via the legacy engine::sync::coarse_sync path. After
@@ -1605,6 +1606,7 @@ impl FrameDecodable for Ft8 {
             req.eq_mode,
             req.ap_hint,
             req.sync_min,
+            req.search_hz,
             req.on_result,
             &mut budget,
         );

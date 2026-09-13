@@ -823,11 +823,31 @@ FT8 escapes only because it has its own AP path and never enters that
 engine, which is the whole content of the `SupportsWideBandAp` trait
 being FT8-only.
 
+That early exit is now fixed — the engine is `decode_band_ap` and the
+sniper is one of its callers — and the same pass found a second defect
+behind it: the AP engine generated FT4's candidates with the *generic*
+2-D Costas search rather than FT4's own `getcandidates4.f90` port, so
+both the candidate set and the meaning of `sync_min` (baseline-normalised
+for FT4, not for the generic search) were wrong on that path.
+
+**Neither fix makes wide-band AP work, and the reason is worth
+recording.** Measured on the WSJT-X FT4 golden: routing a wide-band
+decode through the AP engine returns 4 decodes where the plain path
+returns 11, and loses the hinted station itself. It returns the
+*identical* set whether the hint names a station that is present or one
+that is absent — so AP is changing nothing, and the loss is entirely the
+different ladder. It invents nothing, so this is a recall problem rather
+than a false-decode one: `process_candidate_ap` offers OSD at depth 2
+only, with no depth-3/4 escalation and no Top-K rescue, and most of that
+recording's decodes come from exactly those.
+
 So `SupportsWideBandAp` does not mean "FT4 and FST4 cannot do wide-band
-AP". It means one early-exit is gated on the wrong condition. Fixing
-that is small; validating it is not, because wide-band AP on those two
-protocols is unmeasured capability and AP's whole risk profile is false
-decodes.
+AP", and it also is not one line away. It means AP lives in a parallel,
+shallower per-candidate ladder. Wide-band AP means giving
+`process_candidate_basic` — the ladder the wide-band engine actually
+uses — an AP option. That is the real shape of the work, and it still
+needs a false-decode measurement on top, since AP's risk profile is
+manufactured decodes.
 
 #### Compute budget: `.budget(check)`
 

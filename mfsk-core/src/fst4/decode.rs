@@ -210,7 +210,7 @@ macro_rules! impl_frame_decodable {
                     req.audio,
                     &$cfg,
                     req.target_freq,
-                    250.0,
+                    req.search_hz,
                     req.sync_min,
                     req.depth,
                     req.max_cand,

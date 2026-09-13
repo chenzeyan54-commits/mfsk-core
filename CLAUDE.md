@@ -137,11 +137,16 @@ beside it to flatten the tilt that analogue filter's skirt puts on the
 passband — so **EQ is a property of the input audio, not of the search**,
 which is why `DecodeRequest` carries it too and why it costs decodes on
 flat `ft4sim` corpora. And **A-priori decoding is a general option that
-got coupled to sniper by accident**: `msg::pipeline_ap::decode_sniper_ap`
-breaks out of its candidate loop on `if has_ap`, so a hint — not a narrow
-search — is what makes it single-target. That one line is the entire
-content of `SupportsWideBandAp` being FT8-only. Do not read the trait as
-"FT4/FST4 can't do wide-band AP". Full writeup in `LIBRARY.md` §4.
+got coupled to sniper by accident**: the AP engine broke out of its
+candidate loop on `if has_ap`, so a hint — not a narrow search — was what
+made it single-target (fixed 2026-09-13; the engine is now
+`decode_band_ap` with the sniper as a caller). **But that was not the
+whole blocker**: AP lives in a *parallel, shallower* per-candidate ladder
+(`process_candidate_ap`, OSD depth-2 only) rather than in the wide-band
+engine's, so routing a wide-band decode through it costs most of the
+decodes — 4 against 11 on the FT4 golden, measured. Wide-band AP means
+giving `process_candidate_basic` an AP option, not reusing the sniper's
+engine. Full writeup in `LIBRARY.md` §4.
 
 **MSK144 is intentionally outside the `Protocol` trait** — it isn't FSK,
 and `msk144::decode::decode_slot` bypasses `engine::pipeline` by design.
