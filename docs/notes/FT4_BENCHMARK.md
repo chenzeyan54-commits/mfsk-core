@@ -3487,12 +3487,20 @@ frames, and nothing was invented. `tests/ft4_ap_scramble.rs` holds the
 precision line directly: a hint for a station that is not transmitting
 does not produce that station, at three SNRs and against pure noise.
 
-### Still open
+### Both follow-ups, closed (2026-09-13)
 
-`apmag` is `max(|llr|) * 1.01` here (`fec/ldpc/mod.rs:162`) against
-upstream's `* 1.1` (`ft4_decode.f90:327`, `fst4_decode.f90:418`) — the
-AP bits get a weaker vote than WSJT-X gives them. Not yet measured
-either way.
+`apmag` was `max(|llr|) * 1.01` here against upstream's `* 1.1`
+(`ft4_decode.f90:327`, `fst4_decode.f90:418`), so AP bits got a weaker
+vote than WSJT-X gives them. It is now `Protocol::AP_MAG_SCALE` —
+FT8's 1.01 (`ft8b.f90:303`) and FT4/FST4's 1.1 — since FT8 and FT4
+share `Ldpc174_91` and the codec cannot tell which protocol it is
+serving. Measured neutral on sensitivity; it is a fidelity fix, not a
+gain.
 
-FST4 got the same pass and its golden is unaffected, but its sweep has
-not been re-run.
+FST4's sweep has now been run, all five sub-modes: **+0.00 dB on twelve
+of twenty cells, −0.03 to −0.10 dB on the other six, none worse.** The
+pass is wired and reachable on FST4 — it wins once in eighty FST4-60
+AWGN files — it simply almost never wins, because FST4's nsym=4 ladder
+and zsum-OSD have already converged by the time it is reached. FT4's
+ladder had a real gap there; FST4's does not. Worst-case cost measured
+at 1.5% wall clock. Full write-up in `FST4_BENCHMARK.md` §16.

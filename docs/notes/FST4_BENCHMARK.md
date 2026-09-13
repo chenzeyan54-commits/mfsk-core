@@ -1808,3 +1808,71 @@ wrong:
   prefers internal DRAM and silently falls back to PSRAM once it is
   gone. Reserving 132 KB of internal DRAM with no radio present
   reproduces the entire 33 → 54 s slowdown.
+
+## 16. The blind CQ AP pass is free, and FST4 does not need it (2026-09-13)
+
+FT4 and FST4 both gained an always-on blind CQ a-priori pass in the same
+change — upstream's `iaptype = 1`, which locks the message type and the
+`CQ` prefix using no knowledge of the station at all, and which mfsk-core
+had never run because AP only fired when a caller supplied a hint.
+
+On FT4 that was worth 1.11 dB on AWGN (`FT4_BENCHMARK.md` §48). On FST4
+it is worth nothing measurable, and the reason is the interesting part.
+
+**The sweep (all five sub-modes, 2026-09-13, `c7acb4da` baseline):**
+
+| sub-mode | AWGN | CCIR good | CCIR moderate | CCIR poor |
+|---|---:|---:|---:|---:|
+| FST4-15 | −0.03 | +0.00 | −0.10 | +0.00 |
+| FST4-30 | +0.00 | +0.00 | −0.08 | −0.05 |
+| FST4-60 | +0.00 | −0.05 | +0.00 | +0.00 |
+| FST4-120 | +0.00 | +0.00 | +0.00 | +0.00 |
+| FST4-300 | +0.00 | +0.00 | +0.00 | +0.00 |
+
+Twenty cells, none worse, twelve bit-identical, six better by 0.03-0.10 dB
+— which at 180-900 trials per cell is interpolation granularity, not a
+gain. The corpus is `CQ JL1NIE PM95`, the same CQ-only best case that made
+FT4's number as large as it is, so this is not a case of the prior failing
+to apply.
+
+**Why it is flat: FST4's ladder already earns those decodes.** Counting
+which rung carried each decode on the FST4-60 AWGN corpus, 20 files per
+point:
+
+| SNR | decodes | rungs that won |
+|---:|---:|---|
+| −26 dB | 19/20 | 1×3, 2×3, 5×4, 6×9 |
+| −27 dB | 17/20 | 2×3, 5×9, 6×4, **12×1** |
+| −28 dB | 7/20 | 2×2, 4×1, 5×4 |
+| −29 dB | 1/20 | 4×1 |
+
+Pass 12 is the blind CQ hypothesis. It fires once in eighty files. The
+rung is wired and reachable — this is not a dead branch, and the check
+matters because a silently-unreached rung would look exactly like this in
+a sweep — it simply almost never wins, because the nsym=4 LLR ladder and
+zsum-OSD above it (§8) have already converged by the time it is reached.
+FT4's ladder had a real gap there; FST4's does not.
+
+**And it is close to free.** The rung sits at the end of
+`process_candidate_basic`, so a candidate that decodes never reaches it;
+only a candidate that has failed everything above pays. The worst case is
+therefore a below-threshold slot where every candidate fails the whole
+ladder. Timed on the 40 FST4-60 AWGN files at −29 and −30 dB (1 decode
+between them), with the pass and with it ablated:
+
+| | wall clock |
+|---|---:|
+| with blind CQ | 30.67 s |
+| ablated | 30.21 s |
+
+1.5%, and recall identical. That matters for embedded rather than for
+host: issue #306 measured a pathological false survivor at ~14 s against
+~55 ms for a real decode, so a rung that runs only on survivors is the
+shape to worry about. It is not this one.
+
+**Keep it anyway.** It costs 1.5% in the worst case, is neutral on
+sensitivity, and it is what upstream runs — `fst4_decode.f90` runs its AP
+passes on every decode, the same as `ft4_decode.f90:328`. Divergence from
+WSJT-X needs a reason, and "we measured no gain on a CQ-only corpus" is
+not one: on mixed traffic the pass is the difference between attempting
+upstream's hypothesis set and attempting none.
