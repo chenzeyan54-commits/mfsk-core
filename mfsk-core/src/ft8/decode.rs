@@ -22,7 +22,7 @@ use super::{
     sync::SyncCandidate,
 };
 use crate::msg::decode_request::{
-    DecodeOutcome, DecodeRequest, FrameDecodable, SniperRequest, SupportsSicEarly,
+    BudgetReport, DecodeOutcome, DecodeRequest, FrameDecodable, SniperRequest, SupportsSicEarly,
     SupportsSicRounds, SupportsWideBandAp,
 };
 
@@ -162,6 +162,12 @@ fn process_candidate(
 /// scratch pool across calls instead of paying its allocation cost on
 /// every candidate (issue #201, same pattern as issue #199's fix for
 /// `decode_block_multipass`).
+///
+/// Composed of [`triage_candidate`] then [`run_candidate_ladder`] — the
+/// two halves a budget-aware caller needs separately (the first is cheap
+/// and runs for everyone; the second is the expensive one worth
+/// ordering). Composed here rather than duplicated there, so the
+/// unbudgeted path cannot drift from the budgeted one.
 #[allow(clippy::too_many_arguments)]
 fn process_candidate_with_scratch(
     cand: &SyncCandidate,
@@ -177,7 +183,43 @@ fn process_candidate_with_scratch(
         LlrT,
     >,
 ) -> Option<DecodeResult> {
-    let _ = strictness; // used inside try_decode via the inner
+    let state = triage_candidate(cand, audio, fft_cache)?;
+    run_candidate_ladder(
+        state, audio, fft_cache, depth, strictness, known, eq_mode, ap_hint, bp_scratch,
+    )
+}
+
+/// What [`triage_candidate`] hands [`run_candidate_ladder`].
+///
+/// Sized so a scheduler can hold one per surviving candidate: the `cs`
+/// box is 5 056 B and everything else is scalar, and `cd0` — the 25 KB
+/// baseband — is deliberately *not* here, because the triage drops it
+/// before returning and both later `fill_symbol_spectra` calls rebuild
+/// their own from the shared `fft_cache` anyway. Splitting the function
+/// therefore costs no extra DSP, only this box's lifetime.
+struct CandidateTriage {
+    refined: SyncCandidate,
+    sync_cv: f32,
+    /// Costas sync quality, 0..=21. The scheduler's priority key.
+    nsync: u32,
+    /// `SymMask::SyncOnly`-filled; [`run_candidate_ladder`] fills the
+    /// 58 data symbols into the same box.
+    cs: alloc::boxed::Box<[[crate::engine::scalar::Cmplx<f32>; 8]; 79]>,
+}
+
+/// Cheap half of a candidate: downsample → 3-stage fine refine →
+/// `sync_cv` → Costas-only symbol spectra → the `nsync <= 6` gate.
+///
+/// ~82 % of the candidates a full staged decode sees on
+/// `qso3_busy.wav` end here, before the expensive 58-symbol DFT — which
+/// is what makes this the right place to split: a budget-aware caller
+/// can afford to run it for *every* candidate and then spend what is
+/// left on the survivors in `nsync` order.
+fn triage_candidate(
+    cand: &SyncCandidate,
+    audio: &[i16],
+    fft_cache: &[num_complex::Complex<f32>],
+) -> Option<CandidateTriage> {
     // Use `downsample_cached` directly so the FT8 wrapper's
     // `cache.to_vec()` clone (~3 MB) on the `Some(_)` branch is
     // bypassed — same pattern as `fill_symbol_spectra_via_cd0`.
@@ -270,14 +312,243 @@ fn process_candidate_with_scratch(
     }
     #[cfg(feature = "std")]
     crate::ft8::decode_block::TRACE_NSYNC_PASS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    Some(CandidateTriage {
+        refined,
+        sync_cv,
+        nsync,
+        cs: cs_raw,
+    })
+}
+
+/// The deadline predicate plus the tally of what it cut, threaded
+/// through the sequential strategies as one parameter.
+///
+/// Exists because the SIC engines poll in several places (per candidate,
+/// per round, per checkpoint) and each of them has to both ask and
+/// record; passing a predicate and a report separately through five
+/// functions that already carry a dozen arguments each would be worse.
+struct BudgetState<'a> {
+    check: Option<crate::msg::decode_request::BudgetCheck<'a>>,
+    report: BudgetReport,
+}
+
+impl<'a> BudgetState<'a> {
+    fn new(check: Option<crate::msg::decode_request::BudgetCheck<'a>>) -> Self {
+        Self {
+            check,
+            report: BudgetReport::default(),
+        }
+    }
+
+    /// May another unit of work be *started*? Records the stop when the
+    /// answer first turns to no. Always `true` when no budget was set.
+    ///
+    /// `cut_sync` / `cut_score` describe the work being declined, so the
+    /// caller can tell a cut that dropped noise from one that dropped a
+    /// station. Either may be `None` where the boundary has no such
+    /// number to offer — a whole SIC round, or a candidate that has not
+    /// been triaged yet.
+    fn allows(&mut self, cut_sync: Option<u32>, cut_score: Option<f32>) -> bool {
+        let Some(check) = self.check else {
+            return true;
+        };
+        if self.report.exhausted {
+            return false;
+        }
+        if check() {
+            return true;
+        }
+        self.report.exhausted = true;
+        self.report.cut_at_sync = self.report.cut_at_sync.or(cut_sync);
+        self.report.cut_at_score = self.report.cut_at_score.or(cut_score);
+        false
+    }
+}
+
+/// Every candidate, in the order `coarse_sync` produced them — the
+/// unbudgeted single-pass loop, parallel where rayon is available.
+///
+/// `accept` is the shared SNR-gate/`on_result` tail; see its definition
+/// in [`decode_frame_inner`].
+#[allow(clippy::too_many_arguments)]
+fn decode_all_candidates(
+    candidates: &[SyncCandidate],
+    audio: &[i16],
+    fft_cache: &[num_complex::Complex<f32>],
+    depth: DecodeDepth,
+    strictness: DecodeStrictness,
+    known: &[DecodeResult],
+    eq_mode: EqMode,
+    ap_hint: Option<&ApHint>,
+    accept: &(dyn Fn(DecodeResult) -> Option<DecodeResult> + Sync),
+) -> Vec<DecodeResult> {
+    let decode_one = |cand: &SyncCandidate| -> Option<DecodeResult> {
+        let r = process_candidate(
+            cand, audio, fft_cache, depth, strictness, known, eq_mode, ap_hint,
+        )?;
+        accept(r)
+    };
+    #[cfg(feature = "parallel")]
+    {
+        candidates.par_iter().filter_map(decode_one).collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        candidates.iter().filter_map(decode_one).collect()
+    }
+}
+
+/// Cheapest-first: triage every candidate, then spend what the budget
+/// allows on the survivors, strongest sync first.
+///
+/// **Phase A — the triage sweep — is never gated.** Every candidate gets
+/// [`triage_candidate`] whatever the budget says, because that sweep is
+/// what produces the ordering; gating it would make the schedule depend
+/// on the frequency order of the candidate list, which is the property
+/// this whole function exists to remove. It is also the cheap part: the
+/// gate it ends in rejects ~82 % of candidates before the expensive
+/// 58-symbol DFT. Callers who cannot afford even that have `max_cand`,
+/// which is the knob for it.
+///
+/// **Phase B — the ladder — is sequential.** One shared absolute
+/// deadline across N rayon workers would overshoot by N candidates
+/// rather than one, and work-stealing dissolves the very ordering being
+/// bought. Sequential also lets the whole sweep reuse one `BpScratch`,
+/// the same way `sic_inner_passes_with_cache` does (issue #201).
+///
+/// Results are re-sorted into the original coarse-sync order before
+/// returning, so the caller's first-wins dedup picks the same winner it
+/// would have picked without a budget. Without that, two candidates
+/// converging on one message would resolve differently here than in
+/// [`decode_all_candidates`] — a silent difference in the reported
+/// freq/dt/SNR of a decode, which reads as a sensitivity regression.
+#[allow(clippy::too_many_arguments)]
+fn decode_scheduled_candidates(
+    candidates: &[SyncCandidate],
+    audio: &[i16],
+    fft_cache: &[num_complex::Complex<f32>],
+    depth: DecodeDepth,
+    strictness: DecodeStrictness,
+    known: &[DecodeResult],
+    eq_mode: EqMode,
+    ap_hint: Option<&ApHint>,
+    check: crate::msg::decode_request::BudgetCheck<'_>,
+    accept: &(dyn Fn(DecodeResult) -> Option<DecodeResult> + Sync),
+) -> (Vec<DecodeResult>, BudgetReport) {
+    let triage_one = |(i, cand): (usize, &SyncCandidate)| -> Option<(usize, CandidateTriage)> {
+        triage_candidate(cand, audio, fft_cache).map(|t| (i, t))
+    };
+    #[cfg(feature = "parallel")]
+    let mut triaged: Vec<(usize, CandidateTriage)> = candidates
+        .par_iter()
+        .enumerate()
+        .filter_map(triage_one)
+        .collect();
+    #[cfg(not(feature = "parallel"))]
+    let mut triaged: Vec<(usize, CandidateTriage)> = candidates
+        .iter()
+        .enumerate()
+        .filter_map(triage_one)
+        .collect();
+
+    // Strongest sync first. `sort_by` is stable, so candidates tied on
+    // `nsync` keep their coarse-score order — the schedule is therefore
+    // deterministic, and identical under any rayon thread count.
+    triaged.sort_by_key(|(_, t)| core::cmp::Reverse(t.nsync));
+
+    let mut bp_scratch =
+        crate::fec::ldpc::bp::BpScratch::<crate::fec::ldpc::params::Ldpc174_91Params, LlrT>::new();
+    let mut out: Vec<(usize, DecodeResult)> = Vec::new();
+    let mut report = BudgetReport::default();
+
+    // One sweep, each candidate's full ladder at once — **not** a cheap
+    // BP-only sweep followed by an OSD sweep over the failures. That
+    // alternative is the obvious next move (OSD is ~30 % of an FT8
+    // decode's wall-clock for ~30 % of its decodes), it was built, and
+    // it measured worse at nearly every budget. `bench/wasm` under
+    // Node, `qso3_busy.wav`, same build, budget in wall-clock ms:
+    //
+    // | budget | this (interleaved) | BP sweep then OSD sweep |
+    // |---|---|---|
+    // | 15 ms | 8 stations | 7 |
+    // | 17 ms | 13 | 11 |
+    // | 20 ms | 14 | 11 |
+    // | 25 ms | 14 | 13 |
+    // | uncapped | 14 in 28 ms | 14 in 36 ms |
+    //
+    // The second sweep has to recompute each revisited candidate's
+    // LLR/BP ladder, and that costs more than the OSD it deferred —
+    // even with the 58 data-symbol DFTs retained across the two passes,
+    // which was the first thing tried. Issue #284 measured the same
+    // direction on the SIC engine (deferring OSD out of pass 0: 27 ms
+    // *worse*) for the same reason. Don't re-attempt without a
+    // measurement in front of it.
+    let mut remaining = triaged.into_iter();
+    for (idx, t) in remaining.by_ref() {
+        // Checked *before* claiming the candidate, never during: an
+        // in-flight decode runs to completion, so an overrun is bounded
+        // by one candidate. Same discipline as the embedded receivers.
+        if !check() {
+            report.exhausted = true;
+            report.candidates_skipped = 1;
+            report.cut_at_sync = Some(t.nsync);
+            report.cut_at_score = candidates.get(idx).map(|c| c.score);
+            break;
+        }
+        report.stages_run += 1;
+        if let Some(r) = run_candidate_ladder(
+            t,
+            audio,
+            fft_cache,
+            depth,
+            strictness,
+            known,
+            eq_mode,
+            ap_hint,
+            &mut bp_scratch,
+        ) && let Some(r) = accept(r)
+        {
+            out.push((idx, r));
+        }
+    }
+    report.candidates_skipped += remaining.count() as u32;
+
+    out.sort_by_key(|(i, _)| *i);
+    (out.into_iter().map(|(_, r)| r).collect(), report)
+}
+
+/// Expensive half: the 58 data-symbol DFTs, then the LLR/BP/OSD/AP
+/// staircase. Everything a budget would want to stop before.
+#[allow(clippy::too_many_arguments)]
+fn run_candidate_ladder(
+    triage: CandidateTriage,
+    audio: &[i16],
+    fft_cache: &[num_complex::Complex<f32>],
+    depth: DecodeDepth,
+    strictness: DecodeStrictness,
+    known: &[DecodeResult],
+    eq_mode: EqMode,
+    ap_hint: Option<&ApHint>,
+    bp_scratch: &mut crate::fec::ldpc::bp::BpScratch<
+        crate::fec::ldpc::params::Ldpc174_91Params,
+        LlrT,
+    >,
+) -> Option<DecodeResult> {
+    let CandidateTriage {
+        refined,
+        sync_cv,
+        nsync,
+        mut cs,
+    } = triage;
     crate::ft8::decode_block::fill_symbol_spectra(
-        &mut cs_raw,
+        &mut cs,
         audio,
         refined.freq_hz,
         refined.dt_sec,
         crate::ft8::decode_block::SymMask::DataOnly,
         Some(fft_cache),
     );
+    let cs_raw = cs;
 
     // Per-candidate decode delegated to the unified inner — same
     // staircase + OSD + AP loop the embedded `decode_block` path
@@ -345,7 +616,13 @@ fn decode_frame_inner(
     precomputed_fft: Option<&[num_complex::Complex<f32>]>,
     ap_hint: Option<&ApHint>,
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
-) -> (Vec<DecodeResult>, Vec<num_complex::Complex<f32>>) {
+    budget: Option<crate::msg::decode_request::BudgetCheck<'_>>,
+) -> (
+    Vec<DecodeResult>,
+    Vec<num_complex::Complex<f32>>,
+    BudgetReport,
+) {
+    let mut budget_report = BudgetReport::default();
     // `freq_hint` is intentionally not forwarded — the WSJT-X-faithful
     // decode_block::coarse_sync (the only FT8 coarse-sync after the v0.6
     // consolidation in #48) does not honour candidate-score promotion.
@@ -376,7 +653,7 @@ fn decode_frame_inner(
         None => build_fft_cache(audio),
     };
     if candidates.is_empty() {
-        return (Vec::new(), fft_cache);
+        return (Vec::new(), fft_cache, budget_report);
     }
     #[cfg(feature = "std")]
     if trace_stage {
@@ -399,60 +676,65 @@ fn decode_frame_inner(
         crate::ft8::baseline::fit_baseline(&avg, 0, spec.n_freq - 1)
     };
 
-    // `on_result` fires here, inside the per-candidate closure, *before*
-    // the cross-candidate dedup pass below — see `DecodeRequest::
-    // on_result`'s doc comment for why that ordering means a result can
-    // fire via callback but not survive into the returned `Vec`.
-    #[cfg(feature = "parallel")]
-    let raw: Vec<DecodeResult> = candidates
-        .par_iter()
-        .filter_map(|cand| {
-            #[cfg_attr(
-                not(all(feature = "fft-rustfft", feature = "std", not(feature = "fixed-point"))),
-                allow(unused_mut)
-            )]
-            let mut r = process_candidate(
-                cand, audio, &fft_cache, depth, strictness, known, eq_mode, ap_hint,
-            )?;
-            #[cfg(all(feature = "fft-rustfft", feature = "std", not(feature = "fixed-point")))]
-            {
-                let xsig =
-                    crate::ft8::decode_block::compute_xsig_wsjtx(&r, audio, Some(&fft_cache));
-                if !crate::ft8::decode_block::apply_wsjtx_xsnr2(&mut r, xsig, &sbase, &spec) {
-                    return None;
-                }
+    // The SNR gate and `on_result`, shared by the plain and the
+    // budgeted paths so the two cannot drift. `on_result` fires here,
+    // *before* the cross-candidate dedup pass below — see
+    // `DecodeRequest::on_result`'s doc comment for why that ordering
+    // means a result can fire via callback but not survive into the
+    // returned `Vec`.
+    let accept = |r: DecodeResult| -> Option<DecodeResult> {
+        #[cfg_attr(
+            not(all(feature = "fft-rustfft", feature = "std", not(feature = "fixed-point"))),
+            allow(unused_mut)
+        )]
+        let mut r = r;
+        #[cfg(all(feature = "fft-rustfft", feature = "std", not(feature = "fixed-point")))]
+        {
+            let xsig = crate::ft8::decode_block::compute_xsig_wsjtx(&r, audio, Some(&fft_cache));
+            if !crate::ft8::decode_block::apply_wsjtx_xsnr2(&mut r, xsig, &sbase, &spec) {
+                return None;
             }
-            if let Some(cb) = on_result {
-                cb(&r);
-            }
-            Some(r)
-        })
-        .collect();
-    #[cfg(not(feature = "parallel"))]
-    let raw: Vec<DecodeResult> = candidates
-        .iter()
-        .filter_map(|cand| {
-            #[cfg_attr(
-                not(all(feature = "fft-rustfft", feature = "std", not(feature = "fixed-point"))),
-                allow(unused_mut)
-            )]
-            let mut r = process_candidate(
-                cand, audio, &fft_cache, depth, strictness, known, eq_mode, ap_hint,
-            )?;
-            #[cfg(all(feature = "fft-rustfft", feature = "std", not(feature = "fixed-point")))]
-            {
-                let xsig =
-                    crate::ft8::decode_block::compute_xsig_wsjtx(&r, audio, Some(&fft_cache));
-                if !crate::ft8::decode_block::apply_wsjtx_xsnr2(&mut r, xsig, &sbase, &spec) {
-                    return None;
-                }
-            }
-            if let Some(cb) = on_result {
-                cb(&r);
-            }
-            Some(r)
-        })
-        .collect();
+        }
+        if let Some(cb) = on_result {
+            cb(&r);
+        }
+        Some(r)
+    };
+
+    let raw: Vec<DecodeResult> = match budget {
+        // Unbudgeted: every candidate, in coarse-sync order, exactly as
+        // this loop has always run. Keeping it a separate arm rather
+        // than "the scheduler with an always-true predicate" is what
+        // makes a budget-free decode bit-identical by construction and
+        // not merely by test.
+        None => decode_all_candidates(
+            &candidates,
+            audio,
+            &fft_cache,
+            depth,
+            strictness,
+            known,
+            eq_mode,
+            ap_hint,
+            &accept,
+        ),
+        Some(check) => {
+            let (v, rep) = decode_scheduled_candidates(
+                &candidates,
+                audio,
+                &fft_cache,
+                depth,
+                strictness,
+                known,
+                eq_mode,
+                ap_hint,
+                check,
+                &accept,
+            );
+            budget_report = rep;
+            v
+        }
+    };
     #[cfg(feature = "std")]
     if let Some(t1) = __trace_t1 {
         eprintln!(
@@ -474,7 +756,7 @@ fn decode_frame_inner(
             results.push(r);
         }
     }
-    (results, fft_cache)
+    (results, fft_cache, budget_report)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -520,6 +802,7 @@ fn flat_sic_inner(
     precomputed_fft: Option<&[num_complex::Complex<f32>]>,
     n_rounds: usize,
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
+    budget: &mut BudgetState<'_>,
 ) -> (Vec<DecodeResult>, FftCache) {
     let mut residual = audio.to_vec();
     sic_inner_passes_with_cache(
@@ -536,6 +819,7 @@ fn flat_sic_inner(
         precomputed_fft,
         n_rounds,
         on_result,
+        budget,
     )
 }
 
@@ -568,10 +852,11 @@ fn sic_inner_passes(
     ap_hint: Option<&ApHint>,
     n_rounds: usize,
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
+    budget: &mut BudgetState<'_>,
 ) -> Vec<DecodeResult> {
     sic_inner_passes_with_cache(
         residual, freq_min, freq_max, sync_min, depth, max_cand, strictness, known, eq_mode,
-        ap_hint, None, n_rounds, on_result,
+        ap_hint, None, n_rounds, on_result, budget,
     )
     .0
 }
@@ -606,6 +891,7 @@ fn sic_inner_passes_with_cache(
     precomputed_fft: Option<&[num_complex::Complex<f32>]>,
     n_rounds: usize,
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
+    budget: &mut BudgetState<'_>,
 ) -> (Vec<DecodeResult>, FftCache) {
     let mut all_results: Vec<DecodeResult> = Vec::new();
     let mut pass0_cache: Option<FftCache> = None;
@@ -622,6 +908,13 @@ fn sic_inner_passes_with_cache(
     let mut prev_total: usize = 0;
     for ipass in 0..n_rounds {
         if ipass >= 1 && all_results.len() == prev_total {
+            break;
+        }
+        // A SIC round is a whole coarse-sync sweep plus a candidate
+        // loop; not starting one is the coarsest thing this engine can
+        // decline. The per-candidate check below is the fine-grained
+        // one.
+        if !budget.allows(None, None) {
             break;
         }
         prev_total = all_results.len();
@@ -655,7 +948,17 @@ fn sic_inner_passes_with_cache(
         if ipass == 0 {
             pass0_cache = Some(FftCache(fft_cache.clone()));
         }
-        for cand in &candidates {
+        for (icand, cand) in candidates.iter().enumerate() {
+            // Before claiming the candidate, never between accepting a
+            // decode and subtracting it (further down): a cut there
+            // would leave an accepted-but-unsubtracted signal in the
+            // residual, which the next round's `coarse_sync` re-finds
+            // as a fresh candidate — a duplicate generator.
+            if !budget.allows(None, Some(cand.score)) {
+                budget.report.candidates_skipped += (candidates.len() - icand) as u32;
+                break;
+            }
+            budget.report.stages_run += 1;
             #[cfg_attr(
                 not(all(feature = "fft-rustfft", feature = "std", not(feature = "fixed-point"))),
                 allow(unused_mut)
@@ -833,6 +1136,7 @@ pub(crate) fn decode_frame_subtract_staged_with_ap_debug_residual(
         ap_hint,
         &[],
         None,
+        &mut BudgetState::new(None),
     )
 }
 
@@ -872,6 +1176,7 @@ fn decode_frame_subtract_staged_with_ap_inner(
     // is what makes that existing atomic gate also cover this case.
     outer_known: &[DecodeResult],
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
+    budget: &mut BudgetState<'_>,
 ) -> (Vec<DecodeResult>, Vec<i16>) {
     use staged_checkpoint::{A_SAMPLES, B_SAMPLES, C_SAMPLES};
 
@@ -924,6 +1229,7 @@ fn decode_frame_subtract_staged_with_ap_inner(
             None,
             CHECKPOINT_SIC_ROUNDS,
             on_result,
+            budget,
         );
         return (r, audio_clean);
     }
@@ -960,6 +1266,7 @@ fn decode_frame_subtract_staged_with_ap_inner(
         ap_hint,
         CHECKPOINT_SIC_ROUNDS,
         on_result,
+        budget,
     );
     // Checkpoint A's own residual is not carried forward — only its
     // decoded results are (ft8_decode.f90 reloads `dd=iwave` fresh at
@@ -992,6 +1299,7 @@ fn decode_frame_subtract_staged_with_ap_inner(
             None,
             CHECKPOINT_SIC_ROUNDS,
             on_result,
+            budget,
         );
         return (r, audio_clean);
     }
@@ -1068,6 +1376,7 @@ fn decode_frame_subtract_staged_with_ap_inner(
         ap_hint,
         CHECKPOINT_SIC_ROUNDS,
         on_result,
+        budget,
     );
 
     let mut all_results = early_results;
@@ -1092,6 +1401,7 @@ fn decode_sniper_inner(
     ap_hint: Option<&ApHint>,
     sync_min: f32,
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
+    budget: &mut BudgetState<'_>,
 ) -> (Vec<DecodeResult>, FftCache) {
     let freq_min = (target_freq - 250.0).max(100.0);
     let freq_max = (target_freq + 250.0).min(5900.0);
@@ -1120,6 +1430,60 @@ fn decode_sniper_inner(
 
     // Same on_result-fires-before-dedup ordering as decode_frame_inner —
     // see its comment above the analogous par_iter block.
+    //
+    // A budgeted sniper takes the sequential arm regardless of
+    // `parallel`: this is a ±250 Hz window with a handful of
+    // candidates, so there is nothing here worth the N-fold deadline
+    // overshoot that polling from N rayon workers would cost.
+    if budget.check.is_some() {
+        let mut raw: Vec<DecodeResult> = Vec::new();
+        for (icand, cand) in candidates.iter().enumerate() {
+            if !budget.allows(None, Some(cand.score)) {
+                budget.report.candidates_skipped += (candidates.len() - icand) as u32;
+                break;
+            }
+            budget.report.stages_run += 1;
+            #[cfg_attr(
+                not(all(feature = "fft-rustfft", feature = "std", not(feature = "fixed-point"))),
+                allow(unused_mut)
+            )]
+            let Some(mut r) = process_candidate(
+                cand,
+                audio,
+                fft_cache.as_slice(),
+                depth,
+                strictness,
+                &[],
+                eq_mode,
+                ap_hint,
+            ) else {
+                continue;
+            };
+            #[cfg(all(feature = "fft-rustfft", feature = "std", not(feature = "fixed-point")))]
+            {
+                let xsig = crate::ft8::decode_block::compute_xsig_wsjtx(
+                    &r,
+                    audio,
+                    Some(fft_cache.as_slice()),
+                );
+                if !crate::ft8::decode_block::apply_wsjtx_xsnr2(&mut r, xsig, &sbase, &spec) {
+                    continue;
+                }
+            }
+            if let Some(cb) = on_result {
+                cb(&r);
+            }
+            raw.push(r);
+        }
+        let mut results: Vec<DecodeResult> = Vec::new();
+        for r in raw {
+            if !results.iter().any(|x| x.message77() == r.message77()) {
+                results.push(r);
+            }
+        }
+        return (results, fft_cache);
+    }
+
     #[cfg(feature = "parallel")]
     let raw: Vec<DecodeResult> = candidates
         .par_iter()
@@ -1207,7 +1571,7 @@ impl FrameDecodable for Ft8 {
     type DecodeResult = DecodeResult;
 
     fn __single_pass(req: &DecodeRequest<'_, Self>) -> DecodeOutcome<Self> {
-        let (results, fft_cache) = decode_frame_inner(
+        let (results, fft_cache, budget) = decode_frame_inner(
             req.audio,
             req.freq_min,
             req.freq_max,
@@ -1221,14 +1585,17 @@ impl FrameDecodable for Ft8 {
             req.fft_cache.as_ref().map(FftCache::as_slice),
             req.ap_hint,
             req.on_result,
+            req.budget,
         );
         DecodeOutcome {
             results,
             fft_cache: FftCache(fft_cache),
+            budget,
         }
     }
 
     fn __sniper(req: &SniperRequest<'_, Self>) -> DecodeOutcome<Self> {
+        let mut budget = BudgetState::new(req.budget);
         let (results, fft_cache) = decode_sniper_inner(
             req.audio,
             req.target_freq,
@@ -1239,13 +1606,19 @@ impl FrameDecodable for Ft8 {
             req.ap_hint,
             req.sync_min,
             req.on_result,
+            &mut budget,
         );
-        DecodeOutcome { results, fft_cache }
+        DecodeOutcome {
+            results,
+            fft_cache,
+            budget: budget.report,
+        }
     }
 }
 
 impl SupportsSicRounds for Ft8 {
     fn __flat_sic(req: &DecodeRequest<'_, Self>) -> DecodeOutcome<Self> {
+        let mut budget = BudgetState::new(req.budget);
         // Subtract caller-supplied `known` before round 0, same rationale
         // as `SupportsSicEarly::__staged_sic` below: without this, a
         // strong `known` carrier continues to mask weaker signals
@@ -1270,8 +1643,13 @@ impl SupportsSicRounds for Ft8 {
                 req.fft_cache.as_ref().map(FftCache::as_slice),
                 req.sic_rounds,
                 req.on_result,
+                &mut budget,
             );
-            DecodeOutcome { results, fft_cache }
+            DecodeOutcome {
+                results,
+                fft_cache,
+                budget: budget.report,
+            }
         } else {
             let mut audio_clean = req.audio.to_vec();
             for r in req.known {
@@ -1291,8 +1669,13 @@ impl SupportsSicRounds for Ft8 {
                 None,
                 req.sic_rounds,
                 req.on_result,
+                &mut budget,
             );
-            DecodeOutcome { results, fft_cache }
+            DecodeOutcome {
+                results,
+                fft_cache,
+                budget: budget.report,
+            }
         }
     }
 }
@@ -1342,6 +1725,7 @@ impl SupportsSicEarly for Ft8 {
         // which is exactly that hazard: it ran *after*
         // `decode_frame_subtract_staged_with_ap_inner` had already
         // fired `on_result` for every checkpoint's raw candidates.
+        let mut budget = BudgetState::new(req.budget);
         let (results, residual) = decode_frame_subtract_staged_with_ap_inner(
             req.audio,
             req.freq_min,
@@ -1355,9 +1739,14 @@ impl SupportsSicEarly for Ft8 {
             req.ap_hint,
             req.known,
             req.on_result,
+            &mut budget,
         );
         let fft_cache = FftCache(build_fft_cache(&residual));
-        DecodeOutcome { results, fft_cache }
+        DecodeOutcome {
+            results,
+            fft_cache,
+            budget: budget.report,
+        }
     }
 }
 

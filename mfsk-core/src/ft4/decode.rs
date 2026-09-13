@@ -14,7 +14,7 @@ use crate::msg::pipeline_ap;
 pub use crate::engine::pipeline::{DecodeDepth, DecodeResult, DecodeStrictness, FftCache};
 pub use crate::msg::ApHint;
 use crate::msg::decode_request::{
-    DecodeOutcome, DecodeRequest, FrameDecodable, SniperRequest, SupportsSicRounds,
+    BudgetReport, DecodeOutcome, DecodeRequest, FrameDecodable, SniperRequest, SupportsSicRounds,
 };
 
 /// FT4 downsample configuration: 12 kHz → ~666.7 Hz baseband, covering four
@@ -93,6 +93,7 @@ impl FrameDecodable for Ft4 {
         DecodeOutcome {
             results: pipeline::dedup_known(raw, req.known),
             fft_cache,
+            budget: BudgetReport::default(),
         }
     }
 
@@ -128,7 +129,11 @@ impl FrameDecodable for Ft4 {
             req.audio,
             &FT4_DOWNSAMPLE,
         ));
-        DecodeOutcome { results, fft_cache }
+        DecodeOutcome {
+            results,
+            fft_cache,
+            budget: BudgetReport::default(),
+        }
     }
 }
 
@@ -194,6 +199,7 @@ impl SupportsSicRounds for Ft4 {
         DecodeOutcome {
             results: pipeline::dedup_known(raw, req.known),
             fft_cache,
+            budget: BudgetReport::default(),
         }
     }
 }

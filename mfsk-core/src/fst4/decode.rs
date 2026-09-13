@@ -22,7 +22,9 @@ use crate::engine::pipeline;
 
 pub use crate::engine::pipeline::{DecodeDepth, DecodeResult, DecodeStrictness, FftCache};
 pub use crate::msg::ApHint;
-use crate::msg::decode_request::{DecodeOutcome, DecodeRequest, FrameDecodable, SniperRequest};
+use crate::msg::decode_request::{
+    BudgetReport, DecodeOutcome, DecodeRequest, FrameDecodable, SniperRequest,
+};
 
 /// FST4-15 downsample configuration: 12 kHz → 666.7 Hz baseband
 /// (NDOWN = 18, matching WSJT-X `fst4_decode.f90`'s `ndown` for
@@ -200,6 +202,7 @@ macro_rules! impl_frame_decodable {
                 DecodeOutcome {
                     results: pipeline::dedup_known(raw, req.known),
                     fft_cache,
+                    budget: BudgetReport::default(),
                 }
             }
 
@@ -222,7 +225,11 @@ macro_rules! impl_frame_decodable {
                 let fft_cache = FftCache(crate::engine::dsp::downsample::build_fft_cache(
                     req.audio, &$cfg,
                 ));
-                DecodeOutcome { results, fft_cache }
+                DecodeOutcome {
+                    results,
+                    fft_cache,
+                    budget: BudgetReport::default(),
+                }
             }
         }
     };
