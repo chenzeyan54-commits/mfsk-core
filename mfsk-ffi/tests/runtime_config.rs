@@ -17,6 +17,14 @@
 //! Single test function on purpose: the pool is process-global and can
 //! only be built once, so the ordering has to be explicit rather than
 //! left to the harness.
+//!
+//! And it is feature-split, because there are two contracts. Without
+//! `parallel` there is no pool to configure — decoding is already
+//! single-threaded, which is a *stronger* guarantee than the pool
+//! provides, not a missing one — and the call must say so rather than
+//! pretend to succeed. CI runs this suite under `--features mobile`
+//! too, which is how the first version of this test was caught
+//! asserting only half of what the library documents.
 
 mod common;
 
@@ -54,6 +62,45 @@ fn cfg(threads: u32, user: *mut c_void) -> MfskRuntimeConfig {
     }
 }
 
+/// Without `parallel`: nothing to configure, and it says so.
+#[cfg(not(feature = "parallel"))]
+#[test]
+fn a_build_without_a_pool_says_so() {
+    assert_eq!(
+        unsafe { mfsk_runtime_configure(&cfg(4, std::ptr::null_mut())) },
+        MfskStatus::Unsupported
+    );
+    let msg = unsafe { std::ffi::CStr::from_ptr(mfsk_last_error()) }.to_string_lossy();
+    assert!(
+        msg.contains("single-threaded"),
+        "the error should say decoding is already serial, not that something broke: {msg}"
+    );
+    assert_eq!(
+        mfsk_runtime_thread_count(),
+        1,
+        "a build without `parallel` decodes on one thread"
+    );
+
+    // And a NULL config is the same answer, not a crash.
+    assert_eq!(
+        unsafe { mfsk_runtime_configure(std::ptr::null()) },
+        MfskStatus::Unsupported
+    );
+
+    // The decode still works; it just does not use a pool.
+    let slot = synth_slot_i16(MfskMode::Ft8, "CQ", "JA1ABC", "PM95", 1500.0);
+    let dec = open(MfskMode::Ft8, None);
+    let rows = decode_i16(dec, &slot);
+    unsafe { mfsk_session_close(dec) };
+    assert!(any_contains(&rows, "JA1ABC"), "{:?}", texts(&rows));
+    assert_eq!(
+        STARTS.load(Ordering::SeqCst),
+        0,
+        "no worker thread should have started"
+    );
+}
+
+#[cfg(feature = "parallel")]
 #[test]
 fn the_configured_pool_is_the_one_decoding_runs_on() {
     // Before configuring, the count is rayon's global default.

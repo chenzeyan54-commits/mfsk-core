@@ -55,13 +55,18 @@ for features in "${FEATURE_MATRIX[@]}"; do
 done
 
 echo "► mfsk-ffi feature combinations"
-# `desktop` is the default and is what every other command here already
-# covers. `mobile` is the one that drops rayon and serde, and since this
-# crate's own source never names rayon, nothing else would catch it
-# breaking.
+# `desktop` is the default; `mobile` drops rayon and serde.
+#
+# **Tested, not merely built** — that distinction cost a red CI run on
+# 2026-09-13. `mfsk_runtime_configure` correctly reports UNSUPPORTED on
+# a build with no thread pool, and the test asserting it asserted only
+# the `parallel` half; it compiled fine under `mobile` and failed at
+# run time. CI runs this suite under both feature sets, so a local gate
+# that only builds them is a gate that reports green on exactly the
+# combinations it is there to cover.
 for ffi_features in "desktop" "mobile"; do
   echo "  · [$ffi_features]"
-  RUSTFLAGS="-D warnings" cargo build -p mfsk-ffi --release \
+  RUSTFLAGS="-D warnings" cargo test -p mfsk-ffi --release \
     --no-default-features --features "$ffi_features"
 done
 

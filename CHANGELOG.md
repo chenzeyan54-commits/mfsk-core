@@ -32,6 +32,21 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
 
 ### Fixed
 
+- **The local pre-push gate built the `mfsk-ffi` feature combinations
+  without testing them**, and that cost a red CI run. `mfsk_runtime_-
+  configure` correctly reports `UNSUPPORTED` on a build with no thread
+  pool; the test asserting it covered only the `parallel` half, compiled
+  fine under `mobile`, and failed at run time. CI runs the suite under
+  both feature sets, so a local gate that only builds them reports green
+  on exactly the combinations it exists to cover. It runs `cargo test`
+  for both now.
+
+  The test is split by feature, which is the better shape anyway: it
+  pins both halves of what the library documents — with a pool, the
+  configuration takes effect; without one, decoding is already
+  single-threaded, which is a *stronger* contract than the pool
+  provides rather than a missing one.
+
 - **A macro-generated `extern "C"` function never reaches the header.**
   The packers and the two synthesis calls were written as
   `macro_rules!`, which cbindgen — parsing this crate syntactically —
