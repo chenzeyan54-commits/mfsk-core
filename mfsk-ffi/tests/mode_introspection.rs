@@ -45,6 +45,22 @@ fn abi_caps_match_the_registry() {
     }
 }
 
+/// The array-length constants are literals in this crate, for the same
+/// cbindgen reason as the capability bits, so they need the same pin.
+/// Without the `#define` the generated header references an undeclared
+/// identifier and does not compile — which `header_compile.sh` catches,
+/// but only after the value has already gone wrong.
+#[test]
+fn abi_lengths_match_the_shared_definitions() {
+    assert_eq!(MFSK_AP_FIELD_LEN, mfsk_ffi_abi::MFSK_AP_FIELD_LEN);
+    assert_eq!(MFSK_DECODE_TEXT_LEN, mfsk_ffi_abi::MFSK_DECODE_TEXT_LEN);
+    // And they are the sizes the structs actually carry.
+    let p = std::mem::MaybeUninit::<MfskDecodeParams>::zeroed();
+    let p = unsafe { p.assume_init() };
+    assert_eq!(p.ap_call1.len(), MFSK_AP_FIELD_LEN);
+    assert_eq!(p.ap_grid.len(), MFSK_AP_FIELD_LEN);
+}
+
 /// Enumeration must reach every mode this build has, and `mfsk_mode_at`
 /// past the end must fail rather than wrap or return mode 0.
 #[test]

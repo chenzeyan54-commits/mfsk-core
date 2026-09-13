@@ -55,6 +55,146 @@ void print_decodes(const char* proto, const MfskResultList& list) {
     }
 }
 
+// ── v2 decode session ───────────────────────────────────────────────
+//
+// Written the way a consumer would: init params from the mode, open a
+// session, decode into memory the caller owns. Nothing here frees a
+// pointer the library allocated, which is the whole point — that
+// category is what makes Kotlin and Swift wrappers leak when an
+// exception unwinds past the free.
+void test_session_decode() {
+    std::printf("\n— v2 decode session: params → open → rows into caller memory\n");
+
+    MfskSamples pcm{};
+    if (mfsk_encode_ft8("CQ", "JA1ABC", "PM95", 1500.0f, &pcm) != MFSK_STATUS_OK) {
+        fail("session", "mfsk_encode_ft8 failed");
+        return;
+    }
+    std::vector<int16_t> audio(pcm.len);
+    for (size_t i = 0; i < pcm.len; ++i) {
+        audio[i] = static_cast<int16_t>(pcm.samples[i] * 32767.0f);
+    }
+    mfsk_samples_free(&pcm);
+
+    MfskDecodeParams p;
+    std::memset(&p, 0, sizeof p);
+    p.size = sizeof p;
+    if (mfsk_decode_params_init(MFSK_MODE_FT8, &p) != MFSK_STATUS_OK) {
+        fail("session", "mfsk_decode_params_init failed");
+        return;
+    }
+    std::printf("  FT8 defaults: band [%.0f, %.0f] sync_min %.2f max_cand %u\n",
+                p.freq_min_hz, p.freq_max_hz, p.sync_min, p.max_cand);
+
+    MfskStatus st = MFSK_STATUS_INTERNAL;
+    MfskDecodeSession* s = mfsk_session_open(MFSK_MODE_FT8, &p, &st);
+    if (s == nullptr || st != MFSK_STATUS_OK) {
+        fail("session", mfsk_last_error());
+        return;
+    }
+
+    MfskDecode rows[8];
+    std::memset(rows, 0, sizeof rows);
+    for (auto& r : rows) r.size = sizeof r;
+    size_t n = 0;
+    if (mfsk_session_decode_i16(s, audio.data(), audio.size(), 12000,
+                                nullptr, rows, 8, &n) != MFSK_STATUS_OK) {
+        fail("session", mfsk_session_last_error(s));
+        mfsk_session_close(s);
+        return;
+    }
+    std::printf("  %zu decode(s):\n", n);
+    bool found = false;
+    for (size_t i = 0; i < n; ++i) {
+        std::printf("    mode=%d freq=%7.2f dt=%+.3f snr=%+.1f cv=%.3f "
+                    "info=%u pass=%u text='%s'\n",
+                    static_cast<int>(rows[i].mode), rows[i].freq_hz, rows[i].dt_sec,
+                    rows[i].snr_db, rows[i].sync_cv, rows[i].info_bits,
+                    rows[i].pass, rows[i].text);
+        if (std::strstr(rows[i].text, "JA1ABC") != nullptr) found = true;
+        if (rows[i].mode != MFSK_MODE_FT8) {
+            fail("session", "row reports the wrong mode");
+        }
+        if (rows[i].info_bits != 91) {
+            fail("session", "FT8 is LDPC(174,91); info_bits should be 91");
+        }
+    }
+    if (!found) {
+        fail("session", "did not decode the signal it was given");
+    }
+
+    // FEC bits come from the session, not from a pointer in the row.
+    size_t need = 0;
+    if (mfsk_session_copy_info(s, 0, nullptr, 0, &need) != MFSK_STATUS_INVALID_ARG ||
+        need != 91) {
+        fail("session", "copy_info should report the size it needs");
+    } else {
+        std::vector<uint8_t> bits(need);
+        size_t got = 0;
+        if (mfsk_session_copy_info(s, 0, bits.data(), bits.size(), &got) != MFSK_STATUS_OK ||
+            got != need) {
+            fail("session", "copy_info failed with a correctly sized buffer");
+        }
+    }
+
+    // A short buffer reports the count needed rather than truncating.
+    size_t needed = 0;
+    MfskDecode one;
+    std::memset(&one, 0, sizeof one);
+    one.size = sizeof one;
+    if (mfsk_session_decode_i16(s, audio.data(), audio.size(), 12000,
+                                nullptr, &one, 0, &needed) != MFSK_STATUS_INVALID_ARG) {
+        fail("session", "a zero-capacity buffer should report INVALID_ARG");
+    } else if (needed != n) {
+        fail("session", "*out_len should be the count needed");
+    }
+
+    mfsk_session_close(s);
+
+    // Asking a mode for something it does not have fails at open, with
+    // a message — not silently at decode, which is what the pre-v2
+    // options handle did with six of its eleven fields.
+    MfskDecodeParams bad;
+    std::memset(&bad, 0, sizeof bad);
+    bad.size = sizeof bad;
+    mfsk_decode_params_init(MFSK_MODE_FT4, &bad);
+    bad.sic_early = true;
+    MfskStatus badst = MFSK_STATUS_OK;
+    if (mfsk_session_open(MFSK_MODE_FT4, &bad, &badst) != nullptr ||
+        badst != MFSK_STATUS_UNSUPPORTED) {
+        fail("session", "sic_early on FT4 should be refused at open");
+    } else {
+        std::printf("  refused sic_early on FT4: %s\n", mfsk_last_error());
+    }
+
+    // A mode with no decode handle says so, naming the bit to check.
+    MfskStatus wst = MFSK_STATUS_OK;
+    if (mfsk_session_open(MFSK_MODE_WSPR, nullptr, &wst) != nullptr ||
+        wst != MFSK_STATUS_UNSUPPORTED) {
+        fail("session", "WSPR has no decode handle and should refuse");
+    }
+
+    // Every mode that claims the handle must open one.
+    const uint32_t total = mfsk_mode_count();
+    int opened = 0;
+    for (uint32_t i = 0; i < total; ++i) {
+        MfskMode m;
+        if (mfsk_mode_at(i, &m) != MFSK_STATUS_OK) continue;
+        if ((mfsk_mode_caps(m) & MFSK_CAP_DECODE_HANDLE) == 0) continue;
+        MfskStatus ost = MFSK_STATUS_INTERNAL;
+        MfskDecodeSession* sess = mfsk_session_open(m, nullptr, &ost);
+        if (sess == nullptr || ost != MFSK_STATUS_OK) {
+            fail(mfsk_mode_name(m), "claims MFSK_CAP_DECODE_HANDLE but will not open");
+        } else {
+            opened++;
+            mfsk_session_close(sess);
+        }
+    }
+    std::printf("  opened a session for all %d handle-driving mode(s)\n", opened);
+
+    std::printf("  OK\n");
+}
+
 // ── Mode introspection (FFI v2 slice 1) ─────────────────────────────
 //
 // The point of this surface is that a C consumer stops hardcoding a
@@ -749,6 +889,7 @@ int main() {
                 ver & 0xff);
 
     test_mode_introspection();
+    test_session_decode();
     test_ft8();
     test_ft8_streaming();
     test_builder_options();

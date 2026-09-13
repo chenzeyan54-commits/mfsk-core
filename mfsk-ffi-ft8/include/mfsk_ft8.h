@@ -19,6 +19,16 @@
  */
 typedef enum MfskDecodeDepth {
   /**
+   * Whatever the mode publishes as its default.
+   *
+   * Discriminant 0 used to be deliberately unassigned, which made a
+   * `memset`-to-zero options struct carry an invalid discriminant —
+   * harmless as a C int, undefined the moment Rust reads it as an
+   * enum. Giving 0 a meaning removes that edge and makes the
+   * obvious C idiom mean the obvious thing.
+   */
+  MFSK_DECODE_DEPTH_MODE_DEFAULT = 0,
+  /**
    * Full LLR-variant staircase + BP, no OSD fallback.
    */
   MFSK_DECODE_DEPTH_BP_ALL = 1,

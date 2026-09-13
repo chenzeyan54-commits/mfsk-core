@@ -90,6 +90,14 @@ pub enum MfskStatus {
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum MfskDecodeDepth {
+    /// Whatever the mode publishes as its default.
+    ///
+    /// Discriminant 0 used to be deliberately unassigned, which made a
+    /// `memset`-to-zero options struct carry an invalid discriminant —
+    /// harmless as a C int, undefined the moment Rust reads it as an
+    /// enum. Giving 0 a meaning removes that edge and makes the
+    /// obvious C idiom mean the obvious thing.
+    ModeDefault = 0,
     /// Full LLR-variant staircase + BP, no OSD fallback.
     BpAll = 1,
     /// Above + OSD fallback (host-only; a no-op on protocols/builds
@@ -439,4 +447,152 @@ pub struct MfskDecodeDefaults {
     /// with FT8's or FST4's, and a caller that copies one across modes
     /// is wrong with nothing to tell it so.
     pub sync_scale: MfskSyncScale,
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Decode parameters and result rows (FFI v2 slice 3)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Inline capacity for an a-priori hint field. A callsign is at most 13
+/// characters in WSJT's own grammar; 16 leaves room and keeps the struct
+/// aligned.
+pub const MFSK_AP_FIELD_LEN: usize = 16;
+
+/// Capacity of [`MfskDecode::text`], including the NUL.
+///
+/// Widened from the 40 that [`MfskResult`] carries. That number was the
+/// longest WSJT-77 message plus one, which is true and was still too
+/// tight the moment a hash-resolved `<...>` callsign expands in place.
+pub const MFSK_DECODE_TEXT_LEN: usize = 64;
+
+/// Everything a decode can be asked to do, as one size-versioned
+/// struct passed by `const*`.
+///
+/// This replaces an opaque handle with eight setter functions. Three
+/// reasons, in order of how much they matter:
+///
+/// 1. **The handle was unsound.** Its accessor fabricated a
+///    `&'static mut` from a raw pointer with no synchronisation, which
+///    is UB under Stacked Borrows the moment two setters' borrows
+///    overlap — single-threaded, never mind concurrently. A plain
+///    `#[repr(C)]` struct the caller owns has no such question.
+/// 2. **Marshalling.** Kotlin and Swift wrappers copy one struct
+///    instead of sequencing eight fallible calls.
+/// 3. **Growth is still safe**, via `size` — see [`MfskModeInfo`].
+///
+/// Initialise with `mfsk_decode_params_init(mode, &params)`, which
+/// fills in that mode's published defaults; then override what you
+/// want. Zeroing the struct by hand is *not* equivalent: a zero
+/// `max_cand` or a zero frequency band decodes nothing.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct MfskDecodeParams {
+    /// `sizeof(MfskDecodeParams)` as the caller understands it.
+    pub size: u32,
+    /// Low edge of the search band, Hz.
+    pub freq_min_hz: f32,
+    /// High edge of the search band, Hz.
+    pub freq_max_hz: f32,
+    /// Sync threshold. **Not comparable across modes** — see
+    /// `MfskDecodeDefaults::sync_scale`.
+    pub sync_min: f32,
+    /// Candidate budget.
+    pub max_cand: u32,
+    /// Cost/recall rung.
+    pub depth: MfskDecodeDepth,
+    /// Accept/reject threshold profile.
+    pub strictness: MfskStrictness,
+    /// Equalisation. A property of the *input audio* — it flattens a
+    /// passband an analogue filter has tilted — not of the search, so
+    /// it belongs here rather than only on a narrow-band call.
+    pub eq_mode: MfskEqMode,
+    /// Prioritise candidates near this frequency. NaN means unset,
+    /// which is what `mfsk_decode_params_init` writes.
+    pub freq_hint_hz: f32,
+    /// Successive-interference-cancellation rounds, 0 for none.
+    /// Requires `MFSK_CAP_SIC_ROUNDS`.
+    pub sic_rounds: u8,
+    /// Checkpoint-emulation early decode. Requires `MFSK_CAP_SIC_EARLY`.
+    pub sic_early: bool,
+    /// Whether the three `ap_*` fields below carry a hint.
+    pub has_ap_hint: bool,
+    /// A-priori hint: the transmitting station, NUL-terminated, or
+    /// empty. Requires `MFSK_CAP_AP_WIDEBAND` (or `_AP_NARROW` on a
+    /// narrow-band call).
+    pub ap_call1: [core::ffi::c_char; MFSK_AP_FIELD_LEN],
+    /// A-priori hint: the correspondent, or `"CQ"`.
+    pub ap_call2: [core::ffi::c_char; MFSK_AP_FIELD_LEN],
+    /// A-priori hint: the grid square.
+    pub ap_grid: [core::ffi::c_char; MFSK_AP_FIELD_LEN],
+    /// Half-width of a narrow-band search, Hz; 0 for the mode's
+    /// default. Only meaningful with `MFSK_CAP_SNIPER`.
+    pub search_hz: f32,
+}
+
+/// One decoded transmission, written into caller memory.
+///
+/// Shaped on `mfsk_core`'s own `msg::decoded::Decoded`, which
+/// `docs/notes/DECODED_ROW.md` says was made flat "precisely so it can
+/// map to a C struct in `mfsk-ffi` later". This is that later.
+///
+/// Rows go into an array the caller allocates, which deletes the whole
+/// "a Rust global-allocator pointer crosses the boundary and must come
+/// back to be freed" category — the thing that makes Kotlin and Swift
+/// wrappers fiddly and leaks when an exception unwinds past the free.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct MfskDecode {
+    /// `sizeof(MfskDecode)` as the caller understands it.
+    pub size: u32,
+    /// The **concrete sub-mode**, not the family. `Decoded::protocol`
+    /// collapses all five FST4 periods onto one id; this must not,
+    /// because the addressing model does not.
+    pub mode: MfskMode,
+    /// Decoded message text, NUL-terminated.
+    pub text: [core::ffi::c_char; MFSK_DECODE_TEXT_LEN],
+    /// Carrier frequency, Hz.
+    pub freq_hz: f32,
+    /// Time offset from the slot's `dt = 0` reference, seconds.
+    pub dt_sec: f32,
+    /// Estimated SNR in a 2500 Hz reference bandwidth, dB.
+    pub snr_db: f32,
+    /// Sync correlation score for this decode.
+    pub sync_score: f32,
+    /// Coefficient of variation of the per-block sync powers — near 0
+    /// on a stable channel, elevated under QSB or fading. Free to
+    /// report, and the only fading indicator the row carries.
+    pub sync_cv: f32,
+    /// Hard-decision errors the FEC had to correct.
+    pub hard_errors: u32,
+    /// Width of the FEC information block — 91 (CRC-14) or 101
+    /// (CRC-24). Says how many bits `mfsk_decoder_copy_info` returns.
+    pub info_bits: u16,
+    /// Which decode pass produced this row. **Protocol-private**: the
+    /// numbers mean different things for different modes, and are for
+    /// diagnostics, not for logic.
+    pub pass: u8,
+    /// Bit 0: the text required the callsign hash table to resolve a
+    /// `<...>` reference. Other bits reserved, currently zero.
+    pub flags: u8,
+}
+
+/// [`MfskDecode::flags`] bit 0.
+pub const MFSK_DECODE_FLAG_HASH_RESOLVED: u8 = 1 << 0;
+
+/// Opaque decode-session handle (FFI v2).
+///
+/// Deliberately **not** the same type as `MfskDecoder`, the pre-v2
+/// handle: the two own different Rust values, and a `MfskDecoder*` that
+/// wandered into `mfsk_session_close` (or the reverse) would be
+/// undefined behaviour that no compiler had any way to notice. Distinct
+/// incomplete types make that a C type error instead, which is what the
+/// legacy surface's own history argues for — it is being retired in
+/// part because a handle whose meaning depends on which function you
+/// pass it to is exactly the failure mode this redesign exists to end.
+///
+/// "Session" rather than "decoder" because it is the right word for
+/// what it owns: a callsign hash table and the previous slot's rows,
+/// both of which only mean anything across more than one call.
+pub struct MfskDecodeSession {
+    _marker: PhantomData<*mut ()>,
 }

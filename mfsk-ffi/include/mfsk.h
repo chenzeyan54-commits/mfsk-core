@@ -11,6 +11,25 @@
 #include <stdlib.h>
 
 /**
+ * Inline capacity of each `MfskDecodeParams` a-priori field.
+ *
+ * A literal here, not a re-export of `mfsk_ffi_abi`'s, for the same
+ * reason as the capability bits below: cbindgen writes the *name* into
+ * the struct it generates (`char ap_call1[MFSK_AP_FIELD_LEN]`) but
+ * cannot emit a `#define` for a constant that lives in a dependency,
+ * so the header referenced an undeclared identifier and would not
+ * compile. Caught by `tests/header_compile.sh`, which is exactly the
+ * check that did not exist before this branch.
+ */
+#define MFSK_AP_FIELD_LEN 16
+
+/**
+ * Capacity of `MfskDecode::text`, including the NUL. See
+ * [`MFSK_AP_FIELD_LEN`] for why it is a literal.
+ */
+#define MFSK_DECODE_TEXT_LEN 64
+
+/**
  * Drives the `DecodeRequest` builder, i.e. `mfsk_decode_i16` and
  * friends apply. Modes without this bit decode through their own
  * entry point (Q65 takes a nominal start sample and a tolerance;
@@ -145,6 +164,16 @@ typedef enum MfskProtocol {
  * passing `1`/`2` remain valid.
  */
 typedef enum MfskDecodeDepth {
+    /**
+     * Whatever the mode publishes as its default.
+     *
+     * Discriminant 0 used to be deliberately unassigned, which made a
+     * `memset`-to-zero options struct carry an invalid discriminant —
+     * harmless as a C int, undefined the moment Rust reads it as an
+     * enum. Giving 0 a meaning removes that edge and makes the
+     * obvious C idiom mean the obvious thing.
+     */
+    MFSK_DECODE_DEPTH_MODE_DEFAULT = 0,
     /**
      * Full LLR-variant staircase + BP, no OSD fallback.
      */
@@ -526,6 +555,24 @@ typedef struct MfskCallsignHashTable MfskCallsignHashTable;
 typedef struct MfskDecodeOptions MfskDecodeOptions;
 
 /**
+ * Opaque decode-session handle (FFI v2).
+ *
+ * Deliberately **not** the same type as `MfskDecoder`, the pre-v2
+ * handle: the two own different Rust values, and a `MfskDecoder*` that
+ * wandered into `mfsk_session_close` (or the reverse) would be
+ * undefined behaviour that no compiler had any way to notice. Distinct
+ * incomplete types make that a C type error instead, which is what the
+ * legacy surface's own history argues for — it is being retired in
+ * part because a handle whose meaning depends on which function you
+ * pass it to is exactly the failure mode this redesign exists to end.
+ *
+ * "Session" rather than "decoder" because it is the right word for
+ * what it owns: a callsign hash table and the previous slot's rows,
+ * both of which only mean anything across more than one call.
+ */
+typedef struct MfskDecodeSession MfskDecodeSession;
+
+/**
  * Opaque decoder handle. Construct with [`mfsk_decoder_new`], release
  * with [`mfsk_decoder_free`].
  * Emitted as an incomplete type (`struct X;`) rather than a struct with a
@@ -803,6 +850,173 @@ typedef struct MfskDecodeDefaults {
      */
     enum MfskSyncScale sync_scale;
 } MfskDecodeDefaults;
+
+/**
+ * Everything a decode can be asked to do, as one size-versioned
+ * struct passed by `const*`.
+ *
+ * This replaces an opaque handle with eight setter functions. Three
+ * reasons, in order of how much they matter:
+ *
+ * 1. **The handle was unsound.** Its accessor fabricated a
+ *    `&'static mut` from a raw pointer with no synchronisation, which
+ *    is UB under Stacked Borrows the moment two setters' borrows
+ *    overlap — single-threaded, never mind concurrently. A plain
+ *    `#[repr(C)]` struct the caller owns has no such question.
+ * 2. **Marshalling.** Kotlin and Swift wrappers copy one struct
+ *    instead of sequencing eight fallible calls.
+ * 3. **Growth is still safe**, via `size` — see [`MfskModeInfo`].
+ *
+ * Initialise with `mfsk_decode_params_init(mode, &params)`, which
+ * fills in that mode's published defaults; then override what you
+ * want. Zeroing the struct by hand is *not* equivalent: a zero
+ * `max_cand` or a zero frequency band decodes nothing.
+ */
+typedef struct MfskDecodeParams {
+    /**
+     * `sizeof(MfskDecodeParams)` as the caller understands it.
+     */
+    uint32_t size;
+    /**
+     * Low edge of the search band, Hz.
+     */
+    float freq_min_hz;
+    /**
+     * High edge of the search band, Hz.
+     */
+    float freq_max_hz;
+    /**
+     * Sync threshold. **Not comparable across modes** — see
+     * `MfskDecodeDefaults::sync_scale`.
+     */
+    float sync_min;
+    /**
+     * Candidate budget.
+     */
+    uint32_t max_cand;
+    /**
+     * Cost/recall rung.
+     */
+    enum MfskDecodeDepth depth;
+    /**
+     * Accept/reject threshold profile.
+     */
+    enum MfskStrictness strictness;
+    /**
+     * Equalisation. A property of the *input audio* — it flattens a
+     * passband an analogue filter has tilted — not of the search, so
+     * it belongs here rather than only on a narrow-band call.
+     */
+    enum MfskEqMode eq_mode;
+    /**
+     * Prioritise candidates near this frequency. NaN means unset,
+     * which is what `mfsk_decode_params_init` writes.
+     */
+    float freq_hint_hz;
+    /**
+     * Successive-interference-cancellation rounds, 0 for none.
+     * Requires `MFSK_CAP_SIC_ROUNDS`.
+     */
+    uint8_t sic_rounds;
+    /**
+     * Checkpoint-emulation early decode. Requires `MFSK_CAP_SIC_EARLY`.
+     */
+    bool sic_early;
+    /**
+     * Whether the three `ap_*` fields below carry a hint.
+     */
+    bool has_ap_hint;
+    /**
+     * A-priori hint: the transmitting station, NUL-terminated, or
+     * empty. Requires `MFSK_CAP_AP_WIDEBAND` (or `_AP_NARROW` on a
+     * narrow-band call).
+     */
+    char ap_call1[MFSK_AP_FIELD_LEN];
+    /**
+     * A-priori hint: the correspondent, or `"CQ"`.
+     */
+    char ap_call2[MFSK_AP_FIELD_LEN];
+    /**
+     * A-priori hint: the grid square.
+     */
+    char ap_grid[MFSK_AP_FIELD_LEN];
+    /**
+     * Half-width of a narrow-band search, Hz; 0 for the mode's
+     * default. Only meaningful with `MFSK_CAP_SNIPER`.
+     */
+    float search_hz;
+} MfskDecodeParams;
+
+/**
+ * One decoded transmission, written into caller memory.
+ *
+ * Shaped on `mfsk_core`'s own `msg::decoded::Decoded`, which
+ * `docs/notes/DECODED_ROW.md` says was made flat "precisely so it can
+ * map to a C struct in `mfsk-ffi` later". This is that later.
+ *
+ * Rows go into an array the caller allocates, which deletes the whole
+ * "a Rust global-allocator pointer crosses the boundary and must come
+ * back to be freed" category — the thing that makes Kotlin and Swift
+ * wrappers fiddly and leaks when an exception unwinds past the free.
+ */
+typedef struct MfskDecode {
+    /**
+     * `sizeof(MfskDecode)` as the caller understands it.
+     */
+    uint32_t size;
+    /**
+     * The **concrete sub-mode**, not the family. `Decoded::protocol`
+     * collapses all five FST4 periods onto one id; this must not,
+     * because the addressing model does not.
+     */
+    enum MfskMode mode;
+    /**
+     * Decoded message text, NUL-terminated.
+     */
+    char text[MFSK_DECODE_TEXT_LEN];
+    /**
+     * Carrier frequency, Hz.
+     */
+    float freq_hz;
+    /**
+     * Time offset from the slot's `dt = 0` reference, seconds.
+     */
+    float dt_sec;
+    /**
+     * Estimated SNR in a 2500 Hz reference bandwidth, dB.
+     */
+    float snr_db;
+    /**
+     * Sync correlation score for this decode.
+     */
+    float sync_score;
+    /**
+     * Coefficient of variation of the per-block sync powers — near 0
+     * on a stable channel, elevated under QSB or fading. Free to
+     * report, and the only fading indicator the row carries.
+     */
+    float sync_cv;
+    /**
+     * Hard-decision errors the FEC had to correct.
+     */
+    uint32_t hard_errors;
+    /**
+     * Width of the FEC information block — 91 (CRC-14) or 101
+     * (CRC-24). Says how many bits `mfsk_decoder_copy_info` returns.
+     */
+    uint16_t info_bits;
+    /**
+     * Which decode pass produced this row. **Protocol-private**: the
+     * numbers mean different things for different modes, and are for
+     * diagnostics, not for logic.
+     */
+    uint8_t pass;
+    /**
+     * Bit 0: the text required the callsign hash table to resolve a
+     * `<...>` reference. Other bits reserved, currently zero.
+     */
+    uint8_t flags;
+} MfskDecode;
 
 #ifdef __cplusplus
 extern "C" {
@@ -1484,6 +1698,135 @@ enum MfskStatus mfsk_mode_defaults(enum MfskMode mode,
  * deciding a header and a library agree.
  */
 uint32_t mfsk_abi_version(void);
+
+/**
+ * Fill `out` with `mode`'s published defaults.
+ *
+ * Always call this before touching a `MfskDecodeParams`. Zeroing it by
+ * hand is not equivalent: a zero `max_cand` or a zero band decodes
+ * nothing, and `freq_hint_hz` has to be NaN rather than 0 to mean
+ * "unset" — 0 Hz is a frequency.
+ *
+ * # Safety
+ * `out` must point to at least `out->size` writable bytes.
+ */
+enum MfskStatus mfsk_decode_params_init(enum MfskMode mode,
+                                        struct MfskDecodeParams *out);
+
+/**
+ * Create a decoder for `mode`, validated against `params`.
+ *
+ * `params` may be NULL for the mode's defaults. On failure this
+ * returns NULL and writes the reason to `out_status` (which may itself
+ * be NULL if you only care that it failed); `mfsk_last_error()` carries
+ * the detail.
+ *
+ * **A parameter the mode does not support is an error here**, not a
+ * field silently dropped at decode time.
+ *
+ * # Safety
+ * `params` must be null or point to a valid `MfskDecodeParams`.
+ */
+struct MfskDecodeSession *mfsk_session_open(enum MfskMode mode,
+                                            const struct MfskDecodeParams *params,
+                                            enum MfskStatus *out_status);
+
+/**
+ * Release a handle from [`mfsk_session_open`]. Null is a no-op.
+ *
+ * # Safety
+ * `dec` must be a handle from `mfsk_session_open`, released once.
+ */
+void mfsk_session_close(struct MfskDecodeSession *dec);
+
+/**
+ * The last error recorded **on this handle**, or NULL.
+ *
+ * Prefer this over `mfsk_last_error()` whenever you have a handle. The
+ * global one is a `thread_local!`, which a Kotlin coroutine or a Swift
+ * `async` caller reads as NULL after hopping threads between the status
+ * check and the message. The pointer is valid until the next call on
+ * this handle.
+ *
+ * # Safety
+ * `dec` must be a live handle or null.
+ */
+const char *mfsk_session_last_error(const struct MfskDecodeSession *dec);
+
+/**
+ * Decode one slot of 16-bit PCM.
+ *
+ * `params` may be NULL to use the handle's own, set at
+ * [`mfsk_session_open`]. Passing one here overrides for this call only
+ * and is validated the same way.
+ *
+ * Rows go into `out[0..out_cap]`; `*out_len` always receives the number
+ * of decodes found, so a short buffer returns
+ * `MFSK_STATUS_INVALID_ARG` with the required count rather than a
+ * truncated answer you cannot detect.
+ *
+ * # Safety
+ * `samples` must be `n_samples` readable `int16_t`; `out` must be
+ * `out_cap` writable `MfskDecode`.
+ */
+enum MfskStatus mfsk_session_decode_i16(struct MfskDecodeSession *dec,
+                                        const int16_t *samples,
+                                        uintptr_t n_samples,
+                                        uint32_t sample_rate,
+                                        const struct MfskDecodeParams *params,
+                                        struct MfskDecode *out,
+                                        uintptr_t out_cap,
+                                        uintptr_t *out_len);
+
+/**
+ * Decode one slot of 32-bit float PCM, nominally `-1.0..=1.0`.
+ *
+ * **Not a lossier wrapper.** The pre-v2 `mfsk_decode_f32` quantised
+ * f32 to i16 before decoding, which made the float entry point
+ * strictly worse than the integer one; this resamples in float and
+ * converts once at the end, where the decoders take i16 anyway.
+ *
+ * # Safety
+ * As [`mfsk_session_decode_i16`], with `samples` as `float`.
+ */
+enum MfskStatus mfsk_session_decode_f32(struct MfskDecodeSession *dec,
+                                        const float *samples,
+                                        uintptr_t n_samples,
+                                        uint32_t sample_rate,
+                                        const struct MfskDecodeParams *params,
+                                        struct MfskDecode *out,
+                                        uintptr_t out_cap,
+                                        uintptr_t *out_len);
+
+/**
+ * FEC information bits for the `index`-th row of the last decode.
+ *
+ * The raw bits are deliberately not a row field: they are 91 or 101
+ * bytes and only a caller doing subtraction or persistence wants them.
+ * `MfskDecode::info_bits` says how many there are.
+ *
+ * # Safety
+ * `out` must be `cap` writable bytes.
+ */
+enum MfskStatus mfsk_session_copy_info(const struct MfskDecodeSession *dec,
+                                       uintptr_t index,
+                                       uint8_t *out,
+                                       uintptr_t cap,
+                                       uintptr_t *out_len);
+
+/**
+ * Teach the handle a callsign, so a later slot's `<...>` reference to
+ * it resolves.
+ *
+ * Decoded messages populate the table automatically; this is for
+ * callsigns known from outside the decoder — a band map, a previous
+ * session, an operator's log.
+ *
+ * # Safety
+ * `call` must be a valid NUL-terminated C string.
+ */
+enum MfskStatus mfsk_session_add_callsign(struct MfskDecodeSession *dec,
+                                          const char *call);
 
 /**
  * Library version, major.minor.patch packed into a 32-bit integer (8

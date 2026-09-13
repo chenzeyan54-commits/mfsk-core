@@ -281,6 +281,95 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
 
 ### Added
 
+- **A decode session: one struct of parameters, rows into caller memory,
+  and a callsign table that survives the slot.** `mfsk_session_open` /
+  `_decode_i16` / `_decode_f32` / `_copy_info` / `_add_callsign` /
+  `_last_error` / `_close`, plus `mfsk_decode_params_init`.
+
+  Three defects it removes, in order of how much they mattered:
+
+  **Hashed callsigns could never resolve over this ABI.** Every decode
+  call built a fresh empty `CallsignHashTable` (`:927`, `:987`,
+  `:1137`), so a `<...>` reference had nothing to look up — for any
+  protocol, in any call, since the ABI was written. A table is worth
+  something only if it outlives the slot that populated it, which is
+  why the session owns one; it is fed from each decode and from
+  `mfsk_session_add_callsign` for callsigns known from a band map or a
+  log. `tests/v2_decode.rs` pins both halves against a type-4 message,
+  whose text reads `<...> JA1ABC/QRP` until the table has seen the
+  standard call.
+
+  **The options handle was unsound.** `options_inner_mut` fabricated a
+  `&'static mut` from a raw pointer with no synchronisation, which is UB
+  under Stacked Borrows the moment two setters' borrows overlap —
+  single-threaded, never mind concurrently. `MfskDecodeParams` is a
+  plain `#[repr(C)]` struct the caller owns, which has no such question,
+  and replaces eight fallible setter calls with one marshalling step for
+  Kotlin and Swift.
+
+  **Unsupported options were dropped in silence**, and one was silently
+  *upgraded*. `ap_hint` reached FT8 only, `sic_rounds` FT8+FT4,
+  `strictness` was a no-op on FST4 — and `MFSK_DECODE_DEPTH_BP_ALL` was
+  quietly promoted to the full ladder, so a caller asking for the cheap
+  path paid for the expensive one. On FST4-300 that ladder sits behind a
+  4 194 304-point transform. Now `mfsk_session_open` returns
+  `MFSK_STATUS_UNSUPPORTED` with a message naming the mode and the
+  capability, and a mode with no decode handle at all is refused there
+  rather than failing later with a confusing complaint about `max_cand`.
+
+  Rows go into a caller-allocated `MfskDecode[]`, which deletes the
+  "a Rust global-allocator pointer crosses the boundary and must come
+  back to be freed" category for decode results. A short buffer returns
+  `MFSK_STATUS_INVALID_ARG` with `*out_len` set to the count needed, so
+  a caller can size and retry rather than get a truncation it cannot
+  detect. The FEC information bits stay off the row — 91 or 101 bytes
+  only a subtracting or persisting caller wants — and come back through
+  `mfsk_session_copy_info`.
+
+  `MfskDecode::mode` is the **concrete sub-mode**: `Decoded::protocol`
+  collapses all five FST4 periods onto one id and the C row must not,
+  because the addressing model does not.
+
+- **Three things the type system and the new gates caught**, each of
+  which would otherwise have shipped:
+
+  **A `memset`-to-zero params struct was undefined, not merely
+  invalid.** `MfskDecodeDepth` left discriminant 0 deliberately
+  unassigned, so the commonest C idiom produced a value Rust has no
+  variant for — and reading it as a Rust enum is UB, not a wrong
+  answer. Found by `rustc` refusing to zero-initialise the type in a
+  test. Fixed at both ends: `MFSK_DECODE_DEPTH_MODE_DEFAULT = 0` gives
+  zero a meaning, and `read_params` validates every enum and bool field
+  *as an integer* before the caller's bytes are ever read as Rust
+  types. That is the same class of defect as the `&'static mut`
+  accessor being replaced, so it would have been a poor thing to
+  reintroduce in the replacement.
+
+  **Two handle types were sharing one opaque C type.** The new session
+  and the legacy `MfskDecoder` own different Rust values, and a pointer
+  that wandered from one to the other's free function was UB no compiler
+  could notice. `MfskDecodeSession` is a distinct incomplete type, so
+  mixing them is a C type error. ("Session" is also the right word: it
+  owns a hash table and the previous slot's rows, both of which only
+  mean anything across more than one call.)
+
+  **The generated header did not compile as C++.** `MFSK_AP_FIELD_LEN`
+  and `MFSK_DECODE_TEXT_LEN` live in `mfsk-ffi-abi`, and cbindgen writes
+  the *name* into the struct it generates while being unable to emit a
+  `#define` for a dependency's constant — so `char text[…]` referenced
+  an undeclared identifier. Caught by `tests/header_compile.sh`, added
+  earlier in this same section; the fix is the same one the capability
+  bits needed.
+
+- **The float decode path no longer loses dynamic range at 12 kHz.**
+  `resample_f32_to_12k` interpolates in f64 and peak-normalises to 0.8
+  full-scale before quantising, but the pre-v2 path took that route only
+  when a resample was needed and did a bare `(s * 32767.0) as i16` at
+  12 kHz. So a quiet float buffer — a USB radio adapter at a low system
+  volume, which is the case that normalisation exists for — was worse
+  off at the one rate that needed no work. The session converts through
+  the normalising path unconditionally.
+
 - **The C ABI can be asked what it supports, instead of being guessed
   at.** `mfsk_version()` was the entire introspection surface, while
   `registry::PROTOCOLS` — which knows every wired mode with full

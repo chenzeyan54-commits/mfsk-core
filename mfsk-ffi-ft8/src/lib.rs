@@ -183,6 +183,11 @@ fn map_depth(d: MfskDecodeDepth) -> DecodeDepth {
     match d {
         MfskDecodeDepth::BpAll => DecodeDepth::BP_ONLY,
         MfskDecodeDepth::BpAllOsd => DecodeDepth::FULL,
+        // Discriminant 0 used to be unassigned, so a `memset`-to-zero
+        // options struct carried an invalid value. It now means "the
+        // mode's default", which here is the full ladder — this crate
+        // decodes FT8 and nothing else.
+        MfskDecodeDepth::ModeDefault => DecodeDepth::FULL,
     }
 }
 
