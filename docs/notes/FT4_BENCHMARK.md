@@ -3429,3 +3429,70 @@ the idea but the **size**: on this board a table large enough to
 displace the internal-DRAM working set makes unrelated code slower,
 and the code it slowed was in the same function, two call sites away.
 Before caching anything here, ask what it evicts.
+
+## 48. The residual AWGN gap was a missing AP pass (2026-09-13)
+
+Section 9 closed most of a ~1.8 dB gap against WSJT-X's published
+-17.5 dB and left ≈0.8 dB, later measured at 0.61 dB (baseline
+-16.89 dB). Section 10 ruled out BP/OSD decode strength. The remainder
+was neither: **WSJT-X runs a-priori passes on every FT4 decode, and
+mfsk-core ran none unless the caller supplied a hint.**
+
+`ft4_decode.f90:328` is `npasses = 3 + nappasses(nQSOProgress)` — three
+plain LLR passes, then AP passes. Its `iaptype = 1` (`:361-368`) locks
+the first 29 bits to the CQ pattern (`apmask(1:29)=1`,
+`llrd(1:29)=apmag*mcq(1:29)`) and needs **no knowledge of the station
+at all**. `fst4_decode.f90:419,445` is the same structure.
+
+FT8 has had the equivalent since issue #190 — its Pass 12 blind-CQ —
+and adding it is what closed FT8's own gap against its published
+figure. FT4 and FST4 never got one. `BLIND_CQ_MIN_NSYNC`'s doc comment
+claimed `msg::pipeline_ap::ap_passes`' pass 7 was the FT4/FST4 analog;
+it is not. Pass 7 requires the correspondent's callsign, making it
+upstream's iaptype 2/3. Nothing here corresponded to iaptype 1, so a
+blind FT4 decode attempted no AP whatsoever.
+
+Two fixes landed together, and the first was load-bearing for the
+second: FT4/FST4 AP had been locking roughly half its bits to the
+**opposite** of the truth, because an `ApHint` describes the message
+while these protocols XOR it with their RVEC before FEC — so the
+codeword carries the scrambled message. Until that was corrected, an
+always-on AP pass would have made things worse, not better.
+
+### Result — `ft4sim` sweep, 40 trials/point, 1 dB grid
+
+| channel | before | after | delta |
+|---|---:|---:|---:|
+| AWGN | -16.89 dB | **-18.00 dB** | **-1.11 dB** |
+| CCIR good | -17.46 dB | -17.62 dB | -0.15 dB |
+| CCIR moderate | -15.71 dB | -16.33 dB | -0.62 dB |
+| CCIR poor | -16.00 dB | -16.25 dB | -0.25 dB |
+
+AWGN now sits 0.5 dB **ahead** of the published -17.5 dB, where it was
+0.6 dB behind.
+
+### Read this number for what it is
+
+**The sweep corpus transmits `CQ JL1NIE PM95`** (`gen_ft4_sweep_wavs.sh`),
+so the blind CQ prior is hinting the exact message being sent. This is
+the best case for the change, and it is the same best case WSJT-X's own
+published figure enjoys, since upstream runs the same pass. It is not a
+generic +1.1 dB.
+
+On mixed traffic the effect is nil and, importantly, harmless: the
+WSJT-X golden (`000000_000002.wav`, 14 reference messages, mostly
+exchange frames) still decodes 11/14 single-pass and 14/14 with SIC,
+both with **extra 0** — the three the CQ prior cannot reach are exchange
+frames, and nothing was invented. `tests/ft4_ap_scramble.rs` holds the
+precision line directly: a hint for a station that is not transmitting
+does not produce that station, at three SNRs and against pure noise.
+
+### Still open
+
+`apmag` is `max(|llr|) * 1.01` here (`fec/ldpc/mod.rs:162`) against
+upstream's `* 1.1` (`ft4_decode.f90:327`, `fst4_decode.f90:418`) — the
+AP bits get a weaker vote than WSJT-X gives them. Not yet measured
+either way.
+
+FST4 got the same pass and its golden is unaffected, but its sweep has
+not been re-run.

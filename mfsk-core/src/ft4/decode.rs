@@ -75,23 +75,35 @@ impl FrameDecodable for Ft4 {
         let on_result: Option<&(dyn Fn(&DecodeResult) + Sync)> = filtered_cb
             .as_ref()
             .map(|f| f as &(dyn Fn(&DecodeResult) + Sync));
-        // Every a-priori hypothesis WSJT-X would try from this hint,
-        // not just the caller's literal one — see `ap_passes`. Built
-        // here because `ApHint` is a `msg` type and the engine takes
-        // plain slices.
-        let ap_owned: Vec<(Vec<u8>, Vec<u8>, u8)> = req
+        // Every a-priori hypothesis WSJT-X would try, not just the
+        // caller's literal hint — and the blind CQ one **whether or
+        // not a hint was given at all**.
+        //
+        // WSJT-X runs AP passes on every decode: `ft4_decode.f90:328`
+        // `npasses = 3 + nappasses(nQSOProgress)`, and its `iaptype = 1`
+        // locks the first 29 bits to the CQ pattern using no knowledge
+        // of the station at all. mfsk-core ran AP only when a caller
+        // supplied a hint, so a blind decode attempted none — while FT8
+        // has had the equivalent since issue #190, where adding it is
+        // what closed FT8's own gap against the published figure.
+        //
+        // (`ap_passes`' pass 7 is *not* this: it needs the
+        // correspondent's callsign, so it is upstream's iaptype 2/3,
+        // not 1. `BLIND_CQ_MIN_NSYNC`'s doc comment claims otherwise
+        // and is wrong.)
+        let mut ap_hints: Vec<(crate::msg::ap::ApHint, u8)> = req
             .ap_hint
             .filter(|h| h.has_info())
-            .map(|h| {
-                crate::msg::pipeline_ap::ap_passes(h)
-                    .into_iter()
-                    .map(|(cfg, pid)| {
-                        let (m, v) = crate::msg::pipeline_ap::ap_bits_for::<Ft4>(&cfg);
-                        (m, v, pid)
-                    })
-                    .collect()
-            })
+            .map(crate::msg::pipeline_ap::ap_passes)
             .unwrap_or_default();
+        ap_hints.push((crate::msg::ap::ApHint::new().with_call1("CQ"), 12));
+        let ap_owned: Vec<(Vec<u8>, Vec<u8>, u8)> = ap_hints
+            .iter()
+            .map(|(cfg, pid)| {
+                let (m, v) = crate::msg::pipeline_ap::ap_bits_for::<Ft4>(cfg);
+                (m, v, *pid)
+            })
+            .collect();
         let ap: Vec<(&[u8], &[u8], u8)> = ap_owned
             .iter()
             .map(|(m, v, pid)| (m.as_slice(), v.as_slice(), *pid))

@@ -1809,15 +1809,19 @@ where
 /// with zero recall change on any golden test, while leaving the
 /// CCIR-sweep fix fully intact.
 ///
-/// **FT4/FST4 analog**: this Pass 12 blind-CQ pass is FT8's own
-/// bespoke equivalent of [`crate::msg::pipeline_ap::ap_passes`]'s
-/// `pass 7` (CQ + DX call), which FT4/FST4 reach via
-/// `msg::pipeline_ap`. Independent implementations, independently
-/// tuned — review both when adjusting either (issue #285, split from
-/// #192). No shared numeric threshold to ratchet-test here (unlike
-/// FT8's OSD-escalation `Q_NDEEP3_THRESHOLD`, see
-/// `ft8::decode_block::osd_strategy`) — `ap_passes` doesn't gate pass
-/// 7 on an nsync value of its own.
+/// **FT4/FST4 analog**: they now push the same
+/// `ApHint::new().with_call1("CQ")` hypothesis onto their own AP list
+/// unconditionally, gated on `osd_escalation_gates`' attempt threshold
+/// rather than on a constant of their own.
+///
+/// This comment used to name `msg::pipeline_ap::ap_passes`' `pass 7`
+/// (CQ + DX call) as the analog. **It is not**: pass 7 requires the
+/// correspondent's callsign, which makes it upstream's iaptype 2/3.
+/// Nothing corresponded to iaptype 1 — the pass that needs no
+/// knowledge of the station — so a blind FT4/FST4 decode ran no AP at
+/// all, and that was worth 1.1 dB of AWGN sensitivity on FT4
+/// (`docs/notes/FT4_BENCHMARK.md` §48). Review all three when
+/// adjusting any (issue #285, split from #192).
 #[cfg(feature = "fft-rustfft")]
 const BLIND_CQ_MIN_NSYNC: u32 = 12;
 

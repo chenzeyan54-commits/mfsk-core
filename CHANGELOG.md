@@ -59,6 +59,44 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
 
 ### Fixed
 
+- **FT4's residual sensitivity gap against WSJT-X was a missing
+  a-priori pass: −16.89 dB → −18.00 dB AWGN.** WSJT-X runs AP passes on
+  *every* FT4 and FST4 decode — `ft4_decode.f90:328`'s
+  `npasses = 3 + nappasses(…)`, whose `iaptype = 1` locks the first 29
+  bits to the CQ pattern using no knowledge of the station at all.
+  mfsk-core ran AP only when a caller supplied a hint, so a blind decode
+  attempted none.
+
+  FT8 has had the equivalent since issue #190, and adding it there is
+  what closed FT8's own gap against its published figure.
+  `BLIND_CQ_MIN_NSYNC`'s doc claimed `ap_passes`' pass 7 was the
+  FT4/FST4 analog; it is not — pass 7 needs the correspondent's
+  callsign, making it upstream's iaptype 2/3. Nothing corresponded to
+  iaptype 1.
+
+  | channel | before | after |
+  |---|---:|---:|
+  | AWGN | −16.89 dB | **−18.00 dB** |
+  | CCIR good | −17.46 dB | −17.62 dB |
+  | CCIR moderate | −15.71 dB | −16.33 dB |
+  | CCIR poor | −16.00 dB | −16.25 dB |
+
+  AWGN now sits 0.5 dB **ahead** of WSJT-X's published −17.5 dB, where
+  it was 0.6 dB behind. The gap history in `FT4_BENCHMARK.md` runs
+  1.8 dB → 0.8 dB (§9, sync) → 0.6 dB → ahead (§48, this).
+
+  **Read the number for what it is.** The sweep corpus transmits
+  `CQ JL1NIE PM95`, so the blind CQ prior is hinting the exact message
+  being sent — the best case, and the same best case upstream's
+  published figure enjoys, since WSJT-X runs the same pass. On mixed
+  traffic it changes nothing and invents nothing: the WSJT-X golden
+  still decodes 11/14 single-pass and 14/14 with SIC, both with
+  `extra 0`. The three it cannot reach are exchange frames, which a CQ
+  prior structurally cannot help.
+
+  This depended on the scramble fix below. Until that landed, an
+  always-on AP pass would have made FT4 *worse*.
+
 - **FT4 and FST4 a-priori decoding locked about half its bits to the
   wrong value, and had done so for as long as it existed.** An `ApHint`
   describes the *message*; FT4 and FST4 XOR that message with their own

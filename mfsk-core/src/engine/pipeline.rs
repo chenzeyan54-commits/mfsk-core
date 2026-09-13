@@ -1351,7 +1351,14 @@ where
             // bits "are". `strictness.ap_max_errors(locked)` is the
             // ceiling that keeps it honest, and it tightens as more bits
             // are locked.
-            for (mask, values, ap_pass_id) in ap {
+            // Gated on the same `nsync` the OSD escalation uses. A
+            // candidate that rung declined is the same bet here, and
+            // the gate is already calibrated per protocol
+            // (`osd_escalation_gates`). WSJT-X bounds its own AP passes
+            // by frequency proximity to the QSO target instead
+            // (`ft4_decode.f90`'s `napwid`), which assumes an operator
+            // aim point this API does not have.
+            for (mask, values, ap_pass_id) in ap.iter().filter(|_| nsync >= osd_attempt_min) {
                 // `ap_bits_for` has already put these in codeword space
                 // (scrambled where the protocol scrambles), because the
                 // hint describes the message and the decoder does not.
