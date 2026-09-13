@@ -2,9 +2,31 @@
 
 ## 0.10.2 — the M5StickS3 USB-host claim said more than the measurement did
 
-**Why a patch bump.** Additive public API, an embedded-only fix,
-documentation and release tooling. No host decoder behaviour change and
-no measured sensitivity movement.
+**This section no longer describes a patch.** It opened as one —
+additive API, an embedded-only fix, documentation and release tooling,
+with no host decoder behaviour change and no measured sensitivity
+movement. Two later batches changed that and the heading has to say so
+before this is tagged:
+
+- **The public API breaks.** `SniperRequest` is gated on a new
+  `SupportsSniper`, implemented for `Ft8` alone, so
+  `DecodeRequest::<Ft4>::sniper` and the five FST4 equivalents no
+  longer exist and `mfsk_decode_{i16,f32}_sniper` returns
+  `MFSK_STATUS_UNKNOWN_PROTOCOL` for those protocols.
+- **Host decode behaviour and sensitivity both move.** FT4 and FST4
+  a-priori decoding was locking about half its bits to the opposite of
+  the truth, and neither ran the blind CQ pass upstream runs on every
+  decode. FT4's AWGN threshold goes −16.89 → −18.00 dB. FST4's is
+  unchanged across all twenty sweep cells, measured, for a reason
+  recorded in `FST4_BENCHMARK.md` §16.
+
+By this crate's own convention that makes the next tag a **minor** bump
+rather than a patch — the precedent is `0.7.0` (the generic
+`decode_frame_for::<P>` API) and `0.10.0` (three public
+search-parameter type changes), both structural or breaking rather than
+merely capable. The version in `Cargo.toml` has not been moved yet;
+that is a release decision, not a merge one.
+
 This section accumulates until the next tag — see `CLAUDE.md`'s
 "Release cadence".
 
@@ -56,8 +78,6 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
   too large for one 0.725 s gap being carried rather than truncated.
   `SlotAccum::phase_error` exposes the same number for the receiver to
   log.
-
-### Fixed
 
 - **The AP magnitude is upstream's per-protocol value, not one constant.**
   `apmag = max(|llr|) * scale` decides how far above the strongest
