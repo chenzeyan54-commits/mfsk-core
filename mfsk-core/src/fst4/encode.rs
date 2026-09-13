@@ -12,7 +12,7 @@
 use alloc::vec::Vec;
 
 use super::Fst4s60;
-use crate::engine::dsp::gfsk::{GfskCfg, synth_f32, synth_i16};
+use crate::engine::dsp::gfsk::{GfskCfg, synth_f32, synth_f32_into, synth_i16, synth_i16_into};
 use crate::engine::{FecCodec, FrameLayout, ModulationParams};
 use crate::fec::Ldpc240_101;
 
@@ -110,6 +110,55 @@ pub fn message_to_tones(message77: &[u8; 77]) -> Vec<u8> {
     let mut cw = [0u8; 240];
     codec.encode(&info, &mut cw);
     crate::engine::tx::codeword_to_itone::<Fst4s60>(&cw)
+}
+
+/// Output sample count for one FST4 transmission at the geometry `cfg`
+/// describes — `N_SYMBOLS x samples_per_symbol`.
+///
+/// FT8 and FT4 each expose this as a `TONES_OUTPUT_LEN` constant
+/// because each has exactly one geometry. FST4 has five, differing only
+/// in `NSPS` (720 / 1 680 / 3 888 / 8 200 / 21 504), so the answer is a
+/// function of the sub-mode's config rather than a constant. Every
+/// sub-mode shares `N_SYMBOLS = 160`: the LDPC(240, 101) codeword is
+/// 240 bits at 2 bits/symbol = 120 data symbols plus 40 sync — a
+/// property of the FEC, not of the period.
+///
+/// Exists so a caller can size a buffer *before* it has the tones,
+/// which is what the zero-allocation `*_into` pair below needs, and
+/// what a C caller needs in order to allocate at all.
+pub const fn synth_sample_count(cfg: &GfskCfg) -> usize {
+    (<Fst4s60 as FrameLayout>::N_SYMBOLS as usize) * cfg.samples_per_symbol
+}
+
+/// Synthesise into a caller-provided f32 PCM buffer. **No allocation of
+/// the output**; `out.len()` must equal [`synth_sample_count`]`(cfg)`.
+///
+/// Unlike FT8's and FT4's `tones_to_f32_into`, this takes the GFSK
+/// config explicitly. That is not an inconsistency to tidy away: those
+/// two have one geometry each and can bake it in, while an FST4 tone
+/// sequence is period-independent and only becomes a particular
+/// waveform once a sub-mode's config is applied. Baking one in would
+/// silently mean FST4-60A — the latent trap the plain `tones_to_f32`
+/// wrapper below already carries.
+pub fn tones_to_f32_into(out: &mut [f32], itone: &[u8], f0: f32, amplitude: f32, cfg: &GfskCfg) {
+    debug_assert_eq!(itone.len(), <Fst4s60 as FrameLayout>::N_SYMBOLS as usize);
+    debug_assert_eq!(out.len(), synth_sample_count(cfg));
+    synth_f32_into(out, itone, f0, amplitude, cfg)
+}
+
+/// Synthesise into a caller-provided i16 PCM buffer. Peak equals
+/// `amplitude_i16`; `out.len()` must equal [`synth_sample_count`]`(cfg)`.
+/// See [`tones_to_f32_into`] for why `cfg` is explicit.
+pub fn tones_to_i16_into(
+    out: &mut [i16],
+    itone: &[u8],
+    f0: f32,
+    amplitude_i16: i16,
+    cfg: &GfskCfg,
+) {
+    debug_assert_eq!(itone.len(), <Fst4s60 as FrameLayout>::N_SYMBOLS as usize);
+    debug_assert_eq!(out.len(), synth_sample_count(cfg));
+    synth_i16_into(out, itone, f0, amplitude_i16, cfg)
 }
 
 /// Synthesise a 12 kHz f32 PCM waveform from an FST4 tone sequence
