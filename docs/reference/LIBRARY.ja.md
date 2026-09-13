@@ -738,20 +738,60 @@ equalize / pipeline ドライバも同じスタイルで、プロトコル型を
   `.sic_rounds(n)` / `.sic_early()` のいずれかで successive-
   interference-cancellation 戦略を選択 (`SupportsSicRounds`:
   FT8+FT4、`n`は1..=3にクランプ。`SupportsSicEarly`: FT8のみ、
-  チェックポイント構造は3固定) をチェーンする。`.decode()` で
+  チェックポイント構造は3固定)、そして `.budget(check)`
+  (呼び出し側が与える wall-clock デッドライン述語。後述) を
+  チェーンする。`.decode()` で
   `DecodeOutcome<P>` (`.results: Vec<P::DecodeResult>`、後続呼び出し用の
-  `.fft_cache` も含む) を得る。
+  `.fft_cache`、`.budget: BudgetReport`) を得る。
 * **`SniperRequest<P>`** — narrow-band、単一ターゲット探索。
   `DecodeRequest::<P>::sniper(audio, target_freq_hz, max_cand)` または
   `SniperRequest::<P>::new(...)` を直接呼ぶ。`.osd(bool)`、
   `.strictness(...)`、`.eq_mode(...)`、プロトコルのメッセージ
   コーデックが `WsjtApCompatible` を実装していれば `.ap_hint(...)`
-  (SIC バリアントは無し — sniper モードは元々単一候補)。
+  (SIC バリアントは無し — sniper モードは元々単一候補)、
+  `.budget(check)` (上と同じ)。
   `.decode()` は同じ `DecodeOutcome<P>` 形状を返す。
 
 これにより FT8 の `decode_frame*`/`decode_frame_subtract*`/
 `decode_sniper*` 系 (公開関数 15 個) と FT4/FST4 独自の同種の
 suffix 展開を置き換えた — §6.2/§6.4 に実例がある。
+
+#### 計算予算: `.budget(check)`
+
+`check: &(dyn Fn() -> bool + Sync)` が `false` を返した時点で、
+デコードはそれ以上の作業を**開始しない**。何が積み残されたかは
+`DecodeOutcome::budget` (`exhausted`、`candidates_skipped`、
+`stages_run`、切り捨てた中で最良の候補の sync スコア) が返す。
+オプトインであり、指定しなければ従来どおりの挙動。
+
+クロージャであること、そして `mfsk-core` 自身が時計を持たないことは
+意図的である: `wasm32-unknown-unknown` は `Instant::now` が未実装で、
+`no_std` にはそもそも無い。時計は呼び出し側が渡す — host は
+`Instant`、ブラウザは `performance.now()`、組込みは
+`esp_timer_get_time`。`FnMut` ではなく `Sync` なのは、捕捉した絶対
+デッドラインを候補ごとに借用し直さず `rayon` バッチ全体で共有できる
+ようにするため。`wspr::decode` の `budget` 引数と同じ形。
+
+**予算の使われ方は戦略ごとに違う。** 既定の single-pass は
+*cheapest-first*: まず安い sync トリアージを全候補に通し (ここは
+予算で止めない — 順序を作るのがこの掃引であり、しかも高価な
+58 シンボル DFT の前に候補の ~82% を捨てる段でもある)、生き残りを
+sync 品質順に並べ、その順にラダーを回して予算が尽きた時点で止める。
+`qso3_busy.wav` では予算 1/2/4/8 候補で実際に 1/2/4/8 件デコードでき
+(帯域の下端から順に拾うのではなく強い順)、16 で非予算時の全 14 件に
+到達する。SIC 戦略は既存の順序のまま候補境界・ラウンド境界でのみ
+ポーリングする — 各デコードは次の候補を見る前に残差から減算される
+ので、その順序自体がアルゴリズムだから。
+
+トリアージ掃引は**下限**である: 予算で止めないので、それより短い
+予算は「掃引の時間は使った上で何も返さない」。`bench/wasm` を Node
+で回した実測 (`qso3_busy.wav`) で、デコード全体 ~28 ms のうち
+~13 ms — 予算 5/10 ms は 0 局、20 ms で全 14 局。下限そのものを
+動かす knob は `max_cand` であり、`.budget(..)` はその上を配分する。
+
+実装済みはFT8。FT4/FST4 は `.budget(..)` を受け取るが無視し、
+`BudgetReport::default()` を返す。プレーンな `decode_block` FT8 API
+(§4、組込みボードが呼ぶ方) は影響を受けない。
 
 `DecodeDepth` (`llr_effort`/`osd`) という型自体は残っている ——
 `decode_block`/`decode_block_into` (embedded/host共通のプレーン関数

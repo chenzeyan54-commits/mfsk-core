@@ -59,6 +59,89 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
 
 ### Added
 
+- **`DecodeRequest::budget` / `SniperRequest::budget` — FT8 decodes
+  cheapest-first inside a caller's wall-clock allowance.** A decode can
+  now be handed a caller-supplied deadline predicate
+  (`BudgetCheck<'a> = &'a (dyn Fn() -> bool + Sync)`), and
+  `DecodeOutcome` carries a `BudgetReport` saying what was left undone.
+  Host and WASM callers have had no way to bound decode wall-clock at
+  all: `max_cand`, `sync_min` and `.osd(bool)` are all chosen before the
+  audio is seen, so a browser tab or a phone has to configure for its
+  worst slot and pay that on every slot.
+
+  **A closure rather than a `fn` pointer, and no clock in this crate.**
+  `std::time::Instant::now` is unimplemented on
+  `wasm32-unknown-unknown` and absent on `no_std`, so the caller
+  supplies the clock — host `Instant`, browser `performance.now()`,
+  embedded `esp_timer_get_time`. A `fn` pointer cannot capture that
+  deadline, which is why `fst4::rung_major`'s existing `budget_ok:
+  Option<fn() -> bool>` forced its embedded consumer to route the
+  deadline through a per-core `UnsafeCell` global; `wspr::decode`'s
+  `budget` parameter already uses the closure shape adopted here, and
+  its `Sync` bound is what lets one captured deadline be shared across a
+  `rayon` batch.
+
+  **What "cheapest-first" buys, measured.** On `qso3_busy.wav` at the
+  host research config, the budgeted single-pass decode returns the
+  *strongest* n signals rather than the first n across the band: a
+  budget of 1/2/4/8 candidates returns 1/2/4/8 real decodes, and 16
+  reaches the full set of 14 that the unbudgeted decode finds. The
+  scheduler gets that by sweeping the cheap sync triage across every
+  candidate first — the gate that already rejects ~82 % of them before
+  the 58-symbol DFT — then ordering the survivors by sync quality and
+  spending the budget down that order. Phase one is never gated: it is
+  what produces the ordering, and gating it would put the schedule back
+  at the mercy of frequency order.
+
+  **Deferring OSD to a second sweep was built and measured worse, so it
+  is not here.** Running a cheap BP-only sweep across every survivor and
+  offering OSD only to the failures is the obvious next move — OSD is
+  ~30 % of an FT8 decode's wall-clock for ~30 % of its decodes. Same
+  build, same WAV, budget in wall-clock ms through `bench/wasm`:
+  interleaved returns 8/13/14 stations at 15/17/20 ms where the deferred
+  schedule returns 7/11/11, and finishes the whole decode in 28 ms
+  against 36 ms. The second sweep has to recompute each revisited
+  candidate's LLR/BP ladder, and that costs more than the OSD it
+  deferred — even with the 58 data-symbol DFTs retained across the two
+  passes, which was the first thing tried. Issue #284 measured the same
+  direction on the SIC engine for the same reason. The table is recorded
+  at the scheduler so it is not re-attempted blind.
+
+  **The triage sweep is a floor.** It is never gated — that is what
+  makes the schedule independent of frequency order — so a budget
+  shorter than the sweep returns nothing, having spent the sweep's time
+  anyway. Measured through `bench/wasm` under Node on `qso3_busy.wav`:
+  ~13 ms of a ~28 ms decode, so 5 ms and 10 ms budgets return zero
+  stations in ~13 ms while a 20 ms budget returns all 14. `max_cand`
+  remains the knob for the floor itself. `bench/wasm` gained
+  `decode_wav_budget(audio, budget_ms)` and `bench.mjs` an
+  `MFSK_BENCH_BUDGET_MS=5,10,20` sweep to reproduce that table.
+
+  The SIC strategies (`.sic_rounds(n)`, `.sic_early()`) take the
+  predicate too, but only poll at candidate and round boundaries, in
+  their existing order. They cannot be reordered — each accepted decode
+  is subtracted from the residual before the next candidate is looked
+  at, so the order is the algorithm — and the poll deliberately sits
+  *before* a candidate rather than between accepting a decode and
+  subtracting it, since a cut in that window would leave an
+  unsubtracted signal for the next round's `coarse_sync` to re-find as
+  a duplicate. `tests/ft8_budget_scheduler.rs` asserts that directly.
+
+  **FT4 and FST4 accept `.budget(..)` and ignore it** for now, reporting
+  `BudgetReport::default()`. FT8's own `decode_block` driver — what the
+  ESP32 boards run — is untouched and keeps its app-level deadline.
+
+  Because the API takes a closure and not a clock, the tests get a
+  device-independent unit for free: a predicate backed by a counter
+  cuts after exactly n candidates on every machine and thread count.
+  A host is ~50× a CoreS3, so a wall-clock cap in a test would have
+  asserted on the machine rather than on the scheduler.
+
+  `DecodeOutcome` gaining a field is additive for anyone reading
+  `.results` / `.fft_cache` (which is every known consumer, `mfsk-ffi`
+  included) and source-breaking only for a downstream that constructs
+  the struct itself.
+
 - **`mfsk_decode_i16_sniper` / `mfsk_decode_f32_sniper` — single-target
   decode over the C ABI (#249).** Where `mfsk_decode_i16` searches a
   band, these aim at one `target_freq_hz`: the shape for a caller who

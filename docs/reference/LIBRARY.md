@@ -760,25 +760,66 @@ points, §6.3/§6.5):
   `.sic_rounds(n)` / `.sic_early()` to pick a
   successive-interference-cancellation strategy where the protocol
   supports it (`SupportsSicRounds`: FT8+FT4, `n` clamped 1..=3;
-  `SupportsSicEarly`: FT8 only, fixed 3-checkpoint structure), and
+  `SupportsSicEarly`: FT8 only, fixed 3-checkpoint structure),
   `.on_result(cb)` for streaming delivery — see below; Q65/WSPR/
   JT65/JT9 get the same *pattern* through their own bespoke entry
-  points (§10), not this trait. Call
+  points (§10), not this trait — and `.budget(check)`, a
+  caller-supplied wall-clock deadline predicate (see below). Call
   `.decode()` to get a
-  `DecodeOutcome<P>` (`.results: Vec<P::DecodeResult>`, plus
-  `.fft_cache` for a follow-up call).
+  `DecodeOutcome<P>` (`.results: Vec<P::DecodeResult>`, `.fft_cache`
+  for a follow-up call, and `.budget: BudgetReport`).
 * **`SniperRequest<P>`** — narrow-band, single-target search.
   `DecodeRequest::<P>::sniper(audio, target_freq_hz, max_cand)` or
   `SniperRequest::<P>::new(...)` directly; `.osd(bool)`,
   `.strictness(...)`, `.eq_mode(...)`, `.ap_hint(...)` where the
   protocol's message codec implements `WsjtApCompatible` (no SIC
   variant — sniper mode is inherently single-candidate), and
-  `.on_result(cb)` (same as above). `.decode()`
+  `.on_result(cb)` and `.budget(check)` (same as above). `.decode()`
   returns the same `DecodeOutcome<P>` shape.
 
 This replaced FT8's `decode_frame*`/`decode_frame_subtract*`/
 `decode_sniper*` family (15 public functions) and FT4/FST4's own
 suffix-exploded equivalents — see §6.2/§6.4 for worked examples.
+
+#### Compute budget: `.budget(check)`
+
+`check: &(dyn Fn() -> bool + Sync)` returns `false` once the caller's
+wall-clock allowance is spent, and the decode then starts no further
+work; `DecodeOutcome::budget` reports what was left undone
+(`exhausted`, `candidates_skipped`, `stages_run`, and the sync score of
+the best candidate that was cut). Opt-in: without it, a decode behaves
+exactly as it always has.
+
+It is a closure, and `mfsk-core` holds no clock of its own, because
+neither `wasm32-unknown-unknown` (`Instant::now` is unimplemented) nor
+`no_std` can supply one — the caller passes host `Instant`, browser
+`performance.now()`, or embedded `esp_timer_get_time`. `Sync`, not
+`FnMut`, so one captured deadline can be shared across a `rayon` batch
+rather than borrowed per candidate. This mirrors `wspr::decode`'s own
+`budget` parameter.
+
+**How the budget is spent, per strategy.** The default single-pass
+strategy is *cheapest-first*: the cheap sync triage sweeps every
+candidate (never budget-gated — it is what produces the ordering, and
+it already rejects ~82 % of candidates before the expensive 58-symbol
+DFT), the survivors are ordered by sync quality, and the ladder runs
+down that order until the budget says stop. On `qso3_busy.wav` a budget
+of 1/2/4/8 candidates therefore returns 1/2/4/8 *real* decodes rather
+than whatever sits at the low end of the band, and 16 reaches the full
+set. The SIC strategies poll only at candidate and round boundaries in
+their existing order — each accepted decode is subtracted before the
+next candidate is examined, so that order is the algorithm.
+
+The triage sweep is a **floor**: never gated, so a budget shorter than
+it returns nothing while still spending its time. Measured through
+`bench/wasm` under Node on `qso3_busy.wav`, ~13 ms of a ~28 ms decode —
+5 ms and 10 ms budgets return zero stations, 20 ms returns all 14.
+`max_cand` is the knob for the floor; `.budget(..)` spends what is
+above it.
+
+Implemented for FT8. FT4 and FST4 accept `.budget(..)` and ignore it,
+reporting `BudgetReport::default()`. The plain `decode_block` FT8 API
+(§4, what the embedded boards call) is unaffected.
 
 #### Streaming delivery: `.on_result(cb)`
 
