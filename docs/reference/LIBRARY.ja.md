@@ -1548,6 +1548,62 @@ const char*       mfsk_last_error(void);
 * デコーダはキャッシュとエラー報告にスレッドローカルを使うので、
   複数スレッドそれぞれが自分のハンドルを持つコストは小さい
 
+### プラットフォーム別のリンク
+
+**`MFSK_API`** を全宣言に付けている。静的ライブラリ `libmfsk.a` を
+リンクするときは `MFSK_STATIC`、DLL 自体をビルドするときは
+`MFSK_BUILDING` を定義し、DLL を使う側は何も定義しない。これが無いと
+Windows の DLL はリンクできるものを何もエクスポートせず、Unix の共有
+オブジェクトは Rust 内部を含む全非 static シンボルを公開してしまう。
+
+呼び出し規約は `extern "C"` 自身のもので、ここの全シグネチャについて
+Windows では `__cdecl`。出力せず文書化しているのは、cbindgen は戻り値型
+の前に prefix を置けるが、MSVC が要求する「戻り値型と名前の間」には
+置けないため — 必要な位置に置けないマクロを作る方が既定より悪い。
+
+| プラットフォーム | リンク行 |
+|---|---|
+| Linux | `-lmfsk -lpthread -ldl -lm` |
+| Android | `-lmfsk -llog -lm` (`-ldl`/`-lpthread` 不要、Bionic の libc 内) |
+| macOS | `-lmfsk -lpthread -lm` |
+| Windows (MSVC) | `mfsk.dll.lib` + `ws2_32.lib userenv.lib ntdll.lib bcrypt.lib` |
+| Windows (GNU) | `-lmfsk -lws2_32 -luserenv -lntdll -lbcrypt` |
+
+このリポジトリにあった唯一の Unix 向け `-ldl` 一行は、新しい3ターゲット
+すべてで誤りだった。
+
+**Android は 16 KB ページアラインが要る。** Android 15 からカーネル
+ページサイズ 16 KB の端末が出ており、4 KB でリンクした `.so` はそこで
+ロードできない — 最新ハードでだけ `UnsatisfiedLinkError` になる。
+`.cargo/config.toml` が Android の3トリプルに
+`-C link-arg=-Wl,-z,max-page-size=16384` を設定し、**CI は生成された
+`.so` が実際にそのアラインを持つことを確認する**。環境変数 `RUSTFLAGS`
+は `target.*.rustflags` を*上書き*する（マージしない）ので、この
+フラグはワークフローの1行編集で黙って消えうるからである。
+
+### スレッドプールはホストが決める
+
+```c
+MfskStatus mfsk_runtime_configure(const MfskRuntimeConfig* cfg);
+uint32_t   mfsk_runtime_thread_count(void);
+```
+
+`parallel` が有効でも、デコードは rayon の**グローバル**プールを使って
+いた: `num_cpus` 本・各 2 MiB スタック、最初のデコードで遅延生成、
+join されない。Android ではこれらのスレッドが ART にアタッチされて
+いないのでコールバックから JNIEnv に触れず、iOS では GCD の QoS の外に
+いてオーディオレンダースレッドと競合し、どちらもアプリがバックグラウンド
+に入った後も動き続ける。**これを変える手段がどの層にも無かった。**
+
+`on_thread_start`/`on_thread_stop` は rayon の
+`start_handler`/`exit_handler` にそのまま対応するので、JNI から
+`AttachCurrentThread`/`DetachCurrentThread` が呼べる。`num_threads = 1`
+は直列化で、`parallel` 抜きビルドと同じ挙動になる。
+
+一度だけ呼ぶこと。2回目は `MFSK_STATUS_UNSUPPORTED` を返す —
+rayon はスレッドが park しているかもしれないプールを作り直せないので、
+黙って無視するより返した方がよい。
+
 ### 送受信は同じ形: 境界を越える確保が無い
 
 デコード結果は呼び出し側が持つ配列に書かれ、送信も

@@ -291,6 +291,75 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
 
 ### Added
 
+- **`MFSK_API`, and a header that says how to link it.** Every
+  declaration now carries an export/visibility macro: `__declspec`
+  on Windows, `visibility("default")` elsewhere. The header had none,
+  which means a Windows DLL exported nothing linkable and a Unix shared
+  object exported every non-static symbol including Rust internals.
+  Define `MFSK_STATIC` for the static library, `MFSK_BUILDING` when
+  building the DLL.
+
+  The calling convention is documented rather than emitted: cbindgen can
+  place a prefix before the return type but not in the `__cdecl`
+  position between return type and name, and a macro that cannot go
+  where MSVC needs it would be worse than `extern "C"`'s default (which
+  *is* `__cdecl` for every signature here). `LIBRARY.md` §8 gains a
+  per-platform link table; the repo's single Unix `-ldl` line was wrong
+  on all three new targets.
+
+- **`mfsk_runtime_configure` — the host decides how threads are used.**
+  Even with `parallel` on, decoding used rayon's **global** pool:
+  `num_cpus` threads with 2 MiB stacks, spawned lazily on the first
+  decode and never joined. On Android those threads are not attached to
+  ART, so a callback from one cannot touch a JNIEnv; on iOS they sit
+  outside GCD's quality-of-service classes, competing with the audio
+  render thread; on both they keep running after the app is
+  backgrounded. There was no hook to change any of that, at any layer.
+
+  Decoding now runs inside a private pool when one is configured.
+  `on_thread_start`/`on_thread_stop` map onto rayon's
+  `start_handler`/`exit_handler`, which is what makes
+  `AttachCurrentThread`/`DetachCurrentThread` possible from JNI and
+  therefore what makes a decode callback legal from a worker thread
+  there. `num_threads = 1` forces serial decoding.
+
+  Configuring it once is enforced: a second call returns
+  `MFSK_STATUS_UNSUPPORTED` rather than being silently ignored, because
+  rayon cannot rebuild a pool its threads may be parked in.
+  `mfsk_runtime_thread_count` is how a caller checks it took effect, and
+  the test asserts that rather than that the call returned OK — a pool
+  accepted and then not used would look identical from outside.
+
+  No `unsafe` was needed to install it: every field of the session is
+  already `Send`, the one raw pointer having carried that claim since
+  the callback was added.
+
+- **Cross-compilation is checked on every source change.** A `cross` CI
+  job builds `x86_64-pc-windows-gnu` and `aarch64-linux-android`. The
+  repo previously contained **zero** occurrences of any Windows, iOS or
+  macOS target triple, while `LIBRARY.md` §9's Android section was
+  described by the repo itself as "aspirationally" written.
+
+  The job asserts rather than assumes: that the Windows DLL actually
+  exports six named symbols (which is what `MFSK_API` is for), that the
+  Android `.so` is 16 KB page-aligned, and that the `mobile` feature
+  really has no rayon in its dependency tree.
+
+  **Android 15 ships devices with a 16 KB kernel page size**, and a
+  `.so` linked for 4 KB does not load there — surfacing as
+  `UnsatisfiedLinkError` on exactly the newest hardware.
+  `.cargo/config.toml` sets the link flag for the three Android
+  triples, and the CI assertion exists because setting `RUSTFLAGS` in
+  the environment **overrides** `target.*.rustflags` rather than merging
+  with it. This workflow sets `RUSTFLAGS: -D warnings` globally, so the
+  flag was one edit away from being silently dropped — the job passes it
+  explicitly and then checks the ELF.
+
+  iOS is deliberately still absent: it needs a macOS runner and the plan
+  puts it at tag time. The risk is a break landing on main and being
+  found at release, mitigated by iOS being a pure cross-compile of code
+  Linux and Android exercise here.
+
 - **Streaming capture, generalised off FT8.** `mfsk_stream_open` /
   `_push_i16` / `_push_f32` / `_buffered` / `_slot_ready` /
   `_take_slot_i16` / `_set_epoch` / `_clear` / `_close`, plus the fused

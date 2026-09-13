@@ -1,0 +1,20 @@
+# Android needs 16 KB page alignment, and the failure is silent.
+#
+# Android 15 introduced devices with a 16 KB kernel page size. A shared
+# object linked with the older 4 KB max-page-size does not load there,
+# and the failure surfaces as `UnsatisfiedLinkError` on exactly the
+# newest hardware — the phones a consumer is least likely to have on a
+# desk and most likely to hear about from a user.
+#
+# Set here rather than in CI so a local `cargo ndk` build gets it too.
+# `ci.yml`'s Android job asserts the resulting `.so` actually carries
+# the alignment, because a flag that is set and then dropped by a
+# toolchain update would look exactly like a flag that works.
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

@@ -9,6 +9,22 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#ifndef MFSK_API
+#if defined(_WIN32) || defined(__CYGWIN__)
+#  if defined(MFSK_STATIC)
+#    define MFSK_API
+#  elif defined(MFSK_BUILDING)
+#    define MFSK_API __declspec(dllexport)
+#  else
+#    define MFSK_API __declspec(dllimport)
+#  endif
+#elif defined(__GNUC__) || defined(__clang__)
+#  define MFSK_API __attribute__((visibility("default")))
+#else
+#  define MFSK_API
+#endif
+#endif  /* MFSK_API */
+
 
 /**
  * Inline capacity of each `MfskDecodeParams` a-priori field.
@@ -762,6 +778,55 @@ typedef struct MfskDecodeParams {
 typedef void (*MfskDecodeCallback)(const struct MfskDecode *row,
                                    void *user_data);
 
+/**
+ * Called on each worker thread as it starts and as it exits.
+ *
+ * On Android these are where a JNI consumer calls
+ * `AttachCurrentThread` and `DetachCurrentThread`. `index` is rayon's
+ * own worker index, stable for the life of the pool.
+ */
+typedef void (*MfskThreadHook)(uint32_t index,
+                               void *user_data);
+
+/**
+ * How the decode should use threads.
+ *
+ * Size-versioned like every other growable struct here: set
+ * `size = sizeof(MfskRuntimeConfig)`, or zero it and the library fills
+ * `size` in — a zeroed struct means "rayon's defaults, no hooks",
+ * which is the pre-v2 behaviour.
+ */
+typedef struct MfskRuntimeConfig {
+    /**
+     * `sizeof(MfskRuntimeConfig)` as the caller understands it.
+     */
+    uint32_t size;
+    /**
+     * Worker threads. 0 for rayon's default (`num_cpus`); **1 forces
+     * serial decoding**, which is also what a build without the
+     * `parallel` feature does.
+     */
+    uint32_t num_threads;
+    /**
+     * Stack bytes per worker. 0 for rayon's default, which is 2 MiB —
+     * `num_cpus * 2 MiB` of address space reserved on a phone before
+     * the first sample is decoded.
+     */
+    uint32_t thread_stack_bytes;
+    /**
+     * Called as each worker starts. See [`MfskThreadHook`].
+     */
+    MfskThreadHook on_thread_start;
+    /**
+     * Called as each worker exits.
+     */
+    MfskThreadHook on_thread_stop;
+    /**
+     * Passed to both hooks, untouched.
+     */
+    void *thread_user;
+} MfskRuntimeConfig;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -771,12 +836,14 @@ extern "C" {
  * no error has been recorded on this thread. The pointer is valid until
  * the next fallible call on this thread.
  */
+MFSK_API
 const char *mfsk_last_error(void);
 
 /**
  * Construct an empty callsign hash table. Free with
  * [`mfsk_callsign_hash_table_free`].
  */
+MFSK_API
 struct MfskCallsignHashTable *mfsk_callsign_hash_table_new(void);
 
 /**
@@ -786,6 +853,7 @@ struct MfskCallsignHashTable *mfsk_callsign_hash_table_new(void);
  * `ht` must be a pointer previously returned by
  * [`mfsk_callsign_hash_table_new`], or NULL.
  */
+MFSK_API
 void mfsk_callsign_hash_table_free(struct MfskCallsignHashTable *ht);
 
 /**
@@ -799,6 +867,7 @@ void mfsk_callsign_hash_table_free(struct MfskCallsignHashTable *ht);
  * `ht` must be a live handle from [`mfsk_callsign_hash_table_new`].
  * `call` must be a NUL-terminated UTF-8 string.
  */
+MFSK_API
 enum MfskStatus mfsk_callsign_hash_table_insert(struct MfskCallsignHashTable *ht,
                                                 const char *call);
 
@@ -812,6 +881,7 @@ enum MfskStatus mfsk_callsign_hash_table_insert(struct MfskCallsignHashTable *ht
  * `out` must be `cap` writable `f32`; `*out_len` receives the
  * sample count (or the count needed, if `cap` was too small).
  */
+MFSK_API
 enum MfskStatus mfsk_encode_ft8(const char *call1,
                                 const char *call2,
                                 const char *report,
@@ -827,6 +897,7 @@ enum MfskStatus mfsk_encode_ft8(const char *call1,
  *
  * See [`mfsk_encode_ft8`].
  */
+MFSK_API
 enum MfskStatus mfsk_encode_ft4(const char *call1,
                                 const char *call2,
                                 const char *report,
@@ -842,6 +913,7 @@ enum MfskStatus mfsk_encode_ft4(const char *call1,
  *
  * See [`mfsk_encode_ft8`].
  */
+MFSK_API
 enum MfskStatus mfsk_encode_fst4s60(const char *call1,
                                     const char *call2,
                                     const char *report,
@@ -857,6 +929,7 @@ enum MfskStatus mfsk_encode_fst4s60(const char *call1,
  *
  * See [`mfsk_encode_ft8`].
  */
+MFSK_API
 enum MfskStatus mfsk_encode_wspr(const char *call,
                                  const char *grid,
                                  int32_t power_dbm,
@@ -872,6 +945,7 @@ enum MfskStatus mfsk_encode_wspr(const char *call,
  *
  * See [`mfsk_encode_ft8`].
  */
+MFSK_API
 enum MfskStatus mfsk_encode_jt9(const char *call1,
                                 const char *call2,
                                 const char *grid_or_report,
@@ -887,6 +961,7 @@ enum MfskStatus mfsk_encode_jt9(const char *call1,
  *
  * See [`mfsk_encode_ft8`].
  */
+MFSK_API
 enum MfskStatus mfsk_encode_jt65(const char *call1,
                                  const char *call2,
                                  const char *grid_or_report,
@@ -905,6 +980,7 @@ enum MfskStatus mfsk_encode_jt65(const char *call1,
  *
  * See [`mfsk_encode_ft8`].
  */
+MFSK_API
 enum MfskStatus mfsk_encode_q65(uint32_t submode,
                                 const char *call1,
                                 const char *call2,
@@ -932,6 +1008,7 @@ enum MfskStatus mfsk_encode_q65(uint32_t submode,
  * `out` must point to at least `cap` writable [`MfskDecode`] rows;
  * `*out_len` receives the number of decodes found.
  */
+MFSK_API
 enum MfskStatus mfsk_q65_decode(uint32_t submode,
                                 const float *samples,
                                 uintptr_t n_samples,
@@ -954,6 +1031,7 @@ enum MfskStatus mfsk_q65_decode(uint32_t submode,
  * As [`mfsk_q65_decode`]. The four hint strings, when non-NULL,
  * must be NUL-terminated UTF-8.
  */
+MFSK_API
 enum MfskStatus mfsk_q65_decode_with_ap(uint32_t submode,
                                         const float *samples,
                                         uintptr_t n_samples,
@@ -979,6 +1057,7 @@ enum MfskStatus mfsk_q65_decode_with_ap(uint32_t submode,
  *
  * As [`mfsk_q65_decode`].
  */
+MFSK_API
 enum MfskStatus mfsk_q65_decode_fading(uint32_t submode,
                                        const float *samples,
                                        uintptr_t n_samples,
@@ -1005,6 +1084,7 @@ enum MfskStatus mfsk_q65_decode_fading(uint32_t submode,
  * NUL-terminated UTF-8 strings; `his_grid` may be NULL or
  * NUL-terminated UTF-8.
  */
+MFSK_API
 enum MfskStatus mfsk_q65_decode_with_ap_list(uint32_t submode,
                                              const float *samples,
                                              uintptr_t n_samples,
@@ -1022,6 +1102,7 @@ enum MfskStatus mfsk_q65_decode_with_ap_list(uint32_t submode,
  * number of `MfskMode` discriminants: protocols are feature-gated.
  * Pair with `mfsk_mode_at` to enumerate.
  */
+MFSK_API
 uint32_t mfsk_mode_count(void);
 
 /**
@@ -1035,6 +1116,7 @@ uint32_t mfsk_mode_count(void);
  * # Safety
  * `out` must be null or point to a writable `MfskMode`.
  */
+MFSK_API
 enum MfskStatus mfsk_mode_at(uint32_t index,
                              enum MfskMode *out);
 
@@ -1049,6 +1131,7 @@ enum MfskStatus mfsk_mode_at(uint32_t index,
  * Answers for a mode this build lacks — the name is a property of the
  * mode, not of the build.
  */
+MFSK_API
 const char *mfsk_mode_name(uint32_t mode);
 
 /**
@@ -1065,6 +1148,7 @@ const char *mfsk_mode_name(uint32_t mode);
  * `name` must be a valid NUL-terminated C string; `out` must point to a
  * writable `MfskMode`.
  */
+MFSK_API
 enum MfskStatus mfsk_mode_from_name(const char *name,
                                     enum MfskMode *out);
 
@@ -1081,6 +1165,7 @@ enum MfskStatus mfsk_mode_from_name(const char *name,
  * # Safety
  * `out` must point to at least `out->size` writable bytes.
  */
+MFSK_API
 enum MfskStatus mfsk_mode_info(uint32_t mode,
                                struct MfskModeInfo *out);
 
@@ -1090,6 +1175,7 @@ enum MfskStatus mfsk_mode_info(uint32_t mode,
  * build lacks, which is also a legal "supports nothing" answer; use
  * `mfsk_mode_info` when the difference matters.
  */
+MFSK_API
 uint64_t mfsk_mode_caps(uint32_t mode);
 
 /**
@@ -1108,6 +1194,7 @@ uint64_t mfsk_mode_caps(uint32_t mode);
  * # Safety
  * `out` must point to at least `out->size` writable bytes.
  */
+MFSK_API
 enum MfskStatus mfsk_mode_defaults(uint32_t mode,
                                    struct MfskDecodeDefaults *out);
 
@@ -1119,6 +1206,7 @@ enum MfskStatus mfsk_mode_defaults(uint32_t mode,
  * when the C surface changes shape, so it is the one to check before
  * deciding a header and a library agree.
  */
+MFSK_API
 uint32_t mfsk_abi_version(void);
 
 /**
@@ -1132,6 +1220,7 @@ uint32_t mfsk_abi_version(void);
  * # Safety
  * `out` must point to at least `out->size` writable bytes.
  */
+MFSK_API
 enum MfskStatus mfsk_decode_params_init(uint32_t mode,
                                         struct MfskDecodeParams *out);
 
@@ -1149,6 +1238,7 @@ enum MfskStatus mfsk_decode_params_init(uint32_t mode,
  * # Safety
  * `params` must be null or point to a valid `MfskDecodeParams`.
  */
+MFSK_API
 struct MfskDecodeSession *mfsk_session_open(uint32_t mode,
                                             const struct MfskDecodeParams *params,
                                             enum MfskStatus *out_status);
@@ -1159,6 +1249,7 @@ struct MfskDecodeSession *mfsk_session_open(uint32_t mode,
  * # Safety
  * `dec` must be a handle from `mfsk_session_open`, released once.
  */
+MFSK_API
 void mfsk_session_close(struct MfskDecodeSession *dec);
 
 /**
@@ -1173,6 +1264,7 @@ void mfsk_session_close(struct MfskDecodeSession *dec);
  * # Safety
  * `dec` must be a live handle or null.
  */
+MFSK_API
 const char *mfsk_session_last_error(const struct MfskDecodeSession *dec);
 
 /**
@@ -1196,6 +1288,7 @@ const char *mfsk_session_last_error(const struct MfskDecodeSession *dec);
  * `user_data` must stay valid for that time if the callback
  * dereferences it.
  */
+MFSK_API
 enum MfskStatus mfsk_session_set_on_decode(struct MfskDecodeSession *dec,
                                            MfskDecodeCallback callback,
                                            void *user_data);
@@ -1216,6 +1309,7 @@ enum MfskStatus mfsk_session_set_on_decode(struct MfskDecodeSession *dec,
  * `samples` must be `n_samples` readable `int16_t`; `out` must be
  * `out_cap` writable `MfskDecode`.
  */
+MFSK_API
 enum MfskStatus mfsk_session_decode_i16(struct MfskDecodeSession *dec,
                                         const int16_t *samples,
                                         uintptr_t n_samples,
@@ -1236,6 +1330,7 @@ enum MfskStatus mfsk_session_decode_i16(struct MfskDecodeSession *dec,
  * # Safety
  * As [`mfsk_session_decode_i16`], with `samples` as `float`.
  */
+MFSK_API
 enum MfskStatus mfsk_session_decode_f32(struct MfskDecodeSession *dec,
                                         const float *samples,
                                         uintptr_t n_samples,
@@ -1255,6 +1350,7 @@ enum MfskStatus mfsk_session_decode_f32(struct MfskDecodeSession *dec,
  * # Safety
  * `out` must be `cap` writable bytes.
  */
+MFSK_API
 enum MfskStatus mfsk_session_copy_info(const struct MfskDecodeSession *dec,
                                        uintptr_t index,
                                        uint8_t *out,
@@ -1272,6 +1368,7 @@ enum MfskStatus mfsk_session_copy_info(const struct MfskDecodeSession *dec,
  * # Safety
  * `call` must be a valid NUL-terminated C string.
  */
+MFSK_API
 enum MfskStatus mfsk_session_add_callsign(struct MfskDecodeSession *dec,
                                           const char *call);
 
@@ -1282,6 +1379,7 @@ enum MfskStatus mfsk_session_add_callsign(struct MfskDecodeSession *dec,
  * `samples` must be `n_samples` readable `int16_t`; `out` must be `cap`
  * writable `MfskDecode`.
  */
+MFSK_API
 enum MfskStatus mfsk_wspr_decode(const int16_t *samples,
                                  uintptr_t n_samples,
                                  uint32_t sample_rate,
@@ -1302,6 +1400,7 @@ enum MfskStatus mfsk_wspr_decode(const int16_t *samples,
  * # Safety
  * As [`mfsk_wspr_decode`].
  */
+MFSK_API
 enum MfskStatus mfsk_jt9_decode_at(const int16_t *samples,
                                    uintptr_t n_samples,
                                    uint32_t sample_rate,
@@ -1316,6 +1415,7 @@ enum MfskStatus mfsk_jt9_decode_at(const int16_t *samples,
  * # Safety
  * As [`mfsk_wspr_decode`].
  */
+MFSK_API
 enum MfskStatus mfsk_jt65_decode_at(const int16_t *samples,
                                     uintptr_t n_samples,
                                     uint32_t sample_rate,
@@ -1332,6 +1432,7 @@ enum MfskStatus mfsk_jt65_decode_at(const int16_t *samples,
  * [`mfsk_tones_to_i16`] apply. WSPR, JT9, JT65 and Q65 synthesise from
  * their own message codecs in one step and report 0 here.
  */
+MFSK_API
 uintptr_t mfsk_symbol_count(uint32_t mode);
 
 /**
@@ -1343,6 +1444,7 @@ uintptr_t mfsk_symbol_count(uint32_t mode);
  * baked for 60A is silently wrong for the other four — which is
  * exactly the trap the old `tones_to_f32` wrapper carried.
  */
+MFSK_API
 uintptr_t mfsk_synth_output_len(uint32_t mode);
 
 /**
@@ -1355,6 +1457,7 @@ uintptr_t mfsk_synth_output_len(uint32_t mode);
  * Strings must be NUL-terminated; `out_message77` must be 77 writable
  * bytes.
  */
+MFSK_API
 enum MfskStatus mfsk_pack77(const char *call1,
                             const char *call2,
                             const char *report,
@@ -1366,6 +1469,7 @@ enum MfskStatus mfsk_pack77(const char *call1,
  * # Safety
  * As [`mfsk_pack77`].
  */
+MFSK_API
 enum MfskStatus mfsk_pack77_type1(const char *call1,
                                   const char *call2,
                                   const char *grid,
@@ -1377,6 +1481,7 @@ enum MfskStatus mfsk_pack77_type1(const char *call1,
  * # Safety
  * As [`mfsk_pack77`].
  */
+MFSK_API
 enum MfskStatus mfsk_pack77_free_text(const char *text,
                                       uint8_t *out_message77);
 
@@ -1391,6 +1496,7 @@ enum MfskStatus mfsk_pack77_free_text(const char *text,
  * Strings must be NUL-terminated; `out_message77` must be 77 writable
  * bytes.
  */
+MFSK_API
 enum MfskStatus mfsk_pack77_type4(const char *nonstd_call,
                                   const char *std_call,
                                   const char *report,
@@ -1409,6 +1515,7 @@ enum MfskStatus mfsk_pack77_type4(const char *nonstd_call,
  * `message77` must be 77 readable bytes; `out` must be `cap` writable
  * bytes; `session`, if non-null, must be a live session.
  */
+MFSK_API
 enum MfskStatus mfsk_unpack77(const struct MfskDecodeSession *session,
                               const uint8_t *message77,
                               char *out,
@@ -1425,6 +1532,7 @@ enum MfskStatus mfsk_unpack77(const struct MfskDecodeSession *session,
  * `message77` must be 77 readable bytes; `out_itone` must be `cap`
  * writable bytes.
  */
+MFSK_API
 enum MfskStatus mfsk_message_to_tones(uint32_t mode,
                                       const uint8_t *message77,
                                       uint8_t *out_itone,
@@ -1442,6 +1550,7 @@ enum MfskStatus mfsk_message_to_tones(uint32_t mode,
  * `itone` must be `n_tones` readable bytes; `out` must be `cap`
  * writable `int16_t`.
  */
+MFSK_API
 enum MfskStatus mfsk_tones_to_i16(uint32_t mode,
                                   const uint8_t *itone,
                                   uintptr_t n_tones,
@@ -1457,6 +1566,7 @@ enum MfskStatus mfsk_tones_to_i16(uint32_t mode,
  * # Safety
  * As [`mfsk_tones_to_i16`], with `out` as `float`.
  */
+MFSK_API
 enum MfskStatus mfsk_tones_to_f32(uint32_t mode,
                                   const uint8_t *itone,
                                   uintptr_t n_tones,
@@ -1478,6 +1588,7 @@ enum MfskStatus mfsk_tones_to_f32(uint32_t mode,
  * # Safety
  * `out_status` may be null.
  */
+MFSK_API
 struct MfskStream *mfsk_stream_open(uint32_t mode,
                                     uint32_t sample_rate,
                                     enum MfskStatus *out_status);
@@ -1488,6 +1599,7 @@ struct MfskStream *mfsk_stream_open(uint32_t mode,
  * # Safety
  * `s` must be a handle from [`mfsk_stream_open`], released once.
  */
+MFSK_API
 void mfsk_stream_close(struct MfskStream *s);
 
 /**
@@ -1496,6 +1608,7 @@ void mfsk_stream_close(struct MfskStream *s);
  * # Safety
  * `samples` must be `n` readable `int16_t`.
  */
+MFSK_API
 enum MfskStatus mfsk_stream_push_i16(struct MfskStream *s,
                                      const int16_t *samples,
                                      uintptr_t n);
@@ -1506,6 +1619,7 @@ enum MfskStatus mfsk_stream_push_i16(struct MfskStream *s,
  * # Safety
  * `samples` must be `n` readable `float`.
  */
+MFSK_API
 enum MfskStatus mfsk_stream_push_f32(struct MfskStream *s,
                                      const float *samples,
                                      uintptr_t n);
@@ -1513,6 +1627,7 @@ enum MfskStatus mfsk_stream_push_f32(struct MfskStream *s,
 /**
  * How many 12 kHz samples are buffered.
  */
+MFSK_API
 uintptr_t mfsk_stream_buffered(const struct MfskStream *s);
 
 /**
@@ -1528,12 +1643,14 @@ uintptr_t mfsk_stream_buffered(const struct MfskStream *s);
  * # Safety
  * `s` must be a live stream or null.
  */
+MFSK_API
 void mfsk_stream_set_epoch(struct MfskStream *s,
                            double utc_seconds);
 
 /**
  * Whether a whole slot is buffered and ready to take.
  */
+MFSK_API
 bool mfsk_stream_slot_ready(const struct MfskStream *s);
 
 /**
@@ -1548,6 +1665,7 @@ bool mfsk_stream_slot_ready(const struct MfskStream *s);
  * `out` must be `cap` writable `int16_t`; `out_slot_start_utc` may be
  * null.
  */
+MFSK_API
 uintptr_t mfsk_stream_take_slot_i16(struct MfskStream *s,
                                     int16_t *out,
                                     uintptr_t cap,
@@ -1559,6 +1677,7 @@ uintptr_t mfsk_stream_take_slot_i16(struct MfskStream *s,
  * # Safety
  * `s` must be a live stream or null.
  */
+MFSK_API
 void mfsk_stream_clear(struct MfskStream *s);
 
 /**
@@ -1576,6 +1695,7 @@ void mfsk_stream_clear(struct MfskStream *s);
  * As [`mfsk_session_decode_i16`], plus `stream` must be a live stream
  * opened for the same mode as `dec`.
  */
+MFSK_API
 enum MfskStatus mfsk_session_decode_stream(struct MfskDecodeSession *dec,
                                            struct MfskStream *stream,
                                            const struct MfskDecodeParams *params,
@@ -1585,10 +1705,45 @@ enum MfskStatus mfsk_session_decode_stream(struct MfskDecodeSession *dec,
                                            double *out_slot_start_utc);
 
 /**
+ * Configure the thread pool every subsequent decode runs on.
+ *
+ * **Call once, before the first decode.** The pool is built on the
+ * first call and kept for the life of the process; a second call
+ * returns `MFSK_STATUS_UNSUPPORTED` rather than silently ignoring you,
+ * because rayon cannot rebuild a pool threads may be parked in.
+ *
+ * Pass NULL to mean "rayon's defaults", which is also what happens if
+ * this is never called.
+ *
+ * Returns `MFSK_STATUS_UNSUPPORTED` on a build without the `parallel`
+ * feature — there is one thread there and nothing to configure, which
+ * is a *stronger* contract rather than a missing one.
+ *
+ * # Safety
+ * `config` must be null or point to at least `config->size` readable
+ * bytes. The two hooks, if set, must be safely callable from a thread
+ * this library spawns, and `thread_user` must outlive the pool — which
+ * is the life of the process.
+ */
+MFSK_API
+enum MfskStatus mfsk_runtime_configure(const struct MfskRuntimeConfig *config);
+
+/**
+ * How many worker threads decoding will use.
+ *
+ * 1 means serial — either because this build has no `parallel` feature
+ * or because [`mfsk_runtime_configure`] was told to. Useful for a host
+ * deciding how much other work to run alongside.
+ */
+MFSK_API
+uint32_t mfsk_runtime_thread_count(void);
+
+/**
  * Library version, major.minor.patch packed into a 32-bit integer (8
  * bits per field). Useful for the consumer to sanity-check ABI
  * compatibility.
  */
+MFSK_API
 uint32_t mfsk_version(void);
 
 #ifdef __cplusplus

@@ -2299,7 +2299,7 @@ pub unsafe extern "C" fn mfsk_session_decode_i16(
     } else {
         mfsk_core::engine::dsp::resample::resample_to_12k(pcm, sample_rate)
     };
-    if let Err(e) = run_decode(d, &audio, &p) {
+    if let Err(e) = in_pool_mut(|| run_decode(d, &audio, &p)) {
         return d.fail(e);
     }
     unsafe { emit(d, out, out_cap, out_len) }
@@ -2350,7 +2350,7 @@ pub unsafe extern "C" fn mfsk_session_decode_f32(
     // which is the common case this normalisation exists for — lost
     // dynamic range precisely when no resampling was required.
     let audio = mfsk_core::engine::dsp::resample::resample_f32_to_12k(pcm, sample_rate);
-    if let Err(e) = run_decode(d, &audio, &p) {
+    if let Err(e) = in_pool_mut(|| run_decode(d, &audio, &p)) {
         return d.fail(e);
     }
     unsafe { emit(d, out, out_cap, out_len) }
@@ -3472,10 +3472,240 @@ pub unsafe extern "C" fn mfsk_session_decode_stream(
     st.ring.drain(..st.slot_samples);
     st.taken += st.slot_samples as u64;
 
-    if let Err(e) = run_decode(d, &slot, &p) {
+    if let Err(e) = in_pool_mut(|| run_decode(d, &slot, &p)) {
         return d.fail(e);
     }
     unsafe { emit(d, out, out_cap, out_len) }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Runtime configuration (FFI v2 slice 6)
+//
+// The single most important mobile fix in this redesign, and there was
+// no hook for it at any layer before.
+//
+// Even with `parallel` on, the decode used rayon's **global** pool:
+// `num_cpus` threads with 2 MiB stacks each, spawned lazily on the
+// first decode and never joined. On Android those threads are not
+// attached to ART, so a callback from one cannot touch a JNIEnv; on
+// iOS they sit outside GCD's quality-of-service classes, competing with
+// the audio render thread; and on both they keep running after the app
+// is backgrounded. A host had no way to say otherwise.
+//
+// `mfsk_runtime_configure` builds a private pool and every decode runs
+// inside `pool.install(...)`, so thread count, stack size and the
+// start/stop hooks are the caller's to set. The two hooks map straight
+// onto rayon's `start_handler`/`exit_handler`, which is what makes
+// `AttachCurrentThread`/`DetachCurrentThread` possible from JNI — and
+// therefore what makes a callback from a worker thread legal there.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Called on each worker thread as it starts and as it exits.
+///
+/// On Android these are where a JNI consumer calls
+/// `AttachCurrentThread` and `DetachCurrentThread`. `index` is rayon's
+/// own worker index, stable for the life of the pool.
+pub type MfskThreadHook = Option<unsafe extern "C" fn(index: u32, user_data: *mut c_void)>;
+
+/// How the decode should use threads.
+///
+/// Size-versioned like every other growable struct here: set
+/// `size = sizeof(MfskRuntimeConfig)`, or zero it and the library fills
+/// `size` in — a zeroed struct means "rayon's defaults, no hooks",
+/// which is the pre-v2 behaviour.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct MfskRuntimeConfig {
+    /// `sizeof(MfskRuntimeConfig)` as the caller understands it.
+    pub size: u32,
+    /// Worker threads. 0 for rayon's default (`num_cpus`); **1 forces
+    /// serial decoding**, which is also what a build without the
+    /// `parallel` feature does.
+    pub num_threads: u32,
+    /// Stack bytes per worker. 0 for rayon's default, which is 2 MiB —
+    /// `num_cpus * 2 MiB` of address space reserved on a phone before
+    /// the first sample is decoded.
+    pub thread_stack_bytes: u32,
+    /// Called as each worker starts. See [`MfskThreadHook`].
+    pub on_thread_start: MfskThreadHook,
+    /// Called as each worker exits.
+    pub on_thread_stop: MfskThreadHook,
+    /// Passed to both hooks, untouched.
+    pub thread_user: *mut c_void,
+}
+
+#[cfg(feature = "parallel")]
+struct HookUser(*mut c_void);
+#[cfg(feature = "parallel")]
+unsafe impl Send for HookUser {}
+#[cfg(feature = "parallel")]
+unsafe impl Sync for HookUser {}
+
+#[cfg(feature = "parallel")]
+static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+
+/// Run the decode on the configured pool, or directly if none was
+/// configured — which keeps the pre-v2 behaviour exactly: rayon's
+/// global pool, the right default for a desktop host and the wrong one
+/// for a phone.
+///
+/// No `unsafe` and no `Send` wrapper, despite the closure borrowing the
+/// session mutably: every field of `V2Decoder` is already `Send` — the
+/// only one not inherently so is the C `user_data` pointer, and
+/// `SyncUserData` carries that claim with its own reasoning. So
+/// `&mut V2Decoder` is `Send` and the closure crosses on its own terms.
+///
+/// `install` moves the closure to one pool thread and blocks this one
+/// until it returns, so the session is never touched from two threads
+/// at once. What runs in parallel is the `par_iter` inside `mfsk_core`,
+/// which is the whole reason the pool has to be installed here rather
+/// than left to rayon's global one.
+#[cfg(feature = "parallel")]
+fn in_pool_mut<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    match POOL.get() {
+        Some(p) => p.install(f),
+        None => f(),
+    }
+}
+
+/// Without `parallel` there is one thread and nothing to install on —
+/// a *stronger* contract than the pool provides, not a missing one.
+#[cfg(not(feature = "parallel"))]
+fn in_pool_mut<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
+/// Configure the thread pool every subsequent decode runs on.
+///
+/// **Call once, before the first decode.** The pool is built on the
+/// first call and kept for the life of the process; a second call
+/// returns `MFSK_STATUS_UNSUPPORTED` rather than silently ignoring you,
+/// because rayon cannot rebuild a pool threads may be parked in.
+///
+/// Pass NULL to mean "rayon's defaults", which is also what happens if
+/// this is never called.
+///
+/// Returns `MFSK_STATUS_UNSUPPORTED` on a build without the `parallel`
+/// feature — there is one thread there and nothing to configure, which
+/// is a *stronger* contract rather than a missing one.
+///
+/// # Safety
+/// `config` must be null or point to at least `config->size` readable
+/// bytes. The two hooks, if set, must be safely callable from a thread
+/// this library spawns, and `thread_user` must outlive the pool — which
+/// is the life of the process.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_runtime_configure(config: *const MfskRuntimeConfig) -> MfskStatus {
+    #[cfg(not(feature = "parallel"))]
+    {
+        let _ = config;
+        set_error(
+            "mfsk_runtime_configure: this build has no thread pool (built without \
+             `parallel`), so decoding is already single-threaded",
+        );
+        MfskStatus::Unsupported
+    }
+    #[cfg(feature = "parallel")]
+    {
+        if POOL.get().is_some() {
+            set_error(
+                "mfsk_runtime_configure: already configured — rayon cannot rebuild a \
+                 pool its threads may be parked in, so call this once before the \
+                 first decode",
+            );
+            return MfskStatus::Unsupported;
+        }
+
+        let mut cfg = MfskRuntimeConfig {
+            size: core::mem::size_of::<MfskRuntimeConfig>() as u32,
+            num_threads: 0,
+            thread_stack_bytes: 0,
+            on_thread_start: None,
+            on_thread_stop: None,
+            thread_user: ptr::null_mut(),
+        };
+        if !config.is_null() {
+            let full = core::mem::size_of::<MfskRuntimeConfig>();
+            let declared = unsafe { core::ptr::read_unaligned(config as *const u32) } as usize;
+            let n = if declared == 0 || declared > full {
+                full
+            } else {
+                declared
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    config as *const u8,
+                    &mut cfg as *mut MfskRuntimeConfig as *mut u8,
+                    n,
+                );
+            }
+            cfg.size = full as u32;
+        }
+
+        let mut builder = rayon::ThreadPoolBuilder::new();
+        if cfg.num_threads > 0 {
+            builder = builder.num_threads(cfg.num_threads as usize);
+        }
+        if cfg.thread_stack_bytes > 0 {
+            builder = builder.stack_size(cfg.thread_stack_bytes as usize);
+        }
+        let user = HookUser(cfg.thread_user);
+        if let Some(start) = cfg.on_thread_start {
+            let u = HookUser(user.0);
+            builder = builder.start_handler(move |i| {
+                // Bind the wrapper, not the field: edition-2021
+                // closures capture disjoint fields, which would move
+                // the bare `*mut c_void` and lose the `Send + Sync`
+                // the wrapper exists to assert.
+                let u = &u;
+                unsafe { start(i as u32, u.0) }
+            });
+        }
+        if let Some(stop) = cfg.on_thread_stop {
+            let u = HookUser(user.0);
+            builder = builder.exit_handler(move |i| {
+                let u = &u;
+                unsafe { stop(i as u32, u.0) }
+            });
+        }
+
+        match builder.build() {
+            Ok(pool) => {
+                // `set` cannot fail: the `get` above ran on this thread
+                // and nothing else writes this, but a lost race would
+                // mean two pools, so report it rather than assume.
+                if POOL.set(pool).is_err() {
+                    set_error("mfsk_runtime_configure: raced with another call");
+                    return MfskStatus::Unsupported;
+                }
+                MfskStatus::Ok
+            }
+            Err(e) => {
+                set_error(format!("mfsk_runtime_configure: {e}"));
+                MfskStatus::Internal
+            }
+        }
+    }
+}
+
+/// How many worker threads decoding will use.
+///
+/// 1 means serial — either because this build has no `parallel` feature
+/// or because [`mfsk_runtime_configure`] was told to. Useful for a host
+/// deciding how much other work to run alongside.
+#[unsafe(no_mangle)]
+pub extern "C" fn mfsk_runtime_thread_count() -> u32 {
+    #[cfg(feature = "parallel")]
+    {
+        match POOL.get() {
+            Some(p) => p.current_num_threads() as u32,
+            None => rayon::current_num_threads() as u32,
+        }
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        1
+    }
 }
 
 /// Write synthesised f32 PCM into caller memory.

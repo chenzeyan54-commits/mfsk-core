@@ -623,6 +623,91 @@ jobs:
   # compile failures. The --no-deps limits doc generation to our
   # own crate (not the full dep tree).
   # ───────────────────────────────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────
+  # Cross-compilation: the C ABI claims Windows / Android / iOS
+  # equivalence, and until this job existed the repo contained zero
+  # occurrences of any of those target triples. The Rust itself is
+  # portable — no file or syscall access on the decode path — so these
+  # are build checks, not a port, and they are cheap enough to run on
+  # every PR that touches source.
+  #
+  # iOS is deliberately absent: it needs a macOS runner, and the plan
+  # puts it at tag time. The risk that buys is a break landing on main
+  # and being found at release; it is mitigated by iOS being a pure
+  # cross-compile of code Linux and Android already exercise here.
+  # ───────────────────────────────────────────────────────────────
+  cross:
+    name: Cross-compile (windows-gnu, android)
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.src == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu, aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the MinGW linker
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - name: Build for Windows (GNU)
+        run: cargo build -p mfsk-ffi --release --target x86_64-pc-windows-gnu
+
+      # `MFSK_API` exists so a Windows DLL exports something. Check the
+      # import library actually carries the symbols rather than trusting
+      # the macro to have been emitted in the right place.
+      - name: Windows DLL exports the ABI
+        run: |
+          set -euo pipefail
+          DLL=target/x86_64-pc-windows-gnu/release/mfsk.dll
+          test -f "$DLL" || { echo "::error::no DLL produced"; exit 1; }
+          for sym in mfsk_abi_version mfsk_session_open mfsk_session_decode_i16 \
+                     mfsk_mode_count mfsk_pack77 mfsk_stream_open; do
+            x86_64-w64-mingw32-nm -g --defined-only "$DLL" | grep -q " $sym\$" \
+              || { echo "::error::$sym is not exported from the DLL"; exit 1; }
+          done
+          echo "all checked symbols exported"
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      # `.cargo/config.toml` sets the 16 KB page flag, but the global
+      # `RUSTFLAGS: -D warnings` at the top of this workflow **overrides**
+      # `target.*.rustflags` — cargo takes the environment over the
+      # config file, it does not merge them. So the flag has to be
+      # repeated here, and the assertion below is what catches it going
+      # missing again.
+      - name: Build for Android (arm64)
+        env:
+          RUSTFLAGS: "-D warnings -C link-arg=-Wl,-z,max-page-size=16384"
+        run: |
+          cargo ndk -t arm64-v8a -o /tmp/jniLibs build -p mfsk-ffi --release \
+            --no-default-features --features mobile
+
+      # Android 15 ships devices with a 16 KB kernel page size, and an
+      # `.so` linked for 4 KB does not load there — surfacing as a
+      # silent `UnsatisfiedLinkError` on exactly the newest hardware.
+      # Assert the alignment rather than assume the flag survived.
+      - name: The Android .so is 16 KB aligned
+        run: |
+          set -euo pipefail
+          SO=$(find /tmp/jniLibs -name 'libmfsk.so' | head -1)
+          test -n "$SO" || { echo "::error::no .so produced"; exit 1; }
+          ALIGN=$(readelf -lW "$SO" | awk '$1 == "LOAD" { print $NF; exit }')
+          echo "first LOAD alignment: $ALIGN"
+          [ "$ALIGN" = "0x4000" ] \
+            || { echo "::error::expected 0x4000 (16 KB), got $ALIGN — the link flag was dropped"; exit 1; }
+
+      # The `mobile` feature drops rayon, which is the reason it exists.
+      - name: The mobile build really has no rayon
+        run: |
+          set -euo pipefail
+          cargo tree -p mfsk-ffi --no-default-features --features mobile -e normal \
+            | grep -q rayon \
+            && { echo "::error::the mobile feature still pulls rayon"; exit 1; }
+          echo "no rayon in the mobile dependency tree"
+
   docs:
     name: rustdoc
     runs-on: ubuntu-latest

@@ -47,6 +47,14 @@ mfsk-ffi-abi = { path = "../mfsk-ffi-abi" }
 #
 # `desktop` is the default and is byte-for-byte what this crate built
 # before, so nothing changes for anyone who does not opt in.
+# Only for `mfsk_runtime_configure`: a **private** pool, so decodes stop
+# using rayon's global one. That pool is `num_cpus` threads with 2 MiB
+# stacks, spawned lazily on first decode, never joined, unattached to
+# ART on Android and outside GCD's QoS on iOS — still running after the
+# app is backgrounded. There was no hook to change any of that at any
+# layer.
+rayon = { version = "1", optional = true }
+
 [features]
 default = ["desktop"]
 
@@ -78,7 +86,7 @@ protocols = [
 # source does not cfg them out yet.
 legacy = ["mfsk-core/q65", "mfsk-core/wspr", "mfsk-core/jt9", "mfsk-core/jt65"]
 
-parallel = ["mfsk-core/parallel"]
+parallel = ["mfsk-core/parallel", "dep:rayon"]
 serde    = ["mfsk-core/serde"]
 
 [build-dependencies]

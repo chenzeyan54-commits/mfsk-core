@@ -1530,7 +1530,44 @@ protocol's bespoke decode tests need to run.
 
 Every tagged release also attaches a prebuilt `linux-x86_64` tarball
 of these artefacts to the GitHub Release — see `mfsk-ffi/README.md`.
-Other platforms/ABIs (including Android) still need a local build.
+Other platforms still need a local build; CI cross-compiles
+Windows-GNU and Android arm64 on every source change, so they are
+build-verified even though no binary is published for them yet.
+
+### Linking, per platform
+
+**`MFSK_API`** is emitted on every declaration. Define `MFSK_STATIC`
+when linking `libmfsk.a`, `MFSK_BUILDING` when building the DLL itself,
+and nothing when consuming the DLL. Without it a Windows DLL exports
+nothing linkable, and a Unix shared object exports every non-static
+symbol including Rust internals.
+
+The calling convention is `extern "C"`'s own, which is `__cdecl` on
+Windows for every signature here. It is documented rather than emitted:
+cbindgen can place a prefix before the return type but not in the
+`__cdecl` position between return type and name, and a macro that
+cannot go where MSVC needs it would be worse than the default.
+
+| platform | link line |
+|---|---|
+| Linux | `-lmfsk -lpthread -ldl -lm` |
+| Android | `-lmfsk -llog -lm` (no `-ldl`/`-lpthread`; both are in Bionic's libc) |
+| macOS | `-lmfsk -lpthread -lm` |
+| Windows (MSVC) | `mfsk.dll.lib` plus `ws2_32.lib userenv.lib ntdll.lib bcrypt.lib` |
+| Windows (GNU) | `-lmfsk -lws2_32 -luserenv -lntdll -lbcrypt` |
+
+The repo's own single Unix `-ldl` line was wrong on all three of the
+new targets.
+
+**Android needs 16 KB page alignment.** Android 15 ships devices with a
+16 KB kernel page size, and a `.so` linked for 4 KB does not load
+there — surfacing as `UnsatisfiedLinkError` on exactly the newest
+hardware. `.cargo/config.toml` sets
+`-C link-arg=-Wl,-z,max-page-size=16384` for the three Android
+triples, **and CI asserts the resulting `.so` carries it**, because
+setting `RUSTFLAGS` in the environment *overrides* `target.*.rustflags`
+rather than merging with it — so the flag is one workflow edit away
+from being silently dropped.
 
 ### API
 
@@ -1684,6 +1721,32 @@ See `mfsk-ffi/examples/cpp_smoke/` for a minimal end-to-end demo.
 * An `MfskDecoder` is `!Sync`: one handle per concurrent thread.
 * The decoder uses thread-local state for caching and error reporting,
   so spawning multiple threads each with its own handle is cheap.
+
+### The host decides how threads are used
+
+```c
+MfskStatus mfsk_runtime_configure(const MfskRuntimeConfig* cfg);
+uint32_t   mfsk_runtime_thread_count(void);
+```
+
+Even with `parallel` on, decoding used rayon's **global** pool:
+`num_cpus` threads with 2 MiB stacks, spawned lazily on the first decode
+and never joined. On Android those threads are not attached to ART, so a
+callback from one cannot touch a JNIEnv; on iOS they sit outside GCD's
+quality-of-service classes, competing with the audio render thread; on
+both they keep running after the app is backgrounded. **There was no
+hook to change any of that, at any layer.**
+
+`on_thread_start` / `on_thread_stop` map straight onto rayon's
+`start_handler` / `exit_handler`, which is what makes
+`AttachCurrentThread` / `DetachCurrentThread` possible from JNI — and
+therefore what makes a decode callback legal from a worker thread there.
+`num_threads = 1` forces serial decoding, which is also what a build
+without `parallel` does.
+
+Call it once, before the first decode. A second call returns
+`MFSK_STATUS_UNSUPPORTED` rather than being silently ignored: rayon
+cannot rebuild a pool its threads may be parked in.
 
 ### Transmit is the same shape: nothing crosses as an allocation
 
