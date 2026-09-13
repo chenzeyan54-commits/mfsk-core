@@ -291,6 +291,32 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
 
 ### Added
 
+- **Streaming capture, generalised off FT8.** `mfsk_stream_open` /
+  `_push_i16` / `_push_f32` / `_buffered` / `_slot_ready` /
+  `_take_slot_i16` / `_set_epoch` / `_clear` / `_close`, plus the fused
+  `mfsk_session_decode_stream`.
+
+  `mfsk-ffi-ft8` had the only streaming front end in this repo, sized
+  for FT8 and taking i16 alone. The ring is sized from
+  `slot_samples_12k` now, so FST4-300's 3.6 M-sample slot works the way
+  FT4's 90 000-sample one does — a factor of 40 an FT8-sized ring got
+  wrong in both directions.
+
+  **Time is a parameter and is never read.** No `Instant`, no
+  `SystemTime`, no clock of any kind: the host says what UTC second the
+  next sample belongs to and the grid does arithmetic. That is what
+  keeps this usable from wasm, from `no_std`, and from a phone that was
+  backgrounded for four minutes — the same choice `BudgetCheck` makes
+  for the decode deadline. Without an epoch the grid free-runs from the
+  first sample, which is exactly right for replaying a recording. A
+  test runs the same capture twice and asserts an identical reported
+  time, which no wall-clock implementation could pass.
+
+  `mfsk_session_decode_stream` is fused because taking FST4-300's slot
+  out and handing it straight back in moves 7 MB for nothing. Polling it
+  before a slot is ready returns `MFSK_STATUS_UNSUPPORTED` with
+  `*out_len = 0` — a "not yet", not a failure to guard against.
+
 - **Transmit is the same shape as receive: nothing crosses the boundary
   as an allocation.** `mfsk_pack77` / `_type1` / `_type4` /
   `_free_text` → `mfsk_message_to_tones` → `mfsk_tones_to_i16` /
@@ -676,6 +702,42 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
   ordinary wide-band `mfsk_decode_i16`, which is where it belonged.
 
 ### Removed
+
+- **`mfsk-ffi-ft8` is retired.** Issue #251 decided not to invest
+  further in it and wrote its own exit condition: "revisit only if …
+  the crate becomes an actual maintenance drag on other refactors."
+  This was that.
+
+  The case for keeping it had already stopped holding.
+  `embedded-poc/idf-component/README.md` states it itself — "pure-C code
+  can't define `extern "Rust"` symbols" — so an ESP-IDF project must
+  write a Rust staticlib shim to supply
+  `mfsk_core_make_default_fft_planner()` regardless. Once a consumer is
+  writing Rust, calling `mfsk_core::ft8::decode_block::*` directly is
+  strictly simpler, which is exactly what all three of this repo's
+  boards do. The C ABI never removed the work it existed to remove.
+
+  Its residual value was catching embedded build breakage, and
+  `scripts/pre-push-check.sh` already builds `alloc ft8 fft-extern` and
+  `alloc ft8 fft-extern fixed-point` — the thing that actually matters,
+  and it needs no C ABI.
+
+  Removed with it: the crate and its header, the esp32/esp32s3 release
+  tarballs (13 downloads across 30 releases), its CI job, and
+  `ffi_smoke_one` in `embedded-shared/src/apps/compute_bench.rs` —
+  ~40 lines whose timings the same bench already measured natively, so
+  the C ABI there was adding a wrapper rather than a measurement. The
+  four embedded app crates drop the dependency.
+
+  **`embedded-poc/` is outside the workspace and CI never builds it**,
+  so those edits are not compile-verified here. They are dependency
+  removals and one deleted function with its only call site, but that is
+  a statement about their shape, not a green build.
+
+  This does not foreclose a `no_std` C ABI later — it would just be
+  built on the redesigned surface rather than the legacy one, when a
+  consumer exists. `mfsk-ffi-abi` stays split out for that reason: the
+  types are plain data with no `std` requirement.
 
 - **The pre-v2 decode surface is gone.** `mfsk_decoder_new`/`_free`, the
   `MfskDecodeOptions` handle and its eight setters, `mfsk_decode_i16`/

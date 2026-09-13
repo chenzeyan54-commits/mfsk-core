@@ -431,6 +431,11 @@ typedef struct MfskCallsignHashTable MfskCallsignHashTable;
 typedef struct MfskDecodeSession MfskDecodeSession;
 
 /**
+ * Opaque streaming-capture handle.
+ */
+typedef struct MfskStream MfskStream;
+
+/**
  * One decoded transmission, written into caller memory.
  *
  * Shaped on `mfsk_core`'s own `msg::decoded::Decoded`, which
@@ -1460,6 +1465,124 @@ enum MfskStatus mfsk_tones_to_f32(uint32_t mode,
                                   float *out,
                                   uintptr_t cap,
                                   uintptr_t *out_len);
+
+/**
+ * Open a capture stream for `mode`, accepting audio at `sample_rate`.
+ *
+ * The ring holds exactly one slot. Pushing more than that before
+ * taking one overwrites the oldest audio, which is the right failure
+ * for a live receiver: the newest slot is the one worth decoding.
+ *
+ * Returns NULL and writes the reason to `out_status` on failure.
+ *
+ * # Safety
+ * `out_status` may be null.
+ */
+struct MfskStream *mfsk_stream_open(uint32_t mode,
+                                    uint32_t sample_rate,
+                                    enum MfskStatus *out_status);
+
+/**
+ * Release a stream. Null is a no-op.
+ *
+ * # Safety
+ * `s` must be a handle from [`mfsk_stream_open`], released once.
+ */
+void mfsk_stream_close(struct MfskStream *s);
+
+/**
+ * Push 16-bit PCM at the rate the stream was opened with.
+ *
+ * # Safety
+ * `samples` must be `n` readable `int16_t`.
+ */
+enum MfskStatus mfsk_stream_push_i16(struct MfskStream *s,
+                                     const int16_t *samples,
+                                     uintptr_t n);
+
+/**
+ * Push 32-bit float PCM, nominally `-1.0..=1.0`.
+ *
+ * # Safety
+ * `samples` must be `n` readable `float`.
+ */
+enum MfskStatus mfsk_stream_push_f32(struct MfskStream *s,
+                                     const float *samples,
+                                     uintptr_t n);
+
+/**
+ * How many 12 kHz samples are buffered.
+ */
+uintptr_t mfsk_stream_buffered(const struct MfskStream *s);
+
+/**
+ * Tell the stream what UTC second the **next** sample pushed belongs
+ * to, so slot boundaries land where the protocol says.
+ *
+ * Without this the grid free-runs from the first sample, which is
+ * exactly right for replaying a recording and wrong for a live
+ * receiver. Call it whenever your clock is resynchronised; the grid
+ * re-anchors from that point rather than shifting what is already
+ * buffered.
+ *
+ * # Safety
+ * `s` must be a live stream or null.
+ */
+void mfsk_stream_set_epoch(struct MfskStream *s,
+                           double utc_seconds);
+
+/**
+ * Whether a whole slot is buffered and ready to take.
+ */
+bool mfsk_stream_slot_ready(const struct MfskStream *s);
+
+/**
+ * Take the buffered slot, copying it into `out` and reporting the UTC
+ * second its first sample fell on.
+ *
+ * Returns the number of samples written, or 0 if no slot is ready or
+ * `cap` is too small — ask [`mfsk_stream_slot_ready`] first and size
+ * from `MfskModeInfo::slot_samples_12k`.
+ *
+ * # Safety
+ * `out` must be `cap` writable `int16_t`; `out_slot_start_utc` may be
+ * null.
+ */
+uintptr_t mfsk_stream_take_slot_i16(struct MfskStream *s,
+                                    int16_t *out,
+                                    uintptr_t cap,
+                                    double *out_slot_start_utc);
+
+/**
+ * Drop everything buffered, keeping the epoch.
+ *
+ * # Safety
+ * `s` must be a live stream or null.
+ */
+void mfsk_stream_clear(struct MfskStream *s);
+
+/**
+ * Decode the stream's buffered slot directly, without copying it out
+ * and back in.
+ *
+ * Fused on purpose: FST4-300's slot is 3 600 000 samples, and a
+ * take-then-decode round trip moves 7 MB for nothing.
+ *
+ * Returns `MFSK_STATUS_UNSUPPORTED` with `*out_len = 0` when no slot
+ * is ready yet, so a caller can poll this instead of
+ * [`mfsk_stream_slot_ready`] if it prefers.
+ *
+ * # Safety
+ * As [`mfsk_session_decode_i16`], plus `stream` must be a live stream
+ * opened for the same mode as `dec`.
+ */
+enum MfskStatus mfsk_session_decode_stream(struct MfskDecodeSession *dec,
+                                           struct MfskStream *stream,
+                                           const struct MfskDecodeParams *params,
+                                           struct MfskDecode *out,
+                                           uintptr_t out_cap,
+                                           uintptr_t *out_len,
+                                           double *out_slot_start_utc);
 
 /**
  * Library version, major.minor.patch packed into a 32-bit integer (8

@@ -23,8 +23,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 status=0
 for header in \
-    "$REPO_ROOT/mfsk-ffi/include/mfsk.h" \
-    "$REPO_ROOT/mfsk-ffi-ft8/include/mfsk_ft8.h"
+    "$REPO_ROOT/mfsk-ffi/include/mfsk.h"
 do
     [ -f "$header" ] || { echo "missing header: $header"; status=1; continue; }
     name="$(basename "$header")"

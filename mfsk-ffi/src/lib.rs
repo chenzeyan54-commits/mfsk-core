@@ -3124,6 +3124,360 @@ pub unsafe extern "C" fn mfsk_tones_to_f32(
     MfskStatus::Ok
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Streaming ingestion and the slot grid (FFI v2 slice 5)
+//
+// `mfsk-ffi-ft8` had the only streaming front end in this repo, sized
+// for FT8 and taking i16 alone. This generalises it over `MfskMode` —
+// the ring is sized from `slot_samples_12k`, so FST4-300's 3.6 M-sample
+// slot works the same way FT4's 90 000-sample one does.
+//
+// **Time enters as a parameter and is never read.** No `Instant`, no
+// `SystemTime`, no clock of any kind: the host says what UTC second the
+// next sample belongs to, and the grid does arithmetic. That is what
+// keeps this usable from wasm, from `no_std`, and from an iOS app that
+// was backgrounded for four minutes — and it is the same choice
+// `BudgetCheck` makes for the decode deadline.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Opaque streaming-capture handle.
+pub struct MfskStream {
+    _marker: core::marker::PhantomData<*mut ()>,
+}
+
+struct StreamInner {
+    mode: MfskMode,
+    /// Samples in one slot at 12 kHz — the ring's capacity and the
+    /// amount `take_slot` hands over.
+    slot_samples: usize,
+    /// `None` when the source is already 12 kHz.
+    resampler: Option<mfsk_core::engine::dsp::resample::LinearResamplerI16To12k>,
+    ring: Vec<i16>,
+    /// Total 12 kHz samples ever pushed. The grid is arithmetic on
+    /// this, so it survives the ring wrapping.
+    pushed: u64,
+    /// Samples consumed by `take_slot`, so `pushed - taken` is what is
+    /// available.
+    taken: u64,
+    /// UTC second that sample index `epoch_at` fell on, if the host has
+    /// said. `None` means free-running from the first sample, which is
+    /// exactly right for replaying a recording.
+    epoch_utc: Option<f64>,
+    epoch_at: u64,
+}
+
+impl StreamInner {
+    /// UTC of the sample at absolute index `i`, if the epoch is known.
+    fn utc_of(&self, i: u64) -> f64 {
+        match self.epoch_utc {
+            Some(t0) => t0 + (i as f64 - self.epoch_at as f64) / 12_000.0,
+            None => i as f64 / 12_000.0,
+        }
+    }
+}
+
+fn stream_inner(s: *mut MfskStream) -> Option<&'static mut StreamInner> {
+    unsafe { (s as *mut StreamInner).as_mut() }
+}
+
+fn stream_ref(s: *const MfskStream) -> Option<&'static StreamInner> {
+    unsafe { (s as *const StreamInner).as_ref() }
+}
+
+/// Open a capture stream for `mode`, accepting audio at `sample_rate`.
+///
+/// The ring holds exactly one slot. Pushing more than that before
+/// taking one overwrites the oldest audio, which is the right failure
+/// for a live receiver: the newest slot is the one worth decoding.
+///
+/// Returns NULL and writes the reason to `out_status` on failure.
+///
+/// # Safety
+/// `out_status` may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_stream_open(
+    mode: u32,
+    sample_rate: u32,
+    out_status: *mut MfskStatus,
+) -> *mut MfskStream {
+    let report = |st: MfskStatus| {
+        if !out_status.is_null() {
+            unsafe { *out_status = st };
+        }
+    };
+    let Some(m) = mode_of(mode) else {
+        set_error("mfsk_stream_open: not a mode this library knows");
+        report(MfskStatus::InvalidArg);
+        return ptr::null_mut();
+    };
+    let Some(meta) = mode_meta(m) else {
+        set_error("mfsk_stream_open: no such mode in this build");
+        report(MfskStatus::UnknownProtocol);
+        return ptr::null_mut();
+    };
+    if meta.profile.caps & mfsk_core::registry::caps::DECODE_HANDLE == 0 {
+        set_error(
+            "mfsk_stream_open: this mode has no decode handle to feed — check \
+             MFSK_CAP_DECODE_HANDLE",
+        );
+        report(MfskStatus::Unsupported);
+        return ptr::null_mut();
+    }
+    if sample_rate == 0 {
+        set_error("mfsk_stream_open: sample_rate is 0");
+        report(MfskStatus::InvalidArg);
+        return ptr::null_mut();
+    }
+    let slot_samples = meta.slot_samples_12k as usize;
+    report(MfskStatus::Ok);
+    Box::into_raw(Box::new(StreamInner {
+        mode: m,
+        slot_samples,
+        resampler: (sample_rate != 12_000)
+            .then(|| mfsk_core::engine::dsp::resample::LinearResamplerI16To12k::new(sample_rate)),
+        ring: Vec::with_capacity(slot_samples),
+        pushed: 0,
+        taken: 0,
+        epoch_utc: None,
+        epoch_at: 0,
+    })) as *mut MfskStream
+}
+
+/// Release a stream. Null is a no-op.
+///
+/// # Safety
+/// `s` must be a handle from [`mfsk_stream_open`], released once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_stream_close(s: *mut MfskStream) {
+    if !s.is_null() {
+        drop(unsafe { Box::from_raw(s as *mut StreamInner) });
+    }
+}
+
+fn ring_push(st: &mut StreamInner, src: &[i16]) {
+    st.ring.extend_from_slice(src);
+    st.pushed += src.len() as u64;
+    // Keep at most one slot: a live receiver wants the newest audio,
+    // and holding more would only delay the decode.
+    if st.ring.len() > st.slot_samples {
+        let drop_n = st.ring.len() - st.slot_samples;
+        st.ring.drain(..drop_n);
+        st.taken += drop_n as u64;
+    }
+}
+
+/// Push 16-bit PCM at the rate the stream was opened with.
+///
+/// # Safety
+/// `samples` must be `n` readable `int16_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_stream_push_i16(
+    s: *mut MfskStream,
+    samples: *const i16,
+    n: usize,
+) -> MfskStatus {
+    let Some(st) = stream_inner(s) else {
+        set_error("mfsk_stream_push_i16: null stream");
+        return MfskStatus::InvalidArg;
+    };
+    if n == 0 {
+        return MfskStatus::Ok;
+    }
+    if samples.is_null() {
+        set_error("mfsk_stream_push_i16: null samples");
+        return MfskStatus::InvalidArg;
+    }
+    let src = unsafe { slice::from_raw_parts(samples, n) };
+    match st.resampler.as_mut() {
+        None => ring_push(st, src),
+        Some(_) => {
+            // Resample in bounded chunks so a long push does not
+            // allocate a second copy of the whole buffer.
+            let mut scratch = [0i16; 512];
+            let mut pos = 0;
+            while pos < src.len() {
+                let r = st.resampler.as_mut().expect("checked");
+                let (consumed, produced) = r.process(&src[pos..], &mut scratch);
+                if consumed == 0 && produced == 0 {
+                    break;
+                }
+                let chunk: Vec<i16> = scratch[..produced].to_vec();
+                ring_push(st, &chunk);
+                pos += consumed;
+            }
+        }
+    }
+    MfskStatus::Ok
+}
+
+/// Push 32-bit float PCM, nominally `-1.0..=1.0`.
+///
+/// # Safety
+/// `samples` must be `n` readable `float`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_stream_push_f32(
+    s: *mut MfskStream,
+    samples: *const f32,
+    n: usize,
+) -> MfskStatus {
+    if samples.is_null() && n != 0 {
+        set_error("mfsk_stream_push_f32: null samples");
+        return MfskStatus::InvalidArg;
+    }
+    if n == 0 {
+        return MfskStatus::Ok;
+    }
+    let src = unsafe { slice::from_raw_parts(samples, n) };
+    let as_i16: Vec<i16> = src
+        .iter()
+        .map(|&x| (x * 32767.0).clamp(-32_768.0, 32_767.0) as i16)
+        .collect();
+    unsafe { mfsk_stream_push_i16(s, as_i16.as_ptr(), as_i16.len()) }
+}
+
+/// How many 12 kHz samples are buffered.
+#[unsafe(no_mangle)]
+pub extern "C" fn mfsk_stream_buffered(s: *const MfskStream) -> usize {
+    stream_ref(s).map(|st| st.ring.len()).unwrap_or(0)
+}
+
+/// Tell the stream what UTC second the **next** sample pushed belongs
+/// to, so slot boundaries land where the protocol says.
+///
+/// Without this the grid free-runs from the first sample, which is
+/// exactly right for replaying a recording and wrong for a live
+/// receiver. Call it whenever your clock is resynchronised; the grid
+/// re-anchors from that point rather than shifting what is already
+/// buffered.
+///
+/// # Safety
+/// `s` must be a live stream or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_stream_set_epoch(s: *mut MfskStream, utc_seconds: f64) {
+    if let Some(st) = stream_inner(s) {
+        st.epoch_utc = Some(utc_seconds);
+        st.epoch_at = st.pushed;
+    }
+}
+
+/// Whether a whole slot is buffered and ready to take.
+#[unsafe(no_mangle)]
+pub extern "C" fn mfsk_stream_slot_ready(s: *const MfskStream) -> bool {
+    stream_ref(s)
+        .map(|st| st.ring.len() >= st.slot_samples)
+        .unwrap_or(false)
+}
+
+/// Take the buffered slot, copying it into `out` and reporting the UTC
+/// second its first sample fell on.
+///
+/// Returns the number of samples written, or 0 if no slot is ready or
+/// `cap` is too small — ask [`mfsk_stream_slot_ready`] first and size
+/// from `MfskModeInfo::slot_samples_12k`.
+///
+/// # Safety
+/// `out` must be `cap` writable `int16_t`; `out_slot_start_utc` may be
+/// null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_stream_take_slot_i16(
+    s: *mut MfskStream,
+    out: *mut i16,
+    cap: usize,
+    out_slot_start_utc: *mut f64,
+) -> usize {
+    let Some(st) = stream_inner(s) else {
+        return 0;
+    };
+    if st.ring.len() < st.slot_samples || out.is_null() || cap < st.slot_samples {
+        return 0;
+    }
+    let n = st.slot_samples;
+    if !out_slot_start_utc.is_null() {
+        let first = st.taken;
+        unsafe { *out_slot_start_utc = st.utc_of(first) };
+    }
+    unsafe { ptr::copy_nonoverlapping(st.ring.as_ptr(), out, n) };
+    st.ring.drain(..n);
+    st.taken += n as u64;
+    n
+}
+
+/// Drop everything buffered, keeping the epoch.
+///
+/// # Safety
+/// `s` must be a live stream or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_stream_clear(s: *mut MfskStream) {
+    if let Some(st) = stream_inner(s) {
+        st.taken += st.ring.len() as u64;
+        st.ring.clear();
+    }
+}
+
+/// Decode the stream's buffered slot directly, without copying it out
+/// and back in.
+///
+/// Fused on purpose: FST4-300's slot is 3 600 000 samples, and a
+/// take-then-decode round trip moves 7 MB for nothing.
+///
+/// Returns `MFSK_STATUS_UNSUPPORTED` with `*out_len = 0` when no slot
+/// is ready yet, so a caller can poll this instead of
+/// [`mfsk_stream_slot_ready`] if it prefers.
+///
+/// # Safety
+/// As [`mfsk_session_decode_i16`], plus `stream` must be a live stream
+/// opened for the same mode as `dec`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_session_decode_stream(
+    dec: *mut MfskDecodeSession,
+    stream: *mut MfskStream,
+    params: *const MfskDecodeParams,
+    out: *mut MfskDecode,
+    out_cap: usize,
+    out_len: *mut usize,
+    out_slot_start_utc: *mut f64,
+) -> MfskStatus {
+    let Some(d) = v2(dec) else {
+        set_error("mfsk_session_decode_stream: null session handle");
+        return MfskStatus::InvalidArg;
+    };
+    let Some(st) = stream_inner(stream) else {
+        return d.fail("mfsk_session_decode_stream: null stream handle");
+    };
+    if st.mode != d.mode {
+        return d.fail(
+            "mfsk_session_decode_stream: the stream and the session are for different modes",
+        );
+    }
+    if !out_len.is_null() {
+        unsafe { *out_len = 0 };
+    }
+    if st.ring.len() < st.slot_samples {
+        set_error("mfsk_session_decode_stream: no whole slot buffered yet");
+        return MfskStatus::Unsupported;
+    }
+    let mut p = d.params;
+    if !params.is_null() {
+        if let Err(e) = unsafe { read_params(params, &mut p) } {
+            return d.fail(format!("mfsk_session_decode_stream: {e}"));
+        }
+        if let Err(e) = validate_params(d.mode, &p) {
+            return d.fail(format!("mfsk_session_decode_stream: {e}"));
+        }
+    }
+    if !out_slot_start_utc.is_null() {
+        unsafe { *out_slot_start_utc = st.utc_of(st.taken) };
+    }
+    let slot: Vec<i16> = st.ring[..st.slot_samples].to_vec();
+    st.ring.drain(..st.slot_samples);
+    st.taken += st.slot_samples as u64;
+
+    if let Err(e) = run_decode(d, &slot, &p) {
+        return d.fail(e);
+    }
+    unsafe { emit(d, out, out_cap, out_len) }
+}
+
 /// Write synthesised f32 PCM into caller memory.
 ///
 /// The seven `mfsk_encode_*` functions used to hand back a heap

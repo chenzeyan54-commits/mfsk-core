@@ -92,7 +92,6 @@ jobs:
               - 'mfsk-core/examples/**'
               - 'mfsk-core/benches/**'
               - 'mfsk-ffi/**'
-              - 'mfsk-ffi-ft8/**'
             ft8:
               - '.github/workflows/**'
               - 'mfsk-core/Cargo.toml'
@@ -536,20 +535,20 @@ jobs:
           fi
 
   # ───────────────────────────────────────────────────────────────
-  # mfsk-ffi + mfsk-ffi-ft8: cdylib build + Rust-level ABI tests
-  # (`cargo test -p mfsk-ffi`, covering q65_ffi.rs and wsjt_ffi.rs;
-  # `cargo test -p mfsk-ffi-ft8`, covering streaming.rs) + C++ driver
-  # for mfsk-ffi (encode/decode for every protocol + multi-threaded
-  # stress). Neither crate publishes to crates.io but both are real
-  # ABIs that C/C++/Kotlin/embedded consumers link against, so
-  # regressions here need catching.
+  # mfsk-ffi: cdylib build + Rust-level ABI tests + the C++ driver
+  # (every mode's round trip, the decode session, streaming capture,
+  # the TX pipeline, and a thread fan-out). The crate does not publish
+  # to crates.io but it is a real ABI that C/C++/Kotlin consumers link
+  # against, so regressions here need catching.
   #
-  # mfsk-ffi-ft8 is only host-tested (default `host` feature — the
-  # same rustfft backend as `mfsk-ffi`). Its `embedded-fixed-point`
-  # feature builds `no_std`, which has no `cargo test` harness to run
-  # here; those cross-compiled builds (xtensa-esp32/esp32s3-espidf)
-  # are build-only-verified at release time in `release.yml` and can
-  # only be exercised on real hardware.
+  # The driver is a separate translation unit on purpose: it compiles
+  # against the generated header, so it catches things no Rust test
+  # can — a macro-generated `extern "C"` function that never reached
+  # the header, and an out-of-range enum argument that segfaulted.
+  #
+  # `mfsk-ffi-ft8` used to be built and tested here too; it was retired
+  # (issue #251's own exit condition) once the v2 ABI covered its
+  # streaming and TX pipelines for every mode rather than FT8 alone.
   # ───────────────────────────────────────────────────────────────
   ffi:
     name: mfsk-ffi + C++ driver
@@ -586,9 +585,8 @@ jobs:
       # checkout, never the committed one.
       - name: Committed headers are current
         run: |
-          cargo build -p mfsk-ffi-ft8 --release
-          git diff --exit-code -- mfsk-ffi/include mfsk-ffi-ft8/include \
-            || { echo "::error::include/ is stale — run 'cargo build -p mfsk-ffi -p mfsk-ffi-ft8' and commit"; exit 1; }
+          git diff --exit-code -- mfsk-ffi/include \
+            || { echo "::error::include/ is stale — run 'cargo build -p mfsk-ffi' and commit"; exit 1; }
 
       # `cpp_compat = true` is set in both cbindgen.toml files and nothing
       # checked it. Compile each header as the only thing in a translation
@@ -620,12 +618,6 @@ jobs:
           cargo build -p mfsk-ffi --release --no-default-features --features mobile
           cargo test  -p mfsk-ffi --release --no-default-features --features mobile
 
-      - name: Build mfsk-ffi-ft8 (default host feature)
-        run: cargo build -p mfsk-ffi-ft8 --release
-
-      - name: cargo test -p mfsk-ffi-ft8 (host feature only)
-        run: cargo test -p mfsk-ffi-ft8 --release
-
   # ───────────────────────────────────────────────────────────────
   # rustdoc: catches broken intra-doc links and missing-example
   # compile failures. The --no-deps limits doc generation to our
@@ -653,7 +645,7 @@ jobs:
       # comments are also what cbindgen copies into the committed C
       # headers, so a bad link there is wrong in two places at once.
       - name: "Build docs (FFI crates)"
-        run: cargo doc -p mfsk-ffi -p mfsk-ffi-abi -p mfsk-ffi-ft8 --no-deps
+        run: cargo doc -p mfsk-ffi -p mfsk-ffi-abi --no-deps
 
   # ───────────────────────────────────────────────────────────────
   # MSRV gate. `[workspace.package] rust-version` is a claim about

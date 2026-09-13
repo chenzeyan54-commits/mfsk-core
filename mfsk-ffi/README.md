@@ -9,7 +9,9 @@ other platforms/ABIs (including Android) still need a local
 `cargo build -p mfsk-ffi`.
 
 > **Embedded (no_std + alloc) targets — ESP32-S3, RP2350, Cortex-M:**
-> use the sibling [`mfsk-ffi-ft8`](../mfsk-ffi-ft8/) crate instead.
+> build `mfsk-core` directly with `alloc,ft8,fft-extern` — an ESP-IDF
+> project needs a Rust staticlib shim for the FFT-planner symbol either
+> way, and once that shim exists the C ABI adds nothing.
 > It exposes the FT8 decode + transmit slice with the fixed-point
 > hot path enabled, distributed as prebuilt static libraries on the
 > same [GitHub Releases](https://github.com/jl1nie/mfsk-core/releases) page

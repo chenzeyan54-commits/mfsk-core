@@ -606,6 +606,111 @@ void test_ft8_streaming() {
     mfsk_session_close(s);
 }
 
+// ── Streaming capture and the slot grid ─────────────────────────────
+//
+// Generalised from `mfsk-ffi-ft8`'s FT8-only, i16-only front end. The
+// ring is sized from the mode, and **time enters as a parameter** —
+// the library reads no clock, which is what keeps this usable from a
+// phone that was backgrounded and from a replayed recording alike.
+void test_stream_capture() {
+    std::printf("\n— streaming capture: push → slot ready → fused decode\n");
+
+    const std::vector<int16_t> slot =
+        synth_slot(MFSK_MODE_FT8, "CQ", "JA1ABC", "PM95", 1500.0f);
+
+    MfskStatus st = MFSK_STATUS_INTERNAL;
+    MfskStream* stream = mfsk_stream_open(MFSK_MODE_FT8, 12000, &st);
+    if (stream == nullptr || st != MFSK_STATUS_OK) {
+        fail("stream", mfsk_last_error());
+        return;
+    }
+    mfsk_stream_set_epoch(stream, 1700000000.0);
+
+    if (mfsk_stream_slot_ready(stream)) {
+        fail("stream", "a fresh stream should have no slot ready");
+    }
+    // Push in chunks, the way a UAC reader delivers.
+    const size_t kChunk = 1920;
+    for (size_t i = 0; i < slot.size(); i += kChunk) {
+        const size_t n = (i + kChunk < slot.size()) ? kChunk : slot.size() - i;
+        if (mfsk_stream_push_i16(stream, slot.data() + i, n) != MFSK_STATUS_OK) {
+            fail("stream", mfsk_last_error());
+            mfsk_stream_close(stream);
+            return;
+        }
+    }
+    if (!mfsk_stream_slot_ready(stream)) {
+        fail("stream", "a full slot was pushed and is not ready");
+        mfsk_stream_close(stream);
+        return;
+    }
+    std::printf("  buffered %zu sample(s)\n", mfsk_stream_buffered(stream));
+
+    MfskDecodeSession* s = mfsk_session_open(MFSK_MODE_FT8, nullptr, &st);
+    if (s == nullptr) {
+        fail("stream", mfsk_last_error());
+        mfsk_stream_close(stream);
+        return;
+    }
+    Rows rows;
+    double slot_utc = -1.0;
+    const MfskStatus dst = mfsk_session_decode_stream(
+        s, stream, nullptr, rows.items, 16, &rows.len, &slot_utc);
+    if (dst != MFSK_STATUS_OK) {
+        fail("stream", mfsk_session_last_error(s));
+    } else {
+        print_rows("stream", rows);
+        std::printf("  slot started at UTC %.3f\n", slot_utc);
+        if (!rows.contains("JA1ABC")) fail("stream", "expected JA1ABC");
+        if (slot_utc != 1700000000.0) {
+            fail("stream", "the reported slot time should be the epoch the host declared");
+        }
+        if (mfsk_stream_slot_ready(stream)) {
+            fail("stream", "the fused decode should have consumed the slot");
+        }
+    }
+
+    // Polling before a slot is ready is "not yet", not a failure the
+    // caller has to guard against.
+    size_t none = 99;
+    if (mfsk_session_decode_stream(s, stream, nullptr, rows.items, 16, &none, nullptr)
+            != MFSK_STATUS_UNSUPPORTED || none != 0) {
+        fail("stream", "an empty stream should report UNSUPPORTED with *out_len = 0");
+    }
+
+    mfsk_session_close(s);
+    mfsk_stream_close(stream);
+
+    // The ring is sized per mode — an FT8-sized one would be wrong in
+    // both directions for FT4 and FST4-300.
+    for (MfskMode m : {MFSK_MODE_FT4, MFSK_MODE_FST4S300}) {
+        MfskModeInfo info;
+        std::memset(&info, 0, sizeof info);
+        info.size = sizeof info;
+        mfsk_mode_info(m, &info);
+        MfskStream* st2 = mfsk_stream_open(m, 12000, nullptr);
+        if (st2 == nullptr) {
+            fail(mfsk_mode_name(m), "stream_open failed");
+            continue;
+        }
+        const std::vector<int16_t> quiet(info.slot_samples_12k, 0);
+        mfsk_stream_push_i16(st2, quiet.data(), quiet.size());
+        if (!mfsk_stream_slot_ready(st2)) {
+            fail(mfsk_mode_name(m), "a full slot should be ready");
+        }
+        mfsk_stream_close(st2);
+    }
+
+    // A mode with no decode handle has nothing to feed.
+    MfskStatus wst = MFSK_STATUS_OK;
+    if (mfsk_stream_open(MFSK_MODE_WSPR, 12000, &wst) != nullptr ||
+        wst != MFSK_STATUS_UNSUPPORTED) {
+        fail("stream", "WSPR has no decode handle and should refuse a stream");
+    }
+    mfsk_stream_close(nullptr);
+    std::printf("  OK\n");
+}
+
 // ── Every parameter reaches the decoder ─────────────────────────────
 //
 // The pre-v2 ABI accepted eleven options and silently dropped six of
@@ -865,6 +970,7 @@ int main() {
     test_session_decode();
     test_ft8();
     test_ft8_streaming();
+    test_stream_capture();
     test_params();
     test_sniper();
     test_ft4();

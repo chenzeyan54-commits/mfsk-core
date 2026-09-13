@@ -168,7 +168,7 @@ jobs:
 
       # The tag version must match the workspace version in the root
       # `Cargo.toml` (`[workspace.package].version`) — `mfsk-core`,
-      # `mfsk-ffi`, and `mfsk-ffi-ft8` all inherit it via
+      # and `mfsk-ffi` inherit it via
       # `version.workspace = true`, so this one field gates the
       # publishable crate (mfsk-core) and both binary-tarball crates
       # at once.
@@ -191,134 +191,17 @@ jobs:
   # its tarball as a workflow artifact; the publish job downloads all
   # of them and attaches them to a single GitHub release.
   #
-  # Two crates ship binaries here: `mfsk-ffi-ft8` (embedded-focused
-  # FT8-only slice — host/esp32/esp32s3) and `mfsk-ffi` (desktop
-  # all-decoder library — host only for now; Android arm64 deferred,
-  # see `mfsk-ffi/examples/kotlin_jni/` for the manual cargo-ndk
-  # build in the meantime). See `docs/reference/LIBRARY.md` §8-9 for
-  # what each targets.
-  build-ffi-host:
-    name: Build mfsk-ffi-ft8 — linux-x86_64
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build -p mfsk-ffi-ft8 --release
-      - name: Package
-        run: |
-          set -euo pipefail
-          PKG=mfsk-ffi-ft8-${GITHUB_REF#refs/tags/}-linux-x86_64
-          mkdir -p "$PKG"/{lib,include}
-          cp target/release/libmfsk_ft8.so "$PKG"/lib/
-          cp target/release/libmfsk_ft8.a  "$PKG"/lib/
-          cp mfsk-ffi-ft8/include/mfsk_ft8.h "$PKG"/include/
-          cp mfsk-ffi-ft8/README.md          "$PKG"/ 2>/dev/null || true
-          cp mfsk-ffi-ft8/tests/c_smoke/smoke.c "$PKG"/
-          tar -czvf "$PKG".tar.gz "$PKG"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ffi-host
-          path: mfsk-ffi-ft8-*-linux-x86_64.tar.gz
-          if-no-files-found: error
-
-  build-ffi-esp32:
-    name: Build mfsk-ffi-ft8 — Xtensa ESP32
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Xtensa Rust toolchain (+esp)
-        uses: esp-rs/xtensa-toolchain@v1.5
-        with:
-          default: true
-          buildtargets: esp32
-          ldproxy: false
-        # The action wraps `espup install`, which queries
-        # api.github.com/repos/esp-rs/rust-build/releases/latest for
-        # the toolchain version. Without auth this hits the 60 req/h
-        # unauthenticated GitHub API limit shared across the runner's
-        # IP pool — easy to lose the race when the s3 sibling job
-        # consumed a slot a few seconds earlier (v0.6.5 release run
-        # 26005313390 hit this and the publish job got skipped until
-        # `gh run rerun --failed` re-ran the lost job in a fresh
-        # window). Passing the auto-injected workflow token bumps
-        # the limit to 5000 req/h, making the race deterministic.
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-      - uses: Swatinem/rust-cache@v2
-      - name: Build static lib for xtensa-esp32-espidf
-        # The +esp toolchain ships rust-src but no precompiled core
-        # for `xtensa-esp32-espidf`; `-Z build-std=core,alloc,panic_abort`
-        # builds the missing crates from source. Mirrors the
-        # m5stack-core2 example's `.cargo/config.toml` `[unstable]
-        # build-std` setting.
-        env:
-          RUSTFLAGS: "-C panic=abort"
-        run: |
-          cargo +esp build -p mfsk-ffi-ft8 --release \
-              --no-default-features \
-              --features embedded-fixed-point,embedded-runtime \
-              --target xtensa-esp32-espidf \
-              -Z build-std=core,alloc,panic_abort
-      - name: Package
-        run: |
-          set -euo pipefail
-          PKG=mfsk-ffi-ft8-${GITHUB_REF#refs/tags/}-esp32-xtensa
-          mkdir -p "$PKG"/{lib,include}
-          cp target/xtensa-esp32-espidf/release/libmfsk_ft8.a "$PKG"/lib/
-          cp mfsk-ffi-ft8/include/mfsk_ft8.h "$PKG"/include/
-          cp mfsk-ffi-ft8/README.md          "$PKG"/ 2>/dev/null || true
-          tar -czvf "$PKG".tar.gz "$PKG"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ffi-esp32
-          path: mfsk-ffi-ft8-*-esp32-xtensa.tar.gz
-          if-no-files-found: error
-
-  build-ffi-esp32s3:
-    name: Build mfsk-ffi-ft8 — Xtensa ESP32-S3
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Xtensa Rust toolchain (+esp)
-        uses: esp-rs/xtensa-toolchain@v1.5
-        with:
-          default: true
-          buildtargets: esp32s3
-          ldproxy: false
-        # Same GitHub-API rate-limit story as the esp32 sibling job
-        # above — pass the workflow token to bump from 60 to 5000
-        # req/h. Without this the two jobs race for the same per-IP
-        # unauthenticated budget and one of them loses periodically.
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-      - uses: Swatinem/rust-cache@v2
-      - name: Build static lib for xtensa-esp32s3-espidf
-        # See the esp32 job for why `-Z build-std=...` is needed.
-        env:
-          RUSTFLAGS: "-C panic=abort"
-        run: |
-          cargo +esp build -p mfsk-ffi-ft8 --release \
-              --no-default-features \
-              --features embedded-fixed-point,embedded-runtime \
-              --target xtensa-esp32s3-espidf \
-              -Z build-std=core,alloc,panic_abort
-      - name: Package
-        run: |
-          set -euo pipefail
-          PKG=mfsk-ffi-ft8-${GITHUB_REF#refs/tags/}-esp32s3-xtensa
-          mkdir -p "$PKG"/{lib,include}
-          cp target/xtensa-esp32s3-espidf/release/libmfsk_ft8.a "$PKG"/lib/
-          cp mfsk-ffi-ft8/include/mfsk_ft8.h "$PKG"/include/
-          cp mfsk-ffi-ft8/README.md          "$PKG"/ 2>/dev/null || true
-          tar -czvf "$PKG".tar.gz "$PKG"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ffi-esp32s3
-          path: mfsk-ffi-ft8-*-esp32s3-xtensa.tar.gz
-          if-no-files-found: error
-
+  # One crate ships binaries here: `mfsk-ffi`, the all-mode C ABI —
+  # host only for now; Android arm64 deferred, see
+  # `mfsk-ffi/examples/kotlin_jni/` for the manual cargo-ndk build in
+  # the meantime. See `docs/reference/LIBRARY.md` §8-9.
+  #
+  # The esp32/esp32s3 tarballs that used to be built here came from
+  # `mfsk-ffi-ft8`, which was retired: an ESP-IDF consumer had to write
+  # a Rust staticlib shim anyway to supply the FFT planner symbol
+  # (`embedded-poc/idf-component/README.md` said so itself), and once a
+  # consumer is writing Rust, calling `mfsk_core` directly is simpler —
+  # which is what all three of this repo's boards do.
   build-ffi-desktop-host:
     name: Build mfsk-ffi — linux-x86_64
     runs-on: ubuntu-latest
@@ -347,10 +230,9 @@ jobs:
 
   # ── Publish ───────────────────────────────────────────────────────
   # Runs only after every gate above is green: CI passed on this SHA,
-  # tag verification succeeded, and all three FFI binaries built. Then
+  # tag verification succeeded, and the FFI binary built. Then
   # we cargo publish, create a single GitHub release, and attach the
-  # FFI tarballs in one shot — no more idempotent-append racing across
-  # four jobs.
+  # FFI tarball in one shot.
   publish:
     name: Publish to crates.io + GitHub release
     runs-on: ubuntu-latest
@@ -358,9 +240,6 @@ jobs:
       [
         wait-for-ci,
         verify-tag,
-        build-ffi-host,
-        build-ffi-esp32,
-        build-ffi-esp32s3,
         build-ffi-desktop-host,
       ]
     permissions:
@@ -384,11 +263,10 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         # mfsk-core is the only crate we publish to crates.io.
-        # `mfsk-ffi` and `mfsk-ffi-ft8` both `publish = false` —
-        # they are binary deliverables (the cbindgen-generated `.h`
-        # + the staticlib), distributed via the GitHub release
-        # tarballs attached below. Keeps the crates.io index
-        # focused on the actual library consumers depend on.
+        # `mfsk-ffi` is `publish = false` — it is a binary deliverable
+        # (the cbindgen-generated `.h` + the staticlib), distributed
+        # via the GitHub release tarball attached below. Keeps the
+        # crates.io index focused on the library consumers depend on.
         run: cargo publish -p mfsk-core --features full
 
       - name: Create GitHub release
@@ -404,16 +282,9 @@ jobs:
             [CHANGELOG.md](https://github.com/jl1nie/mfsk-core/blob/main/CHANGELOG.md)
             for curated release notes.
 
-            **Prebuilt `mfsk-ffi-ft8` binaries** (embedded FT8-only C ABI:
-            linux-x86_64, esp32-xtensa, esp32s3-xtensa) are attached below
-            for users who want to drop the decoder into a non-Rust project
-            without setting up the cross-toolchain themselves — see
-            [`docs/reference/EMBEDDED.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/reference/EMBEDDED.md)
-            for the integration guide.
-
-            **Prebuilt `mfsk-ffi` binaries** (desktop all-decoder C ABI —
-            FT8/FT4/WSPR/JT9/JT65/FST4/Q65: linux-x86_64) are
-            also attached — see
+            **Prebuilt `mfsk-ffi` binaries** (the all-mode C ABI —
+            FT8, FT4, all five FST4 sub-modes, WSPR, JT9, JT65, Q65:
+            linux-x86_64) are attached below — see
             [`mfsk-ffi/README.md`](https://github.com/jl1nie/mfsk-core/blob/main/mfsk-ffi/README.md)
             and the Kotlin/JNI scaffold in
             [`mfsk-ffi/examples/kotlin_jni/`](https://github.com/jl1nie/mfsk-core/blob/main/mfsk-ffi/examples/kotlin_jni/)

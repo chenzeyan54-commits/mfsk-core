@@ -1685,6 +1685,49 @@ See `mfsk-ffi/examples/cpp_smoke/` for a minimal end-to-end demo.
 * The decoder uses thread-local state for caching and error reporting,
   so spawning multiple threads each with its own handle is cheap.
 
+### Transmit is the same shape: nothing crosses as an allocation
+
+Decode rows go into an array you own, and transmit is three stages —
+`mfsk_pack77*` → `mfsk_message_to_tones` → `mfsk_tones_to_i16`/`_f32` —
+each writing into a buffer you sized with `mfsk_symbol_count` and
+`mfsk_synth_output_len`. **There is no pointer to free**, which deletes
+the category that makes Kotlin and Swift wrappers leak when an exception
+unwinds between the call and the free.
+
+Before v2, seven `mfsk_encode_*` functions returned heap buffers and
+accepted only the three-string `call1 call2 report` path, so a caller
+with a type-4 or free-text message had no way in, and FST4 reached 60A
+alone.
+
+**Ask for the size rather than baking it.** The five FST4 sub-modes
+differ by a factor of 30 in samples per symbol (720 → 21 504), so a
+constant taken from 60A is silently wrong for the other four.
+
+### Streaming ingestion: time is a parameter, never read
+
+```c
+MfskStream* mfsk_stream_open(uint32_t mode, uint32_t sample_rate, MfskStatus* out);
+MfskStatus  mfsk_stream_push_i16(MfskStream*, const int16_t*, size_t);
+void        mfsk_stream_set_epoch(MfskStream*, double utc_seconds_of_next_sample);
+bool        mfsk_stream_slot_ready(const MfskStream*);
+MfskStatus  mfsk_session_decode_stream(MfskDecodeSession*, MfskStream*, ...);
+```
+
+The ring is sized from `slot_samples_12k`, so FST4-300's 3.6 M-sample
+slot works the same way FT4's 90 000-sample one does — `mfsk-ffi-ft8`'s
+front end was FT8-sized and i16-only.
+
+**No `Instant`, no `SystemTime`, no clock of any kind.** The host says
+what UTC second the next sample belongs to and the grid does arithmetic.
+That is what keeps this usable from wasm, from `no_std`, and from a
+phone that was backgrounded for four minutes — the same choice
+`BudgetCheck` makes for the decode deadline. Without an epoch the grid
+free-runs from the first sample, which is exactly right for replaying a
+recording.
+
+`mfsk_session_decode_stream` is fused because taking FST4-300's slot out
+and handing it back in moves 7 MB for nothing.
+
 ### Introspection: ask the library, don't hardcode a matrix
 
 Until 2026-09-13 `mfsk_version()` was the entire introspection surface,

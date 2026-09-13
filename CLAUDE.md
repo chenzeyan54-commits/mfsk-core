@@ -34,8 +34,7 @@ Host workspace members (`Cargo.toml` `[workspace] members`):
 |---|---|---|
 | `mfsk-core/` | the library — everything below is a consumer of it | **yes**, crates.io |
 | `mfsk-ffi/` | C ABI over *all* protocols; `include/mfsk.h` is cbindgen-generated and committed; `examples/cpp_smoke/` is a real C++ driver run by CI | no |
-| `mfsk-ffi-ft8/` | embedded-friendly C ABI over the FT8 slice only; host **and** `embedded-fixed-point` (pure `no_std`) builds; ships as prebuilt tarballs on GitHub Releases | no |
-| `mfsk-ffi-abi/` | shared `#[repr(C)]` status/result/options types both FFI crates re-emit (issue #205) | no |
+| `mfsk-ffi-abi/` | shared `#[repr(C)]` mode / status / params / row types `mfsk-ffi` re-emits (issue #205) | no |
 | `hosttest/mfsk-app-shared/` | runs the host-testable parts of `embedded-poc/mfsk-app-shared` under a normal `cargo test` | no |
 
 Only `mfsk-core` reaches crates.io; the rest are `publish = false`.
@@ -240,7 +239,7 @@ up.)
 
 CI (`ci.yml`) then runs: `changes` (a path filter that decides which sweep
 suites are relevant), `lint`, `test` (the tier matrix — see below),
-`feature-matrix`, `ffi` (`mfsk-ffi` + `mfsk-ffi-ft8` Rust tests, the C++
+`feature-matrix`, `ffi` (`mfsk-ffi` Rust tests, the C++
 driver including its multi-thread stress, and `mfsk-app-shared-hosttest`),
 `docs`, and `publish-dry-run`. `RUSTFLAGS: -D warnings` is set globally.
 
@@ -403,8 +402,11 @@ Shared code for these boards lives in `embedded-poc/embedded-shared/`
 (decode-side glue, esp-dsp FFT/dotprod backends) and
 `embedded-poc/mfsk-app-shared/` (UI/app logic, whose host-testable half
 runs in the workspace as `hosttest/mfsk-app-shared`).
-`embedded-poc/idf-component/` is the esp-idf bridge template for C
-projects consuming `mfsk-ffi-ft8`.
+`embedded-poc/idf-component/` is the esp-idf bridge template. Note it
+requires a Rust staticlib shim regardless — pure C cannot define the
+`extern "Rust"` FFT-planner symbol — which is why `mfsk-ffi-ft8` was
+retired: once a consumer is writing Rust, calling `mfsk_core` directly
+is strictly simpler, and that is what all three boards here do.
 
 **WSPR embedded RX (Phase E, issue #260) is a separate track from the
 FT8-controller line above** — it never goes through `decode_block` or
@@ -497,8 +499,8 @@ cargo build --release --bin <bin>
 triggered by a `vX.Y.Z` tag push. The workflow gates the publish on
 the CI for the same commit going green (`wait-for-ci` job), then
 runs `cargo publish -p mfsk-core --features full` + builds the
-`mfsk-ffi-ft8` FFI artifacts + creates the GitHub release with
-attached tarballs.
+`mfsk-ffi` artifact + creates the GitHub release with the attached
+tarball.
 
 `wait-for-ci` checks two things, not one. The workflow-run poll
 tolerates `skipped` (a docs-only push legitimately skips the build

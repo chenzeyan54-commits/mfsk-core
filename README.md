@@ -554,8 +554,9 @@ cargo build -p mfsk-ffi --release
 See `mfsk-ffi/examples/cpp_smoke/` for an end-to-end driver test
 (including multi-threaded usage) and `mfsk-ffi/examples/kotlin_jni/`
 for an Android/JNI skeleton. Embedded targets (ESP32-S3, RP2350,
-Cortex-M) instead use the sibling `mfsk-ffi-ft8` crate — see its own
-prebuilt binaries below.
+Cortex-M) build `mfsk-core` directly with `alloc,ft8,fft-extern`; an
+ESP-IDF project needs a Rust staticlib shim for the FFT-planner symbol
+either way, so a C ABI in between adds nothing.
 
 ## Contributing
 
@@ -586,17 +587,16 @@ strictness controls, and the FT8 wide-band AP path. The local-fence
   --include-ignored` (slow synthetic-SNR / AP / fast-fading sweeps
   enabled), a 13-cell feature matrix that builds every protocol in
   isolation + the embedded `alloc + ft8 + fft-extern + fixed-point`
-  preset, `cargo test` + the C++ driver for `mfsk-ffi` and `cargo test`
-  for `mfsk-ffi-ft8`, rustdoc with `-D warnings`, and a
+  preset, `cargo test` + the C++ driver for `mfsk-ffi`, rustdoc with
+  `-D warnings`, and a
   `cargo publish --dry-run` for `mfsk-core`.
 - **Release**: tag-driven (`vX.Y.Z`). Pushing a tag that matches the
   workspace version (`Cargo.toml::[workspace.package].version`,
-  inherited by `mfsk-core`/`mfsk-ffi`/`mfsk-ffi-ft8` alike) and is
+  inherited by `mfsk-core` and `mfsk-ffi` alike) and is
   reachable from `main` triggers `release.yml`, which publishes
   `mfsk-core` to crates.io and cuts a GitHub release with
-  auto-generated notes. Prebuilt `mfsk-ffi` (linux-x86_64) and
-  `mfsk-ffi-ft8` (linux-x86_64, esp32-xtensa, esp32s3-xtensa)
-  binaries follow on the same tag.
+  auto-generated notes. A prebuilt `mfsk-ffi` binary (linux-x86_64)
+  follows on the same tag.
 
 For non-trivial changes, please open an issue first so the
 WSJT-X-source-faithfulness lineage of any DSP or FEC change is
@@ -635,7 +635,7 @@ reference:
   — generic-scalar architecture (one codebase for f32 host and
   fixed-point embedded), feature-flag map, FFT-extern contract,
   Goertzel per-symbol DFT (zero-scratch, 0.6.4+) with BASIS
-  deprecation, Q-format reference, full `mfsk-ffi-ft8` C ABI
+  deprecation, Q-format reference, the embedded C ABI
   tutorial (streaming + ESP-IDF component layout), performance
   benchmark, streaming RX pipeline, binary footprint.
 - **FST4 sensitivity benchmark setup:**

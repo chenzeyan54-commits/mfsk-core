@@ -246,7 +246,6 @@ num-complex = { version = "0.4", default-features = false }
 # scoped to just the `fst4-bench` bin — Cargo has no per-bin feature
 # sets within one crate.
 mfsk-core = { path = "../../mfsk-core", default-features = false, features = ["alloc", "std", "ft8", "ft4", "fft-extern", "fixed-point", "profile-coarse", "nstep-half", "internal-testing"] }
-mfsk-ffi-ft8 = { path = "../../mfsk-ffi-ft8", default-features = false, features = ["embedded-fixed-point"] }
 
 # Shared decode-pipeline layer (streaming, dual_core, stage1_inc, esp_dsp_fft).
 embedded-shared = { path = "../embedded-shared", features = ["aes3", "ft4-bench"] }

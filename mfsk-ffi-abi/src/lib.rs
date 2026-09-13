@@ -1,5 +1,10 @@
-//! Shared `#[repr(C)]` ABI types for `mfsk-ffi` and `mfsk-ffi-ft8`
-//! (issue #205).
+//! Shared `#[repr(C)]` ABI types for `mfsk-ffi` (issue #205).
+//!
+//! Two FFI crates used to re-emit these; `mfsk-ffi-ft8` was retired
+//! once the v2 ABI covered its streaming and TX pipelines for every
+//! mode rather than FT8 alone. The split is kept because the types are
+//! plain data with no `std` requirement, which is what lets a future
+//! `no_std` C ABI reuse them without reopening this question.
 //!
 //! Before this crate, the two FFI crates independently evolved
 //! incompatible conventions for the same domain: clashing status
@@ -19,7 +24,7 @@
 //! pattern `mfsk-ffi`'s own `MfskDecoder` already established.
 //!
 //! This crate is not published and is not a C ABI on its own — it
-//! exists purely so `mfsk-ffi` and `mfsk-ffi-ft8` re-emit *identical*
+//! existed so both FFI crates re-emitted *identical*
 //! type definitions into their independently cbindgen-generated
 //! `mfsk.h` / `mfsk_ft8.h` headers. The two headers are not designed
 //! to be `#include`d together in the same translation unit (C, unlike
@@ -155,7 +160,7 @@ pub const MFSK_TEXT_CAP: usize = 39;
 /// NUL terminator) — for Rust-side use (`write_text`/`empty_result`
 /// helpers in the consuming crates). **Not** used in the `text` field
 /// below: cbindgen's cross-crate handling of a `pub use`-re-exported
-/// struct (this one, re-exported by `mfsk-ffi`/`mfsk-ffi-ft8`) can't
+/// struct (this one, re-exported by `mfsk-ffi`) can't
 /// turn a named `usize` constant defined in this crate into a C
 /// `#define` the *consuming* crate's header can reference — it
 /// resolves the array length internally (falling back to an opaque,
@@ -173,7 +178,7 @@ const _: () = assert!(MFSK_TEXT_BUF_LEN == 40);
 ///
 /// `text` is a fixed inline buffer (not a heap pointer): the whole
 /// [`MfskResultList`] is one allocation, freed in one call, with no
-/// per-message ownership to track — the model `mfsk-ffi-ft8` already
+/// per-message ownership to track — the model `mfsk-ffi-ft8` had
 /// used, now shared by `mfsk-ffi` too (issue #205; previously
 /// `mfsk-ffi`'s `MfskMessage` held a heap `CString` pointer per
 /// message instead).
@@ -235,7 +240,7 @@ impl MfskResultList {
 /// each crate's own `_options_new(...)`, release with
 /// `_options_free`.
 ///
-/// Both `mfsk-ffi` and `mfsk-ffi-ft8` used to hardcode (or take
+/// Both FFI crates used to hardcode (or take
 /// entirely positionally, with no room to add more later) every
 /// decode-tuning knob. Wrapping them behind an opaque handle now means
 /// a future knob is a new, optional setter function — the options

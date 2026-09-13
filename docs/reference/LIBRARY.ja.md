@@ -1548,6 +1548,46 @@ const char*       mfsk_last_error(void);
 * デコーダはキャッシュとエラー報告にスレッドローカルを使うので、
   複数スレッドそれぞれが自分のハンドルを持つコストは小さい
 
+### 送受信は同じ形: 境界を越える確保が無い
+
+デコード結果は呼び出し側が持つ配列に書かれ、送信も
+`mfsk_pack77*` → `mfsk_message_to_tones` → `mfsk_tones_to_i16/_f32` の
+三段が、それぞれ `mfsk_symbol_count` / `mfsk_synth_output_len` で
+サイズを聞いたバッファに書く。**free すべきポインタが存在しない。**
+これは Kotlin/Swift ラッパーで、呼び出しと free の間で例外が飛ぶと
+漏れる問題の分類ごと消す。
+
+v2 以前は `mfsk_encode_*` 7個が三文字列 (`call1 call2 report`) しか
+受け付けずヒープを返していたので、type-4 や自由文のメッセージには
+入口が無く、FST4 は 60A にしか届かなかった。
+
+**サイズは焼き込まず聞くこと。** FST4 の5サブモードはシンボルあたり
+サンプル数が 30 倍違う (720 → 21 504)。60A から取った定数は残り4つで
+黙って誤りになる。
+
+### ストリーミング取り込み: 時刻はパラメータであって、読まない
+
+```c
+MfskStream* mfsk_stream_open(uint32_t mode, uint32_t sample_rate, MfskStatus* out);
+MfskStatus  mfsk_stream_push_i16(MfskStream*, const int16_t*, size_t);
+void        mfsk_stream_set_epoch(MfskStream*, double utc_seconds_of_next_sample);
+bool        mfsk_stream_slot_ready(const MfskStream*);
+MfskStatus  mfsk_session_decode_stream(MfskDecodeSession*, MfskStream*, ...);
+```
+
+リングは `slot_samples_12k` から採寸するので、FST4-300 の 360 万
+サンプルのスロットも FT4 の 9 万サンプルと同じ形で扱える
+(`mfsk-ffi-ft8` の front end は FT8 固定・i16 のみだった)。
+
+**`Instant` も `SystemTime` も無い。** ホストが「次のサンプルがどの
+UTC 秒か」を言い、グリッドは算術をするだけ。これが wasm・`no_std`・
+4分間バックグラウンドにいた iOS アプリのどれでも使える理由で、
+デコード期限に `BudgetCheck` が取ったのと同じ選択である。epoch を
+与えなければ最初のサンプルから自走し、それは録音の再生にとって正しい。
+
+`mfsk_session_decode_stream` が融合しているのは、FST4-300 のスロットを
+取り出して入れ直すと 7 MB を無駄に動かすからである。
+
 ### イントロスペクション: 行列をハードコードせず、ライブラリに聞く
 
 2026-09-13 まで、C から見えるイントロスペクションは `mfsk_version()`

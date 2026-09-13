@@ -74,7 +74,6 @@ mfsk-core = { path = "../../mfsk-core", default-features = false, features = ["a
 # `mfsk_core_*` extern symbols (FFT planner, dot_q15) supplied by
 # `esp_dsp_fft.rs` resolve both the direct-Rust and the via-FFI path
 # without duplication.
-mfsk-ffi-ft8 = { path = "../../mfsk-ffi-ft8", default-features = false, features = ["embedded-fixed-point"] }
 num-complex = { version = "0.4", default-features = false }
 
 # Shared embedded glue (wav_sim / esp_dsp_fft / dual_core / stage1_inc /

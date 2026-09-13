@@ -132,13 +132,12 @@ pub fn run(target_name: &str, qso_wavs: &'static [(&'static str, &'static [u8])]
         }
     }
 
-    log::info!("\n════════════════════════════════════════════");
-    log::info!("FFI smoke: mfsk_ft8_decode_i16 (C ABI) on each WAV");
-    log::info!("════════════════════════════════════════════");
-    for (label, slot) in &slots {
-        log::info!("\nWAV: {label} (via FFI)");
-        ffi_smoke_one(slot);
-    }
+    // A `mfsk_ft8_decode_i16` smoke pass used to run here, timing the
+    // same WAVs through `mfsk-ffi-ft8`'s C ABI. That crate was retired
+    // (issue #251's own exit condition: "the crate becomes an actual
+    // maintenance drag on other refactors"), and the numbers it printed
+    // were the same decode `decode_one` above already measures — the
+    // C ABI added a wrapper, not a measurement.
 
     log::info!("\n=== Sweep complete. Idling. ===");
     loop {
@@ -148,47 +147,6 @@ pub fn run(target_name: &str, qso_wavs: &'static [(&'static str, &'static [u8])]
     }
 }
 
-fn ffi_smoke_one(slot: &[i16]) {
-    use mfsk_ft8::{
-        mfsk_ft8_decode_i16, mfsk_ft8_options_free, mfsk_ft8_options_new,
-        mfsk_ft8_result_list_free, MfskDecodeDepth, MfskResultList,
-    };
-    let mut results = MfskResultList {
-        items: core::ptr::null_mut(),
-        len: 0,
-        _capacity: 0,
-    };
-    // issue #205: the five positional tuning knobs are now behind an
-    // MfskDecodeOptions handle.
-    let options = mfsk_ft8_options_new(100.0, 3_000.0, 1.0, 30, MfskDecodeDepth::BpAll);
-    let t0 = now_us();
-    let st = unsafe { mfsk_ft8_decode_i16(slot.as_ptr(), slot.len(), options, &mut results) };
-    unsafe { mfsk_ft8_options_free(options) };
-    let t1 = now_us();
-    log::info!(
-        "  ffi status={:?}  {:>3} result(s)  {:>8} us",
-        st,
-        results.len,
-        t1 - t0,
-    );
-    if !results.items.is_null() {
-        let items = unsafe { core::slice::from_raw_parts(results.items, results.len) };
-        for (i, r) in items.iter().enumerate() {
-            let bytes: &[u8] =
-                unsafe { core::slice::from_raw_parts(r.text.as_ptr() as *const u8, r.text.len()) };
-            let n = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-            let text = core::str::from_utf8(&bytes[..n]).unwrap_or("<bad utf8>");
-            log::info!(
-                "    [{i}]  {:>4.0} Hz  SNR={:>5.1} dB  e={}  '{}'",
-                r.freq_hz,
-                r.snr_db,
-                r.hard_errors,
-                text,
-            );
-        }
-    }
-    unsafe { mfsk_ft8_result_list_free(&mut results) };
-}
 
 /// Belief propagation in each scalar, same LLRs, same binary.
 ///
