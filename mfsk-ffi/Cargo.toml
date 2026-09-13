@@ -25,8 +25,61 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # If this crate is ever published, cargo will demand a version on each
 # path dep and say so immediately — an error at the right moment,
 # rather than a stale literal nobody reads.
-mfsk-core = { path = "../mfsk-core", features = ["full"] }
+mfsk-core = { path = "../mfsk-core", default-features = false }
 mfsk-ffi-abi = { path = "../mfsk-ffi-abi" }
+
+# This crate had no `[features]` table at all and pinned `mfsk-core`'s
+# `full`, so every consumer got std + rustfft + rayon + serde whether or
+# not it wanted them, and `--no-default-features` changed nothing. That
+# is a problem for exactly one class of consumer, and it is the class
+# this ABI is being rebuilt for.
+#
+# **rayon is the reason.** The first decode lazily spawns rayon's global
+# pool: `num_cpus` threads, 2 MiB stacks each, never joined. On Android
+# those threads are not attached to ART; on iOS they sit outside GCD's
+# QoS, compete with the audio render thread, and keep running when the
+# app is backgrounded. A mobile build wants the option to say no.
+#
+# Dropping `parallel` also *strengthens* the `.on_result` delivery
+# contract rather than weakening it — from "completion order, from a
+# worker thread, possible transient duplicate" to "exactly once per
+# returned result, in order" (`docs/reference/STREAMING.md` §3a vs §3b).
+#
+# `desktop` is the default and is byte-for-byte what this crate built
+# before, so nothing changes for anyone who does not opt in.
+[features]
+default = ["desktop"]
+
+# Everything this crate built before: every protocol it exposes, plus
+# rayon and serde.
+desktop = ["protocols", "legacy", "parallel", "serde"]
+
+# Same protocol coverage, single-threaded, no serde. This is the build an
+# Android or iOS app wants, and the one thing it changes is the thing that
+# matters there.
+mobile = ["protocols", "legacy"]
+
+# The decoders the C surface actually names. Not individually selectable
+# yet: `src/lib.rs` imports every protocol module unconditionally, so
+# `--features ft8` alone does not compile. Splitting them is part of the
+# ABI rewrite, where the entry points get cfg'd per protocol; until then
+# this is one switch, and pretending otherwise would ship a feature
+# combination nobody can build.
+protocols = [
+    "mfsk-core/std",
+    "mfsk-core/fft-rustfft",   # `ft8::decode` et al. only exist with a backend
+    "mfsk-core/ft8",
+    "mfsk-core/ft4",
+    "mfsk-core/fst4",
+]
+
+# Q65 / WSPR / JT9 / JT65 — the modes that are not `FrameDecodable` and so
+# cannot share the decoder-handle shape. Same caveat as `protocols`: the
+# source does not cfg them out yet.
+legacy = ["mfsk-core/q65", "mfsk-core/wspr", "mfsk-core/jt9", "mfsk-core/jt65"]
+
+parallel = ["mfsk-core/parallel"]
+serde    = ["mfsk-core/serde"]
 
 [build-dependencies]
 cbindgen = "0.29"

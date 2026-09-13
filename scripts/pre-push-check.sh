@@ -54,6 +54,17 @@ for features in "${FEATURE_MATRIX[@]}"; do
   fi
 done
 
+echo "► mfsk-ffi feature combinations"
+# `desktop` is the default and is what every other command here already
+# covers. `mobile` is the one that drops rayon and serde, and since this
+# crate's own source never names rayon, nothing else would catch it
+# breaking.
+for ffi_features in "desktop" "mobile"; do
+  echo "  · [$ffi_features]"
+  RUSTFLAGS="-D warnings" cargo build -p mfsk-ffi --release \
+    --no-default-features --features "$ffi_features"
+done
+
 echo "► FT8 recall floors under fixed-point (issue #359)"
 # `fixed-point` implies `nstep-half` and is the numeric path every
 # embedded build ships, but nothing routine ran it: the merge gate is

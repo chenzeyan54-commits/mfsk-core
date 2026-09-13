@@ -612,6 +612,14 @@ jobs:
           cd mfsk-ffi/examples/cpp_smoke
           ./cpp_smoke
 
+      # The mobile build is the one that drops rayon, and rayon is not
+      # referenced from this crate's own source — so nothing here would
+      # notice it breaking except a build that actually selects it.
+      - name: "Build + test mfsk-ffi (mobile — no rayon, no serde)"
+        run: |
+          cargo build -p mfsk-ffi --release --no-default-features --features mobile
+          cargo test  -p mfsk-ffi --release --no-default-features --features mobile
+
       - name: Build mfsk-ffi-ft8 (default host feature)
         run: cargo build -p mfsk-ffi-ft8 --release
 

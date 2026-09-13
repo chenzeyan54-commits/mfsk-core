@@ -92,6 +92,31 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
 
 ### Added
 
+- **`mfsk-ffi` has feature flags, and one of them drops rayon.** The crate
+  had no `[features]` table at all and pinned `mfsk-core`'s `full`, so
+  every consumer got std + rustfft + rayon + serde whether it wanted them
+  or not, and `--no-default-features` changed nothing.
+
+  rayon is the reason this matters. The first decode lazily spawns rayon's
+  global pool — `num_cpus` threads, 2 MiB stacks each, never joined. On
+  Android those threads are not attached to ART; on iOS they sit outside
+  GCD's QoS, compete with the audio render thread, and keep running when
+  the app is backgrounded. `--no-default-features --features mobile` is
+  the same protocol coverage, single-threaded, without serde.
+
+  Dropping `parallel` also *strengthens* the `.on_result` contract rather
+  than weakening it: from "completion order, from a worker thread, with a
+  possible transient duplicate" to "exactly once per returned result, in
+  order" (`docs/reference/STREAMING.md` §3a vs §3b).
+
+  `desktop` is the default and is byte-for-byte the previous build, down
+  to an identical generated header. Individual protocol features are
+  deliberately *not* offered yet — `src/lib.rs` imports every protocol
+  module unconditionally, so `--features ft8` alone does not compile;
+  splitting them belongs to the ABI rewrite that cfg's the entry points.
+  Shipping a feature combination nobody can build would be worse than
+  shipping one switch.
+
 - **`DecodeRequest::budget` / `SniperRequest::budget` — FT8 decodes
   cheapest-first inside a caller's wall-clock allowance.** A decode can
   now be handed a caller-supplied deadline predicate
