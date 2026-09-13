@@ -37,7 +37,7 @@
 use std::collections::BTreeSet;
 
 use mfsk_core::msg::decode_request::{
-    FrameDecodable, SupportsSicEarly, SupportsSicRounds, SupportsWideBandAp,
+    FrameDecodable, SupportsSicEarly, SupportsSicRounds, SupportsSniper, SupportsWideBandAp,
 };
 use mfsk_core::registry::{DecodeProfile, SyncScale, caps};
 use mfsk_core::{PROTOCOLS, ProtocolMeta};
@@ -76,6 +76,13 @@ fn check_wideband_ap<P: SupportsWideBandAp>(name: &str) {
     );
 }
 
+fn check_sniper<P: SupportsSniper>(name: &str) {
+    assert!(
+        profile(name).caps & caps::SNIPER != 0,
+        "{name} implements SupportsSniper but its registry entry does not claim caps::SNIPER"
+    );
+}
+
 fn check_decode_handle<P: FrameDecodable>(name: &str) {
     assert!(
         profile(name).caps & caps::DECODE_HANDLE != 0,
@@ -104,6 +111,10 @@ fn implemented_capabilities_are_claimed() {
     check_sic_early::<Ft8>("FT8");
 
     check_wideband_ap::<Ft8>("FT8");
+    check_wideband_ap::<Ft4>("FT4");
+    check_wideband_ap::<Fst4s60>("FST4-60A");
+
+    check_sniper::<Ft8>("FT8");
 }
 
 /// The other direction: a bit claimed by an entry that the list above
@@ -131,11 +142,33 @@ fn claimed_capabilities_are_implemented() {
         "SupportsSicEarly is FT8-only — no other protocol has a checkpoint \
          architecture to port"
     );
+    let mut wideband_ap = BTreeSet::from(["FT8", "FT4"]);
+    wideband_ap.extend(FST4_MODES);
     assert_eq!(
         claims(caps::AP_WIDEBAND),
+        wideband_ap,
+        "wide-band AP reaches every protocol now: it is a rung on the shared \
+         ladder rather than something only the sniper's engine could do"
+    );
+    let q65 = PROTOCOLS
+        .iter()
+        .map(|p| p.name)
+        .filter(|n| n.starts_with("Q65-"));
+    let mut narrow_ap: BTreeSet<&'static str> = q65.collect();
+    narrow_ap.insert("FT8");
+    assert_eq!(
+        claims(caps::AP_NARROW),
+        narrow_ap,
+        "narrow AP is for searches that already know the carrier: FT8's \
+         SniperRequest, and Q65, whose decode is targeted by construction \
+         and so has no wide-band counterpart"
+    );
+    assert_eq!(
+        claims(caps::SNIPER),
         BTreeSet::from(["FT8"]),
-        "wide-band AP is FT8-only: the shared AP engine early-exits after the \
-         first hit, which is correct only for a single target"
+        "narrow-band single-target search is an FT8 mode — the receive half of \
+         an analogue roofing filter. FT4 is a contest protocol and FST4 has its \
+         own DDC channelizer; see SupportsSniper"
     );
 
     let mut handles = BTreeSet::from(["FT8", "FT4"]);

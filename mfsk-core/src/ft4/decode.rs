@@ -5,17 +5,16 @@
 //! via the shared [`crate::msg::decode_request::DecodeRequest`] /
 //! [`crate::msg::decode_request::SniperRequest`] builders (issue #191).
 
+use alloc::vec::Vec;
+
 use super::Ft4;
 use crate::engine::dsp::downsample::DownsampleCfg;
 use crate::engine::dsp::subtract::SubtractCfg;
 use crate::engine::pipeline;
-use crate::msg::pipeline_ap;
 
 pub use crate::engine::pipeline::{DecodeDepth, DecodeResult, DecodeStrictness, FftCache};
 pub use crate::msg::ApHint;
-use crate::msg::decode_request::{
-    DecodeOutcome, DecodeRequest, FrameDecodable, SniperRequest, SupportsSicRounds,
-};
+use crate::msg::decode_request::{DecodeOutcome, DecodeRequest, FrameDecodable, SupportsSicRounds};
 
 /// FT4 downsample configuration: 12 kHz → ~666.7 Hz baseband, covering four
 /// tones spaced 20.833 Hz apart plus headroom.
@@ -49,9 +48,6 @@ pub const FT4_SUBTRACT: SubtractCfg = SubtractCfg {
     }),
 };
 
-/// FT4's coarse sync now uses half-symbol (24 ms = 16 downsampled-sample)
-/// steps; refine across ±1 symbol (32 samples) still to bridge rounding.
-const REFINE_STEPS: i32 = 32;
 /// FT4 has 16 sync symbols (4 × 4); require at least half correct.
 const SYNC_Q_MIN: u32 = 8;
 
@@ -127,46 +123,6 @@ impl FrameDecodable for Ft4 {
         );
         DecodeOutcome {
             results: pipeline::dedup_known(raw, req.known),
-            fft_cache,
-            budget,
-        }
-    }
-
-    fn __sniper(req: &SniperRequest<'_, Self>) -> DecodeOutcome<Self> {
-        // Clamp caller's candidate count: in sniper mode the target is
-        // reliably in the top-5 after dedup even at -18 dB, so >15 just
-        // burns CPU — especially important under the lite feature
-        // defaults where every candidate runs BP + OSD per AP config.
-        let max_cand = req.max_cand.min(15);
-        let (results, budget) = pipeline_ap::decode_sniper_ap::<Ft4>(
-            req.audio,
-            &FT4_DOWNSAMPLE,
-            req.target_freq,
-            req.search_hz,
-            req.sync_min,
-            req.depth,
-            max_cand,
-            req.strictness,
-            req.eq_mode,
-            REFINE_STEPS,
-            // Halve the sync-quality gate for AP: locked bits carry the
-            // decision, so weak sync-quality signals may still succeed.
-            SYNC_Q_MIN / 2,
-            req.ap_hint,
-            req.on_result,
-            req.budget,
-        );
-        // `pipeline_ap::decode_sniper_ap` doesn't return its FFT cache;
-        // sniper mode never exposed one before this redesign either
-        // (old `decode_sniper_ap` returned `Vec<DecodeResult>` only), so
-        // rebuild it once here purely to satisfy `DecodeOutcome`'s
-        // uniform shape.
-        let fft_cache = FftCache(crate::engine::dsp::downsample::build_fft_cache(
-            req.audio,
-            &FT4_DOWNSAMPLE,
-        ));
-        DecodeOutcome {
-            results,
             fft_cache,
             budget,
         }
@@ -247,39 +203,18 @@ impl SupportsSicRounds for Ft4 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::msg::decode_request::DecodeRequest;
-
-    /// Compile-time check that `DecodeRequest<Ft4>` accepts every `osd`
-    /// setting across single-pass, `sic_rounds`, and sniper. No actual
-    /// decoding happens — empty audio returns no candidates fast — but
-    /// this guards against future signature drift.
-    #[test]
-    fn decode_request_accepts_all_param_combos() {
-        let empty = vec![0i16; 12 * 7500]; // 7.5 s of silence at 12 kHz
-        for osd in [false, true] {
-            let _ = DecodeRequest::<Ft4>::new(&empty, 100.0, 3000.0, 1.0, 5)
-                .osd(osd)
-                .decode();
-            let _ = DecodeRequest::<Ft4>::new(&empty, 100.0, 3000.0, 1.0, 5)
-                .osd(osd)
-                .sic_rounds(3)
-                .decode();
-            let _ = DecodeRequest::<Ft4>::sniper(&empty, 1500.0, 5)
-                .osd(osd)
-                .decode();
-        }
-    }
 
     /// Pins `Ft4`'s `GenericPipelineProtocol::snr_db` override to the
     /// real-formula `ft4_snr_db` (issue #255) — a direct, non-flaky
-    /// check that both of FT4's call paths (basic pipeline,
-    /// `msg::pipeline_ap`'s AP path) go through the *same* function.
-    /// The AP path used to call the generic adjacent-tone
-    /// `compute_snr_db` directly instead (a missed 4th call site left
-    /// over from a pre-trait ad-hoc fix); that regression would show up
-    /// here as this test failing, without needing a full synthetic
-    /// decode (whose reported SNR is also sensitive to search-bandwidth
-    /// -dependent candidate scoring, an unrelated confound).
+    /// check that FT4 reports SNR through the *same* function whichever
+    /// rung of the ladder produced the decode. When AP lived in its own
+    /// parallel engine that engine called the generic adjacent-tone
+    /// `compute_snr_db` directly (a missed 4th call site left over from
+    /// a pre-trait ad-hoc fix); the engine is gone, but the trait
+    /// override it bypassed is what this pins, without needing a full
+    /// synthetic decode (whose reported SNR is also sensitive to
+    /// search-bandwidth-dependent candidate scoring, an unrelated
+    /// confound).
     #[test]
     fn snr_db_dispatches_to_ft4_formula() {
         let cs: [num_complex::Complex<f32>; 0] = [];

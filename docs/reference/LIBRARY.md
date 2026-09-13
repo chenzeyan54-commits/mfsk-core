@@ -768,18 +768,17 @@ points, §6.3/§6.5):
   `.decode()` to get a
   `DecodeOutcome<P>` (`.results: Vec<P::DecodeResult>`, `.fft_cache`
   for a follow-up call, and `.budget: BudgetReport`).
-* **`SniperRequest<P>`** — narrow-band, single-target search. **Read
-  "Sniper mode is a roofing-filter mode" below before using it** — it is
-  not a general "hunt one known station" convenience, and the A-priori
-  hint sitting on it is an implementation accident rather than a
-  statement about where AP applies.
+* **`SniperRequest<P>`** — narrow-band, single-target search, gated on
+  `SupportsSniper` and **implemented for FT8 alone**. **Read "Sniper mode
+  is a roofing-filter mode" below before using it** — it is not a general
+  "hunt one known station" convenience, and AP is not part of it.
   `DecodeRequest::<P>::sniper(audio, target_freq_hz, max_cand)` or
-  `SniperRequest::<P>::new(...)` directly; `.osd(bool)`,
-  `.strictness(...)`, `.eq_mode(...)`, `.ap_hint(...)` where the
-  protocol's message codec implements `WsjtApCompatible` (no SIC
-  variant — sniper mode is inherently single-candidate), and
-  `.on_result(cb)` and `.budget(check)` (same as above). `.decode()`
-  returns the same `DecodeOutcome<P>` shape.
+  `SniperRequest::<P>::new(...)` directly; `.search_hz(w)` to widen or
+  narrow the default ±250 Hz window, `.osd(bool)`, `.strictness(...)`,
+  `.eq_mode(...)`, `.ap_hint(...)` (no SIC variant — sniper mode is
+  inherently single-candidate), and `.on_result(cb)` and
+  `.budget(check)` (same as above). `.decode()` returns the same
+  `DecodeOutcome<P>` shape.
 
 This replaced FT8's `decode_frame*`/`decode_frame_subtract*`/
 `decode_sniper*` family (15 public functions) and FT4/FST4's own
@@ -787,8 +786,8 @@ suffix-exploded equivalents — see §6.2/§6.4 for worked examples.
 
 #### Sniper mode is a roofing-filter mode, and AP is not part of it
 
-Two things about `SniperRequest` are repeatedly misread, including by
-people working on this repository. Both have cost real design decisions,
+Three things about `SniperRequest` are repeatedly misread, including by
+people working on this repository. Each has cost a real design decision,
 so they are stated here rather than left in a doc comment.
 
 **1. The ±250 Hz window is hardware, not cleverness.** Sniper mode is the
@@ -812,42 +811,68 @@ cost: the `ft4sim`-generated FT4 golden has no receiver filter, and
 `Local` loses two decodes of fourteen there. Default `Off` is right for
 recordings and simulations and wrong for a narrowed receiver.
 
-**2. A-priori decoding is a general option that got coupled to it.** AP
-locks high-confidence bits and lowers the threshold by 1-3 dB. Nothing
-about it is narrow-band. But the shared AP engine
-(`msg::pipeline_ap::decode_sniper_ap`) breaks out of its candidate loop
-on `if has_ap` — **the presence of a hint is what makes the search
-single-target**, not the width of the search — so handing a hint to a
-wide-band search through that engine stops it after the first decode.
-FT8 escapes only because it has its own AP path and never enters that
-engine, which is the whole content of the `SupportsWideBandAp` trait
-being FT8-only.
+**2. It is FT8-only, and that is the design.** `SupportsSniper` is
+implemented for `Ft8` and nothing else. The wide-band path is the main
+path for every mode in this crate — if it is not WSJT-X-faithful without
+a sniper, that is a bug in the wide-band path, not a reason to reach for
+this one. FT4 is a contest protocol whose entire premise is working a
+full band, so a roofing filter is against its purpose; FST4 narrows
+through its own DDC channelizer (`docs/notes/FST4_DDC_DESIGN.md`), which
+is the same benefit without a second decode engine. FT4 and FST4 sniper
+entry points existed until 2026-09-13 and were removed; the C ABI
+returns `MFSK_STATUS_UNKNOWN_PROTOCOL` for them.
 
-That early exit is now fixed — the engine is `decode_band_ap` and the
-sniper is one of its callers — and the same pass found a second defect
-behind it: the AP engine generated FT4's candidates with the *generic*
-2-D Costas search rather than FT4's own `getcandidates4.f90` port, so
-both the candidate set and the meaning of `sync_min` (baseline-normalised
-for FT4, not for the generic search) were wrong on that path.
+**3. A-priori decoding is a general option that got coupled to it, and
+no longer is.** AP locks high-confidence bits and lowers the threshold
+by 1-3 dB. Nothing about it is narrow-band. But AP used to live in a
+parallel engine (`msg::pipeline_ap::decode_sniper_ap`) that the sniper
+was the only caller of, and that engine broke out of its candidate loop
+on `if has_ap` — **the presence of a hint was what made the search
+single-target**, not the width of the search. FT8 escaped only because
+it has its own AP path and never entered that engine, which was the
+whole content of `SupportsWideBandAp` being FT8-only.
 
-**Neither fix makes wide-band AP work, and the reason is worth
-recording.** Measured on the WSJT-X FT4 golden: routing a wide-band
-decode through the AP engine returns 4 decodes where the plain path
-returns 11, and loses the hinted station itself. It returns the
-*identical* set whether the hint names a station that is present or one
-that is absent — so AP is changing nothing, and the loss is entirely the
-different ladder. It invents nothing, so this is a recall problem rather
-than a false-decode one: `process_candidate_ap` offers OSD at depth 2
-only, with no depth-3/4 escalation and no Top-K rescue, and most of that
+Removing the coupling was not enough, and the measurement is worth
+recording because "it is one line" was asserted twice here and was
+wrong both times. Routing a wide-band FT4 decode through that engine
+returned 4 decodes where the plain path returns 11, lost the hinted
+station itself, and returned the *identical* set whether the hint named
+a present or an absent station — so AP was changing nothing and the loss
+was entirely the ladder: `process_candidate_ap` offered OSD at depth 2
+with no depth-3/4 escalation and no Top-K rescue, and most of that
 recording's decodes come from exactly those.
 
-So `SupportsWideBandAp` does not mean "FT4 and FST4 cannot do wide-band
-AP", and it also is not one line away. It means AP lives in a parallel,
-shallower per-candidate ladder. Wide-band AP means giving
-`process_candidate_basic` — the ladder the wide-band engine actually
-uses — an AP option. That is the real shape of the work, and it still
-needs a false-decode measurement on top, since AP's risk profile is
-manufactured decodes.
+**The engine is now gone.** AP is a rung at the end of
+`engine::pipeline::process_candidate_basic`'s own ladder — everything
+above it has already run and failed, so it can only add decodes — and it
+therefore reaches FT8, FT4 and every FST4 sub-mode. `msg::pipeline_ap`
+is what remains: `ap_passes` (the hypothesis set, WSJT-X's `iaptype`
+equivalents) and `ap_bits_for`, 96 lines with no engine of its own.
+
+Two things were found while wiring it, both shipped:
+
+* **FT4/FST4 AP was locking half its bits to the opposite of the
+  truth.** Those protocols XOR the 77-bit message with their own RVEC
+  before CRC and FEC (`ModulationParams::INFO_SCRAMBLE_RVEC`), so the
+  info bits inside the codeword are the *scrambled* message, while an
+  `ApHint` describes the message. `ap_bits_for` now scrambles. At
+  −17/−18/−19 dB on 12 trials each: 3→12, 0→11, 0→8. FT8 has no RVEC
+  and was never affected — which is why this survived, the protocol
+  where AP is most used being the one where it worked.
+  (`tests/ft4_ap_scramble.rs`.)
+* **A blind-CQ hypothesis was missing** (upstream `iaptype 1`, locking
+  the message type and the `CQ` prefix with no callsign knowledge). It
+  is the pass that applies with no station knowledge at all, so it
+  changes the *baseline* rather than a hinted case. FT4 AWGN threshold
+  moved −16.89 → **−18.00 dB**, from 0.6 dB behind WSJT-X's published
+  −17.5 dB to 0.5 dB ahead. The caveat is recorded in
+  `docs/notes/FT4_BENCHMARK.md` §48: the sweep corpus is CQ-only, so
+  this is the best case for that pass.
+
+AP's risk is manufactured decodes, so wide-band AP ships with precision
+guards in the same file as the gain assertion: a hint naming a station
+that is not transmitting must not produce it, and a confident hint over
+pure noise must decode nothing.
 
 #### Compute budget: `.budget(check)`
 

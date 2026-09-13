@@ -155,22 +155,24 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
   useful option was reachable for FT4 and FST4 only through the sniper,
   a path that exists for a specific piece of radio hardware.
 
-  The engine is now `decode_band_ap`, taking a band, an optional
-  ranking hint, and an explicit `stop_after_first`; the sniper is one of
-  its callers and passes the same condition it used to apply
-  internally, so that path is unchanged.
+  **Decoupling it does not deliver wide-band AP, and the measurement is
+  why this entry is longer than "removed one line".** Routing FT4's
+  wide-band decode through that engine returns 4 decodes where the plain
+  path returns 11 on the WSJT-X golden — and loses the hinted station
+  itself. It returns the *identical* set for a hint naming a present
+  station and one naming an absent station, so AP is changing nothing;
+  the loss is entirely the different ladder. It invents nothing, so this
+  is recall, not false decodes: `process_candidate_ap` offered OSD at
+  depth 2 only, with no depth-3/4 escalation and no Top-K rescue, and
+  most of that recording's decodes come from exactly those.
 
-  **Decoupling it does not deliver wide-band AP, and the measurement
-  says why.** Routing FT4's wide-band decode through that engine returns
-  4 decodes where the plain path returns 11 on the WSJT-X golden — and
-  loses the hinted station itself. It returns the *identical* set for a
-  hint naming a present station and one naming an absent station, so AP
-  is changing nothing; the loss is entirely the different ladder. It
-  invents nothing, so this is recall, not false decodes:
-  `process_candidate_ap` offers OSD at depth 2 only, with no depth-3/4
-  escalation and no Top-K rescue, and most of that recording's decodes
-  come from exactly those. Wide-band AP means giving the wide-band
-  engine's own ladder an AP option — not reusing the sniper's.
+  **So the engine is gone rather than fixed.** AP is a rung at the end
+  of `engine::pipeline::process_candidate_basic`'s own ladder —
+  everything above it has already run and failed, so it can only add
+  decodes — and it therefore reaches FT8, FT4 and every FST4 sub-mode.
+  `SupportsWideBandAp` is implemented for all of them, `caps::AP_WIDEBAND`
+  says so, and `msg::pipeline_ap` is 96 lines of hypothesis generation
+  with no engine of its own.
 
 - **`SniperRequest::search_hz`** — the ±250 Hz window is a parameter
   rather than a literal at each dispatch site. It is the one
@@ -212,15 +214,12 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
   synthetic input EQ can only cost — `Local` loses two decodes of
   fourteen on the `ft4sim`-generated FT4 golden.
 
-  **And A-priori decoding is coupled to sniper by accident.**
-  `msg::pipeline_ap::decode_sniper_ap` leaves its candidate loop on
-  `if has_ap`: the presence of a hint, not the width of the search, is
-  what makes it single-target. That one line is the entire content of
-  `SupportsWideBandAp` being FT8-only — FT8 escapes because it has its
-  own AP path and never enters that engine. The trait does not mean
-  FT4/FST4 cannot take a hint across a band; it means an early exit is
-  gated on the wrong condition. Decoupling it is small and its
-  validation is not, since AP's risk is false decodes.
+  **And A-priori decoding was coupled to sniper by accident** — see the
+  entry above, which is where that was chased down and undone. The doc
+  claim corrected here was narrower and also wrong: that the coupling
+  was one line (`decode_sniper_ap`'s `if has_ap`). It was two things,
+  the second being the shallower ladder AP lived in, and measurement is
+  what said so.
 
   All three are now written down where they will be found: `CLAUDE.md`,
   `docs/reference/LIBRARY.md` §4 (and its `.ja.md` twin), and the
@@ -271,7 +270,7 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
   for.
 
   `PROTOCOLS` has always been able to say "this build has FST4-120". It
-  could not say that FST4 has no SIC at all, that wide-band AP is FT8's
+  could not say that FST4 has no SIC at all, that the sniper is FT8's
   alone, or that `.strictness()` is a no-op on FST4's non-AP path — so
   every consumer that needed to know hardcoded a matrix, and the C ABI
   that is about to publish one would have hardcoded it too.
@@ -436,6 +435,47 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
   Covered by `mfsk-ffi/tests/sniper_ffi.rs` and a `test_sniper` case in
   the CI-run C++ driver, which decodes an FT4 signal at 1200 Hz through
   an AP hint from compiled C++ — the combination that was unreachable.
+
+  **Superseded later in this same unreleased section** — see "The sniper
+  is an FT8 mode" under *Removed*. The FT4/FST4 arms are gone and the
+  AP hint they existed to carry now reaches those protocols through the
+  ordinary wide-band `mfsk_decode_i16`, which is where it belonged.
+
+### Removed
+
+- **The sniper is an FT8 mode, and FT4/FST4 no longer offer one.**
+  `SniperRequest` is now gated on its own trait, `SupportsSniper`,
+  implemented for `Ft8` alone; `DecodeRequest::<Ft4>::sniper` and the
+  FST4 equivalents no longer exist, and `mfsk_decode_*_sniper` returns
+  `MFSK_STATUS_UNKNOWN_PROTOCOL` for them.
+
+  The sniper's ±250 Hz window is the software half of narrowing a
+  transceiver's *analogue* roofing filter — a handful of radios, pointed
+  at a DX station whose carrier is already known. FT4 is a contest
+  protocol whose premise is working a full band, so a roofing filter is
+  against its purpose; FST4 narrows through its own DDC channelizer,
+  which is the same benefit without a second decode engine. And the
+  principle behind both: **the wide-band path is the main path for every
+  mode here, so if it is not WSJT-X-faithful without a sniper, that is a
+  bug in the wide-band path** — not a reason to ship a second one.
+
+  What made the second engine look necessary was AP, and that coupling
+  was an accident (see *Changed* below). With AP on the shared ladder
+  there is nothing the FT4/FST4 sniper could do that the wide-band
+  decode cannot, and it carried two latent defects of its own: it
+  generated FT4's candidates with the generic 2-D Costas search rather
+  than FT4's `getcandidates4.f90` port, so both the candidate set and
+  the meaning of `sync_min` were wrong on that path.
+
+  Deleted with it: `msg::pipeline_ap`'s entire engine — `decode_band_ap`,
+  `decode_sniper_ap`, `process_candidate_ap`, `finalise_result` — leaving
+  96 lines of hypothesis generation (`ap_passes`, `ap_bits_for`);
+  `tests/ft4_sniper_aim_offset.rs`; and the FT4 sniper arms of
+  `ft4_streaming_decode`, `ft4_snr_sweep` and `ft4_timing_budget`, whose
+  AP cases moved to the wide-band path. `tests/registry_caps.rs` now
+  pins `caps::SNIPER` to FT8 in both directions, with a
+  `check_sniper::<P: SupportsSniper>` that will not compile for any
+  other protocol.
 
 ### Fixed
 

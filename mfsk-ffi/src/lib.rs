@@ -1153,40 +1153,16 @@ fn decode_i16_sniper(
                 push_wsjt77(&r, &ht, &mut vec);
             }
         }
-        MfskProtocol::Ft4 => {
-            let mut req = SniperRequest::<mfsk_core::ft4::Ft4>::new(audio, target_freq_hz, mc)
-                .sync_min(smin)
-                .strictness(strictness)
-                .eq_mode(eq_mode);
-            if let Some(hint) = ap {
-                req = req.ap_hint(hint);
-            }
-            for r in req.decode().results {
-                push_ft4(&r, &mut vec);
-            }
-        }
-        MfskProtocol::Fst4s60 => {
-            use mfsk_core::MessageCodec;
-            let codec = mfsk_core::msg::Wsjt77Message;
-            let ctx = mfsk_core::DecodeContext::default();
-            let mut req = SniperRequest::<mfsk_core::fst4::Fst4s60>::new(audio, target_freq_hz, mc)
-                .sync_min(smin)
-                .strictness(strictness)
-                .eq_mode(eq_mode);
-            if let Some(hint) = ap {
-                req = req.ap_hint(hint);
-            }
-            for r in req.decode().results {
-                let text = codec.unpack(r.message77(), &ctx).unwrap_or_default();
-                let mut rec = empty_result(r.freq_hz, r.dt_sec, r.snr_db, r.hard_errors, r.pass);
-                write_text(&mut rec.text, &text);
-                vec.push(rec);
-            }
-        }
+        // Every other protocol, including FT4 and FST4 since their
+        // snipers were retired. Narrow-band single-target search is an
+        // FT8 mode: it is the receive half of an analogue roofing
+        // filter, which is a DX-chasing activity — incompatible with
+        // FT4's contest use, and superseded on FST4 by its own DDC
+        // channelizer. A-priori decoding, the thing this entry point
+        // looked like it was for, is an option on the ordinary
+        // wide-band decode now.
         _ => {
-            set_error(
-                "sniper decode: only FT8, FT4 and FST4-60A have a single-frequency-target mode",
-            );
+            set_error("sniper mode is FT8-only");
             return MfskStatus::UnknownProtocol;
         }
     }

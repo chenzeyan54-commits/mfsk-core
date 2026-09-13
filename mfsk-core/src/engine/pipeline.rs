@@ -373,8 +373,8 @@ impl DecodeStrictness {
     /// random bits flipping to agree with the lock is increasingly
     /// unlikely). Calibrated from a synthetic QSO scenario (REPORT AP at
     /// -18 dB: 15% FP rate with old thresholds 30/36) — shared by FT8's
-    /// per-candidate AP loop and [`crate::msg::pipeline_ap`]'s generic
-    /// sniper (issue #191 type consolidation; previously duplicated
+    /// per-candidate AP loop and the AP rung of this module's generic
+    /// ladder (issue #191 type consolidation; previously duplicated
     /// byte-for-byte in both places).
     pub fn ap_max_errors(self, locked_bits: usize) -> u32 {
         match (self, locked_bits >= 55) {
@@ -1176,9 +1176,8 @@ where
             // the AP pattern. A fourth *blind* `llrd` is FT8's shape
             // (`ft8c.f90:192`, `llrd = scalefac*bmetd`), which this
             // generic ladder inherited and applied to FT4 as well.
-            // (This crate's own AP path, `msg::pipeline_ap`, uses
-            // `llr_set.llrd` for exactly WSJT-X's purpose and is
-            // untouched.)
+            // (The AP rung below uses `llr_set.llrd` for exactly
+            // WSJT-X's purpose and is untouched.)
             //
             // Measured before removing it (`tests/ft4_llr_ladder_
             // ablation.rs`, 2026-08-30): over 560 sweep files
@@ -1334,12 +1333,13 @@ where
             // Additive by construction. Everything above has already
             // run and failed, so this can only add decodes — which is
             // the whole reason it sits here rather than replacing the
-            // ladder. `msg::pipeline_ap` reaches the same technique
-            // through a *parallel* per-candidate path whose OSD stops
-            // at depth 2, and routing a wide-band decode through that
-            // was measured at 4 decodes against this ladder's 11 on the
-            // WSJT-X FT4 golden. AP was never the weak part; the ladder
-            // around it was.
+            // ladder. AP used to reach the same technique through a
+            // *parallel* per-candidate path (`msg::pipeline_ap`) whose
+            // OSD stopped at depth 2; routing a wide-band decode
+            // through that was measured at 4 decodes against this
+            // ladder's 11 on the WSJT-X FT4 golden. AP was never the
+            // weak part; the ladder around it was, which is why that
+            // engine is gone and this rung exists.
             //
             // The mask/values arrive as plain slices rather than as an
             // `ApHint`, because that is a `msg` type and `engine` does
@@ -1396,8 +1396,8 @@ where
                             dt_sec: refined.dt_sec,
                             hard_errors: r.hard_errors,
                             sync_score: refined.score,
-                            // The hypothesis' own pass id, matching
-                            // the ids `msg::pipeline_ap` reports, so an
+                            // The hypothesis' own pass id, from
+                            // `msg::pipeline_ap::ap_passes`, so an
                             // AP-assisted decode is distinguishable
                             // from an earned one and says which
                             // hypothesis carried it.

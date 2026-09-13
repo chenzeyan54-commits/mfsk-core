@@ -126,27 +126,33 @@ absence. **The phantom-prone code lives in these non-default strategies**
 #243 in `__staged_sic`, #253 in `.sic_early()`), so a new strategy ships
 with its precision guard in the same PR.
 
-**Sniper mode is a roofing-filter mode; AP is not part of it.** This has
-been misread more than once, each time costing a design decision, so:
-`SniperRequest`'s ±250 Hz window exists because the operator narrowed the
-transceiver's *analogue* roofing filter (FTDX101MP, FTDX10 — the few
-radios offering one at ~500 Hz) and pointed it at a DX station whose
-carrier is already known. The audio arriving is already band-limited;
-the decoder is matching the hardware, not being clever. `.eq_mode()` sits
-beside it to flatten the tilt that analogue filter's skirt puts on the
-passband — so **EQ is a property of the input audio, not of the search**,
-which is why `DecodeRequest` carries it too and why it costs decodes on
-flat `ft4sim` corpora. And **A-priori decoding is a general option that
-got coupled to sniper by accident**: the AP engine broke out of its
-candidate loop on `if has_ap`, so a hint — not a narrow search — was what
-made it single-target (fixed 2026-09-13; the engine is now
-`decode_band_ap` with the sniper as a caller). **But that was not the
-whole blocker**: AP lives in a *parallel, shallower* per-candidate ladder
-(`process_candidate_ap`, OSD depth-2 only) rather than in the wide-band
-engine's, so routing a wide-band decode through it costs most of the
-decodes — 4 against 11 on the FT4 golden, measured. Wide-band AP means
-giving `process_candidate_basic` an AP option, not reusing the sniper's
-engine. Full writeup in `LIBRARY.md` §4.
+**Sniper mode is an FT8-only roofing-filter mode; AP is not part of it.**
+This has been misread more than once, each time costing a design
+decision, so: `SniperRequest`'s ±250 Hz window exists because the
+operator narrowed the transceiver's *analogue* roofing filter (FTDX101MP,
+FTDX10 — the few radios offering one at ~500 Hz) and pointed it at a DX
+station whose carrier is already known. The audio arriving is already
+band-limited; the decoder is matching the hardware, not being clever.
+`.eq_mode()` sits beside it to flatten the tilt that analogue filter's
+skirt puts on the passband — so **EQ is a property of the input audio,
+not of the search**, which is why `DecodeRequest` carries it too and why
+it costs decodes on flat `ft4sim` corpora.
+
+It is gated on its own trait, `SupportsSniper`, **implemented for FT8
+alone** (2026-09-13). The wide-band path is the main path for every mode
+here; if it is not WSJT-X-faithful without a sniper, that is a bug in the
+wide-band path. FT4 is a contest protocol whose premise is working a full
+band, and FST4 narrows through its own DDC channelizer instead.
+
+**A-priori decoding is a general option that got coupled to sniper by
+accident.** The AP engine broke out of its candidate loop on
+`if has_ap`, so a hint — not a narrow search — was what made it
+single-target; and it ran a *parallel, shallower* per-candidate ladder
+(OSD depth-2 only, no Top-K rescue) that cost most of the decodes — 4
+against 11 on the FT4 golden, measured. Both are gone: AP is now a rung
+on `process_candidate_basic`'s own ladder, reaching FT8, FT4 and every
+FST4 sub-mode, and `msg::pipeline_ap` is 96 lines of hypothesis
+generation with no engine of its own. Full writeup in `LIBRARY.md` §4.
 
 **MSK144 is intentionally outside the `Protocol` trait** — it isn't FSK,
 and `msk144::decode::decode_slot` bypasses `engine::pipeline` by design.

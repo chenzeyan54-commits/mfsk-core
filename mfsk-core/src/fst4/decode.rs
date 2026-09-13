@@ -19,10 +19,11 @@
 
 use crate::engine::dsp::downsample::DownsampleCfg;
 use crate::engine::pipeline;
+use alloc::vec::Vec;
 
 pub use crate::engine::pipeline::{DecodeDepth, DecodeResult, DecodeStrictness, FftCache};
 pub use crate::msg::ApHint;
-use crate::msg::decode_request::{DecodeOutcome, DecodeRequest, FrameDecodable, SniperRequest};
+use crate::msg::decode_request::{DecodeOutcome, DecodeRequest, FrameDecodable};
 
 /// FST4-15 downsample configuration: 12 kHz → 666.7 Hz baseband
 /// (NDOWN = 18, matching WSJT-X `fst4_decode.f90`'s `ndown` for
@@ -120,14 +121,6 @@ pub const FST4_300_DOWNSAMPLE: DownsampleCfg = DownsampleCfg {
 /// ladder (including the 65536-hypothesis nsym=8 rung) in our pipeline
 /// too — issue #197. Shared by every sub-mode.
 const SYNC_Q_MIN: u32 = 16;
-
-/// Fine-refine time-domain search half-width, in *downsampled*
-/// samples. Every FST4 sub-mode's downsampled samples-per-symbol
-/// (`NSPS / NDOWN`) lands in the 36-42 range (WSJT-X picks each
-/// sub-mode's `ndown` so that ratio stays roughly constant), so this
-/// fixed raw-sample count corresponds to a consistent ~1-symbol
-/// search window across all of them — no per-sub-mode retuning needed.
-const REFINE_STEPS: i32 = 40;
 
 /// Implements [`FrameDecodable`] for one FST4 sub-mode ZST, wiring in its
 /// `DownsampleCfg`. Every sub-mode shares the same generic engine
@@ -236,33 +229,6 @@ macro_rules! impl_frame_decodable {
                 );
                 DecodeOutcome {
                     results: pipeline::dedup_known(raw, req.known),
-                    fft_cache,
-                    budget,
-                }
-            }
-
-            fn __sniper(req: &SniperRequest<'_, Self>) -> DecodeOutcome<Self> {
-                let (results, budget) = crate::msg::pipeline_ap::decode_sniper_ap::<$proto>(
-                    req.audio,
-                    &$cfg,
-                    req.target_freq,
-                    req.search_hz,
-                    req.sync_min,
-                    req.depth,
-                    req.max_cand,
-                    req.strictness,
-                    req.eq_mode,
-                    REFINE_STEPS,
-                    SYNC_Q_MIN / 2,
-                    req.ap_hint,
-                    req.on_result,
-                    req.budget,
-                );
-                let fft_cache = FftCache(crate::engine::dsp::downsample::build_fft_cache(
-                    req.audio, &$cfg,
-                ));
-                DecodeOutcome {
-                    results,
                     fft_cache,
                     budget,
                 }
@@ -440,23 +406,5 @@ mod tests {
             1000.0,
             2000.0,
         );
-    }
-
-    /// Compile-time check that `DecodeRequest<Fst4s60>` accepts every
-    /// `osd` setting across single-pass and sniper. No actual decoding
-    /// happens — empty audio returns no candidates fast — but this
-    /// guards against future signature drift breaking downstream
-    /// callers that do parameterised dispatch.
-    #[test]
-    fn decode_request_accepts_all_param_combos() {
-        let empty = vec![0i16; 12 * 60 * 1000]; // 60 s of silence
-        for osd in [false, true] {
-            let _ = DecodeRequest::<crate::fst4::Fst4s60>::new(&empty, 100.0, 3000.0, 0.8, 5)
-                .osd(osd)
-                .decode();
-            let _ = DecodeRequest::<crate::fst4::Fst4s60>::sniper(&empty, 1500.0, 5)
-                .osd(osd)
-                .decode();
-        }
     }
 }

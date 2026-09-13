@@ -22,7 +22,7 @@ use std::ptr;
 
 use mfsk::{
     MfskDecodeDepth, MfskProtocol, MfskResultList, MfskSamples, MfskStatus, mfsk_decode_f32_sniper,
-    mfsk_decode_i16_sniper, mfsk_decode_options_free, mfsk_decode_options_new,
+    mfsk_decode_i16, mfsk_decode_i16_sniper, mfsk_decode_options_free, mfsk_decode_options_new,
     mfsk_decode_options_set_ap_hint, mfsk_decode_options_set_freq_hint,
     mfsk_decode_options_set_sic_rounds, mfsk_decoder_free, mfsk_decoder_new, mfsk_encode_ft4,
     mfsk_encode_ft8, mfsk_result_list_free, mfsk_samples_free,
@@ -155,14 +155,19 @@ fn f32_and_i16_sniper_agree() {
     }
 }
 
-/// **The point of #249.** `mfsk_decode_options_set_ap_hint` is accepted
-/// on an FT4 decode here; through `mfsk_decode_i16` it would be
-/// silently dropped, because `SupportsWideBandAp` is FT8-only.
+/// FT4 has no sniper any more, and the AP hint it was reached through
+/// now works on the ordinary wide-band decode.
+///
+/// Narrow-band single-target search is an FT8 mode — the receive half
+/// of an analogue roofing filter, a DX-chasing activity incompatible
+/// with FT4's contest use. A-priori decoding was never part of that; it
+/// only looked that way because the shared AP engine ended its search
+/// on `if has_ap`, so a hint was what made a search single-target.
 #[test]
-fn ft4_sniper_accepts_an_ap_hint() {
+fn ft4_sniper_is_gone_and_ap_works_wide_band() {
     let audio = synth(mfsk_encode_ft4, "JL1NIE", "VK3NV", "-12", FREQ);
     let dec = mfsk_decoder_new(MfskProtocol::Ft4);
-    let opts = mfsk_decode_options_new(200.0, 3_000.0, 1.2, 8, MfskDecodeDepth::BpAllOsd);
+    let opts = mfsk_decode_options_new(200.0, 3_000.0, 1.2, 50, MfskDecodeDepth::BpAllOsd);
 
     let call1 = CString::new("JL1NIE").unwrap();
     let call2 = CString::new("VK3NV").unwrap();
@@ -180,17 +185,25 @@ fn ft4_sniper_accepts_an_ap_hint() {
     );
 
     let mut list = empty_list();
-    let st = unsafe {
-        mfsk_decode_i16_sniper(
-            dec,
-            audio.as_ptr(),
-            audio.len(),
-            12_000,
-            FREQ,
-            opts,
-            &mut list,
-        )
-    };
+    assert_eq!(
+        unsafe {
+            mfsk_decode_i16_sniper(
+                dec,
+                audio.as_ptr(),
+                audio.len(),
+                12_000,
+                FREQ,
+                opts,
+                &mut list,
+            )
+        },
+        MfskStatus::UnknownProtocol,
+        "FT4 sniper should report the mode as unsupported, not decode"
+    );
+
+    // The same hint on the path FT4 actually has.
+    let mut list = empty_list();
+    let st = unsafe { mfsk_decode_i16(dec, audio.as_ptr(), audio.len(), 12_000, opts, &mut list) };
     assert_eq!(st, MfskStatus::Ok);
     assert!(
         unsafe { list_contains(&list, "JL1NIE") },

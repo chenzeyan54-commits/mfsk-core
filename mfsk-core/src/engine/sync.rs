@@ -1003,15 +1003,17 @@ impl SpectrogramBuilder {
 /// main decode strategies (single-pass, `.sic_rounds()`) route through
 /// `engine::ft4_coarse::ft4_coarse_sync` instead, a separate
 /// `getcandidates4.f90`-faithful port with its own spectrogram
-/// construction — see that module's doc comment for why. FT4's
-/// `SniperRequest::ap_hint` path (`msg::pipeline_ap`) still calls this
-/// function, unconditionally, for any `P: WsjtApCompatible` — so FT4
-/// isn't *entirely* off this path, just off it for the common case.
-/// FST4 (all 5 sub-modes) is the one protocol still fully on this path
-/// today; JT9/Q65/WSPR/uvpacket each have their own separate coarse-sync
+/// construction — see that module's doc comment for why. That is now
+/// *every* FT4 strategy: the parallel AP engine which called this
+/// function unconditionally for any `P: WsjtApCompatible` — and so
+/// silently ran FT4 on the wrong generator and the wrong threshold
+/// scale — has been deleted, and AP is a rung on the ladder the
+/// `ft4_coarse_sync` candidates already feed.
+/// FST4 (all 5 sub-modes) is the one protocol still on this path today;
+/// JT9/Q65/WSPR/uvpacket each have their own separate coarse-sync
 /// implementations (verified via `grep coarse_sync::<` — nothing outside
-/// `engine/pipeline.rs` and `msg/pipeline_ap.rs` calls this generic
-/// function with a non-FST4/FT4 protocol).
+/// `engine/pipeline.rs` calls this generic function with a non-FST4
+/// protocol).
 ///
 /// `grid`: the rate and (for a complex `audio`) down-conversion centre
 /// [`AudioSource`] is actually at — [`RxGrid::real`] for every caller
@@ -1651,8 +1653,8 @@ pub(crate) fn rank_candidates(
 // *within* one `fine_sync_power_per_block` call, see that function's
 // own doc comment), FST4 alternates exactly two (SYNC_A/SYNC_B) — so 2
 // slots never thrash for any protocol actually wired here. Perf review:
-// `fine_sync_power_per_block` runs once per candidate from three call
-// sites (`ft8/decode.rs`, `engine/pipeline.rs`, `msg/pipeline_ap.rs`),
+// `fine_sync_power_per_block` runs once per candidate from two call
+// sites (`ft8/decode.rs`, `engine/pipeline.rs`),
 // and the within-call cache above always started empty — every call
 // rebuilt each pattern's trig table from scratch even when the
 // previous call used the identical `(pattern, ds_spb)` pair. Making

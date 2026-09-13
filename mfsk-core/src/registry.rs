@@ -76,8 +76,8 @@ pub mod caps {
     /// reports a start sample rather than a `dt`; WSPR/JT9/JT65 have no
     /// builder at all. They are not lesser, they are shaped differently.
     pub const DECODE_HANDLE: u32 = 1 << 0;
-    /// Narrow-band single-target search (`SniperRequest`): a ±250 Hz
-    /// window around a known carrier.
+    /// Narrow-band single-target search (`SniperRequest`, gated on the
+    /// `SupportsSniper` trait): a ±250 Hz window around a known carrier.
     ///
     /// Not a software convenience for chasing a spotted station. It is
     /// the receive-side half of narrowing the radio's *analogue*
@@ -86,27 +86,39 @@ pub mod caps {
     /// reaching the decoder is already band-limited. That is also why
     /// [`EQ_MODE`] sits next to it: the filter's skirt tilts the
     /// passband, and local equalisation is what flattens it again.
+    ///
+    /// **FT8 only, and that is the design rather than a gap.** The
+    /// wide-band path is the main path for every mode in this crate; if
+    /// it is not WSJT-X-faithful without a sniper, that is a bug in the
+    /// wide-band path, not a reason to reach for this. FT4 is a contest
+    /// protocol whose whole premise is working a full band, and FST4
+    /// narrows through its own DDC channelizer instead.
     pub const SNIPER: u32 = 1 << 1;
-    /// A-priori hint on the narrow-band search (`SniperRequest::ap_hint`).
+    /// A-priori hint on a *targeted* search — one where the carrier is
+    /// already known, so there is a single hypothesis to lock bits for.
+    ///
+    /// Two different builders carry this: `SniperRequest::ap_hint` on
+    /// FT8, and `q65::Q65DecodeRequest::ap_hint` on Q65, whose decode is
+    /// inherently targeted (a nominal frequency plus a tolerance) and so
+    /// has no wide-band counterpart to offer. Contrast [`AP_WIDEBAND`],
+    /// which is the same hint applied to a whole-band search.
     pub const AP_NARROW: u32 = 1 << 2;
     /// A-priori hint on the *wide-band* search (`SupportsWideBandAp`).
     ///
-    /// FT8 only — but this is an artefact, not a property of the other
-    /// protocols. The shared AP engine breaks out of its candidate loop
-    /// on `if has_ap`, i.e. **the presence of a hint is what makes the
-    /// search single-target**, so handing one to a wide-band search
-    /// would stop it after the first decode. That gating is fixed, but
-    /// it was not the whole blocker: AP lives in a **parallel,
-    /// shallower per-candidate ladder** (`msg::pipeline_ap`'s
-    /// `process_candidate_ap`, OSD at depth 2 with no depth-3/4
-    /// escalation and no Top-K rescue) rather than in the wide-band
-    /// engine's. Driving a wide-band decode through it returns 4 of the
-    /// 11 decodes the plain path finds on the FT4 golden, losing the
-    /// hinted station itself, and returns the same set for a present
-    /// and an absent hint — so the cost is the ladder, not AP.
+    /// This used to be FT8-only, and the reason was an artefact twice
+    /// over. AP lived in a parallel engine (`msg::pipeline_ap`) whose
+    /// candidate loop broke out on `if has_ap` — the *presence of a
+    /// hint*, not the search width, is what made it single-target — and
+    /// whose per-candidate ladder was shallower than the wide-band one
+    /// (OSD at depth 2, no depth-3/4 escalation, no Top-K rescue).
+    /// Driving a wide-band decode through it returned 4 of the 11
+    /// decodes the plain path finds on the FT4 golden, losing the hinted
+    /// station itself and returning the same set for a present and an
+    /// absent hint: the cost was the ladder, not AP.
     ///
-    /// Wide-band AP therefore means giving `process_candidate_basic` an
-    /// AP option, not reusing the sniper's engine.
+    /// Wide-band AP is therefore a *rung on the shared ladder* —
+    /// `process_candidate_basic` takes an AP option — and reaches FT8,
+    /// FT4 and every FST4 sub-mode. The parallel engine is gone.
     pub const AP_WIDEBAND: u32 = 1 << 3;
     /// Flat successive-interference cancellation (`SupportsSicRounds`).
     pub const SIC_ROUNDS: u32 = 1 << 4;
@@ -349,8 +361,7 @@ const FT8_PROFILE: DecodeProfile = DecodeProfile {
 #[allow(dead_code)]
 const FT4_PROFILE: DecodeProfile = DecodeProfile {
     caps: caps::DECODE_HANDLE
-        | caps::SNIPER
-        | caps::AP_NARROW
+        | caps::AP_WIDEBAND
         | caps::SIC_ROUNDS
         | caps::OSD
         | caps::EQ_MODE
@@ -382,8 +393,7 @@ const FT4_PROFILE: DecodeProfile = DecodeProfile {
 #[allow(dead_code)]
 const FST4_PROFILE: DecodeProfile = DecodeProfile {
     caps: caps::DECODE_HANDLE
-        | caps::SNIPER
-        | caps::AP_NARROW
+        | caps::AP_WIDEBAND
         | caps::OSD
         | caps::EQ_MODE
         | caps::BUDGET
@@ -409,7 +419,7 @@ const FST4_PROFILE: DecodeProfile = DecodeProfile {
 /// The defaults mirror what `mfsk-ffi`'s Q65 family already hardcodes.
 #[allow(dead_code)]
 const Q65_PROFILE: DecodeProfile = DecodeProfile {
-    caps: caps::SNIPER | caps::AP_NARROW | caps::ON_RESULT | caps::ENCODE,
+    caps: caps::AP_NARROW | caps::ON_RESULT | caps::ENCODE,
     defaults: DecodeDefaults {
         freq_min_hz: 200.0,
         freq_max_hz: 3000.0,

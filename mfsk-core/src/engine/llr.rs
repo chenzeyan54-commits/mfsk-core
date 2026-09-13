@@ -101,8 +101,9 @@ pub fn symbol_spectra<P: Protocol>(cd0: &[Complex<f32>], i_start: i32) -> Vec<Cm
     // (#211) instead of building a fresh one every call — rustfft's own
     // `FftPlanner` caches per size internally, so sharing one instance
     // across both call sites' different sizes is free. `symbol_spectra`
-    // runs once per candidate from `engine/pipeline.rs` and
-    // `msg/pipeline_ap.rs`, rebuilding this size's twiddle table from
+    // runs once per candidate from `engine/pipeline.rs` (and, until it
+    // was deleted, from the parallel AP engine in `msg/pipeline_ap.rs`),
+    // rebuilding this size's twiddle table from
     // scratch every time before this fix (smaller than
     // `downsample_cached`'s FFT, so a smaller absolute cost per call,
     // but the same anti-pattern at the same call frequency).

@@ -202,9 +202,11 @@ void test_builder_options() {
 // ── Sniper mode (issue #249) ─────────────────────────────────────────
 // The single-frequency entry point, driven the way a C caller actually
 // would: aim at a frequency a sked/spot already named, on FT4, with an
-// AP hint. That combination is the reason the entry point exists —
-// mfsk_decode_options_set_ap_hint reaches the wide-band decoder for FT8
-// only, so before this a C caller could not hint FT4 or FST4 at all.
+// AP hint — which is no longer what this entry point is for.
+// `mfsk_decode_options_set_ap_hint` now reaches the wide-band decoder
+// for every protocol, and the sniper is FT8-only, so this checks both:
+// FT4's sniper reports the mode unsupported, and the same hint decodes
+// through the ordinary entry point.
 void test_sniper() {
     std::printf("— FFI sniper: mfsk_decode_i16_sniper on FT4 at 1200 Hz, with an AP hint\n");
     MfskSamples pcm{};
@@ -228,19 +230,33 @@ void test_sniper() {
         fail("sniper", "set_ap_hint failed");
     }
 
+    // FT4's sniper is gone: narrow-band single-target search is the
+    // receive half of an analogue roofing filter, a DX-chasing mode
+    // that a contest protocol has no use for. It must say so rather
+    // than decode something.
     MfskDecoder* dec = mfsk_decoder_new(MFSK_PROTOCOL_FT4);
     MfskResultList list{};
     const MfskStatus st = mfsk_decode_i16_sniper(
         dec, audio.data(), audio.size(), 12000, 1200.0f, opts, &list);
-    if (st != MFSK_STATUS_OK) {
-        fail("sniper", mfsk_last_error() ? mfsk_last_error() : "sniper decode failed");
-    } else {
-        print_decodes("sniper", list);
-        if (!any_contains(list, "JA1ABC")) {
-            fail("sniper", "sniper at the signal's own frequency did not decode it");
-        }
+    if (st != MFSK_STATUS_UNKNOWN_PROTOCOL) {
+        fail("sniper", "FT4 sniper should return MFSK_STATUS_UNKNOWN_PROTOCOL");
     }
     mfsk_result_list_free(&list);
+
+    // The AP hint this entry point existed to reach now works on the
+    // ordinary wide-band decode, for every protocol.
+    MfskResultList wide{};
+    const MfskStatus wst = mfsk_decode_i16(
+        dec, audio.data(), audio.size(), 12000, opts, &wide);
+    if (wst != MFSK_STATUS_OK) {
+        fail("sniper", mfsk_last_error() ? mfsk_last_error() : "wide-band AP decode failed");
+    } else {
+        print_decodes("sniper", wide);
+        if (!any_contains(wide, "JA1ABC")) {
+            fail("sniper", "wide-band decode with an AP hint did not find the signal");
+        }
+    }
+    mfsk_result_list_free(&wide);
 
     // A protocol with no single-frequency mode must say so rather than
     // decode something else.

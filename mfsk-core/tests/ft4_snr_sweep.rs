@@ -6,7 +6,6 @@
 
 use std::f32::consts::PI;
 
-use mfsk_core::engine::equalize::EqMode;
 use mfsk_core::engine::{MessageCodec, MessageFields};
 use mfsk_core::ft4::Ft4;
 use mfsk_core::ft4::decode::{ApHint, DecodeResult};
@@ -115,8 +114,13 @@ fn ft4_snr_sweep_basic_vs_ap() {
             if hit(&basic, &msg) {
                 ok_b += 1;
             }
-            let ap_result = DecodeRequest::<Ft4>::sniper(&audio, 1000.0, 30)
-                .eq_mode(EqMode::Local)
+            // Wide-band + AP. This used the sniper until FT4's sniper
+            // was retired (it is a roofing-filter mode, incompatible
+            // with a contest protocol) — AP is an option on the normal
+            // decode now, for every protocol, as it is upstream.
+            // `EqMode::Off`: equalisation compensates an analogue
+            // filter's tilt, and this fixture has no filter.
+            let ap_result = DecodeRequest::<Ft4>::new(&audio, 300.0, 2700.0, 1.2, 50)
                 .ap_hint(&ap)
                 .decode()
                 .results;

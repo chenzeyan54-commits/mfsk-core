@@ -30,7 +30,11 @@ pub use crate::engine::pipeline::{BudgetCheck, BudgetReport};
 use crate::engine::pipeline::{DecodeDepth, DecodeStrictness, FftCache, LlrEffort};
 use crate::engine::protocol::Protocol;
 
-use super::ap::{ApHint, WsjtApCompatible};
+use super::ap::ApHint;
+// Only `SniperRequest::ap_hint`'s bound names this, and that item is
+// `ft8`-gated below.
+#[cfg(feature = "ft8")]
+use super::ap::WsjtApCompatible;
 
 /// Protocols with a `decode_frame`-family entry point via [`DecodeRequest`]
 /// / [`SniperRequest`]. Implemented for `Ft8`, `Ft4`, and each FST4
@@ -57,6 +61,44 @@ pub trait FrameDecodable: Protocol {
     fn __single_pass(req: &DecodeRequest<'_, Self>) -> DecodeOutcome<Self>
     where
         Self: Sized;
+}
+
+/// Protocols with a narrow-band single-target search
+/// ([`SniperRequest`]). **FT8 only.**
+///
+/// Not a capability the others lack for want of porting — it is a
+/// capability they should not have. `SniperRequest` is the receive-side
+/// half of narrowing a transceiver's *analogue* roofing filter, a
+/// thing few radios can do and one operators do when chasing a DX
+/// station whose carrier they already know. That is an FT8 activity.
+///
+/// - **FT4 is a contest mode.** Working many stations quickly across
+///   the band is the opposite of pointing a 500 Hz analogue filter at
+///   one of them. The two are fundamentally incompatible.
+/// - **FST4 has its own narrow-band path**, and a better one: the DDC
+///   channelizer (`fst4::ddc`), which narrows in the digital domain
+///   without the sniper's halved sync gate or its assumption that the
+///   audio arrived pre-filtered.
+///
+/// And the thing the sniper looked like it was *for* — reaching AP —
+/// never belonged to it. A-priori decoding is a general option on the
+/// wide-band path now, for every protocol, as it is upstream.
+///
+/// The baseline this leaves behind is the right one: **if the wide-band
+/// decode is not WSJT-X-faithful without a sniper, that is a bug in the
+/// wide-band decode.** WSJT-X has no sniper and reaches its published
+/// sensitivity regardless. Chasing a shortfall with a special mode
+/// hides the defect instead of fixing it — which is exactly what had
+/// happened: FT4 sat 0.6 dB behind the published figure until the
+/// always-on CQ AP pass upstream has always run was added to the
+/// wide-band ladder, at which point it went 0.5 dB ahead.
+// Gated on `ft8` for the same reason the module itself is gated on
+// having any `FrameDecodable` implementor: `SupportsSniper` is
+// implemented for `Ft8` alone, so in a build without it `SniperRequest`
+// has zero concrete instantiations anywhere in the crate and every
+// field is dead code under `-D warnings`.
+#[cfg(feature = "ft8")]
+pub trait SupportsSniper: FrameDecodable {
     #[doc(hidden)]
     fn __sniper(req: &SniperRequest<'_, Self>) -> DecodeOutcome<Self>
     where
@@ -192,11 +234,6 @@ impl<'a, P: FrameDecodable> DecodeRequest<'a, P> {
             budget: None,
             strategy: P::__single_pass,
         }
-    }
-
-    /// ±250 Hz narrow-band, single-target preset. See [`SniperRequest`].
-    pub fn sniper(audio: &'a [i16], target_freq: f32, max_cand: usize) -> SniperRequest<'a, P> {
-        SniperRequest::new(audio, target_freq, max_cand)
     }
 
     /// Preferred frequency; matching candidates are tried first.
@@ -554,6 +591,7 @@ impl<'a, P: SupportsSicEarly> DecodeRequest<'a, P> {
 /// `decode_sniper_sic` (in-band interferer subtraction before a second
 /// relaxed-threshold pass) is dropped rather than ported — it had zero
 /// callers anywhere in the crate.
+#[cfg(feature = "ft8")]
 pub struct SniperRequest<'a, P: FrameDecodable> {
     pub(crate) audio: &'a [i16],
     pub(crate) target_freq: f32,
@@ -575,7 +613,17 @@ pub struct SniperRequest<'a, P: FrameDecodable> {
     _protocol: core::marker::PhantomData<P>,
 }
 
-impl<'a, P: FrameDecodable> SniperRequest<'a, P> {
+#[cfg(feature = "ft8")]
+impl<'a, P: SupportsSniper> DecodeRequest<'a, P> {
+    /// Narrow-band, single-target preset. **FT8 only** — see
+    /// [`SupportsSniper`] for why this is not a gap in the others.
+    pub fn sniper(audio: &'a [i16], target_freq: f32, max_cand: usize) -> SniperRequest<'a, P> {
+        SniperRequest::new(audio, target_freq, max_cand)
+    }
+}
+
+#[cfg(feature = "ft8")]
+impl<'a, P: SupportsSniper> SniperRequest<'a, P> {
     pub fn new(audio: &'a [i16], target_freq: f32, max_cand: usize) -> Self {
         Self {
             audio,
@@ -683,7 +731,8 @@ impl<'a, P: FrameDecodable> SniperRequest<'a, P> {
     }
 }
 
-impl<'a, P: FrameDecodable> SniperRequest<'a, P>
+#[cfg(feature = "ft8")]
+impl<'a, P: SupportsSniper> SniperRequest<'a, P>
 where
     P::Msg: WsjtApCompatible,
 {

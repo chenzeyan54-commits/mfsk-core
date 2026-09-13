@@ -1594,28 +1594,6 @@ impl FrameDecodable for Ft8 {
             budget,
         }
     }
-
-    fn __sniper(req: &SniperRequest<'_, Self>) -> DecodeOutcome<Self> {
-        let mut budget = BudgetState::new(req.budget);
-        let (results, fft_cache) = decode_sniper_inner(
-            req.audio,
-            req.target_freq,
-            req.depth,
-            req.max_cand,
-            req.strictness,
-            req.eq_mode,
-            req.ap_hint,
-            req.sync_min,
-            req.search_hz,
-            req.on_result,
-            &mut budget,
-        );
-        DecodeOutcome {
-            results,
-            fft_cache,
-            budget: budget.report,
-        }
-    }
 }
 
 impl SupportsSicRounds for Ft8 {
@@ -1830,6 +1808,30 @@ impl<'a> DecodeRequest<'a, Ft8> {
             req = req.ap_hint(ap);
         }
         req
+    }
+}
+
+impl crate::msg::decode_request::SupportsSniper for Ft8 {
+    fn __sniper(req: &SniperRequest<'_, Self>) -> DecodeOutcome<Self> {
+        let mut budget = BudgetState::new(req.budget);
+        let (results, fft_cache) = decode_sniper_inner(
+            req.audio,
+            req.target_freq,
+            req.depth,
+            req.max_cand,
+            req.strictness,
+            req.eq_mode,
+            req.ap_hint,
+            req.sync_min,
+            req.search_hz,
+            req.on_result,
+            &mut budget,
+        );
+        DecodeOutcome {
+            results,
+            fft_cache,
+            budget: budget.report,
+        }
     }
 }
 

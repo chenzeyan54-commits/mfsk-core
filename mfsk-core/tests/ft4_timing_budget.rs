@@ -8,7 +8,6 @@
 
 use std::time::Instant;
 
-use mfsk_core::engine::equalize::EqMode;
 use mfsk_core::engine::{MessageCodec, MessageFields};
 use mfsk_core::ft4::Ft4;
 use mfsk_core::ft4::decode::ApHint;
@@ -98,8 +97,11 @@ fn ft4_sniper_ap_wallclock() {
         for seed in 0..3u64 {
             let audio = make_slot(&msg, snr as f32, 0xBEEF + seed);
             let t0 = Instant::now();
-            let results = DecodeRequest::<Ft4>::sniper(&audio, 1000.0, 30)
-                .eq_mode(EqMode::Local)
+            // Wide-band + AP: the sniper this used to call was retired
+            // with FT4's (see `SupportsSniper`). This now measures the
+            // per-slot cost of the path a WASM caller actually has,
+            // which is the point of the file.
+            let results = DecodeRequest::<Ft4>::new(&audio, 300.0, 2700.0, 1.2, 50)
                 .ap_hint(&ap)
                 .decode()
                 .results;
