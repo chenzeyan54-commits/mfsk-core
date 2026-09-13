@@ -26,6 +26,7 @@
 use alloc::vec::Vec;
 
 use crate::engine::equalize::EqMode;
+pub use crate::engine::pipeline::{BudgetCheck, BudgetReport};
 use crate::engine::pipeline::{DecodeDepth, DecodeStrictness, FftCache, LlrEffort};
 use crate::engine::protocol::Protocol;
 
@@ -113,6 +114,9 @@ type OnResultCallback<'a, P> = &'a (dyn Fn(&<P as FrameDecodable>::DecodeResult)
 pub struct DecodeOutcome<P: FrameDecodable> {
     pub results: Vec<P::DecodeResult>,
     pub fft_cache: FftCache,
+    /// What a [`DecodeRequest::budget`] cut short, if one was set.
+    /// [`BudgetReport::default()`] when it wasn't.
+    pub budget: BudgetReport,
 }
 
 /// Wide-band decode request: search `freq_min..freq_max` for every
@@ -147,6 +151,8 @@ pub struct DecodeRequest<'a, P: FrameDecodable> {
     /// Set via [`DecodeRequest::on_result`] — see that method's doc
     /// comment for the delivery-order/dedup contract.
     pub(crate) on_result: Option<OnResultCallback<'a, P>>,
+    /// Set via [`DecodeRequest::budget`].
+    pub(crate) budget: Option<BudgetCheck<'a>>,
     strategy: fn(&DecodeRequest<'a, P>) -> DecodeOutcome<P>,
 }
 
@@ -175,6 +181,7 @@ impl<'a, P: FrameDecodable> DecodeRequest<'a, P> {
             fft_cache: None,
             sic_rounds: 3,
             on_result: None,
+            budget: None,
             strategy: P::__single_pass,
         }
     }
@@ -277,8 +284,74 @@ impl<'a, P: FrameDecodable> DecodeRequest<'a, P> {
     ///
     /// `cb` must be `Sync` for this reason — it may be called
     /// concurrently from multiple `rayon` worker threads.
+    ///
+    /// **Under [`DecodeRequest::budget`]**, the default strategy's
+    /// deliveries change from "completion order, from a worker thread"
+    /// to "sync-quality order, from the calling thread", because that
+    /// is the order the scheduler runs candidates in. The dedup caveat
+    /// above is unchanged — `cb` still fires before it. A budget can
+    /// only make `cb` fire *fewer* times; it never fires for a result
+    /// the budget then discards, because the SNR gate and the callback
+    /// both sit inside the candidate that produced them.
     pub fn on_result(mut self, cb: OnResultCallback<'a, P>) -> Self {
         self.on_result = Some(cb);
+        self
+    }
+
+    /// Bound this decode by a caller-supplied wall-clock budget: once
+    /// `check()` returns `false`, no further work is *started*.
+    ///
+    /// Opt-in and purely subtractive. Without it — the default — the
+    /// decode runs exactly as it always has, and
+    /// [`DecodeOutcome::budget`] comes back all-zero. See
+    /// [`BudgetCheck`] for why it is a closure and why `mfsk-core`
+    /// holds no clock of its own.
+    ///
+    /// **What "no further work is started" means differs by strategy,
+    /// and the difference is deliberate:**
+    ///
+    /// - The default single-pass strategy spends the budget
+    ///   **cheapest-first**: every candidate gets the cheap sync triage
+    ///   (which is never budget-gated — that is the latency invariant
+    ///   this exists to keep), the survivors are then ordered by their
+    ///   triage score, and the expensive ladder runs down that order
+    ///   until the budget says stop. A short budget therefore drops the
+    ///   *weakest* candidates rather than the tail of the frequency
+    ///   sweep.
+    /// - The SIC strategies ([`DecodeRequest::sic_rounds`],
+    ///   [`DecodeRequest::sic_early`]) only poll at candidate and round
+    ///   boundaries, in their existing order. They cannot be reordered:
+    ///   each accepted decode is subtracted from the residual before
+    ///   the next candidate is looked at, so the order *is* the
+    ///   algorithm — and deferring the expensive rung out of an early
+    ///   pass was measured to cost more wall-clock, not less, since an
+    ///   early decode shrinks the work every later pass does.
+    ///
+    /// An in-flight candidate is never interrupted, so an overrun is
+    /// bounded by one candidate's decode — the same semantics the
+    /// embedded receivers already ship at their own app layer.
+    ///
+    /// **The triage sweep is a floor, and it is not small.** Because it
+    /// is never gated, a budget shorter than it buys nothing: the
+    /// sweep runs anyway and no ladder starts, so the call returns
+    /// empty having spent that time. Measured on `qso3_busy.wav`
+    /// through `bench/wasm` under Node — the environment this is for —
+    /// the floor is ~13 ms against ~28 ms for the whole decode, so
+    /// budgets of 5 and 10 ms return nothing in ~13 ms while 20 ms
+    /// returns every station. `max_cand` is the knob that moves the
+    /// floor; this one only spends what is above it.
+    ///
+    /// Implemented for FT8, FT4 and FST4, on every strategy. What the
+    /// ordering key is differs by protocol, because each already
+    /// computes a different one for free: FT8 ranks by the Costas sync
+    /// quality its triage produces, FT4 needs no reordering at all
+    /// (`ft4_coarse_sync` hands back candidates already ranked by
+    /// score), and FST4 ranks by the refined `fst4_sync_search` score
+    /// that `dedup_refined_candidates` has already computed for every
+    /// candidate. FT8's own `decode_block` API — what the embedded
+    /// boards call — is not affected and keeps its app-level deadline.
+    pub fn budget(mut self, check: BudgetCheck<'a>) -> Self {
+        self.budget = Some(check);
         self
     }
 
@@ -396,6 +469,8 @@ pub struct SniperRequest<'a, P: FrameDecodable> {
     /// [`DecodeRequest::on_result`]'s doc comment for the delivery-
     /// order/dedup contract (same rules apply here).
     pub(crate) on_result: Option<OnResultCallback<'a, P>>,
+    /// Set via [`SniperRequest::budget`].
+    pub(crate) budget: Option<BudgetCheck<'a>>,
     _protocol: core::marker::PhantomData<P>,
 }
 
@@ -411,6 +486,7 @@ impl<'a, P: FrameDecodable> SniperRequest<'a, P> {
             eq_mode: EqMode::Off,
             ap_hint: None,
             on_result: None,
+            budget: None,
             _protocol: core::marker::PhantomData,
         }
     }
@@ -441,6 +517,15 @@ impl<'a, P: FrameDecodable> SniperRequest<'a, P> {
     /// duplicate that's later excluded" caveat always applies here).
     pub fn on_result(mut self, cb: OnResultCallback<'a, P>) -> Self {
         self.on_result = Some(cb);
+        self
+    }
+
+    /// See [`DecodeRequest::budget`] — same predicate, same contract.
+    /// A sniper search is a handful of candidates in one ±250 Hz
+    /// window, so there is nothing worth reordering here: the budget is
+    /// polled per candidate, in the existing order.
+    pub fn budget(mut self, check: BudgetCheck<'a>) -> Self {
+        self.budget = Some(check);
         self
     }
 

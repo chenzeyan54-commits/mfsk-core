@@ -182,7 +182,7 @@ macro_rules! impl_frame_decodable {
                 let on_result: Option<&(dyn Fn(&DecodeResult) + Sync)> = filtered_cb
                     .as_ref()
                     .map(|f| f as &(dyn Fn(&DecodeResult) + Sync));
-                let (raw, fft_cache) = pipeline::decode_frame::<$proto>(
+                let (raw, fft_cache, budget) = pipeline::decode_frame_budgeted::<$proto>(
                     req.audio,
                     &$cfg,
                     req.freq_min,
@@ -196,15 +196,17 @@ macro_rules! impl_frame_decodable {
                     SYNC_Q_MIN,
                     req.fft_cache.as_ref().map(FftCache::as_slice),
                     on_result,
+                    req.budget,
                 );
                 DecodeOutcome {
                     results: pipeline::dedup_known(raw, req.known),
                     fft_cache,
+                    budget,
                 }
             }
 
             fn __sniper(req: &SniperRequest<'_, Self>) -> DecodeOutcome<Self> {
-                let results = crate::msg::pipeline_ap::decode_sniper_ap::<$proto>(
+                let (results, budget) = crate::msg::pipeline_ap::decode_sniper_ap::<$proto>(
                     req.audio,
                     &$cfg,
                     req.target_freq,
@@ -218,11 +220,16 @@ macro_rules! impl_frame_decodable {
                     SYNC_Q_MIN / 2,
                     req.ap_hint,
                     req.on_result,
+                    req.budget,
                 );
                 let fft_cache = FftCache(crate::engine::dsp::downsample::build_fft_cache(
                     req.audio, &$cfg,
                 ));
-                DecodeOutcome { results, fft_cache }
+                DecodeOutcome {
+                    results,
+                    fft_cache,
+                    budget,
+                }
             }
         }
     };

@@ -75,7 +75,7 @@ impl FrameDecodable for Ft4 {
         let on_result: Option<&(dyn Fn(&DecodeResult) + Sync)> = filtered_cb
             .as_ref()
             .map(|f| f as &(dyn Fn(&DecodeResult) + Sync));
-        let (raw, fft_cache) = pipeline::decode_frame::<Ft4>(
+        let (raw, fft_cache, budget) = pipeline::decode_frame_budgeted::<Ft4>(
             req.audio,
             &FT4_DOWNSAMPLE,
             req.freq_min,
@@ -89,10 +89,12 @@ impl FrameDecodable for Ft4 {
             SYNC_Q_MIN,
             req.fft_cache.as_ref().map(FftCache::as_slice),
             on_result,
+            req.budget,
         );
         DecodeOutcome {
             results: pipeline::dedup_known(raw, req.known),
             fft_cache,
+            budget,
         }
     }
 
@@ -102,7 +104,7 @@ impl FrameDecodable for Ft4 {
         // burns CPU — especially important under the lite feature
         // defaults where every candidate runs BP + OSD per AP config.
         let max_cand = req.max_cand.min(15);
-        let results = pipeline_ap::decode_sniper_ap::<Ft4>(
+        let (results, budget) = pipeline_ap::decode_sniper_ap::<Ft4>(
             req.audio,
             &FT4_DOWNSAMPLE,
             req.target_freq,
@@ -118,6 +120,7 @@ impl FrameDecodable for Ft4 {
             SYNC_Q_MIN / 2,
             req.ap_hint,
             req.on_result,
+            req.budget,
         );
         // `pipeline_ap::decode_sniper_ap` doesn't return its FFT cache;
         // sniper mode never exposed one before this redesign either
@@ -128,7 +131,11 @@ impl FrameDecodable for Ft4 {
             req.audio,
             &FT4_DOWNSAMPLE,
         ));
-        DecodeOutcome { results, fft_cache }
+        DecodeOutcome {
+            results,
+            fft_cache,
+            budget,
+        }
     }
 }
 
@@ -142,7 +149,7 @@ impl SupportsSicRounds for Ft4 {
         let on_result: Option<&(dyn Fn(&DecodeResult) + Sync)> = filtered_cb
             .as_ref()
             .map(|f| f as &(dyn Fn(&DecodeResult) + Sync));
-        let raw = pipeline::decode_frame_subtract::<Ft4>(
+        let (raw, budget) = pipeline::decode_frame_subtract::<Ft4>(
             req.audio,
             &FT4_DOWNSAMPLE,
             &FT4_SUBTRACT,
@@ -183,6 +190,7 @@ impl SupportsSicRounds for Ft4 {
             1.0,
             req.fft_cache.as_ref().map(FftCache::as_slice),
             on_result,
+            req.budget,
         );
         // Multi-pass SIC has no single "the" cache (residual changes every
         // pass) — rebuild from the original audio, matching the shape
@@ -194,6 +202,7 @@ impl SupportsSicRounds for Ft4 {
         DecodeOutcome {
             results: pipeline::dedup_known(raw, req.known),
             fft_cache,
+            budget,
         }
     }
 }

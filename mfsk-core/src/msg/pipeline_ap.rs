@@ -452,7 +452,13 @@ pub(crate) fn decode_sniper_ap<P: GenericPipelineProtocol>(
     // FT8's sniper strategy). 0-or-1+ calls depending on `has_ap`'s
     // early exit below.
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
-) -> Vec<DecodeResult>
+    // Caller's wall-clock budget (`DecodeRequest::budget`), polled
+    // before each candidate. A sniper searches one narrow window in
+    // candidate-score order, so there is nothing here worth reordering
+    // — the budget just stops it early. `None` is the existing
+    // behaviour.
+    budget: Option<&(dyn Fn() -> bool + Sync)>,
+) -> (Vec<DecodeResult>, crate::engine::pipeline::BudgetReport)
 where
     P::Fec: crate::engine::protocol::BpPooledFec,
     P::Msg: WsjtApCompatible,
@@ -469,13 +475,24 @@ where
         RxGrid::real(12_000.0),
     );
     if candidates.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Default::default());
     }
     let has_ap = ap_hint.is_some_and(|h| h.has_info());
     let fft_cache = build_fft_cache(audio, ds_cfg);
 
     let mut results: Vec<DecodeResult> = Vec::new();
-    for cand in &candidates {
+    let mut budget_report = crate::engine::pipeline::BudgetReport::default();
+    let mut remaining = candidates.iter();
+    for cand in remaining.by_ref() {
+        if let Some(check) = budget
+            && !check()
+        {
+            budget_report.exhausted = true;
+            budget_report.candidates_skipped = 1;
+            budget_report.cut_at_score = Some(cand.score);
+            break;
+        }
+        budget_report.stages_run += 1;
         if let Some(r) = process_candidate_ap::<P>(
             cand,
             &fft_cache,
@@ -502,5 +519,6 @@ where
             }
         }
     }
-    results
+    budget_report.candidates_skipped += remaining.count() as u32;
+    (results, budget_report)
 }

@@ -55,3 +55,59 @@ pub fn decode_wav_subtract(audio: &[i16]) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// One JS clock call. `mfsk-core` holds no clock of its own —
+/// `std::time::Instant::now` is unimplemented on
+/// `wasm32-unknown-unknown` and would panic — so the budget predicate
+/// below reaches for the host's.
+///
+/// `inline_js` rather than a `js-sys`/`web-time` dependency: one
+/// function is not worth a crate, and this keeps the harness's
+/// dependency list honest about what the benchmark measures.
+#[wasm_bindgen(inline_js = "export function now_ms() { return Date.now(); }")]
+extern "C" {
+    fn now_ms() -> f64;
+}
+
+/// [`decode_wav`] under a wall-clock budget — the browser case
+/// `DecodeRequest::budget` exists for: a tab that must stay responsive
+/// cannot afford the worst slot's decode, and configuring `max_cand`
+/// down for the worst case pays that cost on every slot instead.
+///
+/// Returns the same `message|freq_hz|dt_sec` lines, preceded by one
+/// `#budget|…` line carrying the `BudgetReport`, so a caller can see
+/// whether the cut took noise (a low `cut_at_sync`) or a station.
+///
+/// The decode degrades *cheapest-first*: every candidate gets the cheap
+/// sync triage, and the budget is then spent on the survivors strongest
+/// first — so a short budget returns the loudest stations, not the
+/// low-frequency end of the band.
+#[wasm_bindgen]
+pub fn decode_wav_budget(audio: &[i16], budget_ms: f64) -> String {
+    let deadline = now_ms() + budget_ms;
+    let check = || now_ms() < deadline;
+
+    let outcome = DecodeRequest::<Ft8>::new(audio, 100.0, 3000.0, 0.8, 50)
+        .budget(&check)
+        .decode();
+
+    let b = &outcome.budget;
+    let mut lines = alloc_report(b);
+    for d in &outcome.results {
+        let msg = unpack77(d.message77()).unwrap_or_default();
+        lines.push(format!("{msg}|{:.1}|{:.2}", d.freq_hz, d.dt_sec));
+    }
+    lines.join("\n")
+}
+
+fn alloc_report(b: &mfsk_core::msg::decode_request::BudgetReport) -> Vec<String> {
+    vec![format!(
+        "#budget|exhausted={}|ran={}|skipped={}|cut_at_sync={}",
+        b.exhausted,
+        b.stages_run,
+        b.candidates_skipped,
+        b.cut_at_sync
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".into()),
+    )]
+}

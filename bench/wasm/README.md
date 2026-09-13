@@ -60,6 +60,34 @@ WASM section, point at the WAVs used there — `sim_busy_band.wav` /
 MFSK_BENCH_WAV=/path/to/sim_busy_band.wav node bench.mjs
 ```
 
+## Decode budget (`DecodeRequest::budget`)
+
+```sh
+MFSK_BENCH_BUDGET_MS=5,10,20,40 node bench.mjs
+```
+
+Runs `decode_wav_budget(audio, ms)` at each budget and prints the
+station count alongside the `BudgetReport`. This is the browser case the
+option exists for: a tab that must keep a frame cannot afford the worst
+slot's decode.
+
+Measured here on `qso3_busy.wav` (Node, `+simd128`, no rayon):
+
+| budget | stations | wall clock | report |
+|---:|---:|---:|---|
+| 5 ms | 0 | 13.4 ms | `exhausted, ran=0, skipped=17, cut_at_sync=21` |
+| 10 ms | 0 | 13.0 ms | `exhausted, ran=0, skipped=17, cut_at_sync=21` |
+| 15 ms | 8 | 15.3 ms | `exhausted, ran=8, skipped=9, cut_at_sync=17` |
+| 20 ms | 14 | 23.8 ms | `exhausted, ran=15, skipped=2, cut_at_sync=7` |
+| 40 ms | 14 | 27.6 ms | not exhausted |
+
+Two things to read off it. The **sync triage sweep is a floor** — it is
+never budget-gated, so anything under ~13 ms returns nothing *and still
+costs 13 ms*; `max_cand` is the knob for that, not this one. And the
+schedule works: at 20 ms it declines 2 of 17 candidates and loses no
+stations, because `cut_at_sync=7` says the two it dropped were barely
+above the triage gate. A `cut_at_sync` near 21 would mean the opposite.
+
 ## Example before/after
 
 ```sh
