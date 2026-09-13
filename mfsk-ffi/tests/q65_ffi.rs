@@ -15,16 +15,13 @@
 //! - The generic-handle path (`mfsk_decoder_new(MFSK_PROTOCOL_Q65A30)`
 //!   + `mfsk_decode_f32`) routes Q65a30 traffic correctly.
 
-use std::ffi::{CString, c_char};
+use std::ffi::CString;
 use std::ptr;
 
-use mfsk::{
-    MfskProtocol, MfskQ65FadingModel, MfskQ65SubMode, MfskResultList, MfskSamples, MfskStatus,
-    mfsk_callsign_hash_table_free, mfsk_callsign_hash_table_insert, mfsk_callsign_hash_table_new,
-    mfsk_decode_f32, mfsk_decoder_free, mfsk_decoder_new, mfsk_encode_q65, mfsk_q65_decode,
-    mfsk_q65_decode_fading, mfsk_q65_decode_with_ap, mfsk_q65_decode_with_ap_list,
-    mfsk_result_list_free, mfsk_samples_free,
-};
+mod common;
+
+use common::*;
+use mfsk::*;
 
 fn empty_samples() -> MfskSamples {
     MfskSamples {
@@ -34,35 +31,9 @@ fn empty_samples() -> MfskSamples {
     }
 }
 
-fn empty_list() -> MfskResultList {
-    MfskResultList {
-        items: ptr::null_mut(),
-        len: 0,
-        _capacity: 0,
-    }
-}
-
-/// Read a NUL-terminated C string from a decoded message into an
-/// owned `String`. Caller still owns the underlying allocation
-/// (via the parent `MfskResultList`).
-unsafe fn cstr_to_string(p: *const c_char) -> String {
-    if p.is_null() {
-        return String::new();
-    }
-    unsafe { std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned() }
-}
-
-/// True if any decoded message in `list` contains the given
-/// substring. Used to keep the assertions tolerant of FT4-style
-/// `<...>` decorations and protocol-level whitespace.
-unsafe fn list_any_contains(list: &MfskResultList, needle: &str) -> bool {
-    if list.items.is_null() || list.len == 0 {
-        return false;
-    }
-    let slice = unsafe { std::slice::from_raw_parts(list.items, list.len) };
-    slice
-        .iter()
-        .any(|m| unsafe { cstr_to_string(m.text.as_ptr()) }.contains(needle))
+/// Rows the Q65 calls will fill in, plus the count they wrote.
+fn q65_rows() -> Vec<MfskDecode> {
+    vec![blank_row(); 16]
 }
 
 /// Build a `Q65a30` message via the FFI encoder, returning the
@@ -139,24 +110,26 @@ fn encode_q65_roundtrips_for_every_submode() {
 #[test]
 fn q65_plain_decode_recovers_clean_signal() {
     let mut pcm = encode_q65a30("CQ", "K1ABC", "FN42");
-    let mut list = empty_list();
+    let mut rows = q65_rows();
+    let mut n = 0usize;
     let st = unsafe {
         mfsk_q65_decode(
-            MfskQ65SubMode::A30,
+            MfskQ65SubMode::A30 as u32,
             pcm.samples,
             pcm.len,
             12_000,
             ptr::null(),
-            &mut list,
+            rows.as_mut_ptr(),
+            rows.len(),
+            &mut n,
         )
     };
     assert_eq!(st, MfskStatus::Ok);
     assert!(
-        unsafe { list_any_contains(&list, "K1ABC") } && unsafe { list_any_contains(&list, "FN42") },
+        any_contains(&rows[..n], "K1ABC") && any_contains(&rows[..n], "FN42"),
         "expected K1ABC + FN42 in plain Q65 decode output"
     );
     unsafe {
-        mfsk_result_list_free(&mut list);
         mfsk_samples_free(&mut pcm);
     }
 }
@@ -166,10 +139,11 @@ fn q65_decode_with_ap_handles_null_hints() {
     // All four AP hint strings NULL → must behave like the plain
     // path (no false rejects, no crashes).
     let mut pcm = encode_q65a30("CQ", "JA1ABC", "PM95");
-    let mut list = empty_list();
+    let mut rows = q65_rows();
+    let mut n = 0usize;
     let st = unsafe {
         mfsk_q65_decode_with_ap(
-            MfskQ65SubMode::A30,
+            MfskQ65SubMode::A30 as u32,
             pcm.samples,
             pcm.len,
             12_000,
@@ -178,13 +152,14 @@ fn q65_decode_with_ap_handles_null_hints() {
             ptr::null(),
             ptr::null(),
             ptr::null(),
-            &mut list,
+            rows.as_mut_ptr(),
+            rows.len(),
+            &mut n,
         )
     };
     assert_eq!(st, MfskStatus::Ok);
-    assert!(unsafe { list_any_contains(&list, "JA1ABC") });
+    assert!(any_contains(&rows[..n], "JA1ABC"));
     unsafe {
-        mfsk_result_list_free(&mut list);
         mfsk_samples_free(&mut pcm);
     }
 }
@@ -192,11 +167,12 @@ fn q65_decode_with_ap_handles_null_hints() {
 #[test]
 fn q65_decode_with_ap_uses_call1_hint() {
     let mut pcm = encode_q65a30("CQ", "JA1ABC", "PM95");
-    let mut list = empty_list();
+    let mut rows = q65_rows();
+    let mut n = 0usize;
     let cq = CString::new("CQ").unwrap();
     let st = unsafe {
         mfsk_q65_decode_with_ap(
-            MfskQ65SubMode::A30,
+            MfskQ65SubMode::A30 as u32,
             pcm.samples,
             pcm.len,
             12_000,
@@ -205,13 +181,14 @@ fn q65_decode_with_ap_uses_call1_hint() {
             ptr::null(),
             ptr::null(),
             ptr::null(),
-            &mut list,
+            rows.as_mut_ptr(),
+            rows.len(),
+            &mut n,
         )
     };
     assert_eq!(st, MfskStatus::Ok);
-    assert!(unsafe { list_any_contains(&list, "JA1ABC") });
+    assert!(any_contains(&rows[..n], "JA1ABC"));
     unsafe {
-        mfsk_result_list_free(&mut list);
         mfsk_samples_free(&mut pcm);
     }
 }
@@ -219,26 +196,28 @@ fn q65_decode_with_ap_uses_call1_hint() {
 #[test]
 fn q65_decode_fading_recovers_clean_signal() {
     let mut pcm = encode_q65a30("CQ", "K1ABC", "FN42");
-    let mut list = empty_list();
+    let mut rows = q65_rows();
+    let mut n = 0usize;
     let st = unsafe {
         mfsk_q65_decode_fading(
-            MfskQ65SubMode::A30,
+            MfskQ65SubMode::A30 as u32,
             pcm.samples,
             pcm.len,
             12_000,
             0.05, // tight spread → near-AWGN
-            MfskQ65FadingModel::Gaussian,
+            MfskQ65FadingModel::Gaussian as u32,
             ptr::null(),
-            &mut list,
+            rows.as_mut_ptr(),
+            rows.len(),
+            &mut n,
         )
     };
     assert_eq!(st, MfskStatus::Ok);
     assert!(
-        unsafe { list_any_contains(&list, "K1ABC") },
+        any_contains(&rows[..n], "K1ABC"),
         "fast-fading FFI path must decode a clean signal"
     );
     unsafe {
-        mfsk_result_list_free(&mut list);
         mfsk_samples_free(&mut pcm);
     }
 }
@@ -248,13 +227,14 @@ fn q65_decode_with_ap_list_picks_matching_template() {
     // Encode "K1ABC JA1ABC PM95" — that exact template lives in
     // the 206-candidate set generated for (K1ABC, JA1ABC, PM95).
     let mut pcm = encode_q65a30("K1ABC", "JA1ABC", "PM95");
-    let mut list = empty_list();
+    let mut rows = q65_rows();
+    let mut n = 0usize;
     let mc = CString::new("K1ABC").unwrap();
     let hc = CString::new("JA1ABC").unwrap();
     let hg = CString::new("PM95").unwrap();
     let st = unsafe {
         mfsk_q65_decode_with_ap_list(
-            MfskQ65SubMode::A30,
+            MfskQ65SubMode::A30 as u32,
             pcm.samples,
             pcm.len,
             12_000,
@@ -262,16 +242,17 @@ fn q65_decode_with_ap_list_picks_matching_template() {
             hc.as_ptr(),
             hg.as_ptr(),
             ptr::null(),
-            &mut list,
+            rows.as_mut_ptr(),
+            rows.len(),
+            &mut n,
         )
     };
     assert_eq!(st, MfskStatus::Ok);
     assert!(
-        unsafe { list_any_contains(&list, "K1ABC JA1ABC PM95") },
+        any_contains(&rows[..n], "K1ABC JA1ABC PM95"),
         "AP-list FFI path must pick the matching template"
     );
     unsafe {
-        mfsk_result_list_free(&mut list);
         mfsk_samples_free(&mut pcm);
     }
 }
@@ -281,12 +262,13 @@ fn q65_decode_with_ap_list_returns_decode_failed_on_bad_calls() {
     // `standard_qso_codewords` rejects garbage callsigns →
     // empty candidate set → DecodeFailed status.
     let mut pcm = encode_q65a30("CQ", "K1ABC", "FN42");
-    let mut list = empty_list();
+    let mut rows = q65_rows();
+    let mut n = 0usize;
     let bad = CString::new("!!!").unwrap();
     let hc = CString::new("K1ABC").unwrap();
     let st = unsafe {
         mfsk_q65_decode_with_ap_list(
-            MfskQ65SubMode::A30,
+            MfskQ65SubMode::A30 as u32,
             pcm.samples,
             pcm.len,
             12_000,
@@ -294,7 +276,9 @@ fn q65_decode_with_ap_list_returns_decode_failed_on_bad_calls() {
             hc.as_ptr(),
             ptr::null(),
             ptr::null(),
-            &mut list,
+            rows.as_mut_ptr(),
+            rows.len(),
+            &mut n,
         )
     };
     assert_eq!(
@@ -302,9 +286,8 @@ fn q65_decode_with_ap_list_returns_decode_failed_on_bad_calls() {
         MfskStatus::DecodeFailed,
         "garbage calls should yield DecodeFailed without aborting"
     );
-    assert_eq!(list.len, 0);
+    assert_eq!(n, 0);
     unsafe {
-        mfsk_result_list_free(&mut list);
         mfsk_samples_free(&mut pcm);
     }
 }
@@ -331,26 +314,25 @@ fn q65_decode_hash_table_resolves_hashed_callsign() {
     let audio = synthesize_audio_for::<Q65a30>(&tones, 12_000, 1500.0, 0.3);
 
     // Without a hash table: unresolved placeholder.
-    let mut list = empty_list();
+    let mut rows = q65_rows();
+    let mut n = 0usize;
     let st = unsafe {
         mfsk_q65_decode(
-            MfskQ65SubMode::A30,
+            MfskQ65SubMode::A30 as u32,
             audio.as_ptr(),
             audio.len(),
             12_000,
             ptr::null(),
-            &mut list,
+            rows.as_mut_ptr(),
+            rows.len(),
+            &mut n,
         )
     };
     assert_eq!(st, MfskStatus::Ok);
     assert!(
-        unsafe { list_any_contains(&list, "JL1NIE/1") }
-            && unsafe { list_any_contains(&list, "<...>") },
+        any_contains(&rows[..n], "JL1NIE/1") && any_contains(&rows[..n], "<...>"),
         "expected an unresolved '<...>' decode without a hash table"
     );
-    unsafe {
-        mfsk_result_list_free(&mut list);
-    }
 
     // With a hash table pre-seeded with the standard call: resolved.
     let ht = mfsk_callsign_hash_table_new();
@@ -359,43 +341,62 @@ fn q65_decode_hash_table_resolves_hashed_callsign() {
     let ins_st = unsafe { mfsk_callsign_hash_table_insert(ht, ja1abc.as_ptr()) };
     assert_eq!(ins_st, MfskStatus::Ok);
 
-    let mut list2 = empty_list();
+    let mut rows2 = q65_rows();
+    let mut n2 = 0usize;
     let st2 = unsafe {
         mfsk_q65_decode(
-            MfskQ65SubMode::A30,
+            MfskQ65SubMode::A30 as u32,
             audio.as_ptr(),
             audio.len(),
             12_000,
             ht,
-            &mut list2,
+            rows2.as_mut_ptr(),
+            rows2.len(),
+            &mut n2,
         )
     };
     assert_eq!(st2, MfskStatus::Ok);
     assert!(
-        unsafe { list_any_contains(&list2, "JL1NIE/1") }
-            && unsafe { list_any_contains(&list2, "<JA1ABC>") },
+        any_contains(&rows2[..n2], "JL1NIE/1") && any_contains(&rows2[..n2], "<JA1ABC>"),
         "expected the hashed callsign to resolve via the supplied table"
     );
-    unsafe {
-        mfsk_result_list_free(&mut list2);
-        mfsk_callsign_hash_table_free(ht);
-    }
+    unsafe { mfsk_callsign_hash_table_free(ht) };
 }
 
+/// Q65 is addressable through `MfskMode` and describable through
+/// `mfsk_mode_info`, but it does **not** drive the decode session:
+/// its own decode takes a nominal start sample and a time tolerance and
+/// reports `start_sample` rather than `dt`. `MFSK_CAP_DECODE_HANDLE` is
+/// the bit that says so, and opening a session must refuse rather than
+/// decode something shaped differently.
 #[test]
-fn generic_handle_path_decodes_q65a30() {
-    // Confirms MFSK_PROTOCOL_Q65A30 routes through the
-    // mfsk_decode_f32 dispatcher to mfsk_core::q65::decode_scan_default.
-    let mut pcm = encode_q65a30("CQ", "JA1ABC", "PM95");
-    let dec = mfsk_decoder_new(MfskProtocol::Q65a30);
-    assert!(!dec.is_null());
-    let mut list = empty_list();
-    let st = unsafe { mfsk_decode_f32(dec, pcm.samples, pcm.len, 12_000, ptr::null(), &mut list) };
-    assert_eq!(st, MfskStatus::Ok);
-    assert!(unsafe { list_any_contains(&list, "JA1ABC") });
-    unsafe {
-        mfsk_result_list_free(&mut list);
-        mfsk_decoder_free(dec);
-        mfsk_samples_free(&mut pcm);
+fn q65_is_addressable_but_does_not_drive_the_session() {
+    for sub in [
+        MfskMode::Q65a15,
+        MfskMode::Q65a30,
+        MfskMode::Q65a60,
+        MfskMode::Q65a300,
+    ] {
+        assert_eq!(
+            mfsk_mode_caps(sub as u32) & MFSK_CAP_DECODE_HANDLE,
+            0,
+            "{sub:?} must not claim the decode handle"
+        );
+        assert_ne!(
+            mfsk_mode_caps(sub as u32) & MFSK_CAP_AP_NARROW,
+            0,
+            "{sub:?} decode is targeted by construction, so narrow AP applies"
+        );
+        let mut st = MfskStatus::Ok;
+        assert!(unsafe { mfsk_session_open(sub as u32, ptr::null(), &mut st) }.is_null());
+        assert_eq!(st, MfskStatus::Unsupported, "{sub:?}");
+
+        // But it is still fully described.
+        let mut info = std::mem::MaybeUninit::<MfskModeInfo>::zeroed();
+        assert_eq!(
+            unsafe { mfsk_mode_info(sub as u32, info.as_mut_ptr()) },
+            MfskStatus::Ok
+        );
+        assert_eq!(unsafe { info.assume_init() }.mode, sub);
     }
 }

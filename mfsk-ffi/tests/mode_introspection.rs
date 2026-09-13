@@ -99,7 +99,7 @@ fn names_round_trip_and_match_the_registry() {
         let mut m = MfskMode::Ft8;
         assert_eq!(unsafe { mfsk_mode_at(i, &mut m) }, MfskStatus::Ok);
 
-        let name = unsafe { CStr::from_ptr(mfsk_mode_name(m)) }
+        let name = unsafe { CStr::from_ptr(mfsk_mode_name(m as u32)) }
             .to_str()
             .unwrap();
         assert!(!name.is_empty());
@@ -152,7 +152,7 @@ fn a_typo_and_a_missing_feature_report_differently() {
 fn mode_info_reports_real_geometry() {
     let info = |m| {
         let mut i = std::mem::MaybeUninit::<MfskModeInfo>::zeroed();
-        let st = unsafe { mfsk_mode_info(m, i.as_mut_ptr()) };
+        let st = unsafe { mfsk_mode_info(m as u32, i.as_mut_ptr()) };
         assert_eq!(st, MfskStatus::Ok, "{m:?}");
         unsafe { i.assume_init() }
     };
@@ -200,7 +200,7 @@ fn mode_info_reports_real_geometry() {
 fn msk144_is_addressable_and_says_what_it_is_not() {
     let mut i = std::mem::MaybeUninit::<MfskModeInfo>::zeroed();
     assert_eq!(
-        unsafe { mfsk_mode_info(MfskMode::Msk144, i.as_mut_ptr()) },
+        unsafe { mfsk_mode_info(MfskMode::Msk144 as u32, i.as_mut_ptr()) },
         MfskStatus::Ok
     );
     let i = unsafe { i.assume_init() };
@@ -216,7 +216,7 @@ fn msk144_is_addressable_and_says_what_it_is_not() {
 /// including the two this branch just changed.
 #[test]
 fn published_capabilities_match_the_traits() {
-    assert_ne!(mfsk_mode_caps(MfskMode::Ft8) & MFSK_CAP_SNIPER, 0);
+    assert_ne!(mfsk_mode_caps(MfskMode::Ft8 as u32) & MFSK_CAP_SNIPER, 0);
     for m in [
         MfskMode::Ft4,
         MfskMode::Fst4s15,
@@ -224,17 +224,20 @@ fn published_capabilities_match_the_traits() {
         MfskMode::Fst4s300,
     ] {
         assert_eq!(
-            mfsk_mode_caps(m) & MFSK_CAP_SNIPER,
+            mfsk_mode_caps(m as u32) & MFSK_CAP_SNIPER,
             0,
             "{m:?} must not advertise a sniper it does not have"
         );
         assert_ne!(
-            mfsk_mode_caps(m) & MFSK_CAP_AP_WIDEBAND,
+            mfsk_mode_caps(m as u32) & MFSK_CAP_AP_WIDEBAND,
             0,
             "{m:?} does wide-band AP now and must say so"
         );
     }
-    assert_eq!(mfsk_mode_caps(MfskMode::Wspr) & MFSK_CAP_DECODE_HANDLE, 0);
+    assert_eq!(
+        mfsk_mode_caps(MfskMode::Wspr as u32) & MFSK_CAP_DECODE_HANDLE,
+        0
+    );
 }
 
 /// Defaults are data, published per mode — and carry the scale that
@@ -243,7 +246,7 @@ fn published_capabilities_match_the_traits() {
 fn defaults_are_published_with_their_scale() {
     let d = |m| {
         let mut x = std::mem::MaybeUninit::<MfskDecodeDefaults>::zeroed();
-        let st = unsafe { mfsk_mode_defaults(m, x.as_mut_ptr()) };
+        let st = unsafe { mfsk_mode_defaults(m as u32, x.as_mut_ptr()) };
         assert_eq!(st, MfskStatus::Ok, "{m:?}");
         unsafe { x.assume_init() }
     };
@@ -269,7 +272,7 @@ fn defaults_are_published_with_their_scale() {
 
     assert!(ft8.freq_max_hz > ft8.freq_min_hz && ft8.max_cand > 0);
     assert_eq!(
-        unsafe { mfsk_mode_defaults(MfskMode::Ft8, std::ptr::null_mut()) },
+        unsafe { mfsk_mode_defaults(MfskMode::Ft8 as u32, std::ptr::null_mut()) },
         MfskStatus::InvalidArg
     );
 }
@@ -285,7 +288,7 @@ fn size_versioning_writes_only_the_declared_prefix() {
     let mut buf = vec![0xAAu8; FULL];
     // An old header that knows only up to `ntones`.
     buf[..4].copy_from_slice(&(short as u32).to_ne_bytes());
-    let st = unsafe { mfsk_mode_info(MfskMode::Ft8, buf.as_mut_ptr() as *mut MfskModeInfo) };
+    let st = unsafe { mfsk_mode_info(MfskMode::Ft8 as u32, buf.as_mut_ptr() as *mut MfskModeInfo) };
     assert_eq!(st, MfskStatus::Ok);
 
     let written = u32::from_ne_bytes(buf[..4].try_into().unwrap()) as usize;
@@ -298,7 +301,7 @@ fn size_versioning_writes_only_the_declared_prefix() {
     // A zeroed struct means "same header as you", so everything is written.
     let mut full = std::mem::MaybeUninit::<MfskModeInfo>::zeroed();
     assert_eq!(
-        unsafe { mfsk_mode_info(MfskMode::Ft8, full.as_mut_ptr()) },
+        unsafe { mfsk_mode_info(MfskMode::Ft8 as u32, full.as_mut_ptr()) },
         MfskStatus::Ok
     );
     assert_eq!(unsafe { full.assume_init() }.size as usize, FULL);

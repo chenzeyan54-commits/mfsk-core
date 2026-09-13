@@ -644,6 +644,40 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
 
 ### Removed
 
+- **The pre-v2 decode surface is gone.** `mfsk_decoder_new`/`_free`, the
+  `MfskDecodeOptions` handle and its eight setters, `mfsk_decode_i16`/
+  `_f32`, both sniper entry points, `mfsk_decode_i16_streaming`,
+  `MfskResultList`/`MfskResult`/`mfsk_result_list_free`, and the
+  `MfskProtocol` enum. Everything they did is on the decode session or
+  on a per-mode entry point, described in *Added* above.
+
+  Deleted rather than deprecated because the two could not safely
+  coexist: both handles crossed as the same opaque `MfskDecoder*`, so a
+  pointer that wandered into the other's free function was undefined
+  behaviour no compiler could notice.
+
+  `MfskProtocol` was the shape of the problem this work exists to fix.
+  One FST4 entry meant 15/30/120/300 were unreachable from C for decode
+  and encode alike; `MfskMode` addresses all 25 modes.
+
+- **WSPR, JT9 and JT65 have their own entry points instead of a generic
+  dispatch that pretended they were the same shape.** `mfsk_wspr_decode`,
+  `mfsk_jt9_decode_at`, `mfsk_jt65_decode_at`. JT9 and JT65 are point
+  decodes at a known carrier rather than searches, and the pre-v2 path
+  hardcoded 1500 Hz and 1270 Hz with no way to say otherwise — the
+  frequency is an argument now. The Q65 family keeps its four functions
+  and moves to the shared row type.
+
+- **A session is single-threaded, where the old handle was not.** The
+  pre-v2 handle carried one protocol tag, so sharing it across threads
+  happened to work and the C++ driver tested that it did. A session
+  caches a callsign hash table it mutates on every decode, so sharing
+  one would be a data race. This module's own documentation already
+  said that a change adding cached state must "tighten this documented
+  contract back to strict one-per-thread"; this is that change. The
+  driver now exercises one session per thread and concurrent mixed
+  modes, which is the supported shape.
+
 - **The sniper is an FT8 mode, and FT4/FST4 no longer offer one.**
   `SniperRequest` is now gated on its own trait, `SupportsSniper`,
   implemented for `Ft8` alone; `DecodeRequest::<Ft4>::sniper` and the
@@ -679,6 +713,27 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
   other protocol.
 
 ### Fixed
+
+- **An out-of-range enum argument from C was undefined behaviour, and it
+  segfaulted.** `mfsk_mode_name((MfskMode)9999)` from the C++ driver
+  crashed the process. A `#[repr(C)]` fieldless enum is an `int` to C,
+  so a caller can pass a value from a config file, a newer header, or a
+  plain mistake — and reading an out-of-range discriminant *as a Rust
+  enum* lets the compiler assume it is one of the listed variants and
+  optimise the match accordingly.
+
+  Every entry point now takes the mode, the Q65 sub-mode and the fading
+  model as `uint32_t` and validates it. C callers still write
+  `MFSK_MODE_FT8`: an unscoped enum constant converts implicitly in both
+  C and C++, so nothing changes on that side. The crash case is a
+  permanent test.
+
+  This is the third instance of one class of defect found in this
+  redesign — the others being the `&'static mut` fabricated from a raw
+  pointer, and a `memset`-to-zero options struct producing an invalid
+  `MfskDecodeDepth`. All three are "C hands Rust a value Rust's type
+  system says cannot exist", and all three are now checked at the
+  boundary rather than assumed away.
 
 - **The FFI crates' rustdoc was never checked, and a broken intra-doc
   link had already shipped through the gap.** Both the pre-commit hook

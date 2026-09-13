@@ -1,57 +1,30 @@
-//! `mfsk_decode_i16_sniper` / `mfsk_decode_f32_sniper` — the
-//! single-frequency-target entry points (issue #249).
+//! The narrow-band search, which is FT8's alone.
 //!
-//! What these tests are for, in order of what would actually break:
+//! `MfskDecodeParams::search_hz` selects it. What these tests pin, in
+//! order of what would actually break:
 //!
-//! 1. **FT4 and FST4 can take an AP hint through C at all.** That is
-//!    the reason the issue exists: `mfsk_decode_options_set_ap_hint`
-//!    reaches the wide-band decoder for FT8 only, so before this entry
-//!    point a C caller had no way to hint FT4/FST4. A wiring mistake
-//!    here (hint dropped, wrong protocol arm) is invisible on a clean
-//!    signal, so the AP tests assert the hint *reaches* the decoder and
-//!    leaves a decodable signal decodable — the 1-3 dB the hint is
-//!    worth is `mfsk_core`'s own property, tested there.
-//! 2. The options fields that do not apply are ignored rather than
-//!    fatal — a caller reusing one handle across both entry points is
-//!    the expected shape, not an error.
-//! 3. Protocols with no sniper mode say so instead of decoding
-//!    something wrong.
+//! 1. **It still works for the one mode that has it.** With the FT4 and
+//!    FST4 arms gone, an FT8 positive case is the only thing exercising
+//!    this path at all.
+//! 2. **FT4 and FST4 refuse it.** The sniper is the receive half of
+//!    narrowing a transceiver's *analogue* roofing filter — a DX-chasing
+//!    mode a contest protocol has no use for, and one FST4 has a better
+//!    answer to in its own DDC channelizer. Refusing is the design, not
+//!    a gap.
+//! 3. **The AP hint the sniper looked like it was *for* reaches those
+//!    protocols anyway**, through the ordinary wide-band decode. That
+//!    coupling was an accident; this is the test that says it is over.
+
+mod common;
 
 use std::ffi::CString;
 use std::ptr;
 
-use mfsk::{
-    MfskDecodeDepth, MfskProtocol, MfskResultList, MfskSamples, MfskStatus, mfsk_decode_f32_sniper,
-    mfsk_decode_i16, mfsk_decode_i16_sniper, mfsk_decode_options_free, mfsk_decode_options_new,
-    mfsk_decode_options_set_ap_hint, mfsk_decode_options_set_freq_hint,
-    mfsk_decode_options_set_sic_rounds, mfsk_decoder_free, mfsk_decoder_new, mfsk_encode_ft4,
-    mfsk_encode_ft8, mfsk_result_list_free, mfsk_samples_free,
-};
+use common::*;
+use mfsk::*;
 
-fn empty_list() -> MfskResultList {
-    MfskResultList {
-        items: ptr::null_mut(),
-        len: 0,
-        _capacity: 0,
-    }
-}
-
-unsafe fn list_contains(list: &MfskResultList, needle: &str) -> bool {
-    if list.items.is_null() || list.len == 0 {
-        return false;
-    }
-    let slice = unsafe { std::slice::from_raw_parts(list.items, list.len) };
-    slice.iter().any(|m| {
-        let s = unsafe { std::ffi::CStr::from_ptr(m.text.as_ptr()) }.to_string_lossy();
-        s.contains(needle)
-    })
-}
-
-/// `encode`: one of the `mfsk_encode_*` functions, all of which share
-/// the `(call1, call2, report, freq, out)` shape and synthesise at
-/// amplitude 1.0.
 fn synth(
-    encode: unsafe extern "C" fn(
+    enc: unsafe extern "C" fn(
         *const std::ffi::c_char,
         *const std::ffi::c_char,
         *const std::ffi::c_char,
@@ -62,254 +35,155 @@ fn synth(
     call2: &str,
     report: &str,
     freq_hz: f32,
-) -> Vec<i16> {
-    let c1 = CString::new(call1).unwrap();
-    let c2 = CString::new(call2).unwrap();
-    let r = CString::new(report).unwrap();
+) -> (Vec<i16>, Vec<f32>) {
+    let (c1, c2, r) = (
+        CString::new(call1).unwrap(),
+        CString::new(call2).unwrap(),
+        CString::new(report).unwrap(),
+    );
     let mut pcm = MfskSamples {
         samples: ptr::null_mut(),
         len: 0,
         _cap: 0,
     };
-    let st = unsafe { encode(c1.as_ptr(), c2.as_ptr(), r.as_ptr(), freq_hz, &mut pcm) };
-    assert_eq!(st, MfskStatus::Ok);
-    let f32_samples = unsafe { std::slice::from_raw_parts(pcm.samples, pcm.len) };
-    let out: Vec<i16> = f32_samples
-        .iter()
-        .map(|&s| (s * 32_767.0).clamp(-32_768.0, 32_767.0) as i16)
-        .collect();
-    unsafe { mfsk_samples_free(&mut pcm) };
-    out
-}
-
-const FREQ: f32 = 1_200.0;
-
-#[test]
-fn ft8_sniper_decodes_at_the_target_frequency() {
-    let audio = synth(mfsk_encode_ft8, "JL1NIE", "VK3NV", "-12", FREQ);
-    let dec = mfsk_decoder_new(MfskProtocol::Ft8);
-    let mut list = empty_list();
-    let st = unsafe {
-        mfsk_decode_i16_sniper(
-            dec,
-            audio.as_ptr(),
-            audio.len(),
-            12_000,
-            FREQ,
-            ptr::null(),
-            &mut list,
-        )
-    };
-    assert_eq!(st, MfskStatus::Ok);
-    assert!(
-        unsafe { list_contains(&list, "JL1NIE") },
-        "sniper at the signal's own frequency should decode it"
-    );
-    unsafe {
-        mfsk_result_list_free(&mut list);
-        mfsk_decoder_free(dec);
-    }
-}
-
-/// The f32 entry point is the same decode behind a different input
-/// convention — same signal, same result.
-#[test]
-fn f32_and_i16_sniper_agree() {
-    let audio = synth(mfsk_encode_ft8, "JL1NIE", "VK3NV", "-12", FREQ);
-    let as_f32: Vec<f32> = audio.iter().map(|&s| s as f32 / 32_767.0).collect();
-    let dec = mfsk_decoder_new(MfskProtocol::Ft8);
-
-    let mut a = empty_list();
-    let mut b = empty_list();
-    unsafe {
-        assert_eq!(
-            mfsk_decode_i16_sniper(
-                dec,
-                audio.as_ptr(),
-                audio.len(),
-                12_000,
-                FREQ,
-                ptr::null(),
-                &mut a
-            ),
-            MfskStatus::Ok
-        );
-        assert_eq!(
-            mfsk_decode_f32_sniper(
-                dec,
-                as_f32.as_ptr(),
-                as_f32.len(),
-                12_000,
-                FREQ,
-                ptr::null(),
-                &mut b
-            ),
-            MfskStatus::Ok
-        );
-        assert!(list_contains(&a, "JL1NIE"));
-        assert_eq!(a.len, b.len, "same audio, same decode count");
-        assert!(list_contains(&b, "JL1NIE"));
-        mfsk_result_list_free(&mut a);
-        mfsk_result_list_free(&mut b);
-        mfsk_decoder_free(dec);
-    }
-}
-
-/// FT4 has no sniper any more, and the AP hint it was reached through
-/// now works on the ordinary wide-band decode.
-///
-/// Narrow-band single-target search is an FT8 mode — the receive half
-/// of an analogue roofing filter, a DX-chasing activity incompatible
-/// with FT4's contest use. A-priori decoding was never part of that; it
-/// only looked that way because the shared AP engine ended its search
-/// on `if has_ap`, so a hint was what made a search single-target.
-#[test]
-fn ft4_sniper_is_gone_and_ap_works_wide_band() {
-    let audio = synth(mfsk_encode_ft4, "JL1NIE", "VK3NV", "-12", FREQ);
-    let dec = mfsk_decoder_new(MfskProtocol::Ft4);
-    let opts = mfsk_decode_options_new(200.0, 3_000.0, 1.2, 50, MfskDecodeDepth::BpAllOsd);
-
-    let call1 = CString::new("JL1NIE").unwrap();
-    let call2 = CString::new("VK3NV").unwrap();
     assert_eq!(
-        unsafe {
-            mfsk_decode_options_set_ap_hint(
-                opts,
-                call1.as_ptr(),
-                call2.as_ptr(),
-                ptr::null(),
-                ptr::null(),
-            )
-        },
+        unsafe { enc(c1.as_ptr(), c2.as_ptr(), r.as_ptr(), freq_hz, &mut pcm) },
         MfskStatus::Ok
     );
+    let f = unsafe { std::slice::from_raw_parts(pcm.samples, pcm.len) }.to_vec();
+    let i = f
+        .iter()
+        .map(|&s| (s * 32767.0).clamp(-32_768.0, 32_767.0) as i16)
+        .collect();
+    unsafe { mfsk_samples_free(&mut pcm) };
+    (i, f)
+}
 
-    let mut list = empty_list();
-    assert_eq!(
-        unsafe {
-            mfsk_decode_i16_sniper(
-                dec,
-                audio.as_ptr(),
-                audio.len(),
-                12_000,
-                FREQ,
-                opts,
-                &mut list,
-            )
-        },
-        MfskStatus::UnknownProtocol,
-        "FT4 sniper should report the mode as unsupported, not decode"
-    );
+fn sniper_params(target_hz: f32, width_hz: f32) -> MfskDecodeParams {
+    let mut p = params(MfskMode::Ft8);
+    p.freq_hint_hz = target_hz;
+    p.search_hz = width_hz;
+    p
+}
 
-    // The same hint on the path FT4 actually has.
-    let mut list = empty_list();
-    let st = unsafe { mfsk_decode_i16(dec, audio.as_ptr(), audio.len(), 12_000, opts, &mut list) };
-    assert_eq!(st, MfskStatus::Ok);
+#[test]
+fn ft8_decodes_at_the_target_frequency() {
+    let (audio, _) = synth(mfsk_encode_ft8, "CQ", "JA1ABC", "PM95", 1200.0);
+    let p = sniper_params(1200.0, 250.0);
+    let dec = open(MfskMode::Ft8, Some(&p));
+    let rows = decode_i16(dec, &audio);
+    assert!(any_contains(&rows, "JA1ABC"), "{:?}", texts(&rows));
     assert!(
-        unsafe { list_contains(&list, "JL1NIE") },
-        "an AP hint naming the station on air must not stop it decoding"
+        rows.iter().all(|r| (r.freq_hz - 1200.0).abs() < 50.0),
+        "a narrow search should only return what is in its window: {:?}",
+        rows.iter().map(|r| r.freq_hz).collect::<Vec<_>>()
     );
-    unsafe {
-        mfsk_result_list_free(&mut list);
-        mfsk_decode_options_free(opts);
-        mfsk_decoder_free(dec);
-    }
+    unsafe { mfsk_session_close(dec) };
 }
 
-/// Options built for the wide-band entry point are accepted here with
-/// their inapplicable fields ignored — the convention this crate
-/// already follows for `sic_early` on FT4.
 #[test]
-fn wide_band_only_options_are_ignored_not_fatal() {
-    let audio = synth(mfsk_encode_ft8, "JL1NIE", "VK3NV", "-12", FREQ);
-    let dec = mfsk_decoder_new(MfskProtocol::Ft8);
-    let opts = mfsk_decode_options_new(200.0, 3_000.0, 2.0, 8, MfskDecodeDepth::BpAllOsd);
-    unsafe {
-        // Both are `DecodeRequest`-only knobs: a sniper request has no
-        // freq_hint (the target is the hint) and no SIC strategy.
-        assert_eq!(
-            mfsk_decode_options_set_freq_hint(opts, 2_500.0),
-            MfskStatus::Ok
-        );
-        assert_eq!(mfsk_decode_options_set_sic_rounds(opts, 3), MfskStatus::Ok);
-    }
+fn f32_and_i16_agree() {
+    let (i16s, f32s) = synth(mfsk_encode_ft8, "CQ", "JA1ABC", "PM95", 1200.0);
+    let p = sniper_params(1200.0, 250.0);
 
-    let mut list = empty_list();
-    let st = unsafe {
-        mfsk_decode_i16_sniper(
-            dec,
-            audio.as_ptr(),
-            audio.len(),
-            12_000,
-            FREQ,
-            opts,
-            &mut list,
-        )
-    };
-    assert_eq!(st, MfskStatus::Ok, "inapplicable options must not fail");
+    let a = open(MfskMode::Ft8, Some(&p));
+    let via_i16 = texts(&decode_i16(a, &i16s));
+    unsafe { mfsk_session_close(a) };
+
+    let b = open(MfskMode::Ft8, Some(&p));
+    let via_f32 = texts(&decode_f32(b, &f32s));
+    unsafe { mfsk_session_close(b) };
+
+    assert!(!via_i16.is_empty());
+    assert_eq!(via_i16, via_f32);
+}
+
+/// Widening the window admits a signal outside the default one — which
+/// is what says `search_hz` is a parameter rather than a literal.
+#[test]
+fn the_window_width_is_honoured() {
+    let (a, _) = synth(mfsk_encode_ft8, "CQ", "JA1ABC", "PM95", 1500.0);
+    let (b, _) = synth(mfsk_encode_ft8, "CQ", "VK3NV", "QF22", 2100.0);
+    let mixed: Vec<i16> = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| x.saturating_add(y))
+        .collect();
+
+    let narrow = sniper_params(1500.0, 250.0);
+    let d = open(MfskMode::Ft8, Some(&narrow));
+    let t = texts(&decode_i16(d, &mixed));
+    unsafe { mfsk_session_close(d) };
+    assert!(t.iter().any(|s| s.contains("JA1ABC")), "{t:?}");
     assert!(
-        unsafe { list_contains(&list, "JL1NIE") },
-        "a freq_hint pointing 1.3 kHz away is ignored, not obeyed"
+        !t.iter().any(|s| s.contains("VK3NV")),
+        "600 Hz away must be outside a ±250 Hz window: {t:?}"
     );
-    unsafe {
-        mfsk_result_list_free(&mut list);
-        mfsk_decode_options_free(opts);
-        mfsk_decoder_free(dec);
-    }
+
+    let wide = sniper_params(1500.0, 700.0);
+    let d = open(MfskMode::Ft8, Some(&wide));
+    let t = texts(&decode_i16(d, &mixed));
+    unsafe { mfsk_session_close(d) };
+    assert!(t.iter().any(|s| s.contains("VK3NV")), "±700 Hz: {t:?}");
+}
+
+/// The sniper is FT8's alone, and the AP hint it looked like it was for
+/// reaches FT4 through the ordinary wide-band decode.
+#[test]
+fn ft4_has_no_sniper_but_does_have_ap() {
+    let (audio, _) = synth(mfsk_encode_ft4, "CQ", "JA1ABC", "PM95", 1200.0);
+
+    let mut narrow = params(MfskMode::Ft4);
+    narrow.freq_hint_hz = 1200.0;
+    narrow.search_hz = 250.0;
+    let mut st = MfskStatus::Ok;
+    assert!(
+        unsafe { mfsk_session_open(MfskMode::Ft4 as u32, &narrow, &mut st) }.is_null(),
+        "FT4 must not offer a narrow-band search"
+    );
+    assert_eq!(st, MfskStatus::Unsupported);
+
+    let mut wide = params(MfskMode::Ft4);
+    with_ap(&mut wide, "JA1ABC", "CQ", "");
+    let dec = open(MfskMode::Ft4, Some(&wide));
+    let rows = decode_i16(dec, &audio);
+    assert!(
+        any_contains(&rows, "JA1ABC"),
+        "the AP hint must reach FT4's wide-band decode: {:?}",
+        texts(&rows)
+    );
+    unsafe { mfsk_session_close(dec) };
 }
 
 #[test]
-fn protocols_without_a_sniper_mode_are_rejected() {
-    let audio = vec![0i16; 120 * 12_000];
-    for p in [MfskProtocol::Wspr, MfskProtocol::Jt9, MfskProtocol::Q65a30] {
-        let dec = mfsk_decoder_new(p);
-        let mut list = empty_list();
-        let st = unsafe {
-            mfsk_decode_i16_sniper(
-                dec,
-                audio.as_ptr(),
-                audio.len(),
-                12_000,
-                FREQ,
-                ptr::null(),
-                &mut list,
-            )
-        };
-        assert_eq!(
-            st,
-            MfskStatus::UnknownProtocol,
-            "{p:?} has no single-frequency mode and should say so"
+fn no_other_mode_offers_one() {
+    for i in 0..mfsk_mode_count() {
+        let mut m = MfskMode::Ft8;
+        assert_eq!(unsafe { mfsk_mode_at(i, &mut m) }, MfskStatus::Ok);
+        if m == MfskMode::Ft8 || mfsk_mode_caps(m as u32) & MFSK_CAP_DECODE_HANDLE == 0 {
+            continue;
+        }
+        let mut p = params(m);
+        p.freq_hint_hz = 1200.0;
+        p.search_hz = 250.0;
+        let mut st = MfskStatus::Ok;
+        assert!(
+            unsafe { mfsk_session_open(m as u32, &p, &mut st) }.is_null(),
+            "{m:?} accepted a narrow-band search it does not have"
         );
-        unsafe { mfsk_decoder_free(dec) };
+        assert_eq!(st, MfskStatus::Unsupported, "{m:?}");
     }
 }
 
+/// `search_hz` says how wide, `freq_hint_hz` says where. Half a request
+/// is an error rather than a guess.
 #[test]
-fn null_arguments_are_rejected() {
-    let dec = mfsk_decoder_new(MfskProtocol::Ft8);
-    let mut list = empty_list();
-    let audio = vec![0i16; 15 * 12_000];
-    unsafe {
-        assert_eq!(
-            mfsk_decode_i16_sniper(
-                ptr::null(),
-                audio.as_ptr(),
-                audio.len(),
-                12_000,
-                FREQ,
-                ptr::null(),
-                &mut list
-            ),
-            MfskStatus::InvalidArg
-        );
-        assert_eq!(
-            mfsk_decode_i16_sniper(dec, ptr::null(), 0, 12_000, FREQ, ptr::null(), &mut list),
-            MfskStatus::InvalidArg
-        );
-        assert_eq!(
-            mfsk_decode_f32_sniper(dec, ptr::null(), 0, 12_000, FREQ, ptr::null(), &mut list),
-            MfskStatus::InvalidArg
-        );
-        mfsk_decoder_free(dec);
-    }
+fn a_width_without_a_target_is_refused() {
+    let mut p = params(MfskMode::Ft8);
+    p.search_hz = 250.0;
+    let mut st = MfskStatus::Ok;
+    assert!(unsafe { mfsk_session_open(MfskMode::Ft8 as u32, &p, &mut st) }.is_null());
+    assert_eq!(st, MfskStatus::Unsupported);
+    let msg = unsafe { std::ffi::CStr::from_ptr(mfsk_last_error()) }.to_string_lossy();
+    assert!(msg.contains("freq_hint_hz"), "{msg}");
 }

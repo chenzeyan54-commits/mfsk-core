@@ -1,65 +1,27 @@
-//! `mfsk_decode_options_set_*` integration tests (FFI builder-parity
-//! pass, issue #162 follow-up — mfsk-ffi's `MfskDecodeOptions` had not
-//! grown a single setter since its creation, issue #205, despite its
-//! own doc comment anticipating exactly that).
+//! Every `MfskDecodeParams` field must reach the decoder.
 //!
-//! `strictness`/`eq_mode`/`freq_hint` are already exhaustively tested
-//! at the `mfsk_core` level (this pass only wires existing,
-//! already-verified Rust builder methods through to C) — the
-//! round-trip tests here confirm each setter reaches the real decode
-//! call and doesn't break a clean baseline, not a fresh
-//! accept/reject-threshold sweep or candidate-promotion proof. A
-//! `freq_hint`-specific behavioural proof (promotion under a
-//! `max_cand` cap) turned out not to be cheap to construct — see that
-//! test's own doc comment for what got in the way.
+//! The pre-v2 ABI's fields were set through eight fallible setters on
+//! an opaque handle, and six of the eleven were silently dropped
+//! depending on protocol. That is the failure this file exists to stop
+//! coming back: a field that is accepted and ignored looks identical to
+//! a field that works, from C, forever.
+//!
+//! So each test drives a *behavioural* difference rather than checking
+//! that a setter returned OK — `sic_rounds` has to find more stations,
+//! an AP hint has to recover one, `freq_hint` must not exclude
+//! candidates.
+
+mod common;
 
 use std::ffi::CString;
-use std::ptr;
 
-use mfsk::{
-    MfskDecodeDepth, MfskEqMode, MfskProtocol, MfskResultList, MfskSamples, MfskStatus,
-    MfskStrictness, mfsk_decode_i16, mfsk_decode_options_free, mfsk_decode_options_new,
-    mfsk_decode_options_set_ap_hint, mfsk_decode_options_set_eq_mode,
-    mfsk_decode_options_set_freq_hint, mfsk_decode_options_set_sic_early,
-    mfsk_decode_options_set_sic_rounds, mfsk_decode_options_set_strictness, mfsk_decoder_free,
-    mfsk_decoder_new, mfsk_encode_ft8, mfsk_result_list_free, mfsk_samples_free,
-};
-
-fn empty_list() -> MfskResultList {
-    MfskResultList {
-        items: ptr::null_mut(),
-        len: 0,
-        _capacity: 0,
-    }
-}
-
-unsafe fn cstr_to_string(p: *const std::ffi::c_char) -> String {
-    if p.is_null() {
-        return String::new();
-    }
-    unsafe { std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned() }
-}
-
-unsafe fn list_any_contains(list: &MfskResultList, needle: &str) -> bool {
-    if list.items.is_null() || list.len == 0 {
-        return false;
-    }
-    let slice = unsafe { std::slice::from_raw_parts(list.items, list.len) };
-    slice
-        .iter()
-        .any(|m| unsafe { cstr_to_string(m.text.as_ptr()) }.contains(needle))
-}
+use common::*;
+use mfsk::*;
 
 fn synth_ft8_i16(call1: &str, call2: &str, report: &str, freq_hz: f32) -> Vec<i16> {
     synth_ft8_i16_scaled(call1, call2, report, freq_hz, 32_767.0)
 }
 
-/// `mfsk_encode_ft8` synthesises at amplitude 1.0 (`tones_to_f32`'s own
-/// full-scale convention) — fine standalone, but summing two full-scale
-/// i16 signals in [`mix`] would clip both into unrecoverable noise.
-/// `scale` lets [`mix`]-bound callers leave headroom (e.g. `32_767.0 *
-/// 0.45` per signal keeps a two-signal sum comfortably inside i16
-/// range).
 fn synth_ft8_i16_scaled(
     call1: &str,
     call2: &str,
@@ -67,28 +29,29 @@ fn synth_ft8_i16_scaled(
     freq_hz: f32,
     scale: f32,
 ) -> Vec<i16> {
-    let c1 = CString::new(call1).unwrap();
-    let c2 = CString::new(call2).unwrap();
-    let r = CString::new(report).unwrap();
+    let (c1, c2, r) = (
+        CString::new(call1).unwrap(),
+        CString::new(call2).unwrap(),
+        CString::new(report).unwrap(),
+    );
     let mut pcm = MfskSamples {
-        samples: ptr::null_mut(),
+        samples: std::ptr::null_mut(),
         len: 0,
         _cap: 0,
     };
-    let st = unsafe { mfsk_encode_ft8(c1.as_ptr(), c2.as_ptr(), r.as_ptr(), freq_hz, &mut pcm) };
-    assert_eq!(st, MfskStatus::Ok);
-    let f32_samples = unsafe { std::slice::from_raw_parts(pcm.samples, pcm.len) };
-    let i16_samples: Vec<i16> = f32_samples
+    assert_eq!(
+        unsafe { mfsk_encode_ft8(c1.as_ptr(), c2.as_ptr(), r.as_ptr(), freq_hz, &mut pcm) },
+        MfskStatus::Ok
+    );
+    let f = unsafe { std::slice::from_raw_parts(pcm.samples, pcm.len) };
+    let out: Vec<i16> = f
         .iter()
         .map(|&s| (s * scale).clamp(-32_768.0, 32_767.0) as i16)
         .collect();
     unsafe { mfsk_samples_free(&mut pcm) };
-    i16_samples
+    out
 }
 
-/// Mix two synthesised FT8 signals into one buffer (max-hold combine —
-/// matches `subtract.rs`'s own test convention of summing i32 then
-/// clamping).
 fn mix(a: &[i16], b: &[i16]) -> Vec<i16> {
     let len = a.len().max(b.len());
     (0..len)
@@ -100,134 +63,6 @@ fn mix(a: &[i16], b: &[i16]) -> Vec<i16> {
         .collect()
 }
 
-/// `mfsk_decode_options_set_strictness`/`_set_eq_mode` round-trip:
-/// every value still decodes the clean baseline signal identically —
-/// confirms the setter reaches the real decode call (wrong wiring,
-/// e.g. a swapped enum mapping, would show up as *some* combination
-/// failing to decode a clean signal that easily clears every
-/// strictness tier).
-#[test]
-fn strictness_and_eq_mode_setters_reach_decode_without_breaking_clean_signal() {
-    let samples = synth_ft8_i16("CQ", "JA1ABC", "PM95", 1500.0);
-
-    for strictness in [
-        MfskStrictness::Strict,
-        MfskStrictness::Normal,
-        MfskStrictness::Deep,
-    ] {
-        for eq_mode in [MfskEqMode::Off, MfskEqMode::Local] {
-            let opts = mfsk_decode_options_new(200.0, 3_000.0, 2.0, 50, MfskDecodeDepth::BpAllOsd);
-            assert!(!opts.is_null());
-            unsafe {
-                assert_eq!(
-                    mfsk_decode_options_set_strictness(opts, strictness),
-                    MfskStatus::Ok
-                );
-                assert_eq!(
-                    mfsk_decode_options_set_eq_mode(opts, eq_mode),
-                    MfskStatus::Ok
-                );
-            }
-
-            let dec = mfsk_decoder_new(MfskProtocol::Ft8);
-            let mut list = empty_list();
-            let st = unsafe {
-                mfsk_decode_i16(
-                    dec,
-                    samples.as_ptr(),
-                    samples.len(),
-                    12_000,
-                    opts,
-                    &mut list,
-                )
-            };
-            assert_eq!(
-                st,
-                MfskStatus::Ok,
-                "decode failed for strictness={strictness:?} eq_mode={eq_mode:?}"
-            );
-            assert!(
-                unsafe { list_any_contains(&list, "JA1ABC") },
-                "clean signal not recovered for strictness={strictness:?} eq_mode={eq_mode:?}"
-            );
-
-            unsafe {
-                mfsk_result_list_free(&mut list);
-                mfsk_decoder_free(dec);
-                mfsk_decode_options_free(opts);
-            }
-        }
-    }
-}
-
-/// `mfsk_decode_options_set_freq_hint` round-trip: reaches the decode
-/// call, doesn't exclude non-matching candidates (it's documented as
-/// promotion-only, not a filter), and setting it to a signal's own
-/// frequency doesn't break decoding that signal.
-///
-/// A stronger behavioural proof (freq_hint actually changing *which*
-/// candidate survives a `max_cand` cap, mirroring this session's
-/// `.sic_early()` recall proof) turned out not to be cheap to
-/// construct: `max_cand=1` was found, while writing this test, to
-/// drop every candidate outright regardless of hinting (a real, but
-/// pre-existing and unrelated property — not investigated further,
-/// out of scope for this pass), and a 3-signal mix under `max_cand=2`
-/// didn't reliably preserve exactly 2 of the 3 real signals (mixing
-/// three full-strength FT8 signals introduces coarse-sync-visible
-/// cross-artifacts that can outrank a real signal, unrelated to
-/// `freq_hint` itself). Both are `max_cand`/candidate-ranking
-/// questions, not `freq_hint` bugs — worth a separate look sometime,
-/// not blocking this builder-parity pass.
-#[test]
-fn freq_hint_setter_reaches_decode_and_does_not_exclude_candidates() {
-    let sig_a = synth_ft8_i16("CQ", "JA1ABC", "PM95", 1500.0);
-    let sig_b = synth_ft8_i16_scaled("CQ", "K1ABC", "FN42", 2200.0, 32_767.0 * 0.5);
-    let mixed = mix(&sig_a, &sig_b);
-
-    for hint_freq in [1500.0, 2200.0, 2700.0 /* matches neither */] {
-        let opts = mfsk_decode_options_new(200.0, 3_000.0, 2.0, 50, MfskDecodeDepth::BpAllOsd);
-        assert!(!opts.is_null());
-        unsafe {
-            assert_eq!(
-                mfsk_decode_options_set_freq_hint(opts, hint_freq),
-                MfskStatus::Ok
-            );
-        }
-        let dec = mfsk_decoder_new(MfskProtocol::Ft8);
-        let mut list = empty_list();
-        let st =
-            unsafe { mfsk_decode_i16(dec, mixed.as_ptr(), mixed.len(), 12_000, opts, &mut list) };
-        assert_eq!(
-            st,
-            MfskStatus::Ok,
-            "decode failed with freq_hint={hint_freq}"
-        );
-        assert!(
-            unsafe { list_any_contains(&list, "JA1ABC") && list_any_contains(&list, "K1ABC") },
-            "freq_hint={hint_freq} should not exclude either candidate (ample max_cand)"
-        );
-        unsafe {
-            mfsk_result_list_free(&mut list);
-            mfsk_decoder_free(dec);
-            mfsk_decode_options_free(opts);
-        }
-    }
-}
-
-/// `mfsk_decode_options_set_sic_rounds`/`_set_sic_early`'s real
-/// behavioural effect: a weak signal masked by a much stronger nearby
-/// one is invisible to the default single-pass strategy but recovered
-/// once the strong signal is subtracted first. Same amplitude/
-/// frequency choices as `mfsk-core`'s own
-/// `ft8::subtract::tests::subtract_reveals_hidden_signal` (already
-/// proven to reproduce this masking reliably) — reused rather than
-/// re-derived.
-/// Minimal RIFF/WAVE mono-i16 loader, standalone (mfsk-ffi's test
-/// crate can't reach `mfsk-core/tests/common/mod.rs`'s version —
-/// different crate). Path convention matches `CLAUDE.md`'s own
-/// documented rule for non-`mfsk-core`-internal test code:
-/// `CARGO_MANIFEST_DIR`-relative into `embedded-poc/assets/`, never a
-/// hardcoded absolute path.
 fn load_wav_i16(path: &str) -> Vec<i16> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     assert!(
@@ -253,132 +88,173 @@ fn load_wav_i16(path: &str) -> Vec<i16> {
         .collect()
 }
 
-/// `mfsk_decode_options_set_sic_early`/`_set_sic_rounds`'s real
-/// behavioural effect, using the same real busy-band recording (and
-/// the same default-vs-SIC recall gap, ~14-15 vs ~20-22 stations)
-/// this session's WASM/streaming investigation (issue #246) measured
-/// repeatedly on the Rust side — reused here rather than
-/// hand-constructing a synthetic masked-signal scenario, which turned
-/// out to be finicky (see git history of this file: a two-signal
-/// strong/weak construction either decoded both with or without SIC,
-/// or neither, across every amplitude/frequency combination tried;
-/// masking a single weak signal behind one strong one apparently
-/// isn't as reliably reproducible as this real multi-station
-/// recording's own natural overlap).
-#[test]
-fn sic_rounds_and_sic_early_recover_more_stations_than_default() {
-    let audio = load_wav_i16(concat!(
+fn qso3_busy() -> Vec<i16> {
+    load_wav_i16(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../embedded-poc/assets/qso3_busy.wav"
-    ));
+    ))
+}
 
-    let decode_with = |configure: Option<fn(*mut mfsk::MfskDecodeOptions)>| -> usize {
-        let opts = mfsk_decode_options_new(200.0, 3_000.0, 2.0, 50, MfskDecodeDepth::BpAllOsd);
-        assert!(!opts.is_null());
-        if let Some(f) = configure {
-            f(opts);
+/// Count decodes on the busy recording under a given parameter set.
+fn count(p: &MfskDecodeParams, audio: &[i16]) -> usize {
+    let dec = open(MfskMode::Ft8, Some(p));
+    let n = decode_i16(dec, audio).len();
+    unsafe { mfsk_session_close(dec) };
+    n
+}
+
+#[test]
+fn strictness_and_eq_mode_reach_the_decoder_without_breaking_a_clean_signal() {
+    let samples = synth_ft8_i16("CQ", "JA1ABC", "PM95", 1500.0);
+    for strictness in [
+        MfskStrictness::Strict,
+        MfskStrictness::Normal,
+        MfskStrictness::Deep,
+    ] {
+        for eq in [MfskEqMode::Off, MfskEqMode::Local] {
+            let mut p = params(MfskMode::Ft8);
+            p.strictness = strictness;
+            p.eq_mode = eq;
+            let dec = open(MfskMode::Ft8, Some(&p));
+            let rows = decode_i16(dec, &samples);
+            assert!(
+                any_contains(&rows, "JA1ABC"),
+                "{strictness:?}/{eq:?} lost a clean signal: {:?}",
+                texts(&rows)
+            );
+            unsafe { mfsk_session_close(dec) };
         }
-        let dec = mfsk_decoder_new(MfskProtocol::Ft8);
-        let mut list = empty_list();
-        let st =
-            unsafe { mfsk_decode_i16(dec, audio.as_ptr(), audio.len(), 12_000, opts, &mut list) };
-        assert_eq!(st, MfskStatus::Ok);
-        let n = list.len;
-        unsafe {
-            mfsk_result_list_free(&mut list);
-            mfsk_decoder_free(dec);
-            mfsk_decode_options_free(opts);
-        }
-        n
+    }
+}
+
+#[test]
+fn freq_hint_reaches_the_decoder_and_does_not_exclude_candidates() {
+    let sig_a = synth_ft8_i16("CQ", "JA1ABC", "PM95", 1500.0);
+    let sig_b = synth_ft8_i16_scaled("CQ", "K1ABC", "FN42", 2200.0, 32_767.0 * 0.5);
+    let mixed = mix(&sig_a, &sig_b);
+
+    let mut p = params(MfskMode::Ft8);
+    p.freq_hint_hz = 1500.0;
+    let dec = open(MfskMode::Ft8, Some(&p));
+    let rows = decode_i16(dec, &mixed);
+    let t = texts(&rows);
+    assert!(t.iter().any(|s| s.contains("JA1ABC")), "{t:?}");
+    assert!(
+        t.iter().any(|s| s.contains("K1ABC")),
+        "a hint prioritises, it must not exclude: {t:?}"
+    );
+    unsafe { mfsk_session_close(dec) };
+}
+
+/// The two SIC strategies have to *do* something, not merely be
+/// accepted. This is the phantom-prone code (`CLAUDE.md`: both
+/// false-decode bugs this suite has shipped were in subtraction paths),
+/// so it is checked against a real recording rather than a synthetic.
+#[test]
+fn sic_rounds_and_sic_early_recover_more_stations_than_default() {
+    let audio = qso3_busy();
+    let base = || {
+        let mut p = params(MfskMode::Ft8);
+        p.freq_min_hz = 200.0;
+        p.freq_max_hz = 3_000.0;
+        p.sync_min = 2.0;
+        p.max_cand = 50;
+        p
     };
 
-    let default_n = decode_with(None);
-    let sic_early_n = decode_with(Some(|opts| unsafe {
-        assert_eq!(mfsk_decode_options_set_sic_early(opts), MfskStatus::Ok);
-    }));
-    let sic_rounds_n = decode_with(Some(|opts| unsafe {
-        assert_eq!(mfsk_decode_options_set_sic_rounds(opts, 3), MfskStatus::Ok);
-    }));
+    let default_n = count(&base(), &audio);
+
+    let mut early = base();
+    early.sic_early = true;
+    let early_n = count(&early, &audio);
+
+    let mut rounds = base();
+    rounds.sic_rounds = 3;
+    let rounds_n = count(&rounds, &audio);
 
     assert!(
-        sic_early_n > default_n,
-        "sic_early ({sic_early_n}) should recover more qso3_busy stations than default ({default_n})"
+        early_n > default_n,
+        "sic_early ({early_n}) should beat default ({default_n}) on qso3_busy"
     );
     assert!(
-        sic_rounds_n > default_n,
-        "sic_rounds(3) ({sic_rounds_n}) should recover more qso3_busy stations than default ({default_n})"
+        rounds_n > default_n,
+        "sic_rounds(3) ({rounds_n}) should beat default ({default_n}) on qso3_busy"
     );
 }
 
-/// `mfsk_decode_options_set_ap_hint`'s real behavioural effect, same
-/// technique as the SIC test above: reuses `mfsk-core`'s own already-
-/// proven AP-on recall gain on `qso3_busy.wav`
-/// (`tests/ft8_qso3_apon_recall.rs::qso3_apon_strict_superset_of_apoff_same_pipeline`,
-/// `mycall=K1JT`/`hiscall=HA0DU`, freq 100-3000 Hz, `sync_min=1.3`) —
-/// same parameters, same expected extra (`CQ F5RXL IN94`, the
-/// single-pass-reachable JTDX AP-on extra per that test's own
-/// `JTDX_EXTRAS_HARD_FLOOR` docstring).
+/// An AP hint must take no decode away, and must surface the blind-CQ
+/// one this recording is known to carry.
+///
+/// AP's real risk is manufactured decodes, so the strict-superset half
+/// is the one that matters. Note it is deliberately **not** a
+/// count-increase assertion: at these settings the plain path already
+/// reaches 14 on this recording, and AP changes which passes earn them
+/// rather than how many there are.
 #[test]
-fn ap_hint_recovers_an_extra_station_on_qso3_busy() {
-    let audio = load_wav_i16(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../embedded-poc/assets/qso3_busy.wav"
-    ));
-
-    let decode_with_ap = |mycall: Option<&str>, hiscall: Option<&str>| -> Vec<String> {
-        let opts = mfsk_decode_options_new(100.0, 3_000.0, 1.3, 50, MfskDecodeDepth::BpAllOsd);
-        assert!(!opts.is_null());
-        if mycall.is_some() || hiscall.is_some() {
-            let c1 = mycall.map(|s| CString::new(s).unwrap());
-            let c2 = hiscall.map(|s| CString::new(s).unwrap());
-            unsafe {
-                assert_eq!(
-                    mfsk_decode_options_set_ap_hint(
-                        opts,
-                        c1.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
-                        c2.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
-                        ptr::null(),
-                        ptr::null(),
-                    ),
-                    MfskStatus::Ok
-                );
-            }
-        }
-        let dec = mfsk_decoder_new(MfskProtocol::Ft8);
-        let mut list = empty_list();
-        let st =
-            unsafe { mfsk_decode_i16(dec, audio.as_ptr(), audio.len(), 12_000, opts, &mut list) };
-        assert_eq!(st, MfskStatus::Ok);
-        let texts = if list.items.is_null() {
-            Vec::new()
-        } else {
-            unsafe { std::slice::from_raw_parts(list.items, list.len) }
-                .iter()
-                .map(|m| unsafe { cstr_to_string(m.text.as_ptr()) })
-                .collect()
-        };
-        unsafe {
-            mfsk_result_list_free(&mut list);
-            mfsk_decoder_free(dec);
-            mfsk_decode_options_free(opts);
-        }
-        texts
+fn an_ap_hint_surfaces_the_blind_cq_and_loses_nothing() {
+    let audio = qso3_busy();
+    let base = || {
+        let mut p = params(MfskMode::Ft8);
+        p.freq_min_hz = 100.0;
+        p.freq_max_hz = 3_000.0;
+        p.sync_min = 1.3;
+        p.max_cand = 50;
+        p
     };
 
-    let ap_off = decode_with_ap(None, None);
-    let ap_on = decode_with_ap(Some("K1JT"), Some("HA0DU"));
+    let run = |p: &MfskDecodeParams| {
+        let dec = open(MfskMode::Ft8, Some(p));
+        let t = texts(&decode_i16(dec, &audio));
+        unsafe { mfsk_session_close(dec) };
+        t
+    };
 
-    // Strict-superset invariant, same as the mfsk-core-level test.
+    let ap_off = run(&base());
+    let mut on = base();
+    with_ap(&mut on, "K1JT", "HA0DU", "");
+    let ap_on = run(&on);
+
     for m in &ap_off {
         assert!(
             ap_on.contains(m),
-            "AP-on lost a decode AP-off caught: {m:?} (ap_off={ap_off:?} ap_on={ap_on:?})"
+            "AP dropped a decode the plain path found: {m:?}"
         );
     }
     assert!(
         ap_on.iter().any(|m| m.contains("F5RXL")),
-        "AP-on (mycall=K1JT, hiscall=HA0DU) should surface CQ F5RXL IN94 via iaptype-1 \
-         blind-CQ, same as mfsk-core's own qso3_apon_recall test (ap_off={ap_off:?} \
-         ap_on={ap_on:?})"
+        "AP-on (mycall=K1JT, hiscall=HA0DU) should surface CQ F5RXL IN94 via the \
+         blind-CQ pass, same as mfsk-core's own qso3_apon_recall test \
+         (ap_off={ap_off:?} ap_on={ap_on:?})"
+    );
+}
+
+/// A per-call params override applies to that call only — the session
+/// keeps what it was opened with.
+#[test]
+fn a_per_call_override_does_not_stick() {
+    let audio = qso3_busy();
+    let mut wide = params(MfskMode::Ft8);
+    wide.freq_min_hz = 200.0;
+    wide.freq_max_hz = 3_000.0;
+    wide.sync_min = 2.0;
+
+    let dec = open(MfskMode::Ft8, Some(&wide));
+    let n_default = decode_i16(dec, &audio).len();
+
+    let mut narrow = wide;
+    narrow.freq_min_hz = 1_400.0;
+    narrow.freq_max_hz = 1_600.0;
+    let n_narrow = decode_i16_with(dec, &audio, Some(&narrow)).len();
+
+    let n_again = decode_i16(dec, &audio).len();
+    unsafe { mfsk_session_close(dec) };
+
+    assert!(
+        n_narrow < n_default,
+        "a 200 Hz window should find fewer than the full band ({n_narrow} vs {n_default})"
+    );
+    assert_eq!(
+        n_again, n_default,
+        "the override leaked into the next call on the same session"
     );
 }

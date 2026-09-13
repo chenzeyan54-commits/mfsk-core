@@ -46,7 +46,7 @@ fn blank_row() -> MfskDecode {
 fn params(mode: MfskMode) -> MfskDecodeParams {
     let mut p = std::mem::MaybeUninit::<MfskDecodeParams>::zeroed();
     assert_eq!(
-        unsafe { mfsk_decode_params_init(mode, p.as_mut_ptr()) },
+        unsafe { mfsk_decode_params_init(mode as u32, p.as_mut_ptr()) },
         MfskStatus::Ok
     );
     unsafe { p.assume_init() }
@@ -56,7 +56,7 @@ fn open(mode: MfskMode, p: Option<&MfskDecodeParams>) -> *mut MfskDecodeSession 
     let mut st = MfskStatus::Internal;
     let d = unsafe {
         mfsk_session_open(
-            mode,
+            mode as u32,
             p.map(|p| p as *const _).unwrap_or(std::ptr::null()),
             &mut st,
         )
@@ -224,7 +224,7 @@ fn unsupported_options_are_refused_not_dropped() {
         let mut p = params(mode);
         mutate(&mut p);
         let mut st = MfskStatus::Ok;
-        let d = unsafe { mfsk_session_open(mode, &p, &mut st) };
+        let d = unsafe { mfsk_session_open(mode as u32, &p, &mut st) };
         assert!(d.is_null(), "{what} should not open a handle");
         assert_eq!(st, MfskStatus::Unsupported, "{what}");
     }
@@ -255,7 +255,7 @@ fn supported_options_are_accepted() {
     p.search_hz = 250.0;
     let mut st = MfskStatus::Ok;
     assert!(
-        unsafe { mfsk_session_open(MfskMode::Ft8, &p, &mut st) }.is_null(),
+        unsafe { mfsk_session_open(MfskMode::Ft8 as u32, &p, &mut st) }.is_null(),
         "search_hz without freq_hint_hz says how wide but not where"
     );
     assert_eq!(st, MfskStatus::Unsupported);
@@ -279,7 +279,7 @@ fn a_memset_params_struct_is_rejected_not_undefined() {
     let mut st = MfskStatus::Ok;
     let d = unsafe {
         mfsk_session_open(
-            MfskMode::Ft8,
+            MfskMode::Ft8 as u32,
             bytes.as_ptr() as *const MfskDecodeParams,
             &mut st,
         )
@@ -308,7 +308,7 @@ fn an_out_of_range_discriminant_is_refused() {
     let mut st = MfskStatus::Ok;
     let d = unsafe {
         mfsk_session_open(
-            MfskMode::Ft8,
+            MfskMode::Ft8 as u32,
             bytes.as_ptr() as *const MfskDecodeParams,
             &mut st,
         )
@@ -326,7 +326,7 @@ fn every_mode_claiming_the_handle_can_open_one() {
     for i in 0..mfsk_mode_count() {
         let mut m = MfskMode::Ft8;
         assert_eq!(unsafe { mfsk_mode_at(i, &mut m) }, MfskStatus::Ok);
-        if mfsk_mode_caps(m) & MFSK_CAP_DECODE_HANDLE == 0 {
+        if mfsk_mode_caps(m as u32) & MFSK_CAP_DECODE_HANDLE == 0 {
             continue;
         }
         unsafe { mfsk_session_close(open(m, None)) };
@@ -348,7 +348,7 @@ fn a_mode_without_the_handle_is_refused_at_open() {
         MfskMode::Q65a30,
     ] {
         let mut st = MfskStatus::Ok;
-        let d = unsafe { mfsk_session_open(mode, std::ptr::null(), &mut st) };
+        let d = unsafe { mfsk_session_open(mode as u32, std::ptr::null(), &mut st) };
         assert!(d.is_null(), "{mode:?} should not open a decode handle");
         assert_eq!(st, MfskStatus::Unsupported, "{mode:?}");
         let msg = unsafe { std::ffi::CStr::from_ptr(mfsk_last_error()) }.to_string_lossy();
@@ -495,7 +495,7 @@ fn rows_carry_the_concrete_submode() {
 fn nulls_are_rejected_everywhere() {
     let m = params(MfskMode::Ft8);
     assert_eq!(
-        unsafe { mfsk_decode_params_init(MfskMode::Ft8, std::ptr::null_mut()) },
+        unsafe { mfsk_decode_params_init(MfskMode::Ft8 as u32, std::ptr::null_mut()) },
         MfskStatus::InvalidArg
     );
     assert_eq!(

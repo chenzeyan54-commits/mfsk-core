@@ -17,57 +17,73 @@
 //! `mfsk_q65_*` function family exposes every sub-mode and every
 //! strategy.
 //!
-//! Status codes, the result record/list shape, the decode-depth enum,
-//! and the opaque decode-options handle are shared with
-//! `mfsk-ffi-ft8` via `mfsk-ffi-abi` (issue #205) — this crate used to
-//! define its own `MfskStatus`/`MfskResult`/`MfskResultList` with
-//! colliding numeric codes and a heap-`CString`-per-message result
-//! shape (`mfsk-ffi-ft8`'s always used an inline fixed text buffer;
-//! both crates now do).
+//! Status codes, the decode-depth/strictness/equalisation enums and
+//! the mode/row/params types are shared with `mfsk-ffi-ft8` via
+//! `mfsk-ffi-abi` (issue #205) — this crate used to define its own
+//! `MfskStatus` with colliding numeric codes and a
+//! heap-`CString`-per-message result shape.
 //!
 //! # Memory ownership
 //!
-//! - [`mfsk_decoder_new`] / [`mfsk_decoder_free`]: opaque handle pair.
-//! - [`mfsk_decode_f32`] / [`mfsk_decode_i16`]: populate a caller-supplied
-//!   zero-initialised [`MfskResultList`]. The callee owns the returned
-//!   buffer until [`mfsk_result_list_free`] is invoked. An optional
-//!   [`MfskDecodeOptions`] handle (`mfsk_decode_options_new` / `_free`)
-//!   overrides this crate's per-protocol default search range /
-//!   threshold / depth — NULL keeps the pre-0.8.0 hardcoded defaults.
-//! - `mfsk_encode_*`: populate a caller-supplied
-//!   zero-initialised [`MfskSamples`] with the synthesised f32 PCM.
-//!   Free with [`mfsk_samples_free`].
-//! - Every [`MfskResult::text`] is a fixed inline buffer (no
-//!   per-message free needed) — freeing the list frees everything.
+//! **Decode results never cross the boundary as an allocation.**
+//! [`mfsk_session_decode_i16`] and friends write into an array the
+//! caller owns and report how many rows they needed, so there is
+//! nothing to free and no way to leak one by unwinding past a free —
+//! the thing that makes Kotlin and Swift wrappers fiddly.
+//!
+//! - [`mfsk_session_open`] / [`mfsk_session_close`]: the decode
+//!   session, which owns the callsign hash table, the previous slot's
+//!   rows and its own error slot.
+//! - `mfsk_encode_*`: still populate a caller-supplied zero-initialised
+//!   [`MfskSamples`] with synthesised f32 PCM; free with
+//!   [`mfsk_samples_free`]. That half has not been redesigned yet.
+//! - [`MfskDecode::text`] is a fixed inline buffer, so a row is plain
+//!   data you can copy and keep.
+//!
+//! # Enum-typed arguments cross as `uint32_t`
+//!
+//! A `#[repr(C)]` fieldless enum is an `int` to C, so a caller can pass
+//! a value from a config file, a newer header, or a plain mistake —
+//! and reading an out-of-range discriminant *as a Rust enum* is
+//! undefined behaviour, not a wrong answer. Every entry point therefore
+//! takes the mode (and the Q65 sub-mode and fading model) as `uint32_t`
+//! and validates it. C callers still write `MFSK_MODE_FT8`: an unscoped
+//! enum constant converts implicitly in both C and C++.
+//!
+//! `read_params` applies the same rule to the enum and `bool` fields
+//! inside [`MfskDecodeParams`].
 //!
 //! # Thread safety
 //!
-//! The supported usage model is **one [`MfskDecoder`] handle per
-//! thread**. The handle itself carries no mutable state other than
-//! its protocol tag, so in the current implementation sharing one
-//! handle across threads also works — the C++ driver in
-//! `examples/cpp_smoke` exercises both patterns (8 threads × own
-//! handle, 8 threads × shared handle, and a mixed-protocol fan-out)
-//! on every build. Concurrent decode calls allocate their own FFT
-//! planners / scratch buffers; `mfsk_last_error` uses
-//! `thread_local!` storage so error text never crosses threads.
+//! **One [`MfskDecodeSession`] per thread.** This is stricter than the
+//! pre-v2 handle's contract, deliberately: that handle carried only a
+//! protocol tag, so sharing one across threads happened to work, and
+//! this module's own documentation said that any change adding cached
+//! state must "tighten this documented contract back to strict
+//! one-per-thread". A session caches a callsign hash table it mutates
+//! on every decode, so that is now the contract.
 //!
-//! Future changes that add cached state to `DecoderInner` must
-//! keep that shared-handle test green or tighten this documented
-//! contract back to strict one-per-thread.
+//! Concurrent decodes on *separate* sessions are supported and
+//! exercised by the C++ driver in `examples/cpp_smoke` on every build.
+//! They allocate their own FFT planners and scratch buffers.
+//!
+//! Errors live on the session ([`mfsk_session_last_error`]) rather than
+//! in `thread_local!` storage, because a Kotlin coroutine or a Swift
+//! `async` caller legitimately hops threads between checking a status
+//! and reading the message, and would otherwise find NULL.
+//! [`mfsk_last_error`] remains for the handle-less calls.
 
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::os::raw::c_void;
 use std::ptr;
 use std::slice;
 
-use mfsk_core::ft4::decode as ft4;
 use mfsk_core::ft8::decode as ft8;
 
 pub use mfsk_ffi_abi::{
     MFSK_DECODE_FLAG_HASH_RESOLVED, MfskDecode, MfskDecodeDefaults, MfskDecodeDepth,
     MfskDecodeOptions, MfskDecodeParams, MfskDecodeSession, MfskEqMode, MfskMode, MfskModeInfo,
-    MfskResult, MfskResultList, MfskStatus, MfskStrictness, MfskSyncScale,
+    MfskStatus, MfskStrictness, MfskSyncScale,
 };
 /// Inline capacity of each `MfskDecodeParams` a-priori field.
 ///
@@ -148,42 +164,6 @@ pub const MFSK_CAP_ENCODE: u64 = 1 << 14;
 // ──────────────────────────────────────────────────────────────────────────
 // Public C types
 // ──────────────────────────────────────────────────────────────────────────
-
-/// Opaque decoder handle. Construct with [`mfsk_decoder_new`], release
-/// with [`mfsk_decoder_free`].
-/// Emitted as an incomplete type (`struct X;`) rather than a struct with a
-/// zero-length array member: `uint8_t _priv[0]` is a GCC/Clang extension
-/// that ISO C rejects (`-Werror=pedantic`), and MSVC accepts only under a
-/// warning. A pointer to an incomplete type is exactly as opaque, is
-/// standard in both C and C++, and is what every consumer already treats
-/// this as. Binary-compatible: the handle only ever crosses as a pointer.
-pub struct MfskDecoder {
-    _marker: core::marker::PhantomData<*mut ()>,
-}
-
-/// Protocol tag selecting which decoder / synth family this handle
-/// (or encode call) drives.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum MfskProtocol {
-    /// FT8 — 15 s slot, 8-GFSK, LDPC(174,91), 77-bit WSJT message.
-    Ft8 = 0,
-    /// FT4 — 7.5 s slot, 4-GFSK, LDPC(174,91), 77-bit WSJT message.
-    Ft4 = 1,
-    /// WSPR — 120 s slot, 4-FSK, convolutional r=½ K=32 + Fano, 50-bit payload.
-    Wspr = 2,
-    /// JT9 — 60 s slot, 9-FSK, convolutional r=½ K=32 + Fano, 72-bit JT message.
-    Jt9 = 3,
-    /// JT65 — 60 s slot, 65-FSK, Reed-Solomon(63,12) over GF(2⁶), 72-bit JT message.
-    Jt65 = 4,
-    /// FST4-60A — 60 s slot, 4-GFSK, LDPC(240,101) + CRC-24, 77-bit WSJT message.
-    Fst4s60 = 5,
-    /// Q65-30A — 30 s slot, 65-FSK, QRA(15,65) over GF(64), 77-bit WSJT message.
-    /// Other Q65 sub-modes (60A..60E for EME) are reachable via
-    /// the dedicated `mfsk_q65_*` function family with a
-    /// [`MfskQ65SubMode`] parameter.
-    Q65a30 = 6,
-}
 
 /// Q65 sub-mode selector for the dedicated `mfsk_q65_*` function
 /// family. All sub-modes share the same FEC, sync layout and
@@ -287,289 +267,9 @@ pub extern "C" fn mfsk_last_error() -> *const c_char {
 // Handle lifecycle
 // ──────────────────────────────────────────────────────────────────────────
 
-struct DecoderInner {
-    protocol: MfskProtocol,
-}
-
-/// Construct a new decoder handle bound to `protocol`. Returns NULL on
-/// failure (see [`mfsk_last_error`]).
-#[unsafe(no_mangle)]
-pub extern "C" fn mfsk_decoder_new(protocol: MfskProtocol) -> *mut MfskDecoder {
-    let inner = Box::new(DecoderInner { protocol });
-    Box::into_raw(inner) as *mut MfskDecoder
-}
-
-/// Destroy a decoder handle previously returned by [`mfsk_decoder_new`].
-/// Passing NULL is a no-op.
-///
-/// # Safety
-///
-/// `dec` must be a pointer previously returned by [`mfsk_decoder_new`],
-/// or NULL. After this call the pointer is dangling.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_decoder_free(dec: *mut MfskDecoder) {
-    if !dec.is_null() {
-        unsafe {
-            drop(Box::from_raw(dec as *mut DecoderInner));
-        }
-    }
-}
-
 // ──────────────────────────────────────────────────────────────────────────
 // Decode options (opaque handle, issue #205)
 // ──────────────────────────────────────────────────────────────────────────
-
-struct DecodeOptionsInner {
-    freq_min_hz: f32,
-    freq_max_hz: f32,
-    sync_min: f32,
-    max_cand: c_int,
-    depth: MfskDecodeDepth,
-    // Builder-parity fields (issue #162 follow-up) — each mirrors one
-    // mfsk_core::DecodeRequest builder method, set via a dedicated
-    // mfsk_decode_options_set_* function rather than a constructor
-    // parameter, per this struct's own stated growth plan above.
-    strictness: MfskStrictness,
-    eq_mode: MfskEqMode,
-    freq_hint: Option<f32>,
-    // `sic_rounds`/`sic_early` mirror mfsk_core::DecodeRequest's own
-    // mutual-overwrite semantics exactly: both `.sic_rounds(n)` and
-    // `.sic_early()` just overwrite one `strategy` field there, so
-    // setting one here clears the other (see the two setters below).
-    // FT8 (+FT4 for sic_rounds only) — silently ignored elsewhere at
-    // decode time, same convention as every other option here.
-    sic_rounds: Option<u8>,
-    sic_early: bool,
-    // Wide-band AP hint (mfsk_core::DecodeRequest::ap_hint, FT8 only —
-    // SupportsWideBandAp isn't implemented for FT4/FST4). `None` means
-    // "no hint set"; a `Some` with no fields actually populated is
-    // possible too (all-null/all-empty setter call) and is treated the
-    // same as `None` at decode time via `ApHint::has_info()`, matching
-    // the existing `mfsk_q65_decode_with_ap` convention exactly.
-    ap_hint: Option<mfsk_core::msg::ApHint>,
-}
-
-/// Matches this crate's pre-0.8.0 hardcoded per-protocol defaults for
-/// the FT8 case — the widest / most common of the three protocols
-/// [`mfsk_decode_f32`]/[`mfsk_decode_i16`] apply an
-/// [`MfskDecodeOptions`] override to.
-impl Default for DecodeOptionsInner {
-    fn default() -> Self {
-        Self {
-            freq_min_hz: 200.0,
-            freq_max_hz: 3_000.0,
-            sync_min: 2.0,
-            max_cand: 50,
-            depth: MfskDecodeDepth::BpAllOsd,
-            strictness: MfskStrictness::Normal,
-            eq_mode: MfskEqMode::Off,
-            freq_hint: None,
-            sic_rounds: None,
-            sic_early: false,
-            ap_hint: None,
-        }
-    }
-}
-
-fn options_inner(opts: *const MfskDecodeOptions) -> Option<&'static DecodeOptionsInner> {
-    unsafe { (opts as *const DecodeOptionsInner).as_ref() }
-}
-
-/// Mutable counterpart of [`options_inner`], used by the
-/// `mfsk_decode_options_set_*` family below.
-fn options_inner_mut(opts: *mut MfskDecodeOptions) -> Option<&'static mut DecodeOptionsInner> {
-    unsafe { (opts as *mut DecodeOptionsInner).as_mut() }
-}
-
-/// Construct a decode-options handle overriding
-/// [`mfsk_decode_f32`]/[`mfsk_decode_i16`]'s per-protocol default
-/// search range / threshold / depth for the FT8/FT4/FST4-60A/Q65-30A
-/// protocols (WSPR/JT9/JT65 decode at a fixed alignment with no
-/// tunable search — `options` is ignored for those). `freq_min_hz`/
-/// `freq_max_hz` bound the carrier search range. `sync_min` is the
-/// candidate threshold. `max_cand` caps survivors after coarse sync.
-/// `depth` picks the decoder staircase.
-///
-/// Free with [`mfsk_decode_options_free`]. A later knob (issue #205)
-/// arrives as a new, optional setter function — this constructor's
-/// signature and every decode function's signature stay stable.
-#[unsafe(no_mangle)]
-pub extern "C" fn mfsk_decode_options_new(
-    freq_min_hz: f32,
-    freq_max_hz: f32,
-    sync_min: f32,
-    max_cand: c_int,
-    depth: MfskDecodeDepth,
-) -> *mut MfskDecodeOptions {
-    let inner = Box::new(DecodeOptionsInner {
-        freq_min_hz,
-        freq_max_hz,
-        sync_min,
-        max_cand,
-        depth,
-        ..Default::default()
-    });
-    Box::into_raw(inner) as *mut MfskDecodeOptions
-}
-
-/// Free a handle from [`mfsk_decode_options_new`]. NULL is a no-op.
-///
-/// # Safety
-/// `opts` must be a pointer previously returned by
-/// [`mfsk_decode_options_new`], or NULL.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_decode_options_free(opts: *mut MfskDecodeOptions) {
-    if !opts.is_null() {
-        drop(unsafe { Box::from_raw(opts as *mut DecodeOptionsInner) });
-    }
-}
-
-/// Override the accept/reject threshold profile (default `Normal`,
-/// matches [`mfsk_decode_options_new`]'s own pre-existing default).
-/// Mirrors `mfsk_core::DecodeRequest::strictness`. Applies to
-/// FT8/FT4/FST4-60A; ignored for protocols with no tunable threshold.
-///
-/// # Safety
-/// `opts` must be a live handle from [`mfsk_decode_options_new`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_decode_options_set_strictness(
-    opts: *mut MfskDecodeOptions,
-    strictness: MfskStrictness,
-) -> MfskStatus {
-    let Some(inner) = options_inner_mut(opts) else {
-        set_error("mfsk_decode_options_set_strictness: null options handle");
-        return MfskStatus::InvalidArg;
-    };
-    inner.strictness = strictness;
-    MfskStatus::Ok
-}
-
-/// Override the equalisation mode (default `Off`). Mirrors
-/// `mfsk_core::DecodeRequest::eq_mode`. Applies to FT8/FT4/FST4-60A;
-/// ignored elsewhere.
-///
-/// # Safety
-/// `opts` must be a live handle from [`mfsk_decode_options_new`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_decode_options_set_eq_mode(
-    opts: *mut MfskDecodeOptions,
-    eq_mode: MfskEqMode,
-) -> MfskStatus {
-    let Some(inner) = options_inner_mut(opts) else {
-        set_error("mfsk_decode_options_set_eq_mode: null options handle");
-        return MfskStatus::InvalidArg;
-    };
-    inner.eq_mode = eq_mode;
-    MfskStatus::Ok
-}
-
-/// Set a preferred carrier frequency (Hz) — matching candidates are
-/// tried first, but every candidate in range is still searched (not a
-/// narrowing of `freq_min_hz`/`freq_max_hz`). Mirrors
-/// `mfsk_core::DecodeRequest::freq_hint`. Applies to FT8/FT4/FST4-60A;
-/// ignored elsewhere. No getter to clear it back to "unset" — construct
-/// a fresh [`MfskDecodeOptions`] if that's needed.
-///
-/// # Safety
-/// `opts` must be a live handle from [`mfsk_decode_options_new`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_decode_options_set_freq_hint(
-    opts: *mut MfskDecodeOptions,
-    freq_hz: f32,
-) -> MfskStatus {
-    let Some(inner) = options_inner_mut(opts) else {
-        set_error("mfsk_decode_options_set_freq_hint: null options handle");
-        return MfskStatus::InvalidArg;
-    };
-    inner.freq_hint = Some(freq_hz);
-    MfskStatus::Ok
-}
-
-/// Switch to the sequential multi-round SIC strategy: `n` rounds of
-/// coarse-sync + per-candidate decode + subtract over the shrinking
-/// residual, clamped to 1..=3 (mirrors `mfsk_core::DecodeRequest::sic_rounds`
-/// exactly, including its own clamp). Mutually exclusive with
-/// [`mfsk_decode_options_set_sic_early`] — whichever is called last on
-/// this handle wins, same as chaining `.sic_rounds(_).sic_early()` (or
-/// the reverse) on the Rust side. FT8 and FT4 only; ignored for other
-/// protocols at decode time.
-///
-/// # Safety
-/// `opts` must be a live handle from [`mfsk_decode_options_new`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_decode_options_set_sic_rounds(
-    opts: *mut MfskDecodeOptions,
-    rounds: u8,
-) -> MfskStatus {
-    let Some(inner) = options_inner_mut(opts) else {
-        set_error("mfsk_decode_options_set_sic_rounds: null options handle");
-        return MfskStatus::InvalidArg;
-    };
-    inner.sic_rounds = Some(rounds.clamp(1, 3));
-    inner.sic_early = false;
-    MfskStatus::Ok
-}
-
-/// Switch to the checkpointed early-decode SIC strategy (WSJT-X-style
-/// `nzhsym`-staged subtract-and-resync; mirrors
-/// `mfsk_core::DecodeRequest::sic_early`). Mutually exclusive with
-/// [`mfsk_decode_options_set_sic_rounds`] — see that function's doc
-/// comment for the overwrite semantics. FT8 only; ignored elsewhere.
-///
-/// # Safety
-/// `opts` must be a live handle from [`mfsk_decode_options_new`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_decode_options_set_sic_early(
-    opts: *mut MfskDecodeOptions,
-) -> MfskStatus {
-    let Some(inner) = options_inner_mut(opts) else {
-        set_error("mfsk_decode_options_set_sic_early: null options handle");
-        return MfskStatus::InvalidArg;
-    };
-    inner.sic_early = true;
-    inner.sic_rounds = None;
-    MfskStatus::Ok
-}
-
-/// Set a wide-band a-priori hint (mirrors
-/// `mfsk_core::DecodeRequest::ap_hint`) — applied to every candidate
-/// during the search, not just one target frequency (contrast with
-/// `mfsk_q65_decode_with_ap`'s narrow-band AP, a different mechanism
-/// entirely). **FT8 only** (`SupportsWideBandAp` isn't implemented
-/// for FT4/FST4 — this crate has no `SniperRequest`-equivalent
-/// exposed today, which is where their narrow-band AP would need to
-/// live); silently ignored for other protocols at decode time.
-///
-/// Each of `call1`/`call2`/`grid`/`report` may be NULL (no hint for
-/// that field) or a NUL-terminated UTF-8 string; an empty string is
-/// treated the same as NULL. A hint where every field is NULL/empty
-/// is stored but has no effect (equivalent to not calling this
-/// function at all), matching `mfsk_q65_decode_with_ap`'s own
-/// empty-hint-falls-through convention.
-///
-/// # Safety
-/// `opts` must be a live handle from [`mfsk_decode_options_new`]. Each
-/// non-null string argument must point to a valid NUL-terminated C
-/// string.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_decode_options_set_ap_hint(
-    opts: *mut MfskDecodeOptions,
-    call1: *const c_char,
-    call2: *const c_char,
-    grid: *const c_char,
-    report: *const c_char,
-) -> MfskStatus {
-    let Some(inner) = options_inner_mut(opts) else {
-        set_error("mfsk_decode_options_set_ap_hint: null options handle");
-        return MfskStatus::InvalidArg;
-    };
-    let hint = match unsafe { build_ap_hint_from_cstrs(call1, call2, grid, report) } {
-        Ok(h) => h,
-        Err(st) => return st,
-    };
-    inner.ap_hint = Some(hint);
-    MfskStatus::Ok
-}
 
 fn map_osd(d: MfskDecodeDepth) -> bool {
     matches!(d, MfskDecodeDepth::BpAllOsd)
@@ -589,31 +289,6 @@ fn map_eq_mode(e: MfskEqMode) -> mfsk_core::engine::equalize::EqMode {
     match e {
         MfskEqMode::Off => E::Off,
         MfskEqMode::Local => E::Local,
-    }
-}
-
-/// Free a [`MfskResultList`] populated by a decode call. Passing NULL
-/// or an already-freed list is safe.
-///
-/// # Safety
-///
-/// `list` must point to a [`MfskResultList`] written by one of the
-/// `mfsk_decode_*` functions, or be NULL. After this call, `items` is
-/// NULL and `len` is 0.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_result_list_free(list: *mut MfskResultList) {
-    if list.is_null() {
-        return;
-    }
-    unsafe {
-        let list = &mut *list;
-        if !list.items.is_null() && list._capacity > 0 {
-            let slice = slice::from_raw_parts_mut(list.items, list._capacity);
-            let _ = Box::from_raw(slice);
-        }
-        list.items = ptr::null_mut();
-        list.len = 0;
-        list._capacity = 0;
     }
 }
 
@@ -645,264 +320,10 @@ pub unsafe extern "C" fn mfsk_samples_free(s: *mut MfskSamples) {
 // Decode entry points
 // ──────────────────────────────────────────────────────────────────────────
 
-fn inner(dec: *const MfskDecoder) -> Option<&'static DecoderInner> {
-    unsafe { (dec as *const DecoderInner).as_ref() }
-}
-
-/// Write `s` into a fixed inline text buffer (NUL-terminated,
-/// truncated to fit) — the shape [`MfskResult::text`] uses across
-/// both FFI crates (issue #205; this crate used to heap-allocate a
-/// `CString` per message instead).
-fn write_text(dst: &mut [c_char; mfsk_ffi_abi::MFSK_TEXT_BUF_LEN], s: &str) {
-    let bytes = s.as_bytes();
-    let n = bytes.len().min(dst.len() - 1);
-    // Reinterpret c_char vs u8 portably (c_char is i8 on most targets,
-    // u8 on a few — narrowing copy below handles both).
-    for (d, &b) in dst.iter_mut().zip(bytes.iter()).take(n) {
-        *d = b as c_char;
-    }
-    dst[n] = 0;
-}
-
-fn empty_result(freq_hz: f32, dt_sec: f32, snr_db: f32, hard_errors: u32, pass: u8) -> MfskResult {
-    MfskResult {
-        text: [0; mfsk_ffi_abi::MFSK_TEXT_BUF_LEN],
-        freq_hz,
-        dt_sec,
-        snr_db,
-        hard_errors,
-        pass,
-        _pad: [0; 3],
-    }
-}
-
-/// Shared message pusher for the 77-bit family (FT8, FT4).
-fn push_wsjt77(
-    r: &ft8::DecodeResult,
-    ht: &mfsk_core::msg::CallsignHashTable,
-    vec: &mut Vec<MfskResult>,
-) {
-    let text = mfsk_core::msg::wsjt77::unpack77_with_hash(r.message77(), ht).unwrap_or_default();
-    let mut rec = empty_result(r.freq_hz, r.dt_sec, r.snr_db, r.hard_errors, r.pass);
-    write_text(&mut rec.text, &text);
-    vec.push(rec);
-}
-
-fn push_ft4(r: &ft4::DecodeResult, vec: &mut Vec<MfskResult>) {
-    use mfsk_core::MessageCodec;
-    let codec = mfsk_core::msg::Wsjt77Message;
-    let ctx = mfsk_core::DecodeContext::default();
-    let text = codec.unpack(r.message77(), &ctx).unwrap_or_default();
-    let mut rec = empty_result(r.freq_hz, r.dt_sec, r.snr_db, r.hard_errors, r.pass);
-    write_text(&mut rec.text, &text);
-    vec.push(rec);
-}
-
-fn push_simple(freq_hz: f32, dt_sec: f32, snr_db: f32, text: String, vec: &mut Vec<MfskResult>) {
-    let mut rec = empty_result(freq_hz, dt_sec, snr_db, 0, 0);
-    write_text(&mut rec.text, &text);
-    vec.push(rec);
-}
-
-fn finalise(vec: Vec<MfskResult>, out: &mut MfskResultList) {
-    let mut boxed = vec.into_boxed_slice();
-    let items = boxed.as_mut_ptr();
-    let len = boxed.len();
-    std::mem::forget(boxed);
-    out.items = items;
-    out.len = len;
-    out._capacity = len;
-}
-
-/// Decode one slot of f32 PCM audio.
-///
-/// The protocol to decode is whichever was passed to
-/// [`mfsk_decoder_new`]; the sample duration is implicit in the
-/// protocol's slot length (FT8 = 15 s, FT4 = 7.5 s, FST4-60A / JT9 /
-/// JT65 = 60 s, WSPR = 120 s). The audio must already be aligned to
-/// the slot boundary — this function does not search for sync outside
-/// the slot. Non-12 kHz input is linearly resampled to 12 000 Hz
-/// internally.
-///
-/// On success, `out` is filled with the list of decoded messages
-/// (may be empty). The caller owns the list and must release it with
-/// [`mfsk_result_list_free`].
-///
-/// Samples should be scaled to roughly ±1.0 (full-scale sine = 1.0).
-///
-/// # Parameters
-///
-/// - `dec` — decoder handle from [`mfsk_decoder_new`].
-/// - `samples` — pointer to `n_samples` `f32` PCM values, slot-aligned.
-/// - `n_samples` — number of samples in `samples`.
-/// - `sample_rate` — sample rate of `samples` in Hz (commonly 12000,
-///   48000, or 44100). Must be ≥ 8000 Hz.
-/// - `options` — decode-tuning handle from [`mfsk_decode_options_new`],
-///   or null to use each protocol's built-in default search range /
-///   threshold / depth. Applies to FT8/FT4/FST4-60A/Q65-30A; ignored
-///   (accepted but unused) for WSPR/JT9/JT65, which have no tunable
-///   search knobs today.
-/// - `out` — pointer to a caller-allocated `MfskResultList` that is
-///   either zero-initialised or previously freed via
-///   [`mfsk_result_list_free`].
-///
-/// # Returns
-///
-/// [`MfskStatus::Ok`] on success (including zero decodes). On failure
-/// returns an error status and `out` is left unchanged; consult
-/// [`mfsk_last_error`] for details.
-///
-/// # Safety
-///
-/// - `dec` must be a live [`MfskDecoder`] handle.
-/// - `samples` must point to `n_samples` valid `f32` values.
-/// - `options`, if non-null, must be a live [`MfskDecodeOptions`] handle.
-/// - `out` must point to a writable [`MfskResultList`]; caller must
-///   pair with [`mfsk_result_list_free`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_decode_f32(
-    dec: *const MfskDecoder,
-    samples: *const f32,
-    n_samples: usize,
-    sample_rate: u32,
-    options: *const MfskDecodeOptions,
-    out: *mut MfskResultList,
-) -> MfskStatus {
-    let Some(inner_ref) = inner(dec) else {
-        set_error("mfsk_decode_f32: null decoder handle");
-        return MfskStatus::InvalidArg;
-    };
-    if samples.is_null() || out.is_null() {
-        set_error("mfsk_decode_f32: null buffer pointer");
-        return MfskStatus::InvalidArg;
-    }
-    let slice_f32 = unsafe { slice::from_raw_parts(samples, n_samples) };
-    let out = unsafe { &mut *out };
-
-    match inner_ref.protocol {
-        MfskProtocol::Ft8 | MfskProtocol::Ft4 | MfskProtocol::Fst4s60 => {
-            // Reuse the existing i16-based pipeline.
-            let audio: Vec<i16> = if sample_rate == 12_000 {
-                slice_f32
-                    .iter()
-                    .map(|&s| (s * 32767.0).clamp(-32_768.0, 32_767.0) as i16)
-                    .collect()
-            } else {
-                mfsk_core::engine::dsp::resample::resample_f32_to_12k(slice_f32, sample_rate)
-            };
-            decode_i16_wsjt77(inner_ref.protocol, &audio, options, out)
-        }
-        MfskProtocol::Wspr => {
-            let audio =
-                mfsk_core::engine::dsp::resample::resample_f32_to_12k_f32(slice_f32, sample_rate);
-            decode_wspr(&audio, out)
-        }
-        MfskProtocol::Jt9 => {
-            let audio =
-                mfsk_core::engine::dsp::resample::resample_f32_to_12k_f32(slice_f32, sample_rate);
-            decode_jt9_aligned(&audio, out)
-        }
-        MfskProtocol::Jt65 => {
-            let audio =
-                mfsk_core::engine::dsp::resample::resample_f32_to_12k_f32(slice_f32, sample_rate);
-            decode_jt65_aligned(&audio, out)
-        }
-        MfskProtocol::Q65a30 => {
-            let audio =
-                mfsk_core::engine::dsp::resample::resample_f32_to_12k_f32(slice_f32, sample_rate);
-            decode_q65_default(&audio, options, out)
-        }
-    }
-}
-
-/// Decode one slot of 16-bit signed PCM audio.
-///
-/// Identical to [`mfsk_decode_f32`] but takes interleaved `i16`
-/// samples (the direct output of most ADCs and WAV files). Full-scale
-/// input is `±32767`. See [`mfsk_decode_f32`] for parameter semantics,
-/// return values, and slot-alignment requirements.
-///
-/// # Safety
-///
-/// See [`mfsk_decode_f32`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_decode_i16(
-    dec: *const MfskDecoder,
-    samples: *const i16,
-    n_samples: usize,
-    sample_rate: u32,
-    options: *const MfskDecodeOptions,
-    out: *mut MfskResultList,
-) -> MfskStatus {
-    let Some(inner_ref) = inner(dec) else {
-        set_error("mfsk_decode_i16: null decoder handle");
-        return MfskStatus::InvalidArg;
-    };
-    if samples.is_null() || out.is_null() {
-        set_error("mfsk_decode_i16: null buffer pointer");
-        return MfskStatus::InvalidArg;
-    }
-    let slice_i16 = unsafe { slice::from_raw_parts(samples, n_samples) };
-    let out = unsafe { &mut *out };
-
-    match inner_ref.protocol {
-        MfskProtocol::Ft8 | MfskProtocol::Ft4 | MfskProtocol::Fst4s60 => {
-            let audio: Vec<i16> = if sample_rate == 12_000 {
-                slice_i16.to_vec()
-            } else {
-                mfsk_core::engine::dsp::resample::resample_to_12k(slice_i16, sample_rate)
-            };
-            decode_i16_wsjt77(inner_ref.protocol, &audio, options, out)
-        }
-        MfskProtocol::Wspr | MfskProtocol::Jt9 | MfskProtocol::Jt65 | MfskProtocol::Q65a30 => {
-            // These backends consume f32 natively; convert.
-            let audio: Vec<f32> = if sample_rate == 12_000 {
-                slice_i16.iter().map(|&s| s as f32 / 32768.0).collect()
-            } else {
-                mfsk_core::engine::dsp::resample::resample_i16_to_12k_f32(slice_i16, sample_rate)
-            };
-            match inner_ref.protocol {
-                MfskProtocol::Wspr => decode_wspr(&audio, out),
-                MfskProtocol::Jt9 => decode_jt9_aligned(&audio, out),
-                MfskProtocol::Jt65 => decode_jt65_aligned(&audio, out),
-                MfskProtocol::Q65a30 => decode_q65_default(&audio, options, out),
-                _ => unreachable!(),
-            }
-        }
-    }
-}
-
 // ──────────────────────────────────────────────────────────────────────────
 // Streaming decode (issue #246 follow-up: `.on_result()` was never
 // exposed across this FFI — a real gap, not a deliberate omission)
 // ──────────────────────────────────────────────────────────────────────────
-
-/// C callback for [`mfsk_decode_i16_streaming`], invoked once per
-/// accepted decode result *as it is found*, in addition to (not
-/// instead of) the full [`MfskResultList`] the call still populates —
-/// mirrors `mfsk_core`'s own `DecodeRequest::on_result`'s "streaming
-/// is additive" contract exactly. Pass `None` to skip streaming
-/// delivery entirely (equivalent to, but slower than, just calling
-/// [`mfsk_decode_i16`]).
-///
-/// `result` points to a stack-local [`MfskResult`] valid only for the
-/// duration of this specific call — copy the struct if you need to
-/// keep it past the callback returning. `user_data` is passed through
-/// unchanged from the call site, opaque to this crate.
-///
-/// **May be invoked from multiple threads concurrently.** This
-/// crate's default build enables `parallel` (rayon), and FT8's
-/// default single-pass decode strategy — the one this function always
-/// uses — fans candidates out across worker threads; each firing sees
-/// a distinct candidate, but the callback implementation itself, and
-/// anything `user_data` points to, must tolerate concurrent
-/// invocation. See `docs/reference/STREAMING.md` §3 for the exact
-/// ordering/duplicate guarantees this mirrors (parallel strategies:
-/// completion order, possible transient duplicate against the
-/// eventual `out` list — never a value `out` omits that the callback
-/// never saw, see STREAMING.md's "revoke-less retract" audit).
-pub type MfskResultCallback =
-    Option<unsafe extern "C" fn(result: *const MfskResult, user_data: *mut c_void)>;
 
 /// Wraps a C `user_data` pointer to make it `Sync`, which
 /// `DecodeRequest::on_result`'s callback bound (`Fn(&DecodeResult) +
@@ -924,480 +345,6 @@ impl SyncUserData {
     fn ptr(&self) -> *mut c_void {
         self.0
     }
-}
-
-/// Streaming variant of [`mfsk_decode_i16`] — **FT8 only for now**;
-/// other protocols return [`MfskStatus::UnknownProtocol`] (streaming
-/// is exposed protocol-by-protocol as call sites need it, matching
-/// this crate's established additive-growth convention — see
-/// [`mfsk_decode_options_new`]'s doc comment).
-///
-/// In addition to populating `out` exactly as [`mfsk_decode_i16`]
-/// does, invokes `callback` (if non-`None`) once per accepted decode
-/// result before the whole slot finishes decoding. See
-/// [`MfskResultCallback`] for the callback's threading/lifetime
-/// contract.
-///
-/// A Rust panic during decode (a bug, not an expected outcome) is
-/// caught and reported as [`MfskStatus::Internal`] rather than
-/// unwinding across the FFI boundary (undefined behaviour for
-/// `extern "C"` functions) — unlike [`mfsk_decode_i16`], which has
-/// never previously needed this because it runs no caller-supplied
-/// code mid-call.
-///
-/// # Safety
-///
-/// See [`mfsk_decode_i16`]. Additionally: if `callback` is
-/// non-`None`, it must be safely callable (per the C calling
-/// convention) from any thread, any number of times including zero,
-/// for the duration of this call; `user_data` must remain valid for
-/// the duration of this call if `callback` dereferences it.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_decode_i16_streaming(
-    dec: *const MfskDecoder,
-    samples: *const i16,
-    n_samples: usize,
-    sample_rate: u32,
-    options: *const MfskDecodeOptions,
-    callback: MfskResultCallback,
-    user_data: *mut c_void,
-    out: *mut MfskResultList,
-) -> MfskStatus {
-    let Some(inner_ref) = inner(dec) else {
-        set_error("mfsk_decode_i16_streaming: null decoder handle");
-        return MfskStatus::InvalidArg;
-    };
-    if samples.is_null() || out.is_null() {
-        set_error("mfsk_decode_i16_streaming: null buffer pointer");
-        return MfskStatus::InvalidArg;
-    }
-    if !matches!(inner_ref.protocol, MfskProtocol::Ft8) {
-        set_error("mfsk_decode_i16_streaming: streaming only implemented for FT8 so far");
-        return MfskStatus::UnknownProtocol;
-    }
-
-    let slice_i16 = unsafe { slice::from_raw_parts(samples, n_samples) };
-    let audio: Vec<i16> = if sample_rate == 12_000 {
-        slice_i16.to_vec()
-    } else {
-        mfsk_core::engine::dsp::resample::resample_to_12k(slice_i16, sample_rate)
-    };
-    let out = unsafe { &mut *out };
-
-    let o = options_inner(options);
-    let (fmin, fmax, smin, mc, osd) = match o {
-        Some(o) => (
-            o.freq_min_hz,
-            o.freq_max_hz,
-            o.sync_min,
-            o.max_cand as usize,
-            map_osd(o.depth),
-        ),
-        None => (200.0, 3_000.0, 2.0, 50, true),
-    };
-    let strictness = map_strictness(o.map(|o| o.strictness).unwrap_or_default());
-    let eq_mode = map_eq_mode(o.map(|o| o.eq_mode).unwrap_or_default());
-    let freq_hint = o.and_then(|o| o.freq_hint);
-    let sic_early = o.is_some_and(|o| o.sic_early);
-    let sic_rounds = o.and_then(|o| o.sic_rounds);
-    let ap_hint = o.and_then(|o| o.ap_hint.as_ref()).filter(|h| h.has_info());
-
-    let ud = SyncUserData(user_data);
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let ht = mfsk_core::msg::CallsignHashTable::new();
-        let fire = |r: &ft8::DecodeResult| {
-            let Some(cb) = callback else { return };
-            let text =
-                mfsk_core::msg::wsjt77::unpack77_with_hash(r.message77(), &ht).unwrap_or_default();
-            let mut rec = empty_result(r.freq_hz, r.dt_sec, r.snr_db, r.hard_errors, r.pass);
-            write_text(&mut rec.text, &text);
-            unsafe { cb(&rec, ud.ptr()) };
-        };
-        let mut req = mfsk_core::msg::decode_request::DecodeRequest::<mfsk_core::ft8::Ft8>::new(
-            &audio, fmin, fmax, smin, mc,
-        )
-        .osd(osd)
-        .strictness(strictness)
-        .eq_mode(eq_mode);
-        if let Some(fh) = freq_hint {
-            req = req.freq_hint(fh);
-        }
-        if sic_early {
-            req = req.sic_early();
-        } else if let Some(n) = sic_rounds {
-            req = req.sic_rounds(n as usize);
-        }
-        if let Some(hint) = ap_hint {
-            req = req.ap_hint(hint);
-        }
-        let results = req.on_result(&fire).decode().results;
-        let mut vec: Vec<MfskResult> = Vec::new();
-        for r in &results {
-            push_wsjt77(r, &ht, &mut vec);
-        }
-        vec
-    }));
-
-    match outcome {
-        Ok(vec) => {
-            finalise(vec, out);
-            MfskStatus::Ok
-        }
-        Err(_) => {
-            set_error("mfsk_decode_i16_streaming: internal panic during decode (this is a bug)");
-            MfskStatus::Internal
-        }
-    }
-}
-
-/// `options` overrides this crate's per-protocol default search range /
-/// threshold / depth (each of FT8/FT4/FST4-60A previously had its own
-/// hardcoded values here — NULL preserves each protocol's own
-/// pre-0.8.0 default).
-fn decode_i16_wsjt77(
-    protocol: MfskProtocol,
-    audio: &[i16],
-    options: *const MfskDecodeOptions,
-    out: &mut MfskResultList,
-) -> MfskStatus {
-    let mut vec: Vec<MfskResult> = Vec::new();
-    let o = options_inner(options);
-    match protocol {
-        MfskProtocol::Ft8 => {
-            let ht = mfsk_core::msg::CallsignHashTable::new();
-            let (fmin, fmax, smin, mc, osd) = match o {
-                Some(o) => (
-                    o.freq_min_hz,
-                    o.freq_max_hz,
-                    o.sync_min,
-                    o.max_cand as usize,
-                    map_osd(o.depth),
-                ),
-                None => (200.0, 3_000.0, 2.0, 50, true),
-            };
-            let mut req =
-                mfsk_core::msg::decode_request::DecodeRequest::<mfsk_core::ft8::Ft8>::new(
-                    audio, fmin, fmax, smin, mc,
-                )
-                .osd(osd)
-                .strictness(map_strictness(o.map(|o| o.strictness).unwrap_or_default()))
-                .eq_mode(map_eq_mode(o.map(|o| o.eq_mode).unwrap_or_default()));
-            if let Some(fh) = o.and_then(|o| o.freq_hint) {
-                req = req.freq_hint(fh);
-            }
-            // sic_early takes priority if both were somehow set (can't
-            // happen through the setters, which clear each other, but
-            // stay defensive rather than relying on that invariant).
-            if o.is_some_and(|o| o.sic_early) {
-                req = req.sic_early();
-            } else if let Some(n) = o.and_then(|o| o.sic_rounds) {
-                req = req.sic_rounds(n as usize);
-            }
-            if let Some(hint) = o.and_then(|o| o.ap_hint.as_ref()).filter(|h| h.has_info()) {
-                req = req.ap_hint(hint);
-            }
-            let results = req.decode().results;
-            for r in results {
-                push_wsjt77(&r, &ht, &mut vec);
-            }
-        }
-        MfskProtocol::Ft4 => {
-            let (fmin, fmax, smin, mc) = match o {
-                Some(o) => (
-                    o.freq_min_hz,
-                    o.freq_max_hz,
-                    o.sync_min,
-                    o.max_cand as usize,
-                ),
-                None => (200.0, 3_000.0, 1.2, 50),
-            };
-            let mut req =
-                mfsk_core::msg::decode_request::DecodeRequest::<mfsk_core::ft4::Ft4>::new(
-                    audio, fmin, fmax, smin, mc,
-                )
-                .strictness(map_strictness(o.map(|o| o.strictness).unwrap_or_default()))
-                .eq_mode(map_eq_mode(o.map(|o| o.eq_mode).unwrap_or_default()));
-            if let Some(fh) = o.and_then(|o| o.freq_hint) {
-                req = req.freq_hint(fh);
-            }
-            // FT4 has no .sic_early() (SupportsSicEarly isn't
-            // implemented for Ft4) — sic_early is silently ignored
-            // here, matching every other inapplicable-option
-            // convention in this file.
-            if let Some(n) = o.and_then(|o| o.sic_rounds) {
-                req = req.sic_rounds(n as usize);
-            }
-            let results = req.decode().results;
-            for r in results {
-                push_ft4(&r, &mut vec);
-            }
-        }
-        MfskProtocol::Fst4s60 => {
-            // FST4-60A's pipeline::DecodeResult has the same shape; treat
-            // it like FT4/FT8 at the message-unpack step since the payload
-            // is also 77-bit WSJT.
-            use mfsk_core::MessageCodec;
-            let codec = mfsk_core::msg::Wsjt77Message;
-            let ctx = mfsk_core::DecodeContext::default();
-            let (fmin, fmax, smin, mc) = match o {
-                Some(o) => (
-                    o.freq_min_hz,
-                    o.freq_max_hz,
-                    o.sync_min,
-                    o.max_cand as usize,
-                ),
-                None => (100.0, 3_000.0, 0.8, 30),
-            };
-            let mut req =
-                mfsk_core::msg::decode_request::DecodeRequest::<mfsk_core::fst4::Fst4s60>::new(
-                    audio, fmin, fmax, smin, mc,
-                )
-                .strictness(map_strictness(o.map(|o| o.strictness).unwrap_or_default()))
-                .eq_mode(map_eq_mode(o.map(|o| o.eq_mode).unwrap_or_default()));
-            if let Some(fh) = o.and_then(|o| o.freq_hint) {
-                req = req.freq_hint(fh);
-            }
-            let results = req.decode().results;
-            for r in results {
-                let text = codec.unpack(r.message77(), &ctx).unwrap_or_default();
-                let mut rec = empty_result(r.freq_hz, r.dt_sec, r.snr_db, r.hard_errors, r.pass);
-                write_text(&mut rec.text, &text);
-                vec.push(rec);
-            }
-        }
-        _ => unreachable!(),
-    }
-    finalise(vec, out);
-    MfskStatus::Ok
-}
-
-/// Shared body for [`mfsk_decode_i16_sniper`] /
-/// [`mfsk_decode_f32_sniper`] — `SniperRequest` instead of
-/// `DecodeRequest`, one target frequency instead of a search range.
-///
-/// Which `MfskDecodeOptions` fields apply differs from the wide-band
-/// path, and the difference is the point of the entry point rather than
-/// an oversight:
-///
-/// - **used**: `sync_min`, `max_cand`, `depth`, `strictness`,
-///   `eq_mode`, and `ap_hint` — the last of which is why this exists at
-///   all for FT4/FST4 (see the public functions' docs).
-/// - **ignored**: `freq_min_hz`/`freq_max_hz` and `freq_hint` (the
-///   target frequency *is* the hint, and `SniperRequest` derives its
-///   own ±250 Hz window from it), `sic_rounds`/`sic_early`
-///   (`SniperRequest` has no SIC strategy at all).
-///
-/// Silently ignoring an inapplicable field is this crate's established
-/// convention — the same one `sic_early` already follows on FT4 — not a
-/// silent failure: a caller reusing one options handle across both
-/// entry points gets the wide-band knobs honoured there and the sniper
-/// knobs honoured here.
-fn decode_i16_sniper(
-    protocol: MfskProtocol,
-    audio: &[i16],
-    target_freq_hz: f32,
-    options: *const MfskDecodeOptions,
-    out: &mut MfskResultList,
-) -> MfskStatus {
-    use mfsk_core::msg::decode_request::SniperRequest;
-
-    let mut vec: Vec<MfskResult> = Vec::new();
-    let o = options_inner(options);
-    // `SniperRequest::new`'s own defaults, not the wide-band ones: its
-    // sync_min is 0.8 for every protocol, and `max_cand` counts
-    // candidates within one ±250 Hz window rather than across the band.
-    let smin = o.map(|o| o.sync_min).unwrap_or(0.8);
-    let mc = o.map(|o| o.max_cand as usize).unwrap_or(8);
-    let strictness = map_strictness(o.map(|o| o.strictness).unwrap_or_default());
-    let eq_mode = map_eq_mode(o.map(|o| o.eq_mode).unwrap_or_default());
-    let ap = o.and_then(|o| o.ap_hint.as_ref()).filter(|h| h.has_info());
-
-    match protocol {
-        MfskProtocol::Ft8 => {
-            let ht = mfsk_core::msg::CallsignHashTable::new();
-            let mut req = SniperRequest::<mfsk_core::ft8::Ft8>::new(audio, target_freq_hz, mc)
-                .sync_min(smin)
-                .osd(map_osd(
-                    o.map(|o| o.depth).unwrap_or(MfskDecodeDepth::BpAllOsd),
-                ))
-                .strictness(strictness)
-                .eq_mode(eq_mode);
-            if let Some(hint) = ap {
-                req = req.ap_hint(hint);
-            }
-            for r in req.decode().results {
-                push_wsjt77(&r, &ht, &mut vec);
-            }
-        }
-        // Every other protocol, including FT4 and FST4 since their
-        // snipers were retired. Narrow-band single-target search is an
-        // FT8 mode: it is the receive half of an analogue roofing
-        // filter, which is a DX-chasing activity — incompatible with
-        // FT4's contest use, and superseded on FST4 by its own DDC
-        // channelizer. A-priori decoding, the thing this entry point
-        // looked like it was for, is an option on the ordinary
-        // wide-band decode now.
-        _ => {
-            set_error("sniper mode is FT8-only");
-            return MfskStatus::UnknownProtocol;
-        }
-    }
-    finalise(vec, out);
-    MfskStatus::Ok
-}
-
-/// Decode one slot of 16-bit PCM aimed at a **single target
-/// frequency** (issue #249).
-///
-/// Where [`mfsk_decode_i16`] searches a band and reports whatever it
-/// finds, this points the decoder at one carrier — the shape a caller
-/// already knows where the station is: a scheduled sked, a spot from
-/// another receiver, or the frequency the operator is transmitting on.
-/// `SniperRequest` derives a ±250 Hz window around `target_freq_hz` and
-/// spends its whole candidate budget inside it.
-///
-/// **The reason to reach for this on FT4 and FST4 is the a-priori
-/// hint.** `mfsk_decode_options_set_ap_hint` reaches the wide-band
-/// decoder for FT8 only — `SupportsWideBandAp` is not implemented for
-/// the other two — while the sniper path takes an AP hint for all
-/// three, because they share the 77-bit WSJT message. Until this
-/// function existed, FT4 and FST4 AP hinting was unreachable from C
-/// at all. A hint that matches a station actually on air is worth
-/// 1-3 dB.
-///
-/// # Parameters
-///
-/// - `dec` — decoder handle from [`mfsk_decoder_new`]. Must be FT8,
-///   FT4 or FST4-60A; any other protocol returns
-///   [`MfskStatus::UnknownProtocol`], since no other protocol in this
-///   crate has a single-frequency mode.
-/// - `samples`, `n_samples`, `sample_rate` — as [`mfsk_decode_i16`].
-/// - `target_freq_hz` — the carrier to aim at, in Hz.
-/// - `options` — handle from [`mfsk_decode_options_new`], or null for
-///   `SniperRequest`'s own defaults (`sync_min` 0.8, 8 candidates, OSD
-///   on). `sync_min`, `max_cand`, `depth`, `strictness`, `eq_mode` and
-///   the AP hint apply; `freq_min_hz`/`freq_max_hz`, `freq_hint` and
-///   `sic_rounds`/`sic_early` do not — see [`mfsk_decode_i16_sniper`]
-///   for why each is in the list it is in.
-/// - `out` — caller-allocated [`MfskResultList`], freed with
-///   [`mfsk_result_list_free`].
-///
-/// # Returns
-///
-/// [`MfskStatus::Ok`] on success, including zero decodes.
-///
-/// # Safety
-///
-/// See [`mfsk_decode_i16`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_decode_i16_sniper(
-    dec: *const MfskDecoder,
-    samples: *const i16,
-    n_samples: usize,
-    sample_rate: u32,
-    target_freq_hz: f32,
-    options: *const MfskDecodeOptions,
-    out: *mut MfskResultList,
-) -> MfskStatus {
-    let Some(inner_ref) = inner(dec) else {
-        set_error("mfsk_decode_i16_sniper: null decoder handle");
-        return MfskStatus::InvalidArg;
-    };
-    if samples.is_null() || out.is_null() {
-        set_error("mfsk_decode_i16_sniper: null buffer pointer");
-        return MfskStatus::InvalidArg;
-    }
-    let raw = unsafe { slice::from_raw_parts(samples, n_samples) };
-    let out = unsafe { &mut *out };
-    let audio: Vec<i16>;
-    let audio = if sample_rate == 12_000 {
-        raw
-    } else {
-        audio = mfsk_core::engine::dsp::resample::resample_to_12k(raw, sample_rate);
-        &audio
-    };
-    decode_i16_sniper(inner_ref.protocol, audio, target_freq_hz, options, out)
-}
-
-/// Decode one slot of f32 PCM aimed at a single target frequency.
-///
-/// Identical to [`mfsk_decode_i16_sniper`] but takes `f32` samples
-/// scaled to roughly ±1.0, the same input convention
-/// [`mfsk_decode_f32`] uses.
-///
-/// # Safety
-///
-/// See [`mfsk_decode_f32`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_decode_f32_sniper(
-    dec: *const MfskDecoder,
-    samples: *const f32,
-    n_samples: usize,
-    sample_rate: u32,
-    target_freq_hz: f32,
-    options: *const MfskDecodeOptions,
-    out: *mut MfskResultList,
-) -> MfskStatus {
-    let Some(inner_ref) = inner(dec) else {
-        set_error("mfsk_decode_f32_sniper: null decoder handle");
-        return MfskStatus::InvalidArg;
-    };
-    if samples.is_null() || out.is_null() {
-        set_error("mfsk_decode_f32_sniper: null buffer pointer");
-        return MfskStatus::InvalidArg;
-    }
-    let slice_f32 = unsafe { slice::from_raw_parts(samples, n_samples) };
-    let out = unsafe { &mut *out };
-    let audio: Vec<i16> = if sample_rate == 12_000 {
-        slice_f32
-            .iter()
-            .map(|&s| (s * 32767.0).clamp(-32_768.0, 32_767.0) as i16)
-            .collect()
-    } else {
-        mfsk_core::engine::dsp::resample::resample_f32_to_12k(slice_f32, sample_rate)
-    };
-    decode_i16_sniper(inner_ref.protocol, &audio, target_freq_hz, options, out)
-}
-
-fn decode_wspr(audio: &[f32], out: &mut MfskResultList) -> MfskStatus {
-    let mut vec: Vec<MfskResult> = Vec::new();
-    for d in mfsk_core::wspr::decode::decode_scan_default(audio, 12_000) {
-        push_simple(
-            d.freq_hz,
-            d.start_sample as f32 / 12_000.0,
-            d.snr_db,
-            d.message.to_string(),
-            &mut vec,
-        );
-    }
-    finalise(vec, out);
-    MfskStatus::Ok
-}
-
-/// JT9 decode at the canonical 1500 Hz carrier, slot-aligned at sample 0.
-/// Callers that want (freq × time) search should build that on top of
-/// `mfsk_core::jt9::decode_at` directly — the FFI takes the fixed-alignment
-/// path because it's the one the roundtrip test needs. This path uses the
-/// bare `decode_at` (not `decode_scan`/`Jt9Result`), which has no SNR
-/// estimate available; `snr_db` is `0.0` here, unlike `decode_jt9` (Q65-style
-/// scan) which would carry a real value if wired up.
-fn decode_jt9_aligned(audio: &[f32], out: &mut MfskResultList) -> MfskStatus {
-    let mut vec: Vec<MfskResult> = Vec::new();
-    if let Some(msg) = mfsk_core::jt9::decode_at(audio, 12_000, 0, 1500.0) {
-        push_simple(1500.0, 0.0, 0.0, msg.to_string(), &mut vec);
-    }
-    finalise(vec, out);
-    MfskStatus::Ok
-}
-
-/// See [`decode_jt9_aligned`] — same fixed-alignment / no-SNR caveat.
-fn decode_jt65_aligned(audio: &[f32], out: &mut MfskResultList) -> MfskStatus {
-    let mut vec: Vec<MfskResult> = Vec::new();
-    if let Some(msg) = mfsk_core::jt65::decode_at(audio, 12_000, 0, 1270.0) {
-        push_simple(1270.0, 0.0, 0.0, msg.to_string(), &mut vec);
-    }
-    finalise(vec, out);
-    MfskStatus::Ok
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1492,16 +439,6 @@ pub unsafe extern "C" fn mfsk_callsign_hash_table_insert(
 // Q65 helpers (sub-mode dispatch + decoded-message push)
 // ──────────────────────────────────────────────────────────────────────────
 
-fn push_q65_decode(d: &mfsk_core::q65::Q65Result, vec: &mut Vec<MfskResult>) {
-    push_simple(
-        d.freq_hz,
-        d.start_sample as f32 / 12_000.0,
-        d.snr_db,
-        d.message.clone(),
-        vec,
-    );
-}
-
 /// Wide search params used by every `mfsk_q65_*` decode entry point —
 /// matches the Rust-side defaults that work across both terrestrial
 /// Q65-30A and EME 60A‥E recordings.
@@ -1529,32 +466,6 @@ fn q65_default_search(submode: MfskQ65SubMode) -> mfsk_core::q65::SearchParams {
         score_threshold: 0.05,
         max_candidates: 32,
     }
-}
-
-/// Q65a30 default scan (used by the generic-handle path). `options`
-/// overrides the search frequency range and candidate cap; Q65's
-/// `SearchParams::time_tolerance_sec`/`score_threshold` have no
-/// equivalent knob in [`MfskDecodeOptions`] and stay at their default.
-fn decode_q65_default(
-    audio: &[f32],
-    options: *const MfskDecodeOptions,
-    out: &mut MfskResultList,
-) -> MfskStatus {
-    let mut vec: Vec<MfskResult> = Vec::new();
-    let mut params = mfsk_core::q65::SearchParams::default();
-    if let Some(o) = options_inner(options) {
-        params.freq_min_hz = o.freq_min_hz;
-        params.freq_max_hz = o.freq_max_hz;
-        params.max_candidates = o.max_cand as usize;
-    }
-    let decodes =
-        mfsk_core::q65::DecodeRequest::<mfsk_core::q65::Q65a30>::new(audio, 12_000, 0, params)
-            .decode();
-    for d in decodes {
-        push_q65_decode(&d, &mut vec);
-    }
-    finalise(vec, out);
-    MfskStatus::Ok
 }
 
 /// Slot midpoint sample index for a sub-mode (used as the nominal
@@ -2072,10 +983,9 @@ unsafe fn q65_prepare_audio(
     samples: *const f32,
     n_samples: usize,
     sample_rate: u32,
-    out: *mut MfskResultList,
     fn_name: &'static str,
 ) -> Result<Vec<f32>, MfskStatus> {
-    if samples.is_null() || out.is_null() {
+    if samples.is_null() {
         set_error(format!("{fn_name}: null buffer pointer"));
         return Err(MfskStatus::InvalidArg);
     }
@@ -2102,30 +1012,33 @@ unsafe fn q65_prepare_audio(
 /// `samples` must point to `n_samples` valid `f32` values.
 /// `hash_table`, if non-NULL, must be a live handle from
 /// [`mfsk_callsign_hash_table_new`].
-/// `out` must point to a writable [`MfskResultList`]; pair with
-/// [`mfsk_result_list_free`] when done.
+/// `out` must point to at least `cap` writable [`MfskDecode`] rows;
+/// `*out_len` receives the number of decodes found.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mfsk_q65_decode(
-    submode: MfskQ65SubMode,
+    submode: u32,
     samples: *const f32,
     n_samples: usize,
     sample_rate: u32,
     hash_table: *const MfskCallsignHashTable,
-    out: *mut MfskResultList,
+    out: *mut MfskDecode,
+    cap: usize,
+    out_len: *mut usize,
 ) -> MfskStatus {
     let audio =
-        match unsafe { q65_prepare_audio(samples, n_samples, sample_rate, out, "mfsk_q65_decode") }
-        {
+        match unsafe { q65_prepare_audio(samples, n_samples, sample_rate, "mfsk_q65_decode") } {
             Ok(a) => a,
             Err(s) => return s,
         };
-    let out = unsafe { &mut *out };
-    let mut vec: Vec<MfskResult> = Vec::new();
-    for d in q65_scan_for(submode, &audio, hash_table_inner(hash_table)) {
-        push_q65_decode(&d, &mut vec);
-    }
-    finalise(vec, out);
-    MfskStatus::Ok
+    let Some(submode) = q65_submode_of(submode) else {
+        set_error("mfsk_q65_decode: not a Q65 sub-mode");
+        return MfskStatus::InvalidArg;
+    };
+    let rows = q65_rows(
+        submode,
+        &q65_scan_for(submode, &audio, hash_table_inner(hash_table)),
+    );
+    unsafe { emit_rows(&rows, out, cap, out_len) }
 }
 
 /// AP-hint Q65 scan-and-decode. Up to four optional hints
@@ -2141,7 +1054,7 @@ pub unsafe extern "C" fn mfsk_q65_decode(
 /// must be NUL-terminated UTF-8.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mfsk_q65_decode_with_ap(
-    submode: MfskQ65SubMode,
+    submode: u32,
     samples: *const f32,
     n_samples: usize,
     sample_rate: u32,
@@ -2150,19 +1063,19 @@ pub unsafe extern "C" fn mfsk_q65_decode_with_ap(
     ap_grid: *const c_char,
     ap_report: *const c_char,
     hash_table: *const MfskCallsignHashTable,
-    out: *mut MfskResultList,
+    out: *mut MfskDecode,
+    cap: usize,
+    out_len: *mut usize,
 ) -> MfskStatus {
     let audio = match unsafe {
-        q65_prepare_audio(
-            samples,
-            n_samples,
-            sample_rate,
-            out,
-            "mfsk_q65_decode_with_ap",
-        )
+        q65_prepare_audio(samples, n_samples, sample_rate, "mfsk_q65_decode_with_ap")
     } {
         Ok(a) => a,
         Err(s) => return s,
+    };
+    let Some(submode) = q65_submode_of(submode) else {
+        set_error("mfsk_q65_decode_with_ap: not a Q65 sub-mode");
+        return MfskStatus::InvalidArg;
     };
     let out = unsafe { &mut *out };
 
@@ -2172,7 +1085,6 @@ pub unsafe extern "C" fn mfsk_q65_decode_with_ap(
     };
 
     let ht = hash_table_inner(hash_table);
-    let mut vec: Vec<MfskResult> = Vec::new();
     let decodes = if hint.has_info() {
         q65_scan_with_ap_for(submode, &audio, &hint, ht)
     } else {
@@ -2180,11 +1092,8 @@ pub unsafe extern "C" fn mfsk_q65_decode_with_ap(
         // don't need to special-case it.
         q65_scan_for(submode, &audio, ht)
     };
-    for d in decodes {
-        push_q65_decode(&d, &mut vec);
-    }
-    finalise(vec, out);
-    MfskStatus::Ok
+    let rows = q65_rows(submode, &decodes);
+    unsafe { emit_rows(&rows, out, cap, out_len) }
 }
 
 /// Fast-fading Q65 scan-and-decode. Recovers the 5–8 dB the AWGN
@@ -2199,38 +1108,38 @@ pub unsafe extern "C" fn mfsk_q65_decode_with_ap(
 /// As [`mfsk_q65_decode`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mfsk_q65_decode_fading(
-    submode: MfskQ65SubMode,
+    submode: u32,
     samples: *const f32,
     n_samples: usize,
     sample_rate: u32,
     b90_ts: f32,
-    fading_model: MfskQ65FadingModel,
+    fading_model: u32,
     hash_table: *const MfskCallsignHashTable,
-    out: *mut MfskResultList,
+    out: *mut MfskDecode,
+    cap: usize,
+    out_len: *mut usize,
 ) -> MfskStatus {
     let audio = match unsafe {
-        q65_prepare_audio(
-            samples,
-            n_samples,
-            sample_rate,
-            out,
-            "mfsk_q65_decode_fading",
-        )
+        q65_prepare_audio(samples, n_samples, sample_rate, "mfsk_q65_decode_fading")
     } {
         Ok(a) => a,
         Err(s) => return s,
     };
-    let out = unsafe { &mut *out };
+    let Some(submode) = q65_submode_of(submode) else {
+        set_error("mfsk_q65_decode_fading: not a Q65 sub-mode");
+        return MfskStatus::InvalidArg;
+    };
+    let Some(fading_model) = q65_fading_of(fading_model) else {
+        set_error("mfsk_q65_decode_fading: not a fading model");
+        return MfskStatus::InvalidArg;
+    };
     let model = match fading_model {
         MfskQ65FadingModel::Gaussian => mfsk_core::fec::qra::FadingModel::Gaussian,
         MfskQ65FadingModel::Lorentzian => mfsk_core::fec::qra::FadingModel::Lorentzian,
     };
-    let mut vec: Vec<MfskResult> = Vec::new();
-    for d in q65_scan_fading_for(submode, &audio, b90_ts, model, hash_table_inner(hash_table)) {
-        push_q65_decode(&d, &mut vec);
-    }
-    finalise(vec, out);
-    MfskStatus::Ok
+    let decodes = q65_scan_fading_for(submode, &audio, b90_ts, model, hash_table_inner(hash_table));
+    let rows = q65_rows(submode, &decodes);
+    unsafe { emit_rows(&rows, out, cap, out_len) }
 }
 
 /// AP-list (template-matching) Q65 scan-and-decode. Builds the
@@ -2248,7 +1157,7 @@ pub unsafe extern "C" fn mfsk_q65_decode_fading(
 /// NUL-terminated UTF-8.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mfsk_q65_decode_with_ap_list(
-    submode: MfskQ65SubMode,
+    submode: u32,
     samples: *const f32,
     n_samples: usize,
     sample_rate: u32,
@@ -2256,21 +1165,25 @@ pub unsafe extern "C" fn mfsk_q65_decode_with_ap_list(
     his_call: *const c_char,
     his_grid: *const c_char,
     hash_table: *const MfskCallsignHashTable,
-    out: *mut MfskResultList,
+    out: *mut MfskDecode,
+    cap: usize,
+    out_len: *mut usize,
 ) -> MfskStatus {
     let audio = match unsafe {
         q65_prepare_audio(
             samples,
             n_samples,
             sample_rate,
-            out,
             "mfsk_q65_decode_with_ap_list",
         )
     } {
         Ok(a) => a,
         Err(s) => return s,
     };
-    let out = unsafe { &mut *out };
+    let Some(submode) = q65_submode_of(submode) else {
+        set_error("mfsk_q65_decode_with_ap_list: not a Q65 sub-mode");
+        return MfskStatus::InvalidArg;
+    };
     let Ok(mc) = cstr_to_str(my_call) else {
         return MfskStatus::InvalidArg;
     };
@@ -2289,16 +1202,16 @@ pub unsafe extern "C" fn mfsk_q65_decode_with_ap_list(
     let candidates = mfsk_core::q65::standard_qso_codewords(mc, hc, hg);
     if candidates.is_empty() {
         set_error("mfsk_q65_decode_with_ap_list: candidate set empty (bad calls?)");
-        finalise(Vec::new(), out);
+        if !out_len.is_null() {
+            unsafe { *out_len = 0 };
+        }
         return MfskStatus::DecodeFailed;
     }
 
-    let mut vec: Vec<MfskResult> = Vec::new();
-    for d in q65_scan_with_ap_list_for(submode, &audio, &candidates, hash_table_inner(hash_table)) {
-        push_q65_decode(&d, &mut vec);
-    }
-    finalise(vec, out);
-    MfskStatus::Ok
+    let decodes =
+        q65_scan_with_ap_list_for(submode, &audio, &candidates, hash_table_inner(hash_table));
+    let rows = q65_rows(submode, &decodes);
+    unsafe { emit_rows(&rows, out, cap, out_len) }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -2375,6 +1288,32 @@ impl Msk144Geometry {
     const FEC_K: u32 = 90; // LDPC(128,90)
     const FEC_N: u32 = 128;
     const PAYLOAD_BITS: u32 = 77;
+}
+
+/// Turn a caller-supplied mode value into an `MfskMode`, or `None`.
+///
+/// **Every `extern "C"` entry point takes the mode as `uint32_t`, not
+/// as `MfskMode`, and this is why.** A `#[repr(C)]` fieldless enum is
+/// an `int` to C: a caller can pass a value from a config file, a
+/// newer header, or a plain mistake, and reading an out-of-range
+/// discriminant as a Rust enum is undefined behaviour — the compiler is
+/// entitled to assume the value is one of the listed variants and
+/// optimise the match accordingly.
+///
+/// That is not theoretical. `mfsk_mode_name((MfskMode)9999)` from the
+/// C++ driver segfaulted, which is how this was found; the same class
+/// of defect as a `memset` options struct producing an invalid
+/// `MfskDecodeDepth`, and the reason `read_params` validates its enum
+/// fields as integers too.
+///
+/// C callers still write `MFSK_MODE_FT8` — an unscoped enum constant
+/// converts to `uint32_t` implicitly in both C and C++ — so the
+/// ergonomics are unchanged and the soundness question is gone.
+fn mode_of(raw: u32) -> Option<MfskMode> {
+    MODE_TABLE
+        .iter()
+        .map(|(m, _, _)| *m)
+        .find(|m| *m as u32 == raw)
 }
 
 fn mode_index(mode: MfskMode) -> Option<usize> {
@@ -2457,8 +1396,8 @@ pub unsafe extern "C" fn mfsk_mode_at(index: u32, out: *mut MfskMode) -> MfskSta
 /// Answers for a mode this build lacks — the name is a property of the
 /// mode, not of the build.
 #[unsafe(no_mangle)]
-pub extern "C" fn mfsk_mode_name(mode: MfskMode) -> *const c_char {
-    match mode_index(mode) {
+pub extern "C" fn mfsk_mode_name(mode: u32) -> *const c_char {
+    match mode_of(mode).and_then(mode_index) {
         // The literal carries its own NUL, so this is a valid C string.
         Some(i) => MODE_TABLE[i].1.as_ptr() as *const c_char,
         None => ptr::null(),
@@ -2522,11 +1461,15 @@ pub unsafe extern "C" fn mfsk_mode_from_name(
 /// # Safety
 /// `out` must point to at least `out->size` writable bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_mode_info(mode: MfskMode, out: *mut MfskModeInfo) -> MfskStatus {
+pub unsafe extern "C" fn mfsk_mode_info(mode: u32, out: *mut MfskModeInfo) -> MfskStatus {
     if out.is_null() {
         set_error("mfsk_mode_info: out is NULL");
         return MfskStatus::InvalidArg;
     }
+    let Some(mode) = mode_of(mode) else {
+        set_error("mfsk_mode_info: not a mode this library knows");
+        return MfskStatus::InvalidArg;
+    };
     let Some(i) = mode_index(mode) else {
         set_error("mfsk_mode_info: not a mode this library knows");
         return MfskStatus::InvalidArg;
@@ -2610,7 +1553,10 @@ pub unsafe extern "C" fn mfsk_mode_info(mode: MfskMode, out: *mut MfskModeInfo) 
 /// build lacks, which is also a legal "supports nothing" answer; use
 /// `mfsk_mode_info` when the difference matters.
 #[unsafe(no_mangle)]
-pub extern "C" fn mfsk_mode_caps(mode: MfskMode) -> u64 {
+pub extern "C" fn mfsk_mode_caps(mode: u32) -> u64 {
+    let Some(mode) = mode_of(mode) else {
+        return 0;
+    };
     match mode_meta(mode) {
         Some(m) => u64::from(m.profile.caps),
         None if mode == MfskMode::Msk144 && mode_is_present(mode) => MFSK_CAP_ENCODE,
@@ -2633,14 +1579,15 @@ pub extern "C" fn mfsk_mode_caps(mode: MfskMode) -> u64 {
 /// # Safety
 /// `out` must point to at least `out->size` writable bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mfsk_mode_defaults(
-    mode: MfskMode,
-    out: *mut MfskDecodeDefaults,
-) -> MfskStatus {
+pub unsafe extern "C" fn mfsk_mode_defaults(mode: u32, out: *mut MfskDecodeDefaults) -> MfskStatus {
     if out.is_null() {
         set_error("mfsk_mode_defaults: out is NULL");
         return MfskStatus::InvalidArg;
     }
+    let Some(mode) = mode_of(mode) else {
+        set_error("mfsk_mode_defaults: not a mode this library knows");
+        return MfskStatus::InvalidArg;
+    };
     let Some(m) = mode_meta(mode) else {
         set_error("mfsk_mode_defaults: no such mode in this build");
         return MfskStatus::UnknownProtocol;
@@ -2730,6 +1677,9 @@ struct V2Decoder {
     /// The previous call's native rows, kept so `copy_info` can hand
     /// back FEC information bits without the row carrying a pointer.
     last: Vec<(Vec<u8>, MfskDecode)>,
+    /// Streaming delivery, set by `mfsk_session_set_on_decode`.
+    on_decode: MfskDecodeCallback,
+    on_decode_user: SyncUserData,
     /// Per-handle error slot. The process-global `thread_local!` is
     /// wrong for a coroutine or `async` caller, which legitimately hops
     /// threads between checking a status and reading the message and
@@ -2780,13 +1730,17 @@ fn write_field(dst: &mut [c_char], s: &str) {
 /// `out` must point to at least `out->size` writable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mfsk_decode_params_init(
-    mode: MfskMode,
+    mode: u32,
     out: *mut MfskDecodeParams,
 ) -> MfskStatus {
     if out.is_null() {
         set_error("mfsk_decode_params_init: out is NULL");
         return MfskStatus::InvalidArg;
     }
+    let Some(mode) = mode_of(mode) else {
+        set_error("mfsk_decode_params_init: not a mode this library knows");
+        return MfskStatus::InvalidArg;
+    };
     let Some(meta) = mode_meta(mode) else {
         set_error("mfsk_decode_params_init: no such mode in this build");
         return MfskStatus::UnknownProtocol;
@@ -2828,7 +1782,7 @@ pub unsafe extern "C" fn mfsk_decode_params_init(
 /// so a caller asking for the cheap path paid for the expensive one.
 /// On FST4-300 that ladder sits behind a 4 194 304-point transform.
 fn validate_params(mode: MfskMode, p: &MfskDecodeParams) -> Result<(), String> {
-    let caps = mfsk_mode_caps(mode);
+    let caps = mfsk_mode_caps(mode as u32);
     let name = mode_index(mode).map(mode_name_str).unwrap_or("?");
 
     // First, because everything below is about a wide-band search this
@@ -2907,7 +1861,7 @@ fn validate_params(mode: MfskMode, p: &MfskDecodeParams) -> Result<(), String> {
 /// `params` must be null or point to a valid `MfskDecodeParams`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mfsk_session_open(
-    mode: MfskMode,
+    mode: u32,
     params: *const MfskDecodeParams,
     out_status: *mut MfskStatus,
 ) -> *mut MfskDecodeSession {
@@ -2915,6 +1869,11 @@ pub unsafe extern "C" fn mfsk_session_open(
         if !out_status.is_null() {
             unsafe { *out_status = st };
         }
+    };
+    let Some(mode) = mode_of(mode) else {
+        set_error("mfsk_session_open: not a mode this library knows");
+        report(MfskStatus::InvalidArg);
+        return ptr::null_mut();
     };
     if mode_meta(mode).is_none() {
         set_error("mfsk_session_open: no such mode in this build");
@@ -2939,7 +1898,7 @@ pub unsafe extern "C" fn mfsk_session_open(
         ap_grid: [0; MFSK_AP_FIELD_LEN],
         search_hz: 0.0,
     };
-    if unsafe { mfsk_decode_params_init(mode, &mut p) } != MfskStatus::Ok {
+    if unsafe { mfsk_decode_params_init(mode as u32, &mut p) } != MfskStatus::Ok {
         report(MfskStatus::UnknownProtocol);
         return ptr::null_mut();
     }
@@ -2961,6 +1920,8 @@ pub unsafe extern "C" fn mfsk_session_open(
         params: p,
         hashes: mfsk_core::msg::CallsignHashTable::new(),
         last: Vec::new(),
+        on_decode: None,
+        on_decode_user: SyncUserData(ptr::null_mut()),
         error: None,
     })) as *mut MfskDecodeSession
 }
@@ -3158,8 +2119,13 @@ fn run_decode(d: &mut V2Decoder, audio: &[i16], p: &MfskDecodeParams) -> Result<
                     d.hashes.insert(word);
                 }
                 let mode = d.mode;
-                d.last
-                    .push((r.info.to_vec(), row(mode, r, &text, resolved)));
+                let built = row(mode, r, &text, resolved);
+                if let Some(cb) = d.on_decode {
+                    // Valid for the duration of the call only, which is
+                    // what the callback's contract promises.
+                    unsafe { cb(&built, d.on_decode_user.ptr()) };
+                }
+                d.last.push((r.info.to_vec(), built));
             }
             Ok(())
         }};
@@ -3305,6 +2271,48 @@ unsafe fn emit(
     for (i, (_, r)) in d.last.iter().enumerate() {
         unsafe { write_size_versioned(out.add(i), r) };
     }
+    MfskStatus::Ok
+}
+
+/// Called once per decode, as it is found, if the session has one set.
+///
+/// The row pointer is valid **only for the duration of the call** —
+/// copy anything you need. See [`mfsk_session_set_on_decode`] for the
+/// threading contract, which depends on whether this build has `rayon`.
+pub type MfskDecodeCallback =
+    Option<unsafe extern "C" fn(row: *const MfskDecode, user_data: *mut c_void)>;
+
+/// Deliver decodes through `callback` as they are found, in addition to
+/// writing them to the output array at the end of the call.
+///
+/// Pass a null `callback` to stop. The callback applies to every
+/// subsequent decode on this session.
+///
+/// **Threading.** With `rayon` (the `desktop` feature) the callback
+/// fires from a worker thread, possibly several concurrently, in
+/// completion order — `docs/reference/STREAMING.md` §3b. Without it
+/// (`mobile`) there is one thread and candidate order, which is a
+/// *stronger* contract and is the honest answer to "what does dropping
+/// rayon cost". Either way the array written at the end of the call is
+/// the authoritative set.
+///
+/// # Safety
+/// `callback`, if non-null, must be safely callable from any thread,
+/// any number of times including zero, for as long as it is set;
+/// `user_data` must stay valid for that time if the callback
+/// dereferences it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_session_set_on_decode(
+    dec: *mut MfskDecodeSession,
+    callback: MfskDecodeCallback,
+    user_data: *mut c_void,
+) -> MfskStatus {
+    let Some(d) = v2(dec) else {
+        set_error("mfsk_session_set_on_decode: null session handle");
+        return MfskStatus::InvalidArg;
+    };
+    d.on_decode = callback;
+    d.on_decode_user = SyncUserData(user_data);
     MfskStatus::Ok
 }
 
@@ -3473,6 +2481,224 @@ pub unsafe extern "C" fn mfsk_session_add_callsign(
     };
     d.hashes.insert(s);
     MfskStatus::Ok
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Entry points for modes that are not driven by the decode session
+//
+// Q65 takes a nominal start sample and a time tolerance and reports
+// `start_sample` rather than `dt`; WSPR/JT9/JT65 have no builder at all,
+// and JT9/JT65 are fixed-carrier point decodes rather than searches.
+// Forcing them through one `session_decode(params)` would recreate the
+// "eleven options, six silently ignored" failure this redesign exists
+// to end, so they keep their own shapes — and `MFSK_CAP_DECODE_HANDLE`
+// is the bit that tells a caller which is which.
+//
+// What they now share is the row type, so a host has one result struct
+// for every mode rather than one per family.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// A decode from a mode with no FEC information block to report.
+fn simple_row(mode: MfskMode, freq_hz: f32, dt_sec: f32, snr_db: f32, text: &str) -> MfskDecode {
+    let mut d = MfskDecode {
+        size: core::mem::size_of::<MfskDecode>() as u32,
+        mode,
+        text: [0; MFSK_DECODE_TEXT_LEN],
+        freq_hz,
+        dt_sec,
+        snr_db,
+        sync_score: 0.0,
+        sync_cv: 0.0,
+        hard_errors: 0,
+        info_bits: 0,
+        pass: 0,
+        flags: 0,
+    };
+    write_field(&mut d.text, text);
+    d
+}
+
+/// Copy rows into the caller's array, reporting the count needed.
+///
+/// # Safety
+/// `out` must be `cap` writable `MfskDecode`, or null when `cap` is 0.
+unsafe fn emit_rows(
+    rows: &[MfskDecode],
+    out: *mut MfskDecode,
+    cap: usize,
+    out_len: *mut usize,
+) -> MfskStatus {
+    if !out_len.is_null() {
+        unsafe { *out_len = rows.len() };
+    }
+    if rows.len() > cap || (out.is_null() && !rows.is_empty()) {
+        set_error("decode: output buffer too small; *out_len is the count needed");
+        return MfskStatus::InvalidArg;
+    }
+    for (i, r) in rows.iter().enumerate() {
+        unsafe { write_size_versioned(out.add(i), r) };
+    }
+    MfskStatus::Ok
+}
+
+/// Resample caller PCM to the 12 kHz f32 the non-session decoders want.
+///
+/// # Safety
+/// `samples` must be `n` readable `int16_t`.
+unsafe fn pcm_to_12k_f32(samples: *const i16, n: usize, rate: u32) -> Option<Vec<f32>> {
+    if samples.is_null() {
+        return None;
+    }
+    let pcm = unsafe { slice::from_raw_parts(samples, n) };
+    Some(if rate == 12_000 {
+        pcm.iter().map(|&s| s as f32 / 32768.0).collect()
+    } else {
+        mfsk_core::engine::dsp::resample::resample_i16_to_12k_f32(pcm, rate)
+    })
+}
+
+/// Scan a 120 s WSPR slot.
+///
+/// # Safety
+/// `samples` must be `n_samples` readable `int16_t`; `out` must be `cap`
+/// writable `MfskDecode`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_wspr_decode(
+    samples: *const i16,
+    n_samples: usize,
+    sample_rate: u32,
+    out: *mut MfskDecode,
+    cap: usize,
+    out_len: *mut usize,
+) -> MfskStatus {
+    let Some(audio) = (unsafe { pcm_to_12k_f32(samples, n_samples, sample_rate) }) else {
+        set_error("mfsk_wspr_decode: samples is NULL");
+        return MfskStatus::InvalidArg;
+    };
+    let rows: Vec<MfskDecode> = mfsk_core::wspr::decode::decode_scan_default(&audio, 12_000)
+        .iter()
+        .map(|d| {
+            simple_row(
+                MfskMode::Wspr,
+                d.freq_hz,
+                d.start_sample as f32 / 12_000.0,
+                d.snr_db,
+                &d.message.to_string(),
+            )
+        })
+        .collect();
+    unsafe { emit_rows(&rows, out, cap, out_len) }
+}
+
+/// Decode a JT9 or JT65 frame at a known carrier.
+///
+/// These are **point decodes, not searches** — WSJT-X's own JT9/JT65
+/// front end finds the carrier, and this crate's entry points take it.
+/// The pre-v2 ABI reached them only through the generic decode call and
+/// hardcoded 1500 Hz (JT9) and 1270 Hz (JT65) with no way to say
+/// otherwise, which is why the frequency is an argument here. `snr_db`
+/// is reported as 0: neither decoder estimates one.
+///
+/// # Safety
+/// As [`mfsk_wspr_decode`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_jt9_decode_at(
+    samples: *const i16,
+    n_samples: usize,
+    sample_rate: u32,
+    freq_hz: f32,
+    out: *mut MfskDecode,
+    cap: usize,
+    out_len: *mut usize,
+) -> MfskStatus {
+    let Some(audio) = (unsafe { pcm_to_12k_f32(samples, n_samples, sample_rate) }) else {
+        set_error("mfsk_jt9_decode_at: samples is NULL");
+        return MfskStatus::InvalidArg;
+    };
+    let rows: Vec<MfskDecode> = mfsk_core::jt9::decode_at(&audio, 12_000, 0, freq_hz)
+        .map(|m| vec![simple_row(MfskMode::Jt9, freq_hz, 0.0, 0.0, &m.to_string())])
+        .unwrap_or_default();
+    unsafe { emit_rows(&rows, out, cap, out_len) }
+}
+
+/// See [`mfsk_jt9_decode_at`].
+///
+/// # Safety
+/// As [`mfsk_wspr_decode`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_jt65_decode_at(
+    samples: *const i16,
+    n_samples: usize,
+    sample_rate: u32,
+    freq_hz: f32,
+    out: *mut MfskDecode,
+    cap: usize,
+    out_len: *mut usize,
+) -> MfskStatus {
+    let Some(audio) = (unsafe { pcm_to_12k_f32(samples, n_samples, sample_rate) }) else {
+        set_error("mfsk_jt65_decode_at: samples is NULL");
+        return MfskStatus::InvalidArg;
+    };
+    let rows: Vec<MfskDecode> = mfsk_core::jt65::decode_at(&audio, 12_000, 0, freq_hz)
+        .map(|m| {
+            vec![simple_row(
+                MfskMode::Jt65,
+                freq_hz,
+                0.0,
+                0.0,
+                &m.to_string(),
+            )]
+        })
+        .unwrap_or_default();
+    unsafe { emit_rows(&rows, out, cap, out_len) }
+}
+
+/// As [`mode_of`], for the Q65 sub-mode tag. Same reason: a C caller
+/// can put any integer in an `enum` parameter, and matching an
+/// out-of-range one as a Rust enum is undefined behaviour.
+fn q65_submode_of(raw: u32) -> Option<MfskQ65SubMode> {
+    use MfskQ65SubMode::*;
+    [A15, A30, A60, B60, C60, D60, E60, D120, E120, A300]
+        .into_iter()
+        .find(|m| *m as u32 == raw)
+}
+
+/// As [`mode_of`], for the fading model.
+fn q65_fading_of(raw: u32) -> Option<MfskQ65FadingModel> {
+    [MfskQ65FadingModel::Gaussian, MfskQ65FadingModel::Lorentzian]
+        .into_iter()
+        .find(|m| *m as u32 == raw)
+}
+
+/// Which `MfskMode` a Q65 sub-mode tag addresses, so a Q65 row carries
+/// the same mode identity as every other row.
+fn q65_mode(sub: MfskQ65SubMode) -> MfskMode {
+    match sub {
+        MfskQ65SubMode::A15 => MfskMode::Q65a15,
+        MfskQ65SubMode::A30 => MfskMode::Q65a30,
+        MfskQ65SubMode::A60 => MfskMode::Q65a60,
+        MfskQ65SubMode::B60 => MfskMode::Q65b60,
+        MfskQ65SubMode::C60 => MfskMode::Q65c60,
+        MfskQ65SubMode::D60 => MfskMode::Q65d60,
+        MfskQ65SubMode::E60 => MfskMode::Q65e60,
+        MfskQ65SubMode::D120 => MfskMode::Q65d120,
+        MfskQ65SubMode::E120 => MfskMode::Q65e120,
+        MfskQ65SubMode::A300 => MfskMode::Q65a300,
+    }
+}
+
+fn q65_rows(sub: MfskQ65SubMode, ds: &[mfsk_core::q65::Q65Result]) -> Vec<MfskDecode> {
+    ds.iter()
+        .map(|d| {
+            simple_row(
+                q65_mode(sub),
+                d.freq_hz,
+                d.start_sample as f32 / 12_000.0,
+                d.snr_db,
+                &d.message,
+            )
+        })
+        .collect()
 }
 
 /// Library version, major.minor.patch packed into a 32-bit integer (8

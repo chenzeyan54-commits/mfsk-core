@@ -4,8 +4,12 @@
 // message for every supported protocol, feeds the synthesised PCM
 // back through the matching decoder handle, and verifies the decoded
 // text round-trips correctly. Doubles as smoke test for the ABI
-// (NULL handling, last-error, samples / message-list lifetimes) and
-// as proof that each protocol is actually wired up in the C ABI.
+// (NULL handling, last-error, sample lifetimes) and as proof that each
+// mode is actually wired up in the C ABI.
+//
+// Decode results go into memory this file owns: nothing here frees a
+// pointer the library allocated, which is the category the v2 surface
+// removed from the decode path.
 //
 // Build: run `./build.sh`.
 
@@ -31,168 +35,79 @@ void fail(const char* proto, const char* detail) {
     g_failures++;
 }
 
-// Helper: does any decoded message text contain `needle` (case-sensitive)?
-// `text` is a fixed inline buffer (issue #205), always NUL-terminated —
-// no null check needed, unlike the old heap-`CString`-pointer shape.
-bool any_contains(const MfskResultList& list, const char* needle) {
-    for (size_t i = 0; i < list.len; ++i) {
-        const MfskResult& m = list.items[i];
-        if (std::strstr(m.text, needle) != nullptr) {
-            return true;
+// ── Shared decode helpers ───────────────────────────────────────────
+
+struct Rows {
+    MfskDecode items[16];
+    size_t len = 0;
+
+    Rows() {
+        std::memset(items, 0, sizeof items);
+        for (auto& r : items) r.size = sizeof r;
+    }
+    bool contains(const char* needle) const {
+        for (size_t i = 0; i < len; ++i) {
+            if (std::strstr(items[i].text, needle) != nullptr) return true;
         }
+        return false;
     }
-    return false;
-}
+};
 
-void print_decodes(const char* proto, const MfskResultList& list) {
-    std::printf("  [%s] %zu decode(s):\n", proto, list.len);
-    for (size_t i = 0; i < list.len; ++i) {
-        const MfskResult& m = list.items[i];
+void print_rows(const char* tag, const Rows& r) {
+    std::printf("  [%s] %zu decode(s):\n", tag, r.len);
+    for (size_t i = 0; i < r.len; ++i) {
+        const MfskDecode& m = r.items[i];
         std::printf("    freq=%7.2f dt=%+.3f snr=%+.1f err=%u pass=%u text='%s'\n",
-                    m.freq_hz, m.dt_sec, m.snr_db,
-                    m.hard_errors, m.pass,
-                    m.text);
+                    m.freq_hz, m.dt_sec, m.snr_db, m.hard_errors, m.pass, m.text);
     }
 }
 
-// ── v2 decode session ───────────────────────────────────────────────
-//
-// Written the way a consumer would: init params from the mode, open a
-// session, decode into memory the caller owns. Nothing here frees a
-// pointer the library allocated, which is the whole point — that
-// category is what makes Kotlin and Swift wrappers leak when an
-// exception unwinds past the free.
-void test_session_decode() {
-    std::printf("\n— v2 decode session: params → open → rows into caller memory\n");
+using Encoder = MfskStatus (*)(const char*, const char*, const char*, float, MfskSamples*);
 
+std::vector<int16_t> encode_i16(Encoder enc, const char* a, const char* b,
+                                const char* c, float freq) {
     MfskSamples pcm{};
-    if (mfsk_encode_ft8("CQ", "JA1ABC", "PM95", 1500.0f, &pcm) != MFSK_STATUS_OK) {
-        fail("session", "mfsk_encode_ft8 failed");
-        return;
-    }
-    std::vector<int16_t> audio(pcm.len);
+    std::vector<int16_t> out;
+    if (enc(a, b, c, freq, &pcm) != MFSK_STATUS_OK) return out;
+    out.resize(pcm.len);
     for (size_t i = 0; i < pcm.len; ++i) {
-        audio[i] = static_cast<int16_t>(pcm.samples[i] * 32767.0f);
+        out[i] = static_cast<int16_t>(pcm.samples[i] * 32767.0f);
     }
     mfsk_samples_free(&pcm);
+    return out;
+}
 
+MfskDecodeParams defaults_for(MfskMode mode) {
     MfskDecodeParams p;
     std::memset(&p, 0, sizeof p);
     p.size = sizeof p;
-    if (mfsk_decode_params_init(MFSK_MODE_FT8, &p) != MFSK_STATUS_OK) {
-        fail("session", "mfsk_decode_params_init failed");
-        return;
+    if (mfsk_decode_params_init(mode, &p) != MFSK_STATUS_OK) {
+        fail(mfsk_mode_name(mode), "mfsk_decode_params_init failed");
     }
-    std::printf("  FT8 defaults: band [%.0f, %.0f] sync_min %.2f max_cand %u\n",
-                p.freq_min_hz, p.freq_max_hz, p.sync_min, p.max_cand);
+    return p;
+}
 
+/// Open a session, decode one slot, assert the text turns up.
+void session_roundtrip(const char* tag, MfskMode mode,
+                       const std::vector<int16_t>& audio, const char* needle) {
     MfskStatus st = MFSK_STATUS_INTERNAL;
-    MfskDecodeSession* s = mfsk_session_open(MFSK_MODE_FT8, &p, &st);
+    MfskDecodeSession* s = mfsk_session_open(mode, nullptr, &st);
     if (s == nullptr || st != MFSK_STATUS_OK) {
-        fail("session", mfsk_last_error());
+        fail(tag, mfsk_last_error());
         return;
     }
-
-    MfskDecode rows[8];
-    std::memset(rows, 0, sizeof rows);
-    for (auto& r : rows) r.size = sizeof r;
-    size_t n = 0;
-    if (mfsk_session_decode_i16(s, audio.data(), audio.size(), 12000,
-                                nullptr, rows, 8, &n) != MFSK_STATUS_OK) {
-        fail("session", mfsk_session_last_error(s));
-        mfsk_session_close(s);
-        return;
-    }
-    std::printf("  %zu decode(s):\n", n);
-    bool found = false;
-    for (size_t i = 0; i < n; ++i) {
-        std::printf("    mode=%d freq=%7.2f dt=%+.3f snr=%+.1f cv=%.3f "
-                    "info=%u pass=%u text='%s'\n",
-                    static_cast<int>(rows[i].mode), rows[i].freq_hz, rows[i].dt_sec,
-                    rows[i].snr_db, rows[i].sync_cv, rows[i].info_bits,
-                    rows[i].pass, rows[i].text);
-        if (std::strstr(rows[i].text, "JA1ABC") != nullptr) found = true;
-        if (rows[i].mode != MFSK_MODE_FT8) {
-            fail("session", "row reports the wrong mode");
-        }
-        if (rows[i].info_bits != 91) {
-            fail("session", "FT8 is LDPC(174,91); info_bits should be 91");
-        }
-    }
-    if (!found) {
-        fail("session", "did not decode the signal it was given");
-    }
-
-    // FEC bits come from the session, not from a pointer in the row.
-    size_t need = 0;
-    if (mfsk_session_copy_info(s, 0, nullptr, 0, &need) != MFSK_STATUS_INVALID_ARG ||
-        need != 91) {
-        fail("session", "copy_info should report the size it needs");
+    Rows rows;
+    if (mfsk_session_decode_i16(s, audio.data(), audio.size(), 12000, nullptr,
+                                rows.items, 16, &rows.len) != MFSK_STATUS_OK) {
+        fail(tag, mfsk_session_last_error(s));
     } else {
-        std::vector<uint8_t> bits(need);
-        size_t got = 0;
-        if (mfsk_session_copy_info(s, 0, bits.data(), bits.size(), &got) != MFSK_STATUS_OK ||
-            got != need) {
-            fail("session", "copy_info failed with a correctly sized buffer");
+        print_rows(tag, rows);
+        if (!rows.contains(needle)) fail(tag, "expected text missing");
+        for (size_t i = 0; i < rows.len; ++i) {
+            if (rows.items[i].mode != mode) fail(tag, "row reports the wrong mode");
         }
     }
-
-    // A short buffer reports the count needed rather than truncating.
-    size_t needed = 0;
-    MfskDecode one;
-    std::memset(&one, 0, sizeof one);
-    one.size = sizeof one;
-    if (mfsk_session_decode_i16(s, audio.data(), audio.size(), 12000,
-                                nullptr, &one, 0, &needed) != MFSK_STATUS_INVALID_ARG) {
-        fail("session", "a zero-capacity buffer should report INVALID_ARG");
-    } else if (needed != n) {
-        fail("session", "*out_len should be the count needed");
-    }
-
     mfsk_session_close(s);
-
-    // Asking a mode for something it does not have fails at open, with
-    // a message — not silently at decode, which is what the pre-v2
-    // options handle did with six of its eleven fields.
-    MfskDecodeParams bad;
-    std::memset(&bad, 0, sizeof bad);
-    bad.size = sizeof bad;
-    mfsk_decode_params_init(MFSK_MODE_FT4, &bad);
-    bad.sic_early = true;
-    MfskStatus badst = MFSK_STATUS_OK;
-    if (mfsk_session_open(MFSK_MODE_FT4, &bad, &badst) != nullptr ||
-        badst != MFSK_STATUS_UNSUPPORTED) {
-        fail("session", "sic_early on FT4 should be refused at open");
-    } else {
-        std::printf("  refused sic_early on FT4: %s\n", mfsk_last_error());
-    }
-
-    // A mode with no decode handle says so, naming the bit to check.
-    MfskStatus wst = MFSK_STATUS_OK;
-    if (mfsk_session_open(MFSK_MODE_WSPR, nullptr, &wst) != nullptr ||
-        wst != MFSK_STATUS_UNSUPPORTED) {
-        fail("session", "WSPR has no decode handle and should refuse");
-    }
-
-    // Every mode that claims the handle must open one.
-    const uint32_t total = mfsk_mode_count();
-    int opened = 0;
-    for (uint32_t i = 0; i < total; ++i) {
-        MfskMode m;
-        if (mfsk_mode_at(i, &m) != MFSK_STATUS_OK) continue;
-        if ((mfsk_mode_caps(m) & MFSK_CAP_DECODE_HANDLE) == 0) continue;
-        MfskStatus ost = MFSK_STATUS_INTERNAL;
-        MfskDecodeSession* sess = mfsk_session_open(m, nullptr, &ost);
-        if (sess == nullptr || ost != MFSK_STATUS_OK) {
-            fail(mfsk_mode_name(m), "claims MFSK_CAP_DECODE_HANDLE but will not open");
-        } else {
-            opened++;
-            mfsk_session_close(sess);
-        }
-    }
-    std::printf("  opened a session for all %d handle-driving mode(s)\n", opened);
-
-    std::printf("  OK\n");
 }
 
 // ── Mode introspection (FFI v2 slice 1) ─────────────────────────────
@@ -356,164 +271,19 @@ void test_mode_introspection() {
     std::printf("  OK\n");
 }
 
-// ── FT8 ──────────────────────────────────────────────────────────────
-void test_ft8() {
-    std::printf("— FT8 roundtrip: encode 'CQ JA1ABC PM95' at 1500 Hz → decode\n");
+// ── v2 decode session ───────────────────────────────────────────────
+//
+// Written the way a consumer would: init params from the mode, open a
+// session, decode into memory the caller owns. Nothing here frees a
+// pointer the library allocated, which is the whole point — that
+// category is what makes Kotlin and Swift wrappers leak when an
+// exception unwinds past the free.
+void test_session_decode() {
+    std::printf("\n— v2 decode session: params → open → rows into caller memory\n");
+
     MfskSamples pcm{};
     if (mfsk_encode_ft8("CQ", "JA1ABC", "PM95", 1500.0f, &pcm) != MFSK_STATUS_OK) {
-        fail("FT8", mfsk_last_error());
-        return;
-    }
-    MfskDecoder* dec = mfsk_decoder_new(MFSK_PROTOCOL_FT8);
-    MfskResultList list{};
-    const MfskStatus st = mfsk_decode_f32(dec, pcm.samples, pcm.len, 12000, nullptr, &list);
-    if (st != MFSK_STATUS_OK) {
-        fail("FT8", mfsk_last_error() ? mfsk_last_error() : "decode_f32 failed");
-    } else {
-        print_decodes("FT8", list);
-        if (!any_contains(list, "JA1ABC") || !any_contains(list, "PM95")) {
-            fail("FT8", "expected callsign / grid not recovered");
-        }
-    }
-    mfsk_result_list_free(&list);
-    mfsk_decoder_free(dec);
-    mfsk_samples_free(&pcm);
-}
-
-// ── FT8 streaming (mfsk_decode_i16_streaming, issue #246 follow-up) ───
-//
-// A real C callback invoked from actual C++-compiled code, through the
-// generated header — the one thing the Rust-side `tests/streaming_ffi.rs`
-// suite can't exercise (it calls the same crate's own functions
-// directly, never crossing an actual compiler/ABI boundary the way a
-// separate C++ translation unit does).
-extern "C" void streaming_collect(const MfskResult* result, void* user_data) {
-    auto* out = static_cast<std::vector<std::string>*>(user_data);
-    out->emplace_back(result->text);
-}
-
-void test_ft8_streaming() {
-    std::printf("— FT8 streaming: encode 'CQ JA1ABC PM95' at 1650 Hz → mfsk_decode_i16_streaming\n");
-    MfskSamples pcm{};
-    if (mfsk_encode_ft8("CQ", "JA1ABC", "PM95", 1650.0f, &pcm) != MFSK_STATUS_OK) {
-        fail("FT8-streaming", mfsk_last_error());
-        return;
-    }
-    std::vector<int16_t> i16_samples(pcm.len);
-    for (size_t i = 0; i < pcm.len; ++i) {
-        float s = pcm.samples[i] * 32767.0f;
-        if (s > 32767.0f) s = 32767.0f;
-        if (s < -32768.0f) s = -32768.0f;
-        i16_samples[i] = static_cast<int16_t>(s);
-    }
-
-    MfskDecoder* dec = mfsk_decoder_new(MFSK_PROTOCOL_FT8);
-    MfskResultList list{};
-    std::vector<std::string> streamed;
-    const MfskStatus st = mfsk_decode_i16_streaming(
-        dec, i16_samples.data(), i16_samples.size(), 12000, nullptr,
-        streaming_collect, &streamed, &list);
-    if (st != MFSK_STATUS_OK) {
-        fail("FT8-streaming", mfsk_last_error() ? mfsk_last_error() : "decode failed");
-    } else {
-        print_decodes("FT8-streaming (batch list)", list);
-        std::printf("  streamed via callback: %zu\n", streamed.size());
-        bool streamed_ok = false;
-        for (const auto& s : streamed) {
-            if (s.find("JA1ABC") != std::string::npos) streamed_ok = true;
-        }
-        if (!streamed_ok) {
-            fail("FT8-streaming", "callback never delivered JA1ABC");
-        }
-        if (!any_contains(list, "JA1ABC") || !any_contains(list, "PM95")) {
-            fail("FT8-streaming", "batch list missing expected callsign/grid");
-        }
-        if (streamed.size() != list.len) {
-            fail("FT8-streaming", "streamed count != batch list count for one clean candidate");
-        }
-    }
-    mfsk_result_list_free(&list);
-    mfsk_decoder_free(dec);
-    mfsk_samples_free(&pcm);
-}
-
-// ── FFI builder-parity setters (issue #162 follow-up) ──────────────────
-//
-// MfskDecodeOptions hadn't grown a single setter since its creation
-// (issue #205) despite its own doc comment anticipating exactly that —
-// this proves every mfsk_decode_options_set_* setter actually reaches
-// a real decode call from compiled C++, not just that they link.
-void test_builder_options() {
-    std::printf("— FFI builder-parity: mfsk_decode_options_set_* (strictness/eq_mode/freq_hint/sic_rounds/sic_early/ap_hint)\n");
-    MfskSamples pcm{};
-    if (mfsk_encode_ft8("CQ", "JA1ABC", "PM95", 1500.0f, &pcm) != MFSK_STATUS_OK) {
-        fail("builder-options", mfsk_last_error());
-        return;
-    }
-
-    MfskDecodeOptions* opts = mfsk_decode_options_new(
-        200.0f, 3000.0f, 2.0f, 50, MFSK_DECODE_DEPTH_BP_ALL_OSD);
-    if (opts == nullptr) {
-        fail("builder-options", "mfsk_decode_options_new returned null");
-        mfsk_samples_free(&pcm);
-        return;
-    }
-    if (mfsk_decode_options_set_strictness(opts, MFSK_STRICTNESS_DEEP) != MFSK_STATUS_OK) {
-        fail("builder-options", "set_strictness failed");
-    }
-    if (mfsk_decode_options_set_eq_mode(opts, MFSK_EQ_MODE_LOCAL) != MFSK_STATUS_OK) {
-        fail("builder-options", "set_eq_mode failed");
-    }
-    if (mfsk_decode_options_set_freq_hint(opts, 1500.0f) != MFSK_STATUS_OK) {
-        fail("builder-options", "set_freq_hint failed");
-    }
-    // sic_early overwrites whatever sic_rounds set, matching
-    // DecodeRequest's own .sic_rounds(_).sic_early() overwrite
-    // semantics — call both to prove the "last one wins" contract
-    // doesn't error either way, not just that one setter works alone.
-    if (mfsk_decode_options_set_sic_rounds(opts, 2) != MFSK_STATUS_OK) {
-        fail("builder-options", "set_sic_rounds failed");
-    }
-    if (mfsk_decode_options_set_sic_early(opts) != MFSK_STATUS_OK) {
-        fail("builder-options", "set_sic_early failed");
-    }
-    // Wide-band AP hint — string marshalling across the C boundary is
-    // the most novel part of this setter family, worth its own
-    // real-compiler proof. grid/report left NULL (call1/call2 only).
-    if (mfsk_decode_options_set_ap_hint(opts, "JA1ABC", "CQ", nullptr, nullptr) != MFSK_STATUS_OK) {
-        fail("builder-options", "set_ap_hint failed");
-    }
-
-    MfskDecoder* dec = mfsk_decoder_new(MFSK_PROTOCOL_FT8);
-    MfskResultList list{};
-    const MfskStatus st = mfsk_decode_f32(dec, pcm.samples, pcm.len, 12000, opts, &list);
-    if (st != MFSK_STATUS_OK) {
-        fail("builder-options", mfsk_last_error() ? mfsk_last_error() : "decode failed");
-    } else {
-        print_decodes("builder-options", list);
-        if (!any_contains(list, "JA1ABC")) {
-            fail("builder-options", "setters broke a clean decode");
-        }
-    }
-    mfsk_result_list_free(&list);
-    mfsk_decoder_free(dec);
-    mfsk_decode_options_free(opts);
-    mfsk_samples_free(&pcm);
-}
-
-// ── Sniper mode (issue #249) ─────────────────────────────────────────
-// The single-frequency entry point, driven the way a C caller actually
-// would: aim at a frequency a sked/spot already named, on FT4, with an
-// AP hint — which is no longer what this entry point is for.
-// `mfsk_decode_options_set_ap_hint` now reaches the wide-band decoder
-// for every protocol, and the sniper is FT8-only, so this checks both:
-// FT4's sniper reports the mode unsupported, and the same hint decodes
-// through the ordinary entry point.
-void test_sniper() {
-    std::printf("— FFI sniper: FT8 is the only mode that has one; FT4/WSPR must refuse\n");
-    MfskSamples pcm{};
-    if (mfsk_encode_ft4("CQ", "JA1ABC", "PM95", 1200.0f, &pcm) != MFSK_STATUS_OK) {
-        fail("sniper", mfsk_last_error());
+        fail("session", "mfsk_encode_ft8 failed");
         return;
     }
     std::vector<int16_t> audio(pcm.len);
@@ -522,386 +292,542 @@ void test_sniper() {
     }
     mfsk_samples_free(&pcm);
 
-    MfskDecodeOptions* opts = mfsk_decode_options_new(
-        200.0f, 3000.0f, 1.2f, 8, MFSK_DECODE_DEPTH_BP_ALL_OSD);
-    if (opts == nullptr) {
-        fail("sniper", "mfsk_decode_options_new returned null");
+    MfskDecodeParams p;
+    std::memset(&p, 0, sizeof p);
+    p.size = sizeof p;
+    if (mfsk_decode_params_init(MFSK_MODE_FT8, &p) != MFSK_STATUS_OK) {
+        fail("session", "mfsk_decode_params_init failed");
         return;
     }
-    if (mfsk_decode_options_set_ap_hint(opts, "JA1ABC", "CQ", nullptr, nullptr) != MFSK_STATUS_OK) {
-        fail("sniper", "set_ap_hint failed");
+    std::printf("  FT8 defaults: band [%.0f, %.0f] sync_min %.2f max_cand %u\n",
+                p.freq_min_hz, p.freq_max_hz, p.sync_min, p.max_cand);
+
+    MfskStatus st = MFSK_STATUS_INTERNAL;
+    MfskDecodeSession* s = mfsk_session_open(MFSK_MODE_FT8, &p, &st);
+    if (s == nullptr || st != MFSK_STATUS_OK) {
+        fail("session", mfsk_last_error());
+        return;
     }
 
-    // FT4's sniper is gone: narrow-band single-target search is the
-    // receive half of an analogue roofing filter, a DX-chasing mode
-    // that a contest protocol has no use for. It must say so rather
-    // than decode something.
-    MfskDecoder* dec = mfsk_decoder_new(MFSK_PROTOCOL_FT4);
-    MfskResultList list{};
-    const MfskStatus st = mfsk_decode_i16_sniper(
-        dec, audio.data(), audio.size(), 12000, 1200.0f, opts, &list);
-    if (st != MFSK_STATUS_UNKNOWN_PROTOCOL) {
-        fail("sniper", "FT4 sniper should return MFSK_STATUS_UNKNOWN_PROTOCOL");
+    MfskDecode rows[8];
+    std::memset(rows, 0, sizeof rows);
+    for (auto& r : rows) r.size = sizeof r;
+    size_t n = 0;
+    if (mfsk_session_decode_i16(s, audio.data(), audio.size(), 12000,
+                                nullptr, rows, 8, &n) != MFSK_STATUS_OK) {
+        fail("session", mfsk_session_last_error(s));
+        mfsk_session_close(s);
+        return;
     }
-    mfsk_result_list_free(&list);
-
-    // The AP hint this entry point existed to reach now works on the
-    // ordinary wide-band decode, for every protocol.
-    MfskResultList wide{};
-    const MfskStatus wst = mfsk_decode_i16(
-        dec, audio.data(), audio.size(), 12000, opts, &wide);
-    if (wst != MFSK_STATUS_OK) {
-        fail("sniper", mfsk_last_error() ? mfsk_last_error() : "wide-band AP decode failed");
-    } else {
-        print_decodes("FT4 wide-band + AP hint", wide);
-        if (!any_contains(wide, "JA1ABC")) {
-            fail("sniper", "wide-band decode with an AP hint did not find the signal");
+    std::printf("  %zu decode(s):\n", n);
+    bool found = false;
+    for (size_t i = 0; i < n; ++i) {
+        std::printf("    mode=%d freq=%7.2f dt=%+.3f snr=%+.1f cv=%.3f "
+                    "info=%u pass=%u text='%s'\n",
+                    static_cast<int>(rows[i].mode), rows[i].freq_hz, rows[i].dt_sec,
+                    rows[i].snr_db, rows[i].sync_cv, rows[i].info_bits,
+                    rows[i].pass, rows[i].text);
+        if (std::strstr(rows[i].text, "JA1ABC") != nullptr) found = true;
+        if (rows[i].mode != MFSK_MODE_FT8) {
+            fail("session", "row reports the wrong mode");
+        }
+        if (rows[i].info_bits != 91) {
+            fail("session", "FT8 is LDPC(174,91); info_bits should be 91");
         }
     }
-    mfsk_result_list_free(&wide);
+    if (!found) {
+        fail("session", "did not decode the signal it was given");
+    }
 
-    // And the mode that *does* have a sniper must still work through
-    // it. Nothing else covers this entry point from C now that the
-    // FT4 arm is a refusal, so without this the only compiled-C
-    // exercise of the sniper would be two error paths.
-    {
-        MfskSamples ft8pcm{};
-        if (mfsk_encode_ft8("CQ", "JA1ABC", "PM95", 1500.0f, &ft8pcm) != MFSK_STATUS_OK) {
-            fail("sniper", "mfsk_encode_ft8 failed");
+    // FEC bits come from the session, not from a pointer in the row.
+    size_t need = 0;
+    if (mfsk_session_copy_info(s, 0, nullptr, 0, &need) != MFSK_STATUS_INVALID_ARG ||
+        need != 91) {
+        fail("session", "copy_info should report the size it needs");
+    } else {
+        std::vector<uint8_t> bits(need);
+        size_t got = 0;
+        if (mfsk_session_copy_info(s, 0, bits.data(), bits.size(), &got) != MFSK_STATUS_OK ||
+            got != need) {
+            fail("session", "copy_info failed with a correctly sized buffer");
+        }
+    }
+
+    // A short buffer reports the count needed rather than truncating.
+    size_t needed = 0;
+    MfskDecode one;
+    std::memset(&one, 0, sizeof one);
+    one.size = sizeof one;
+    if (mfsk_session_decode_i16(s, audio.data(), audio.size(), 12000,
+                                nullptr, &one, 0, &needed) != MFSK_STATUS_INVALID_ARG) {
+        fail("session", "a zero-capacity buffer should report INVALID_ARG");
+    } else if (needed != n) {
+        fail("session", "*out_len should be the count needed");
+    }
+
+    mfsk_session_close(s);
+
+    // Asking a mode for something it does not have fails at open, with
+    // a message — not silently at decode, which is what the pre-v2
+    // options handle did with six of its eleven fields.
+    MfskDecodeParams bad;
+    std::memset(&bad, 0, sizeof bad);
+    bad.size = sizeof bad;
+    mfsk_decode_params_init(MFSK_MODE_FT4, &bad);
+    bad.sic_early = true;
+    MfskStatus badst = MFSK_STATUS_OK;
+    if (mfsk_session_open(MFSK_MODE_FT4, &bad, &badst) != nullptr ||
+        badst != MFSK_STATUS_UNSUPPORTED) {
+        fail("session", "sic_early on FT4 should be refused at open");
+    } else {
+        std::printf("  refused sic_early on FT4: %s\n", mfsk_last_error());
+    }
+
+    // A mode with no decode handle says so, naming the bit to check.
+    MfskStatus wst = MFSK_STATUS_OK;
+    if (mfsk_session_open(MFSK_MODE_WSPR, nullptr, &wst) != nullptr ||
+        wst != MFSK_STATUS_UNSUPPORTED) {
+        fail("session", "WSPR has no decode handle and should refuse");
+    }
+
+    // Every mode that claims the handle must open one.
+    const uint32_t total = mfsk_mode_count();
+    int opened = 0;
+    for (uint32_t i = 0; i < total; ++i) {
+        MfskMode m;
+        if (mfsk_mode_at(i, &m) != MFSK_STATUS_OK) continue;
+        if ((mfsk_mode_caps(m) & MFSK_CAP_DECODE_HANDLE) == 0) continue;
+        MfskStatus ost = MFSK_STATUS_INTERNAL;
+        MfskDecodeSession* sess = mfsk_session_open(m, nullptr, &ost);
+        if (sess == nullptr || ost != MFSK_STATUS_OK) {
+            fail(mfsk_mode_name(m), "claims MFSK_CAP_DECODE_HANDLE but will not open");
         } else {
-            std::vector<int16_t> ft8audio(ft8pcm.len);
-            for (size_t i = 0; i < ft8pcm.len; ++i) {
-                ft8audio[i] = static_cast<int16_t>(ft8pcm.samples[i] * 32767.0f);
-            }
-            mfsk_samples_free(&ft8pcm);
-
-            MfskDecoder* ft8dec = mfsk_decoder_new(MFSK_PROTOCOL_FT8);
-            MfskResultList hit{};
-            const MfskStatus fst = mfsk_decode_i16_sniper(
-                ft8dec, ft8audio.data(), ft8audio.size(), 12000, 1500.0f, nullptr, &hit);
-            if (fst != MFSK_STATUS_OK) {
-                fail("sniper", mfsk_last_error() ? mfsk_last_error() : "FT8 sniper failed");
-            } else {
-                print_decodes("FT8 sniper", hit);
-                if (!any_contains(hit, "JA1ABC")) {
-                    fail("sniper", "FT8 sniper did not find the signal it was aimed at");
-                }
-            }
-            mfsk_result_list_free(&hit);
-            mfsk_decoder_free(ft8dec);
+            opened++;
+            mfsk_session_close(sess);
         }
     }
+    std::printf("  opened a session for all %d handle-driving mode(s)\n", opened);
 
-    // A protocol with no single-frequency mode must say so rather than
-    // decode something else.
-    MfskDecoder* wspr = mfsk_decoder_new(MFSK_PROTOCOL_WSPR);
-    MfskResultList unused{};
-    const MfskStatus bad = mfsk_decode_i16_sniper(
-        wspr, audio.data(), audio.size(), 12000, 1200.0f, nullptr, &unused);
-    if (bad != MFSK_STATUS_UNKNOWN_PROTOCOL) {
-        fail("sniper", "WSPR sniper should return MFSK_STATUS_UNKNOWN_PROTOCOL");
-    }
-    mfsk_decoder_free(wspr);
-
-    mfsk_decoder_free(dec);
-    mfsk_decode_options_free(opts);
+    std::printf("  OK\n");
 }
 
-// ── FT4 ──────────────────────────────────────────────────────────────
+// ── Per-mode round trips ────────────────────────────────────────────
+
+void test_ft8() {
+    std::printf("\n— FT8 roundtrip: encode 'CQ JA1ABC PM95' at 1500 Hz → decode\n");
+    session_roundtrip("FT8", MFSK_MODE_FT8,
+                      encode_i16(mfsk_encode_ft8, "CQ", "JA1ABC", "PM95", 1500.0f),
+                      "JA1ABC");
+}
+
 void test_ft4() {
-    std::printf("— FT4 roundtrip: encode 'CQ JA1ABC PM95' at 1500 Hz → decode\n");
-    MfskSamples pcm{};
-    if (mfsk_encode_ft4("CQ", "JA1ABC", "PM95", 1500.0f, &pcm) != MFSK_STATUS_OK) {
-        fail("FT4", mfsk_last_error());
+    std::printf("\n— FT4 roundtrip: encode 'CQ JA1ABC PM95' at 1500 Hz → decode\n");
+    session_roundtrip("FT4", MFSK_MODE_FT4,
+                      encode_i16(mfsk_encode_ft4, "CQ", "JA1ABC", "PM95", 1500.0f),
+                      "JA1ABC");
+}
+
+void test_fst4() {
+    if (std::getenv("RUN_FST4_ROUNDTRIP") == nullptr) {
+        std::printf("\n— FST4-60A roundtrip: skipped (set RUN_FST4_ROUNDTRIP=1)\n");
         return;
     }
-    MfskDecoder* dec = mfsk_decoder_new(MFSK_PROTOCOL_FT4);
-    MfskResultList list{};
-    const MfskStatus st = mfsk_decode_f32(dec, pcm.samples, pcm.len, 12000, nullptr, &list);
-    if (st != MFSK_STATUS_OK) {
-        fail("FT4", mfsk_last_error() ? mfsk_last_error() : "decode_f32 failed");
-    } else {
-        print_decodes("FT4", list);
-        if (!any_contains(list, "JA1ABC") || !any_contains(list, "PM95")) {
-            fail("FT4", "expected callsign / grid not recovered");
+    std::printf("\n— FST4-60A roundtrip, and all five sub-modes addressable\n");
+    std::vector<int16_t> frame =
+        encode_i16(mfsk_encode_fst4s60, "CQ", "JA1ABC", "PM95", 1500.0f);
+
+    constexpr size_t kSlot = 60 * 12000;
+    constexpr size_t kOffset = 12000;
+    std::vector<int16_t> slot(kSlot, 0);
+    const size_t n = frame.size() < kSlot - kOffset ? frame.size() : kSlot - kOffset;
+    for (size_t i = 0; i < n; ++i) slot[kOffset + i] = frame[i];
+    session_roundtrip("FST4-60A", MFSK_MODE_FST4S60, slot, "JA1ABC");
+
+    // The four sub-modes the pre-v2 ABI could not address at all:
+    // MfskProtocol had one FST4 entry, so 15/30/120/300 were
+    // unreachable from C for decode and encode alike.
+    const MfskMode others[] = {MFSK_MODE_FST4S15, MFSK_MODE_FST4S30,
+                               MFSK_MODE_FST4S120, MFSK_MODE_FST4S300};
+    for (MfskMode m : others) {
+        MfskStatus st = MFSK_STATUS_INTERNAL;
+        MfskDecodeSession* s = mfsk_session_open(m, nullptr, &st);
+        if (s == nullptr) {
+            fail(mfsk_mode_name(m), "unreachable — this is the hole v2 closes");
+        } else {
+            mfsk_session_close(s);
         }
     }
-    mfsk_result_list_free(&list);
-    mfsk_decoder_free(dec);
-    mfsk_samples_free(&pcm);
+    std::printf("  all five FST4 sub-modes open a session\n");
 }
 
-// ── WSPR ─────────────────────────────────────────────────────────────
+// ── Modes that are not driven by the decode session ─────────────────
+//
+// Q65 takes a nominal start sample and a time tolerance; WSPR/JT9/JT65
+// have no builder, and JT9/JT65 are point decodes at a known carrier
+// rather than searches. They keep their own entry points and share the
+// row type — MFSK_CAP_DECODE_HANDLE is the bit that says which is which.
+
 void test_wspr() {
-    std::printf("— WSPR roundtrip: encode 'K1ABC FN42 37' at 1500 Hz → decode\n");
+    std::printf("\n— WSPR: its own entry point (no decode handle)\n");
     MfskSamples pcm{};
     if (mfsk_encode_wspr("K1ABC", "FN42", 37, 1500.0f, &pcm) != MFSK_STATUS_OK) {
         fail("WSPR", mfsk_last_error());
         return;
     }
-    MfskDecoder* dec = mfsk_decoder_new(MFSK_PROTOCOL_WSPR);
-    MfskResultList list{};
-    const MfskStatus st = mfsk_decode_f32(dec, pcm.samples, pcm.len, 12000, nullptr, &list);
-    if (st != MFSK_STATUS_OK) {
-        fail("WSPR", mfsk_last_error() ? mfsk_last_error() : "decode_f32 failed");
-    } else {
-        print_decodes("WSPR", list);
-        if (!any_contains(list, "K1ABC") || !any_contains(list, "FN42")) {
-            fail("WSPR", "expected callsign / grid not recovered");
-        }
+    std::vector<int16_t> audio(pcm.len);
+    for (size_t i = 0; i < pcm.len; ++i) {
+        audio[i] = static_cast<int16_t>(pcm.samples[i] * 32767.0f);
     }
-    mfsk_result_list_free(&list);
-    mfsk_decoder_free(dec);
     mfsk_samples_free(&pcm);
+
+    Rows rows;
+    if (mfsk_wspr_decode(audio.data(), audio.size(), 12000,
+                         rows.items, 16, &rows.len) != MFSK_STATUS_OK) {
+        fail("WSPR", mfsk_last_error());
+        return;
+    }
+    print_rows("WSPR", rows);
+    if (!rows.contains("K1ABC")) fail("WSPR", "expected K1ABC");
 }
 
-// ── JT9 ──────────────────────────────────────────────────────────────
 void test_jt9() {
-    std::printf("— JT9 roundtrip: encode 'CQ K1ABC FN42' at 1500 Hz → decode\n");
-    MfskSamples pcm{};
-    if (mfsk_encode_jt9("CQ", "K1ABC", "FN42", 1500.0f, &pcm) != MFSK_STATUS_OK) {
+    // 1350 Hz on purpose: the pre-v2 ABI hardcoded 1500 with no way to
+    // say otherwise, so the frequency being an argument is the thing
+    // under test as much as the decode is.
+    std::printf("\n— JT9: point decode at a caller-chosen 1350 Hz\n");
+    std::vector<int16_t> audio = encode_i16(mfsk_encode_jt9, "CQ", "K1ABC", "FN42", 1350.0f);
+    Rows rows;
+    if (mfsk_jt9_decode_at(audio.data(), audio.size(), 12000, 1350.0f,
+                           rows.items, 16, &rows.len) != MFSK_STATUS_OK) {
         fail("JT9", mfsk_last_error());
         return;
     }
-    MfskDecoder* dec = mfsk_decoder_new(MFSK_PROTOCOL_JT9);
-    MfskResultList list{};
-    const MfskStatus st = mfsk_decode_f32(dec, pcm.samples, pcm.len, 12000, nullptr, &list);
-    if (st != MFSK_STATUS_OK) {
-        fail("JT9", mfsk_last_error() ? mfsk_last_error() : "decode_f32 failed");
-    } else {
-        print_decodes("JT9", list);
-        if (!any_contains(list, "K1ABC") || !any_contains(list, "FN42")) {
-            fail("JT9", "expected callsign / grid not recovered");
-        }
-    }
-    mfsk_result_list_free(&list);
-    mfsk_decoder_free(dec);
-    mfsk_samples_free(&pcm);
+    print_rows("JT9", rows);
+    if (!rows.contains("K1ABC")) fail("JT9", "expected K1ABC");
 }
 
-// ── FST4-60A ─────────────────────────────────────────────────────────
-// Gated behind the RUN_FST4_ROUNDTRIP environment variable because the
-// 60-s slot + outer 786 432-pt FFT makes this multi-second and not
-// every developer wants to wait on it every build.
-void test_fst4() {
-    if (!std::getenv("RUN_FST4_ROUNDTRIP")) {
-        std::printf("— FST4-60A roundtrip: skipped (set RUN_FST4_ROUNDTRIP=1)\n");
-        return;
-    }
-    std::printf("— FST4-60A roundtrip: encode 'CQ JA1ABC PM95' at 1500 Hz → decode\n");
-    MfskSamples pcm{};
-    if (mfsk_encode_fst4s60("CQ", "JA1ABC", "PM95", 1500.0f, &pcm) != MFSK_STATUS_OK) {
-        fail("FST4", mfsk_last_error());
-        return;
-    }
-    // Pad up to a full 60-s slot with 1 s of leading silence so the
-    // outer FFT has the window decode_frame expects.
-    constexpr size_t kSlot = 60 * 12000;
-    std::vector<float> slot(kSlot, 0.0f);
-    const size_t offset = 12000;
-    const size_t copy_len = std::min(pcm.len, kSlot - offset);
-    std::memcpy(slot.data() + offset, pcm.samples, copy_len * sizeof(float));
-
-    MfskDecoder* dec = mfsk_decoder_new(MFSK_PROTOCOL_FST4S60);
-    MfskResultList list{};
-    const MfskStatus st = mfsk_decode_f32(dec, slot.data(), slot.size(), 12000, nullptr, &list);
-    if (st != MFSK_STATUS_OK) {
-        fail("FST4", mfsk_last_error() ? mfsk_last_error() : "decode_f32 failed");
-    } else {
-        print_decodes("FST4", list);
-        if (!any_contains(list, "JA1ABC") || !any_contains(list, "PM95")) {
-            fail("FST4", "expected callsign / grid not recovered");
-        }
-    }
-    mfsk_result_list_free(&list);
-    mfsk_decoder_free(dec);
-    mfsk_samples_free(&pcm);
-}
-
-// ── JT65 ─────────────────────────────────────────────────────────────
 void test_jt65() {
-    std::printf("— JT65 roundtrip: encode 'CQ K1ABC FN42' at 1270 Hz → decode\n");
-    MfskSamples pcm{};
-    if (mfsk_encode_jt65("CQ", "K1ABC", "FN42", 1270.0f, &pcm) != MFSK_STATUS_OK) {
+    std::printf("\n— JT65: point decode at 1270 Hz\n");
+    std::vector<int16_t> audio = encode_i16(mfsk_encode_jt65, "CQ", "K1ABC", "FN42", 1270.0f);
+    Rows rows;
+    if (mfsk_jt65_decode_at(audio.data(), audio.size(), 12000, 1270.0f,
+                            rows.items, 16, &rows.len) != MFSK_STATUS_OK) {
         fail("JT65", mfsk_last_error());
         return;
     }
-    MfskDecoder* dec = mfsk_decoder_new(MFSK_PROTOCOL_JT65);
-    MfskResultList list{};
-    const MfskStatus st = mfsk_decode_f32(dec, pcm.samples, pcm.len, 12000, nullptr, &list);
-    if (st != MFSK_STATUS_OK) {
-        fail("JT65", mfsk_last_error() ? mfsk_last_error() : "decode_f32 failed");
+    print_rows("JT65", rows);
+    if (!rows.contains("K1ABC")) fail("JT65", "expected K1ABC");
+}
+
+// ── Streaming delivery ──────────────────────────────────────────────
+//
+// A real C callback invoked from actual C++-compiled code, through the
+// generated header — the one thing `tests/streaming_ffi.rs` cannot
+// exercise, since it calls the same crate's functions directly and
+// never crosses a compiler/ABI boundary the way a separate translation
+// unit does.
+
+extern "C" void streaming_collect(const MfskDecode* row, void* user_data) {
+    auto* out = static_cast<std::vector<std::string>*>(user_data);
+    if (row != nullptr) out->emplace_back(row->text);
+}
+
+void test_ft8_streaming() {
+    std::printf("\n— streaming: mfsk_session_set_on_decode fires as decodes are found\n");
+    std::vector<int16_t> audio =
+        encode_i16(mfsk_encode_ft8, "CQ", "JA1ABC", "PM95", 1650.0f);
+
+    MfskStatus st = MFSK_STATUS_INTERNAL;
+    MfskDecodeSession* s = mfsk_session_open(MFSK_MODE_FT8, nullptr, &st);
+    if (s == nullptr) { fail("streaming", mfsk_last_error()); return; }
+
+    std::vector<std::string> streamed;
+    if (mfsk_session_set_on_decode(s, streaming_collect, &streamed) != MFSK_STATUS_OK) {
+        fail("streaming", "set_on_decode failed");
+    }
+
+    Rows rows;
+    if (mfsk_session_decode_i16(s, audio.data(), audio.size(), 12000, nullptr,
+                                rows.items, 16, &rows.len) != MFSK_STATUS_OK) {
+        fail("streaming", mfsk_session_last_error(s));
     } else {
-        print_decodes("JT65", list);
-        if (!any_contains(list, "K1ABC") || !any_contains(list, "FN42")) {
-            fail("JT65", "expected callsign / grid not recovered");
+        print_rows("FT8 streaming", rows);
+        std::printf("  streamed via callback: %zu\n", streamed.size());
+        if (streamed.empty()) fail("streaming", "the callback never fired");
+        if (!rows.contains("JA1ABC")) fail("streaming", "expected JA1ABC");
+        if (streamed.size() != rows.len) {
+            fail("streaming", "streamed count should match the array for one clean candidate");
         }
     }
-    mfsk_result_list_free(&list);
-    mfsk_decoder_free(dec);
-    mfsk_samples_free(&pcm);
+    mfsk_session_close(s);
 }
 
-// ── Multi-thread stress ─────────────────────────────────────────────
+// ── Every parameter reaches the decoder ─────────────────────────────
 //
-// The C API documents `MfskDecoder` as "not Sync — one handle per
-// thread". These tests back that up with a real multi-threaded
-// driver to catch any accidental shared mutable state in the Rust
-// backends (thread_local slots, global FFT planners, etc.) that
-// would break under concurrent use.
-void test_threads_one_handle_per_thread() {
-    std::printf("— threads × 1 handle each: 8 parallel FT8 decodes\n");
-    constexpr int kThreads = 8;
-    std::atomic<int> ok_count{0};
-    std::atomic<int> fail_count{0};
-    std::vector<std::thread> ts;
-    for (int t = 0; t < kThreads; ++t) {
-        ts.emplace_back([&ok_count, &fail_count, t]() {
-            MfskSamples pcm{};
-            if (mfsk_encode_ft8("CQ", "JA1ABC", "PM95", 1500.0f + t * 20.0f, &pcm) != MFSK_STATUS_OK) {
-                fail_count++;
-                return;
-            }
-            MfskDecoder* dec = mfsk_decoder_new(MFSK_PROTOCOL_FT8);
-            MfskResultList list{};
-            const MfskStatus st = mfsk_decode_f32(dec, pcm.samples, pcm.len, 12000, nullptr, &list);
-            bool ok = (st == MFSK_STATUS_OK) && any_contains(list, "JA1ABC");
-            if (ok) ok_count++; else fail_count++;
-            mfsk_result_list_free(&list);
-            mfsk_decoder_free(dec);
-            mfsk_samples_free(&pcm);
-        });
+// The pre-v2 ABI accepted eleven options and silently dropped six of
+// them depending on protocol, and silently *upgraded* a seventh. This
+// drives each field and checks the decode survives, then checks that a
+// per-call override applies to that call and does not stick.
+
+void test_params() {
+    std::printf("\n— params: strictness / eq_mode / freq_hint / sic / ap all reach the decoder\n");
+    std::vector<int16_t> audio =
+        encode_i16(mfsk_encode_ft8, "CQ", "JA1ABC", "PM95", 1500.0f);
+
+    MfskDecodeParams p = defaults_for(MFSK_MODE_FT8);
+    p.strictness   = MFSK_STRICTNESS_DEEP;
+    p.eq_mode      = MFSK_EQ_MODE_LOCAL;
+    p.freq_hint_hz = 1500.0f;
+    p.sic_rounds   = 2;
+    p.has_ap_hint  = true;
+    std::snprintf(p.ap_call1, MFSK_AP_FIELD_LEN, "%s", "JA1ABC");
+    std::snprintf(p.ap_call2, MFSK_AP_FIELD_LEN, "%s", "CQ");
+
+    MfskStatus st = MFSK_STATUS_INTERNAL;
+    MfskDecodeSession* s = mfsk_session_open(MFSK_MODE_FT8, &p, &st);
+    if (s == nullptr) { fail("params", mfsk_last_error()); return; }
+
+    Rows rows;
+    if (mfsk_session_decode_i16(s, audio.data(), audio.size(), 12000, nullptr,
+                                rows.items, 16, &rows.len) != MFSK_STATUS_OK) {
+        fail("params", mfsk_session_last_error(s));
+    } else {
+        print_rows("params", rows);
+        if (!rows.contains("JA1ABC")) fail("params", "every option on lost the signal");
     }
-    for (auto& th : ts) th.join();
-    std::printf("  → %d/%d OK, %d fail\n",
-                ok_count.load(), kThreads, fail_count.load());
-    if (ok_count.load() != kThreads) {
-        fail("threads", "one-handle-per-thread concurrent decode failed");
+
+    MfskDecodeParams narrow = p;
+    narrow.freq_min_hz  = 2500.0f;
+    narrow.freq_max_hz  = 2900.0f;
+    narrow.freq_hint_hz = 2700.0f;
+    Rows away;
+    mfsk_session_decode_i16(s, audio.data(), audio.size(), 12000, &narrow,
+                            away.items, 16, &away.len);
+    Rows back;
+    mfsk_session_decode_i16(s, audio.data(), audio.size(), 12000, nullptr,
+                            back.items, 16, &back.len);
+    if (away.contains("JA1ABC")) {
+        fail("params", "a 2500-2900 Hz override still found a 1500 Hz signal");
+    }
+    if (!back.contains("JA1ABC")) {
+        fail("params", "the per-call override leaked into the next call");
+    }
+    std::printf("  per-call override applied and did not stick\n");
+    mfsk_session_close(s);
+}
+
+// ── The narrow-band search ──────────────────────────────────────────
+
+void test_sniper() {
+    std::printf("\n— narrow-band search: FT8 only; FT4 refuses and gets AP wide-band instead\n");
+
+    std::vector<int16_t> ft8 = encode_i16(mfsk_encode_ft8, "CQ", "JA1ABC", "PM95", 1500.0f);
+    MfskDecodeParams p = defaults_for(MFSK_MODE_FT8);
+    p.freq_hint_hz = 1500.0f;
+    p.search_hz    = 250.0f;
+    MfskStatus st = MFSK_STATUS_INTERNAL;
+    MfskDecodeSession* s = mfsk_session_open(MFSK_MODE_FT8, &p, &st);
+    if (s == nullptr) {
+        fail("sniper", mfsk_last_error());
+    } else {
+        Rows rows;
+        if (mfsk_session_decode_i16(s, ft8.data(), ft8.size(), 12000, nullptr,
+                                    rows.items, 16, &rows.len) != MFSK_STATUS_OK) {
+            fail("sniper", mfsk_session_last_error(s));
+        } else {
+            print_rows("FT8 narrow", rows);
+            if (!rows.contains("JA1ABC")) fail("sniper", "aimed at it and missed");
+        }
+        mfsk_session_close(s);
+    }
+
+    // FT4 refuses: the sniper is the receive half of narrowing an
+    // analogue roofing filter, which a contest protocol has no use for.
+    MfskDecodeParams q = defaults_for(MFSK_MODE_FT4);
+    q.freq_hint_hz = 1200.0f;
+    q.search_hz    = 250.0f;
+    MfskStatus qst = MFSK_STATUS_OK;
+    if (mfsk_session_open(MFSK_MODE_FT4, &q, &qst) != nullptr ||
+        qst != MFSK_STATUS_UNSUPPORTED) {
+        fail("sniper", "FT4 should refuse a narrow-band search");
+    } else {
+        std::printf("  FT4 refused: %s\n", mfsk_last_error());
+    }
+
+    // And the AP hint the sniper looked like it was *for* reaches FT4
+    // anyway, through the ordinary wide-band decode. That coupling was
+    // an accident; this is the line that says it is over.
+    std::vector<int16_t> ft4 = encode_i16(mfsk_encode_ft4, "CQ", "JA1ABC", "PM95", 1200.0f);
+    MfskDecodeParams w = defaults_for(MFSK_MODE_FT4);
+    w.has_ap_hint = true;
+    std::snprintf(w.ap_call1, MFSK_AP_FIELD_LEN, "%s", "JA1ABC");
+    std::snprintf(w.ap_call2, MFSK_AP_FIELD_LEN, "%s", "CQ");
+    MfskDecodeSession* fs = mfsk_session_open(MFSK_MODE_FT4, &w, &st);
+    if (fs == nullptr) {
+        fail("sniper", mfsk_last_error());
+    } else {
+        Rows rows;
+        if (mfsk_session_decode_i16(fs, ft4.data(), ft4.size(), 12000, nullptr,
+                                    rows.items, 16, &rows.len) != MFSK_STATUS_OK) {
+            fail("sniper", mfsk_session_last_error(fs));
+        } else {
+            print_rows("FT4 wide-band + AP", rows);
+            if (!rows.contains("JA1ABC")) fail("sniper", "AP did not reach FT4");
+        }
+        mfsk_session_close(fs);
     }
 }
 
-// Even stronger: one handle shared across threads. Spec says "not
-// Sync"; this test verifies the *current* implementation in fact
-// stays sound under sharing (no internal mutable state on DecoderInner).
-// If this ever starts failing, tighten the spec AND fix the cause.
-void test_threads_shared_handle() {
-    std::printf("— threads × 1 shared handle: 8 parallel FT8 decodes\n");
+// ── Threading ───────────────────────────────────────────────────────
+//
+// **A session is single-threaded**, and that is a deliberate change.
+// The pre-v2 handle carried one `protocol` field, so sharing it across
+// threads was harmless; a session owns a callsign hash table it mutates
+// on every decode plus the previous slot's rows, so sharing one would
+// be a data race. The supported shape is one session per thread.
+
+void test_threads_one_session_per_thread() {
+    std::printf("\n— threads × 1 session each: 8 parallel FT8 decodes\n");
     constexpr int kThreads = 8;
     std::atomic<int> ok_count{0};
-    std::atomic<int> fail_count{0};
-    MfskDecoder* shared = mfsk_decoder_new(MFSK_PROTOCOL_FT8);
     std::vector<std::thread> ts;
     for (int t = 0; t < kThreads; ++t) {
-        ts.emplace_back([shared, &ok_count, &fail_count, t]() {
-            MfskSamples pcm{};
-            if (mfsk_encode_ft8("CQ", "K1ABC", "FN42", 1500.0f + t * 20.0f, &pcm) != MFSK_STATUS_OK) {
-                fail_count++;
-                return;
-            }
-            MfskResultList list{};
-            const MfskStatus st = mfsk_decode_f32(shared, pcm.samples, pcm.len, 12000, nullptr, &list);
-            bool ok = (st == MFSK_STATUS_OK) && any_contains(list, "K1ABC");
-            if (ok) ok_count++; else fail_count++;
-            mfsk_result_list_free(&list);
-            mfsk_samples_free(&pcm);
+        ts.emplace_back([&ok_count, t]() {
+            std::vector<int16_t> audio =
+                encode_i16(mfsk_encode_ft8, "CQ", "JA1ABC", "PM95", 1500.0f + t * 20.0f);
+            MfskStatus st = MFSK_STATUS_INTERNAL;
+            MfskDecodeSession* s = mfsk_session_open(MFSK_MODE_FT8, nullptr, &st);
+            if (s == nullptr) return;
+            Rows rows;
+            const MfskStatus dst = mfsk_session_decode_i16(
+                s, audio.data(), audio.size(), 12000, nullptr,
+                rows.items, 16, &rows.len);
+            if (dst == MFSK_STATUS_OK && rows.contains("JA1ABC")) ok_count++;
+            mfsk_session_close(s);
         });
     }
     for (auto& th : ts) th.join();
-    mfsk_decoder_free(shared);
-    std::printf("  → %d/%d OK, %d fail\n",
-                ok_count.load(), kThreads, fail_count.load());
+    std::printf("  → %d/%d OK\n", ok_count.load(), kThreads);
     if (ok_count.load() != kThreads) {
-        fail("threads-shared", "shared-handle concurrent decode failed");
+        fail("threads", "one-session-per-thread concurrent decode failed");
     }
 }
 
-// Mixed-protocol threads: ensures per-thread thread_local state
-// (like mfsk_last_error) in the Rust side doesn't cross-contaminate.
-void test_threads_mixed_protocols() {
-    std::printf("— threads × mixed protocols (FT8 + FT4 + WSPR concurrently)\n");
+void test_threads_mixed_modes() {
+    std::printf("\n— threads × mixed modes (FT8 + FT4 concurrently)\n");
     std::atomic<int> ok_count{0};
-    std::atomic<int> fail_count{0};
-    auto run_proto = [&](MfskProtocol proto, auto encode_fn, const char* needle) {
-        MfskSamples pcm{};
-        if (encode_fn(&pcm) != MFSK_STATUS_OK) { fail_count++; return; }
-        MfskDecoder* dec = mfsk_decoder_new(proto);
-        MfskResultList list{};
-        const MfskStatus st = mfsk_decode_f32(dec, pcm.samples, pcm.len, 12000, nullptr, &list);
-        if (st == MFSK_STATUS_OK && any_contains(list, needle)) ok_count++;
-        else fail_count++;
-        mfsk_result_list_free(&list);
-        mfsk_decoder_free(dec);
-        mfsk_samples_free(&pcm);
+    std::vector<std::thread> ts;
+    const struct { MfskMode mode; Encoder enc; } work[] = {
+        {MFSK_MODE_FT8, mfsk_encode_ft8},
+        {MFSK_MODE_FT4, mfsk_encode_ft4},
+        {MFSK_MODE_FT8, mfsk_encode_ft8},
+        {MFSK_MODE_FT4, mfsk_encode_ft4},
     };
-    std::thread t_ft8([&] {
-        run_proto(MFSK_PROTOCOL_FT8,
-                  [](MfskSamples* p) { return mfsk_encode_ft8("CQ", "JA1ABC", "PM95", 1500.0f, p); },
-                  "JA1ABC");
-    });
-    std::thread t_ft4([&] {
-        run_proto(MFSK_PROTOCOL_FT4,
-                  [](MfskSamples* p) { return mfsk_encode_ft4("CQ", "W1AW", "FN31", 1500.0f, p); },
-                  "W1AW");
-    });
-    std::thread t_wspr([&] {
-        run_proto(MFSK_PROTOCOL_WSPR,
-                  [](MfskSamples* p) { return mfsk_encode_wspr("K1ABC", "FN42", 37, 1500.0f, p); },
-                  "K1ABC");
-    });
-    t_ft8.join();
-    t_ft4.join();
-    t_wspr.join();
-    std::printf("  → %d/3 OK, %d fail\n", ok_count.load(), fail_count.load());
-    if (ok_count.load() != 3) {
-        fail("threads-mixed", "mixed-protocol concurrent decode failed");
+    constexpr int kJobs = 4;
+    for (const auto& w : work) {
+        ts.emplace_back([&ok_count, w]() {
+            std::vector<int16_t> audio =
+                encode_i16(w.enc, "CQ", "JA1ABC", "PM95", 1500.0f);
+            MfskStatus st = MFSK_STATUS_INTERNAL;
+            MfskDecodeSession* s = mfsk_session_open(w.mode, nullptr, &st);
+            if (s == nullptr) return;
+            Rows rows;
+            const MfskStatus dst = mfsk_session_decode_i16(
+                s, audio.data(), audio.size(), 12000, nullptr,
+                rows.items, 16, &rows.len);
+            if (dst == MFSK_STATUS_OK && rows.contains("JA1ABC")) ok_count++;
+            mfsk_session_close(s);
+        });
+    }
+    for (auto& th : ts) th.join();
+    std::printf("  → %d/%d OK\n", ok_count.load(), kJobs);
+    if (ok_count.load() != kJobs) {
+        fail("threads", "mixed-mode concurrent decode failed");
     }
 }
 
-// ── Negative paths ──────────────────────────────────────────────────
+// ── NULL / invalid-arg handling ─────────────────────────────────────
+
 void test_null_handling() {
-    std::printf("— NULL / invalid-arg handling\n");
-    // NULL decoder
-    MfskResultList list{};
-    MfskStatus st = mfsk_decode_f32(nullptr, nullptr, 0, 12000, nullptr, &list);
-    if (st != MFSK_STATUS_INVALID_ARG) {
-        fail("null", "expected INVALID_ARG for null decoder");
+    std::printf("\n— NULL / invalid-arg handling\n");
+    size_t n = 0;
+
+    if (mfsk_decode_params_init(MFSK_MODE_FT8, nullptr) != MFSK_STATUS_INVALID_ARG) {
+        fail("null", "params_init(NULL) should be INVALID_ARG");
     }
-    // Free NULL pointers — must not crash.
-    mfsk_decoder_free(nullptr);
-    mfsk_result_list_free(nullptr);
+    if (mfsk_session_decode_i16(nullptr, nullptr, 0, 12000, nullptr,
+                                nullptr, 0, &n) != MFSK_STATUS_INVALID_ARG) {
+        fail("null", "decode with a NULL session should be INVALID_ARG");
+    }
+    if (mfsk_session_copy_info(nullptr, 0, nullptr, 0, &n) != MFSK_STATUS_INVALID_ARG) {
+        fail("null", "copy_info with a NULL session should be INVALID_ARG");
+    }
+    if (mfsk_session_add_callsign(nullptr, nullptr) != MFSK_STATUS_INVALID_ARG) {
+        fail("null", "add_callsign with a NULL session should be INVALID_ARG");
+    }
+    if (mfsk_session_last_error(nullptr) != nullptr) {
+        fail("null", "last_error(NULL) should be NULL");
+    }
+    if (mfsk_wspr_decode(nullptr, 0, 12000, nullptr, 0, &n) != MFSK_STATUS_INVALID_ARG) {
+        fail("null", "wspr_decode(NULL) should be INVALID_ARG");
+    }
+    // An out-of-range mode value: a C caller can put any integer in an
+    // enum parameter, and the boundary must validate rather than match
+    // it as a Rust enum. This exact call used to segfault.
+    if (mfsk_mode_name(9999u) != nullptr) {
+        fail("null", "an unknown mode should have no name");
+    }
+    if (mfsk_mode_caps(9999u) != 0) {
+        fail("null", "an unknown mode should claim no capabilities");
+    }
+    MfskModeInfo bogus;
+    std::memset(&bogus, 0, sizeof bogus);
+    bogus.size = sizeof bogus;
+    if (mfsk_mode_info(9999u, &bogus) != MFSK_STATUS_INVALID_ARG) {
+        fail("null", "mode_info on a bogus mode should be INVALID_ARG");
+    }
+    MfskStatus bst = MFSK_STATUS_OK;
+    if (mfsk_session_open(9999u, nullptr, &bst) != nullptr ||
+        bst != MFSK_STATUS_INVALID_ARG) {
+        fail("null", "session_open on a bogus mode should be INVALID_ARG");
+    }
+    if (mfsk_q65_decode(9999u, nullptr, 0, 12000, nullptr, nullptr, 0, &n)
+            != MFSK_STATUS_INVALID_ARG) {
+        fail("null", "q65_decode with a bogus sub-mode should be INVALID_ARG");
+    }
+
+    MfskSamples pcm{};
+    if (mfsk_encode_ft8("XXX", "Y2Z", "FN42", 1500.0f, &pcm) != MFSK_STATUS_INVALID_ARG) {
+        fail("null", "an unpackable callsign should fail rather than emit garbage");
+    }
+
+    // Freeing null is a no-op, not a crash.
+    mfsk_session_close(nullptr);
     mfsk_samples_free(nullptr);
-    // Unknown callsign at encode time → InvalidArg + meaningful error.
-    MfskSamples bogus{};
-    st = mfsk_encode_ft8("XXX", "Y2Z", "FN42", 1500.0f, &bogus);
-    if (st == MFSK_STATUS_OK) {
-        fail("null", "expected pack77 failure for bogus callsigns");
-        mfsk_samples_free(&bogus);
-    }
+    std::printf("  OK\n");
 }
 
-} // namespace
+}  // namespace
 
 int main() {
     const uint32_t ver = mfsk_version();
-    std::printf("mfsk-ffi version: %u.%u.%u\n",
-                (ver >> 16) & 0xff,
-                (ver >> 8) & 0xff,
-                ver & 0xff);
+    std::printf("mfsk-ffi version: %u.%u.%u (ABI %u)\n",
+                (ver >> 16) & 0xff, (ver >> 8) & 0xff, ver & 0xff,
+                mfsk_abi_version());
 
     test_mode_introspection();
     test_session_decode();
     test_ft8();
     test_ft8_streaming();
-    test_builder_options();
+    test_params();
     test_sniper();
     test_ft4();
     test_fst4();
     test_wspr();
     test_jt9();
     test_jt65();
-    test_threads_one_handle_per_thread();
-    test_threads_shared_handle();
-    test_threads_mixed_protocols();
+    test_threads_one_session_per_thread();
+    test_threads_mixed_modes();
     test_null_handling();
 
     if (g_failures == 0) {
