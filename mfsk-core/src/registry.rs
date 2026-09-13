@@ -21,7 +21,7 @@
 //! `protocol_meta!` macro:
 //!
 //! ```text
-//! protocol_meta!("Pretty-Name", MyProtocolZst),
+//! protocol_meta!("Pretty-Name", MyProtocolZst, MY_PROFILE),
 //! ```
 //!
 //! `tests/protocol_invariants.rs` cross-checks every registry entry
@@ -54,6 +54,120 @@
 use crate::{FecCodec, FrameLayout, MessageCodec, ModulationParams, Protocol};
 
 use crate::ProtocolId;
+
+/// What a protocol's decode API can actually be asked to do.
+///
+/// The registry has always described *geometry* — tones, symbol rate,
+/// FEC widths. It has never described **capability**, and a consumer
+/// that cannot see the difference between "this build has FST4-120" and
+/// "FST4 has no SIC at all" ends up hardcoding the matrix. The C ABI
+/// needs to publish it, and hardcoding it there would guarantee it
+/// drifts, so it is declared here beside the geometry and cross-checked
+/// against the real trait impls by `tests/registry_caps.rs` — in both
+/// directions: a bit claimed without the trait fails, and a trait
+/// implemented without the bit fails too.
+///
+/// A plain `u32` of bits rather than a `bitflags` dependency: this has
+/// to cross a C boundary unchanged, and `no_std` builds carry it too.
+pub mod caps {
+    /// Drives the `DecodeRequest`/`SniperRequest` builder pair (the
+    /// `FrameDecodable` trait). Protocols without this bit decode
+    /// through their own entry point — Q65 takes search parameters and
+    /// reports a start sample rather than a `dt`; WSPR/JT9/JT65 have no
+    /// builder at all. They are not lesser, they are shaped differently.
+    pub const DECODE_HANDLE: u32 = 1 << 0;
+    /// Narrow-band single-target search (`SniperRequest`).
+    pub const SNIPER: u32 = 1 << 1;
+    /// A-priori hint on the narrow-band search (`SniperRequest::ap_hint`).
+    pub const AP_NARROW: u32 = 1 << 2;
+    /// A-priori hint on the *wide-band* search (`SupportsWideBandAp`).
+    /// FT8 only, and deliberately: the shared AP engine early-exits
+    /// after the first hit, which is only correct when hunting one
+    /// target (`msg::pipeline_ap`).
+    pub const AP_WIDEBAND: u32 = 1 << 3;
+    /// Flat successive-interference cancellation (`SupportsSicRounds`).
+    pub const SIC_ROUNDS: u32 = 1 << 4;
+    /// Checkpoint-emulation early decode (`SupportsSicEarly`). FT8 only;
+    /// WSJT-X has no equivalent checkpoint architecture elsewhere.
+    pub const SIC_EARLY: u32 = 1 << 5;
+    /// `.osd(bool)` is honoured. Note this is about the *switch*: FT4
+    /// and FST4 run OSD by default through the shared pipeline, so the
+    /// capability being absent would mean "cannot turn it off", not
+    /// "does not have it".
+    pub const OSD: u32 = 1 << 6;
+    /// `.eq_mode()` reaches the decoder.
+    pub const EQ_MODE: u32 = 1 << 7;
+    /// `.strictness()` changes an acceptance threshold that the
+    /// protocol's non-AP path actually reads. FST4 does not have this:
+    /// its OSD hard-error ceiling is bypassed to match WSJT-X's own
+    /// `fst4_decode.f90`, which has no such gate.
+    pub const STRICTNESS: u32 = 1 << 8;
+    /// `.budget()` — the caller-supplied wall-clock predicate.
+    pub const BUDGET: u32 = 1 << 9;
+    /// `.known()` is honoured as a post-filter: already-decoded
+    /// messages are not re-reported, but the work of re-decoding them
+    /// is still done.
+    pub const KNOWN_FILTER: u32 = 1 << 10;
+    /// `.known()` reaches the engine: known signals are subtracted from
+    /// the audio, so they stop masking weaker ones. Strictly stronger
+    /// than [`KNOWN_FILTER`], and implies it.
+    pub const KNOWN_SUBTRACT: u32 = 1 << 11;
+    /// `.fft_cache()` round-trips, so a second decode of the *same*
+    /// slot skips rebuilding the forward transform.
+    pub const FFT_CACHE: u32 = 1 << 12;
+    /// `.on_result()` streaming delivery.
+    pub const ON_RESULT: u32 = 1 << 13;
+    /// A synthesiser exists: message bits in, audio out.
+    pub const ENCODE: u32 = 1 << 14;
+}
+
+/// How to read a protocol's `sync_min`, because the three scales are
+/// not the same number.
+///
+/// This exists because the single worst trap in the current C ABI is
+/// three per-protocol `sync_min` defaults sitting in one function with
+/// nothing saying they are incomparable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SyncScale {
+    /// Absolute Costas correlation score. Noise has no fixed value, so
+    /// a threshold here is empirical. FT8, FST4.
+    CostasAbsolute = 0,
+    /// The smoothed spectrum is divided by a fitted baseline before
+    /// scoring, so **noise sits at ~1.0 by construction** and any
+    /// threshold below that admits every peak in the band. FT4 — and
+    /// this is why WSJT-X's own `syncmin = 1.2` (`ft4_decode.f90:195`)
+    /// is a floor rather than a knob.
+    BaselineNormalised = 1,
+}
+
+/// The search parameters a caller gets if it does not supply its own.
+///
+/// There is no default anywhere in the library today — `sync_min`,
+/// `max_cand` and the band are positional arguments of
+/// `DecodeRequest::new`, so every caller invents them and the C ABI
+/// invented three different sets. These are this crate's own
+/// host-configuration values, with the provenance recorded per entry.
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeDefaults {
+    pub freq_min_hz: f32,
+    pub freq_max_hz: f32,
+    pub sync_min: f32,
+    pub max_cand: u32,
+}
+
+/// Capability and default-search description for one registry entry.
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeProfile {
+    /// Bitwise OR of [`caps`] constants.
+    pub caps: u32,
+    pub defaults: DecodeDefaults,
+    pub sync_scale: SyncScale,
+    /// Upper bound the sniper path silently applies to `max_cand`, or
+    /// `None` where there is none. FT4 clamps to 15 and says so
+    /// nowhere a caller can see (`ft4::decode`).
+    pub sniper_max_cand_cap: Option<u32>,
+}
 
 /// Compile-time metadata describing one wired protocol.
 ///
@@ -99,6 +213,18 @@ pub struct ProtocolMeta {
     pub fec_n: usize,
     /// Message-codec payload width — `MessageCodec::PAYLOAD_BITS`.
     pub payload_bits: u32,
+    /// Seconds from the start of the slot buffer to the first frame
+    /// symbol — the `dt = 0` reference (`FrameLayout::TX_START_OFFSET_S`).
+    /// 0.5 for FT8, FT4 and FST4-15; 1.0 for the other FST4 sub-modes.
+    /// A host that synthesises a slot has to know this and could not
+    /// ask for it.
+    pub tx_start_offset_s: f32,
+    /// Slot length in samples at the 12 kHz working rate — `t_slot_s`
+    /// made exact, so a caller sizes a buffer without repeating the
+    /// multiply. FT4 90 000, FT8 180 000, FST4-300 3 600 000.
+    pub slot_samples_12k: u32,
+    /// What the decode API can be asked to do, and what it defaults to.
+    pub profile: DecodeProfile,
 }
 
 /// Build a [`ProtocolMeta`] from a `Protocol`-impl ZST `$ty` plus a
@@ -110,7 +236,7 @@ pub struct ProtocolMeta {
 #[allow(unused_macros)] // dead under --no-default-features when every
 // protocol-feature gate evaluates to false.
 macro_rules! protocol_meta {
-    ($name:literal, $ty:ty) => {
+    ($name:literal, $ty:ty, $profile:expr) => {
         ProtocolMeta {
             id: <$ty as Protocol>::ID,
             name: $name,
@@ -128,9 +254,181 @@ macro_rules! protocol_meta {
             fec_k: <<$ty as Protocol>::Fec as FecCodec>::K,
             fec_n: <<$ty as Protocol>::Fec as FecCodec>::N,
             payload_bits: <<$ty as Protocol>::Msg as MessageCodec>::PAYLOAD_BITS,
+            tx_start_offset_s: <$ty as FrameLayout>::TX_START_OFFSET_S,
+            slot_samples_12k: (<$ty as FrameLayout>::T_SLOT_S * 12_000.0) as u32,
+            profile: $profile,
         }
     };
 }
+
+/// FT8. Everything the builder offers.
+///
+/// Defaults are this crate's own host research configuration — the one
+/// `tests/ft8_qso3_full_parity_recall.rs` and `tests/ft8_sweep.rs` drive,
+/// which reaches the full 20-entry golden set. Deliberately *not* the
+/// C ABI's historical `sync_min = 2.0`, a pre-0.8.0 value no test in the
+/// tree uses, nor the embedded ship config (1.0 / 15), which is tuned
+/// for an ESP32's power budget rather than a desktop's recall.
+///
+/// Real `jt9` varies its own threshold by depth (1.6 for `-d1`/`-d2`,
+/// 1.3 for `-d3` — `ft8_decode.f90:176-177`), so there is no single
+/// upstream number to copy here the way there is for FT4.
+#[allow(dead_code)] // unused when the matching protocol feature is off
+const FT8_PROFILE: DecodeProfile = DecodeProfile {
+    caps: caps::DECODE_HANDLE
+        | caps::SNIPER
+        | caps::AP_NARROW
+        | caps::AP_WIDEBAND
+        | caps::SIC_ROUNDS
+        | caps::SIC_EARLY
+        | caps::OSD
+        | caps::EQ_MODE
+        | caps::STRICTNESS
+        | caps::BUDGET
+        | caps::KNOWN_FILTER
+        | caps::KNOWN_SUBTRACT
+        | caps::FFT_CACHE
+        | caps::ON_RESULT
+        | caps::ENCODE,
+    defaults: DecodeDefaults {
+        freq_min_hz: 100.0,
+        freq_max_hz: 3000.0,
+        sync_min: 0.8,
+        max_cand: 60,
+    },
+    sync_scale: SyncScale::CostasAbsolute,
+    sniper_max_cand_cap: None,
+};
+
+/// FT4. No checkpoint SIC (no upstream equivalent to port), no
+/// wide-band AP (the shared AP engine early-exits after the first hit).
+///
+/// `sync_min = 1.2` is **WSJT-X's own** (`ft4_decode.f90:195`), and on
+/// FT4's baseline-normalised scale it is a floor rather than a
+/// preference: noise sits at 1.0 by construction, so anything lower
+/// admits every peak in the band. Measured on 560 sweep files, 0.05 vs
+/// 1.2 costs 2.6×-42× the candidates for identical recall
+/// (`tests/ft4_candidate_budget.rs`). `max_cand = 100` mirrors
+/// `getcandidates4.f90`'s `MAXCAND`.
+#[allow(dead_code)]
+const FT4_PROFILE: DecodeProfile = DecodeProfile {
+    caps: caps::DECODE_HANDLE
+        | caps::SNIPER
+        | caps::AP_NARROW
+        | caps::SIC_ROUNDS
+        | caps::OSD
+        | caps::EQ_MODE
+        | caps::STRICTNESS
+        | caps::BUDGET
+        | caps::KNOWN_FILTER
+        | caps::FFT_CACHE
+        | caps::ON_RESULT
+        | caps::ENCODE,
+    defaults: DecodeDefaults {
+        freq_min_hz: 300.0,
+        freq_max_hz: 2700.0,
+        sync_min: 1.2,
+        max_cand: 100,
+    },
+    sync_scale: SyncScale::BaselineNormalised,
+    sniper_max_cand_cap: Some(15),
+};
+
+/// Every FST4 sub-mode. No SIC of either kind — WSJT-X's own
+/// `fst4_decode.f90` has no subtract path at all, because FST4 targets
+/// point-to-point links rather than crowded shared bands. No
+/// `STRICTNESS` either: the OSD hard-error ceiling is deliberately
+/// bypassed for FST4 to match upstream, whose only acceptance test is
+/// the CRC-24 (`engine::pipeline`).
+///
+/// `0.8 / 50` are the values this crate's own FST4 tests and the
+/// embedded wideband monitor both call the production configuration.
+#[allow(dead_code)]
+const FST4_PROFILE: DecodeProfile = DecodeProfile {
+    caps: caps::DECODE_HANDLE
+        | caps::SNIPER
+        | caps::AP_NARROW
+        | caps::OSD
+        | caps::EQ_MODE
+        | caps::BUDGET
+        | caps::KNOWN_FILTER
+        | caps::FFT_CACHE
+        | caps::ON_RESULT
+        | caps::ENCODE,
+    defaults: DecodeDefaults {
+        freq_min_hz: 100.0,
+        freq_max_hz: 3000.0,
+        sync_min: 0.8,
+        max_cand: 50,
+    },
+    sync_scale: SyncScale::CostasAbsolute,
+    sniper_max_cand_cap: None,
+};
+
+/// Q65. Not `FrameDecodable`: its own builder family takes search
+/// parameters with a time tolerance and a nominal start-sample anchor,
+/// and reports `start_sample` rather than a `dt`. It has streaming and
+/// a callsign hash table, and neither `known` nor a budget.
+///
+/// The defaults mirror what `mfsk-ffi`'s Q65 family already hardcodes.
+#[allow(dead_code)]
+const Q65_PROFILE: DecodeProfile = DecodeProfile {
+    caps: caps::SNIPER | caps::AP_NARROW | caps::ON_RESULT | caps::ENCODE,
+    defaults: DecodeDefaults {
+        freq_min_hz: 200.0,
+        freq_max_hz: 3000.0,
+        sync_min: 0.05,
+        max_cand: 32,
+    },
+    sync_scale: SyncScale::CostasAbsolute,
+    sniper_max_cand_cap: None,
+};
+
+/// WSPR. A whole-slot scan with its own subtract pass; no builder, no
+/// candidate budget a caller can set.
+#[allow(dead_code)]
+const WSPR_PROFILE: DecodeProfile = DecodeProfile {
+    caps: caps::ON_RESULT | caps::ENCODE,
+    defaults: DecodeDefaults {
+        freq_min_hz: 1400.0,
+        freq_max_hz: 1600.0,
+        sync_min: 0.0,
+        max_cand: 0,
+    },
+    sync_scale: SyncScale::CostasAbsolute,
+    sniper_max_cand_cap: None,
+};
+
+/// JT9 and JT65. Fixed-carrier, fixed-alignment `decode_at` — there is
+/// no search to configure, which is why the defaults are the nominal
+/// carrier rather than a band.
+#[allow(dead_code)]
+const JT_PROFILE: DecodeProfile = DecodeProfile {
+    caps: caps::ON_RESULT | caps::ENCODE,
+    defaults: DecodeDefaults {
+        freq_min_hz: 0.0,
+        freq_max_hz: 0.0,
+        sync_min: 0.0,
+        max_cand: 0,
+    },
+    sync_scale: SyncScale::CostasAbsolute,
+    sniper_max_cand_cap: None,
+};
+
+/// uvpacket sub-modes — TX/RX exist, but none of the WSJT-family
+/// search machinery applies.
+#[allow(dead_code)]
+const UV_PROFILE: DecodeProfile = DecodeProfile {
+    caps: caps::ENCODE,
+    defaults: DecodeDefaults {
+        freq_min_hz: 0.0,
+        freq_max_hz: 0.0,
+        sync_min: 0.0,
+        max_cand: 0,
+    },
+    sync_scale: SyncScale::CostasAbsolute,
+    sniper_max_cand_cap: None,
+};
 
 /// Compile-time list of every `Protocol` impl wired into the
 /// current build. Indexable, iterable, and safe to `static`-borrow.
@@ -144,58 +442,58 @@ macro_rules! protocol_meta {
 /// ```
 pub static PROTOCOLS: &[ProtocolMeta] = &[
     #[cfg(feature = "ft8")]
-    protocol_meta!("FT8", crate::Ft8),
+    protocol_meta!("FT8", crate::Ft8, FT8_PROFILE),
     #[cfg(feature = "ft4")]
-    protocol_meta!("FT4", crate::Ft4),
+    protocol_meta!("FT4", crate::Ft4, FT4_PROFILE),
     // FST4-60A stays first among the FST4 entries — it's the dominant
     // terrestrial sub-mode and `by_id`/`for_protocol_id` return the
     // *first* matching entry, so this preserves the pre-existing
     // "FST4-60A is the default FST4" behaviour for callers that don't
     // care about sub-mode.
     #[cfg(feature = "fst4")]
-    protocol_meta!("FST4-60A", crate::Fst4s60),
+    protocol_meta!("FST4-60A", crate::Fst4s60, FST4_PROFILE),
     #[cfg(feature = "fst4")]
-    protocol_meta!("FST4-15", crate::fst4::Fst4s15),
+    protocol_meta!("FST4-15", crate::fst4::Fst4s15, FST4_PROFILE),
     #[cfg(feature = "fst4")]
-    protocol_meta!("FST4-30", crate::fst4::Fst4s30),
+    protocol_meta!("FST4-30", crate::fst4::Fst4s30, FST4_PROFILE),
     #[cfg(feature = "fst4")]
-    protocol_meta!("FST4-120", crate::fst4::Fst4s120),
+    protocol_meta!("FST4-120", crate::fst4::Fst4s120, FST4_PROFILE),
     #[cfg(feature = "fst4")]
-    protocol_meta!("FST4-300", crate::fst4::Fst4s300),
+    protocol_meta!("FST4-300", crate::fst4::Fst4s300, FST4_PROFILE),
     #[cfg(feature = "wspr")]
-    protocol_meta!("WSPR", crate::Wspr),
+    protocol_meta!("WSPR", crate::Wspr, WSPR_PROFILE),
     #[cfg(feature = "jt9")]
-    protocol_meta!("JT9", crate::Jt9),
+    protocol_meta!("JT9", crate::Jt9, JT_PROFILE),
     #[cfg(feature = "jt65")]
-    protocol_meta!("JT65", crate::Jt65),
+    protocol_meta!("JT65", crate::Jt65, JT_PROFILE),
     #[cfg(feature = "q65")]
-    protocol_meta!("Q65-15A", crate::q65::Q65a15),
+    protocol_meta!("Q65-15A", crate::q65::Q65a15, Q65_PROFILE),
     #[cfg(feature = "q65")]
-    protocol_meta!("Q65-30A", crate::q65::Q65a30),
+    protocol_meta!("Q65-30A", crate::q65::Q65a30, Q65_PROFILE),
     #[cfg(feature = "q65")]
-    protocol_meta!("Q65-60A", crate::q65::Q65a60),
+    protocol_meta!("Q65-60A", crate::q65::Q65a60, Q65_PROFILE),
     #[cfg(feature = "q65")]
-    protocol_meta!("Q65-60B", crate::q65::Q65b60),
+    protocol_meta!("Q65-60B", crate::q65::Q65b60, Q65_PROFILE),
     #[cfg(feature = "q65")]
-    protocol_meta!("Q65-60C", crate::q65::Q65c60),
+    protocol_meta!("Q65-60C", crate::q65::Q65c60, Q65_PROFILE),
     #[cfg(feature = "q65")]
-    protocol_meta!("Q65-60D", crate::q65::Q65d60),
+    protocol_meta!("Q65-60D", crate::q65::Q65d60, Q65_PROFILE),
     #[cfg(feature = "q65")]
-    protocol_meta!("Q65-60E", crate::q65::Q65e60),
+    protocol_meta!("Q65-60E", crate::q65::Q65e60, Q65_PROFILE),
     #[cfg(feature = "q65")]
-    protocol_meta!("Q65-120D", crate::q65::Q65d120),
+    protocol_meta!("Q65-120D", crate::q65::Q65d120, Q65_PROFILE),
     #[cfg(feature = "q65")]
-    protocol_meta!("Q65-120E", crate::q65::Q65e120),
+    protocol_meta!("Q65-120E", crate::q65::Q65e120, Q65_PROFILE),
     #[cfg(feature = "q65")]
-    protocol_meta!("Q65-300A", crate::q65::Q65a300),
+    protocol_meta!("Q65-300A", crate::q65::Q65a300, Q65_PROFILE),
     #[cfg(feature = "uvpacket")]
-    protocol_meta!("UvRobust", crate::UvRobust),
+    protocol_meta!("UvRobust", crate::UvRobust, UV_PROFILE),
     #[cfg(feature = "uvpacket")]
-    protocol_meta!("UvStandard", crate::UvStandard),
+    protocol_meta!("UvStandard", crate::UvStandard, UV_PROFILE),
     #[cfg(feature = "uvpacket")]
-    protocol_meta!("UvUltraRobust", crate::UvUltraRobust),
+    protocol_meta!("UvUltraRobust", crate::UvUltraRobust, UV_PROFILE),
     #[cfg(feature = "uvpacket")]
-    protocol_meta!("UvExpress", crate::UvExpress),
+    protocol_meta!("UvExpress", crate::UvExpress, UV_PROFILE),
 ];
 
 /// Iterator over every registry entry sharing `id`. For most

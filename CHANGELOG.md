@@ -92,6 +92,34 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
 
 ### Added
 
+- **The registry describes capability, not just geometry.**
+  `ProtocolMeta` gains `profile: DecodeProfile` — a capability bitmask, a
+  default search (band, `sync_min`, `max_cand`), the *scale* that
+  `sync_min` is measured on, and the sniper candidate cap — plus
+  `tx_start_offset_s` and `slot_samples_12k`, which a host needs in order
+  to place a transmission or size a buffer and previously could not ask
+  for.
+
+  `PROTOCOLS` has always been able to say "this build has FST4-120". It
+  could not say that FST4 has no SIC at all, that wide-band AP is FT8's
+  alone, or that `.strictness()` is a no-op on FST4's non-AP path — so
+  every consumer that needed to know hardcoded a matrix, and the C ABI
+  that is about to publish one would have hardcoded it too.
+
+  **The scale field exists because of a specific trap.** FT4's `sync_min`
+  is divided by a fitted baseline, so noise sits at ~1.0 *by
+  construction* and WSJT-X's own 1.2 (`ft4_decode.f90:195`) is a floor
+  rather than a preference. FT8's and FST4's are absolute Costas scores.
+  Three incomparable numbers currently sit in one C function with nothing
+  saying so.
+
+  `tests/registry_caps.rs` enforces the claims in both directions, and
+  the type system does the work: `check_sic_rounds::<P>` is bounded on
+  `SupportsSicRounds`, so naming a protocol that does not implement it is
+  a compile error, while the body asserts the bit — implementing the
+  trait and forgetting the bit fails at runtime. Verified by removing a
+  bit and watching two tests fail.
+
 - **`mfsk-ffi` has feature flags, and one of them drops rayon.** The crate
   had no `[features]` table at all and pinned `mfsk-core`'s `full`, so
   every consumer got std + rustfft + rayon + serde whether it wanted them
