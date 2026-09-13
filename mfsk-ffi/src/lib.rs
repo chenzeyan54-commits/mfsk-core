@@ -75,9 +75,13 @@ pub use mfsk_ffi_abi::{
 
 /// Opaque decoder handle. Construct with [`mfsk_decoder_new`], release
 /// with [`mfsk_decoder_free`].
-#[repr(C)]
+/// Emitted as an incomplete type (`struct X;`) rather than a struct with a
+/// zero-length array member: `uint8_t _priv[0]` is a GCC/Clang extension
+/// that ISO C rejects (`-Werror=pedantic`), and MSVC accepts only under a
+/// warning. A pointer to an incomplete type is exactly as opaque, is
+/// standard in both C and C++, and is what every consumer already treats
+/// this as. Binary-compatible: the handle only ever crosses as a pointer.
 pub struct MfskDecoder {
-    _priv: [u8; 0],
     _marker: core::marker::PhantomData<*mut ()>,
 }
 
@@ -1365,9 +1369,13 @@ fn decode_jt65_aligned(audio: &[f32], out: &mut MfskResultList) -> MfskStatus {
 /// Mirrors `mfsk_core::q65::decode_request::DecodeRequest::hash_table`
 /// (`Arc<CallsignHashTable>`) — deliberately not folded into
 /// [`MfskDecodeOptions`], which Q65's own function family never uses.
-#[repr(C)]
+/// Emitted as an incomplete type (`struct X;`) rather than a struct with a
+/// zero-length array member: `uint8_t _priv[0]` is a GCC/Clang extension
+/// that ISO C rejects (`-Werror=pedantic`), and MSVC accepts only under a
+/// warning. A pointer to an incomplete type is exactly as opaque, is
+/// standard in both C and C++, and is what every consumer already treats
+/// this as. Binary-compatible: the handle only ever crosses as a pointer.
 pub struct MfskCallsignHashTable {
-    _priv: [u8; 0],
     _marker: core::marker::PhantomData<*mut ()>,
 }
 

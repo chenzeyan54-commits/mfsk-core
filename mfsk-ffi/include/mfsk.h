@@ -230,12 +230,31 @@ typedef enum MfskQ65FadingModel {
 } MfskQ65FadingModel;
 
 /**
- * Opaque decoder handle. Construct with [`mfsk_decoder_new`], release
- * with [`mfsk_decoder_free`].
+ * Opaque callsign hash-table handle. Resolves `<...>` Type-4
+ * hashed-callsign placeholders (WSJT-X's compact encoding for a
+ * non-standard call paired with a standard one) in Q65 decode output.
+ *
+ * Construct with [`mfsk_callsign_hash_table_new`], populate with
+ * [`mfsk_callsign_hash_table_insert`] as real callsigns become known
+ * (e.g. from earlier decodes, a station log, or any other source the
+ * caller trusts), then pass into any `mfsk_q65_decode_*` function's
+ * `hash_table` parameter. NULL there (the pre-#250 behaviour) leaves
+ * hashed callsigns unresolved as literal `<...>` text — nothing else
+ * about decode success or timing changes; this only affects how the
+ * final message *text* renders. Free with
+ * [`mfsk_callsign_hash_table_free`].
+ *
+ * Mirrors `mfsk_core::q65::decode_request::DecodeRequest::hash_table`
+ * (`Arc<CallsignHashTable>`) — deliberately not folded into
+ * [`MfskDecodeOptions`], which Q65's own function family never uses.
+ * Emitted as an incomplete type (`struct X;`) rather than a struct with a
+ * zero-length array member: `uint8_t _priv[0]` is a GCC/Clang extension
+ * that ISO C rejects (`-Werror=pedantic`), and MSVC accepts only under a
+ * warning. A pointer to an incomplete type is exactly as opaque, is
+ * standard in both C and C++, and is what every consumer already treats
+ * this as. Binary-compatible: the handle only ever crosses as a pointer.
  */
-typedef struct MfskDecoder {
-    uint8_t _priv[0];
-} MfskDecoder;
+typedef struct MfskCallsignHashTable MfskCallsignHashTable;
 
 /**
  * Opaque decode-tuning-options handle (issue #205) — construct with
@@ -254,10 +273,26 @@ typedef struct MfskDecoder {
  * crate `Box`es its own private options struct and casts the raw
  * pointer to/from this type. Defined once here purely so both
  * crates' generated headers agree on the type name / pointer shape.
+ * Emitted as an incomplete type (`struct X;`) rather than a struct with a
+ * zero-length array member: `uint8_t _priv[0]` is a GCC/Clang extension
+ * that ISO C rejects (`-Werror=pedantic`), and MSVC accepts only under a
+ * warning. A pointer to an incomplete type is exactly as opaque, is
+ * standard in both C and C++, and is what every consumer already treats
+ * this as. Binary-compatible: the handle only ever crosses as a pointer.
  */
-typedef struct MfskDecodeOptions {
-    uint8_t _priv[0];
-} MfskDecodeOptions;
+typedef struct MfskDecodeOptions MfskDecodeOptions;
+
+/**
+ * Opaque decoder handle. Construct with [`mfsk_decoder_new`], release
+ * with [`mfsk_decoder_free`].
+ * Emitted as an incomplete type (`struct X;`) rather than a struct with a
+ * zero-length array member: `uint8_t _priv[0]` is a GCC/Clang extension
+ * that ISO C rejects (`-Werror=pedantic`), and MSVC accepts only under a
+ * warning. A pointer to an incomplete type is exactly as opaque, is
+ * standard in both C and C++, and is what every consumer already treats
+ * this as. Binary-compatible: the handle only ever crosses as a pointer.
+ */
+typedef struct MfskDecoder MfskDecoder;
 
 /**
  * One successfully decoded message, shared shape across every
@@ -375,29 +410,6 @@ typedef struct MfskSamples {
  */
 typedef void (*MfskResultCallback)(const struct MfskResult *result,
                                    void *user_data);
-
-/**
- * Opaque callsign hash-table handle. Resolves `<...>` Type-4
- * hashed-callsign placeholders (WSJT-X's compact encoding for a
- * non-standard call paired with a standard one) in Q65 decode output.
- *
- * Construct with [`mfsk_callsign_hash_table_new`], populate with
- * [`mfsk_callsign_hash_table_insert`] as real callsigns become known
- * (e.g. from earlier decodes, a station log, or any other source the
- * caller trusts), then pass into any `mfsk_q65_decode_*` function's
- * `hash_table` parameter. NULL there (the pre-#250 behaviour) leaves
- * hashed callsigns unresolved as literal `<...>` text — nothing else
- * about decode success or timing changes; this only affects how the
- * final message *text* renders. Free with
- * [`mfsk_callsign_hash_table_free`].
- *
- * Mirrors `mfsk_core::q65::decode_request::DecodeRequest::hash_table`
- * (`Arc<CallsignHashTable>`) — deliberately not folded into
- * [`MfskDecodeOptions`], which Q65's own function family never uses.
- */
-typedef struct MfskCallsignHashTable {
-    uint8_t _priv[0];
-} MfskCallsignHashTable;
 
 #ifdef __cplusplus
 extern "C" {

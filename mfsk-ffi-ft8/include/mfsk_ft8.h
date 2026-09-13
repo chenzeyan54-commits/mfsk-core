@@ -74,16 +74,6 @@ typedef enum MfskStatus {
 } MfskStatus;
 
 /**
- * Opaque handle returned by [`mfsk_ft8_stream_new`].
- *
- * Owns one resampler + one 12 kHz ring buffer. Single-threaded —
- * callers that capture and decode on different tasks should put the
- * stream on the capture side and copy out via `_peek_latest` for the
- * decoder.
- */
-typedef struct MfskFt8Stream MfskFt8Stream;
-
-/**
  * Opaque decode-tuning-options handle (issue #205) — construct with
  * each crate's own `_options_new(...)`, release with
  * `_options_free`.
@@ -100,10 +90,24 @@ typedef struct MfskFt8Stream MfskFt8Stream;
  * crate `Box`es its own private options struct and casts the raw
  * pointer to/from this type. Defined once here purely so both
  * crates' generated headers agree on the type name / pointer shape.
+ * Emitted as an incomplete type (`struct X;`) rather than a struct with a
+ * zero-length array member: `uint8_t _priv[0]` is a GCC/Clang extension
+ * that ISO C rejects (`-Werror=pedantic`), and MSVC accepts only under a
+ * warning. A pointer to an incomplete type is exactly as opaque, is
+ * standard in both C and C++, and is what every consumer already treats
+ * this as. Binary-compatible: the handle only ever crosses as a pointer.
  */
-typedef struct MfskDecodeOptions {
-  uint8_t _priv[0];
-} MfskDecodeOptions;
+typedef struct MfskDecodeOptions MfskDecodeOptions;
+
+/**
+ * Opaque handle returned by [`mfsk_ft8_stream_new`].
+ *
+ * Owns one resampler + one 12 kHz ring buffer. Single-threaded —
+ * callers that capture and decode on different tasks should put the
+ * stream on the capture side and copy out via `_peek_latest` for the
+ * decoder.
+ */
+typedef struct MfskFt8Stream MfskFt8Stream;
 
 /**
  * One successfully decoded message, shared shape across every

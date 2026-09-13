@@ -578,6 +578,25 @@ jobs:
       - name: Build mfsk-ffi
         run: cargo build -p mfsk-ffi --release
 
+      # The build above regenerates `include/mfsk.h` into the source tree,
+      # so a signature change that was not rebuilt locally shows up here as
+      # a dirty tree. Without this, a PR could merge with a committed header
+      # describing the previous ABI and CI would stay green: the C++ driver
+      # compiles against the freshly-regenerated copy in the runner's
+      # checkout, never the committed one.
+      - name: Committed headers are current
+        run: |
+          cargo build -p mfsk-ffi-ft8 --release
+          git diff --exit-code -- mfsk-ffi/include mfsk-ffi-ft8/include \
+            || { echo "::error::include/ is stale — run 'cargo build -p mfsk-ffi -p mfsk-ffi-ft8' and commit"; exit 1; }
+
+      # `cpp_compat = true` is set in both cbindgen.toml files and nothing
+      # checked it. Compile each header as the only thing in a translation
+      # unit, as C11 and as C++17, so a header that only works because
+      # `main.cpp` happens to include something else first fails here.
+      - name: Headers compile standalone (C11 + C++17)
+        run: bash mfsk-ffi/tests/header_compile.sh
+
       - name: cargo test -p mfsk-ffi (Rust-level ABI tests)
         env:
           RUN_FST4_ROUNDTRIP: "1"

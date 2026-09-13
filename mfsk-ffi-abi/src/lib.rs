@@ -231,8 +231,12 @@ impl MfskResultList {
 /// crate `Box`es its own private options struct and casts the raw
 /// pointer to/from this type. Defined once here purely so both
 /// crates' generated headers agree on the type name / pointer shape.
-#[repr(C)]
+/// Emitted as an incomplete type (`struct X;`) rather than a struct with a
+/// zero-length array member: `uint8_t _priv[0]` is a GCC/Clang extension
+/// that ISO C rejects (`-Werror=pedantic`), and MSVC accepts only under a
+/// warning. A pointer to an incomplete type is exactly as opaque, is
+/// standard in both C and C++, and is what every consumer already treats
+/// this as. Binary-compatible: the handle only ever crosses as a pointer.
 pub struct MfskDecodeOptions {
-    _priv: [u8; 0],
     _marker: PhantomData<*mut ()>,
 }

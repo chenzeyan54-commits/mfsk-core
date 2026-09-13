@@ -57,6 +57,39 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
   `SlotAccum::phase_error` exposes the same number for the receiver to
   log.
 
+### Fixed
+
+- **The generated C headers did not compile as standard C, and nothing
+  would have noticed.** Three opaque handle types (`MfskDecoder`,
+  `MfskDecodeOptions`, `MfskCallsignHashTable`) were emitted as
+  `struct X { uint8_t _priv[0]; }` — a zero-length array member, which is
+  a GCC/Clang extension that ISO C rejects under `-pedantic` and MSVC
+  accepts only with a warning. They are now true incomplete types
+  (`typedef struct X X;`), the shape `MfskFt8Stream` already had and the
+  one every consumer treats them as. A pointer to an incomplete type is
+  exactly as opaque; nothing changes at the binary level, since the
+  handles only ever cross as pointers.
+
+  Found by the new check rather than by a consumer, which is the point:
+  `mfsk-ffi/tests/header_compile.sh` now compiles each header as the only
+  thing in a translation unit, as C11 and as C++17, with warnings fatal.
+  Both `cbindgen.toml` files have set `cpp_compat = true` from the
+  beginning and nothing verified it — the C++ smoke driver includes the
+  header after its own, so a header that only worked in that position
+  would have passed.
+
+- **A cbindgen failure is now fatal, and `mfsk-ffi-abi` is a rerun
+  trigger.** Header generation failing was a `cargo:warning`, so a build
+  that could not regenerate the header succeeded anyway and shipped
+  whatever stale copy was committed. Separately, `cbindgen.toml` sets
+  `parse_deps = true` to pull the shared `#[repr(C)]` types across the
+  crate boundary, but cargo was never told — so editing `MfskResult` left
+  the committed header describing the previous ABI with nothing to catch
+  it. CI now also fails on a dirty `include/` after a build, which is the
+  gate that was missing: the C++ driver compiles against the runner's
+  freshly-regenerated copy, never the committed one, so a stale header
+  could merge green.
+
 ### Added
 
 - **`DecodeRequest::budget` / `SniperRequest::budget` — FT8 decodes
