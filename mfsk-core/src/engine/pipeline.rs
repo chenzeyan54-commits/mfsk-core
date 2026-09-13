@@ -2236,6 +2236,12 @@ pub(crate) fn decode_frame_subtract<P: GenericPipelineProtocol>(
     depth: DecodeDepth,
     max_cand: usize,
     strictness: DecodeStrictness,
+    // Honoured per candidate, like the single-pass engine — it was
+    // hardcoded to `EqMode::Off` here, so `.eq_mode()` was accepted by
+    // the builder and silently dropped on FT4's SIC path alone. Nothing
+    // in the source gave a reason; it was simply never threaded through.
+    // FT8's own SIC engine has always passed it.
+    eq_mode: EqMode,
     // Upper bound on SIC rounds, 1..=3 (`DecodeRequest::sic_rounds`
     // already clamps to this range — not re-validated here, this
     // function has exactly one caller). `passes.len() == 3`, so this
@@ -2360,7 +2366,7 @@ where
                     depth,
                     strictness,
                     &all_results,
-                    EqMode::Off,
+                    eq_mode,
                     sync_q_min,
                 )
             })
@@ -2376,7 +2382,7 @@ where
                     depth,
                     strictness,
                     &all_results,
-                    EqMode::Off,
+                    eq_mode,
                     sync_q_min,
                 )
             })

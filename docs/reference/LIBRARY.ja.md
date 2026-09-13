@@ -744,6 +744,10 @@ equalize / pipeline ドライバも同じスタイルで、プロトコル型を
   `DecodeOutcome<P>` (`.results: Vec<P::DecodeResult>`、後続呼び出し用の
   `.fft_cache`、`.budget: BudgetReport`) を得る。
 * **`SniperRequest<P>`** — narrow-band、単一ターゲット探索。
+  **使う前に下の「sniper モードは roofing filter のためのモード」を
+  読むこと** — 「既知の1局を狙う便利機能」ではないし、そこに乗って
+  いる AP hint は実装上の事故であって、AP の適用範囲を表すものでは
+  ない。
   `DecodeRequest::<P>::sniper(audio, target_freq_hz, max_cand)` または
   `SniperRequest::<P>::new(...)` を直接呼ぶ。`.osd(bool)`、
   `.strictness(...)`、`.eq_mode(...)`、プロトコルのメッセージ
@@ -755,6 +759,45 @@ equalize / pipeline ドライバも同じスタイルで、プロトコル型を
 これにより FT8 の `decode_frame*`/`decode_frame_subtract*`/
 `decode_sniper*` 系 (公開関数 15 個) と FT4/FST4 独自の同種の
 suffix 展開を置き換えた — §6.2/§6.4 に実例がある。
+
+#### sniper モードは roofing filter のためのモード、AP はその一部ではない
+
+`SniperRequest` について繰り返し誤読される点が2つある。このリポジトリで
+作業する側も含めて間違えており、実際に設計判断を誤らせているので、doc
+コメントではなくここに書く。
+
+**1. ±250 Hz はハードウェアの都合であって、賢さではない。** sniper モード
+は、その幅のアナログ roofing filter を持つトランシーバ（Yaesu FTDX101MP、
+FTDX10 など）で受信帯域を**アナログ的に**絞る運用の、ソフト側の片割れで
+ある。~500 Hz のアナログフィルタを選び、搬送波周波数が既知の DX 局に
+向けると、デコーダに届く音声は既にその帯域に限定されている。±250 Hz を
+探索するのは、ハードウェアが通過帯域に残したものにデコーダが合わせて
+いるだけ。特定の無線機のための特殊用途パスであって、「相手が分かって
+いるモード全般」の自然な形ではない。
+
+`.eq_mode(EqMode::Local)` が隣にあるのも同じ理由で、アナログフィルタの
+肩が通過帯域を傾けるのを local equalisation が平坦に戻す。つまり EQ は
+**入力音声の属性**であり、だから `DecodeRequest` 側にもある — フィルタを
+通った音声をワイドバンドデコードに食わせることもできるし、FT8 の
+`eq_mode_recovers_bpf_edge_signal` は band-pass 端の信号が `Local` では
+デコードでき `Off` ではできないことを、ワイドバンドの SIC エンジン経由で
+実証している。平坦な合成入力では EQ は損にしかならない: `ft4sim` 生成の
+FT4 golden には受信機フィルタが存在せず、`Local` は14件中2件を落とす。
+既定の `Off` は録音・シミュレーションには正しく、絞った受信機には誤り。
+
+**2. A priori は汎用オプションなのに、そこに結合してしまっている。** AP は
+確度の高いビットを固定して閾値を 1-3 dB 下げる技術で、狭帯域である必要は
+どこにもない。しかし共通 AP エンジン（`msg::pipeline_ap::decode_sniper_ap`）
+は候補ループを `if has_ap` で抜ける — **hint が付いていることが単一
+ターゲット化の条件**になっていて、探索幅は見ていない。したがって
+このエンジン経由でワイドバンド探索に hint を渡すと、最初の1件で止まる。
+FT8 が免れているのは独自の AP 経路を持っていてこのエンジンに入らない
+からで、`SupportsWideBandAp` が FT8 限定であることの中身はそれだけである。
+
+つまり `SupportsWideBandAp` は「FT4/FST4 はワイドバンド AP ができない」
+という意味ではない。早期終了の条件が間違っている、という意味である。
+修正自体は小さいが検証は小さくない — この2プロトコルのワイドバンド AP
+は未計測の能力であり、AP のリスクは本質的に偽デコードだからである。
 
 #### 計算予算: `.budget(check)`
 

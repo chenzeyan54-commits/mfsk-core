@@ -59,6 +59,51 @@ This section accumulates until the next tag — see `CLAUDE.md`'s
 
 ### Fixed
 
+- **`.eq_mode()` was silently dropped on FT4's SIC path**, and the docs
+  around it, `SniperRequest` and AP said things that are not true.
+
+  The generic SIC engine hardcoded `EqMode::Off` per candidate and had
+  no `eq_mode` parameter at all, so a caller combining `.eq_mode(Local)`
+  with `.sic_rounds(n)` on FT4 got the setting accepted and ignored.
+  FT8's own SIC engine has always honoured it. Threaded through; the
+  default is unchanged, so nothing moves unless a caller asked for it —
+  the FT4 tier-C sweep is +0.00 dB on all four channels, which it must
+  be, since the value passed for a caller that does not set it is the
+  `EqMode::Off` that was hardcoded before.
+
+  **What that surfaced matters more than the fix.** Local equalisation
+  is a property of the *input audio*, not of the search: it flattens a
+  passband that an **analogue** filter has tilted. `SniperRequest`'s
+  ±250 Hz window exists because the operator narrowed the transceiver's
+  analogue roofing filter — a capability of few radios (FTDX101MP,
+  FTDX10) — and pointed it at a DX station whose carrier is known, so
+  the arriving audio is already band-limited. Sniper mode is that
+  hardware's software half, not a general "hunt one known station"
+  convenience, and EQ belongs beside it for the filter, not for the
+  narrow search. Which is also why `DecodeRequest` carries EQ: filtered
+  audio can be handed to a wide-band decode, and FT8's
+  `eq_mode_recovers_bpf_edge_signal` pins a band-pass-edge signal that
+  only `Local` recovers, through the wide-band SIC engine. On flat
+  synthetic input EQ can only cost — `Local` loses two decodes of
+  fourteen on the `ft4sim`-generated FT4 golden.
+
+  **And A-priori decoding is coupled to sniper by accident.**
+  `msg::pipeline_ap::decode_sniper_ap` leaves its candidate loop on
+  `if has_ap`: the presence of a hint, not the width of the search, is
+  what makes it single-target. That one line is the entire content of
+  `SupportsWideBandAp` being FT8-only — FT8 escapes because it has its
+  own AP path and never enters that engine. The trait does not mean
+  FT4/FST4 cannot take a hint across a band; it means an early exit is
+  gated on the wrong condition. Decoupling it is small and its
+  validation is not, since AP's risk is false decodes.
+
+  All three are now written down where they will be found: `CLAUDE.md`,
+  `docs/reference/LIBRARY.md` §4 (and its `.ja.md` twin), and the
+  `SniperRequest` / `ap_hint` / `eq_mode` doc comments. The old
+  `SniperRequest` comment offered "after a 500 Hz hardware BPF (or when
+  hunting one known station)" — correct premise, escape hatch attached,
+  and the escape hatch is what gets remembered.
+
 - **The generated C headers did not compile as standard C, and nothing
   would have noticed.** Three opaque handle types (`MfskDecoder`,
   `MfskDecodeOptions`, `MfskCallsignHashTable`) were emitted as

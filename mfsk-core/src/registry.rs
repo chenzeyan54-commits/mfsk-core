@@ -76,14 +76,31 @@ pub mod caps {
     /// reports a start sample rather than a `dt`; WSPR/JT9/JT65 have no
     /// builder at all. They are not lesser, they are shaped differently.
     pub const DECODE_HANDLE: u32 = 1 << 0;
-    /// Narrow-band single-target search (`SniperRequest`).
+    /// Narrow-band single-target search (`SniperRequest`): a ±250 Hz
+    /// window around a known carrier.
+    ///
+    /// Not a software convenience for chasing a spotted station. It is
+    /// the receive-side half of narrowing the radio's *analogue*
+    /// roofing filter — available on the few transceivers that offer a
+    /// true analogue roofing filter at these widths — so the audio
+    /// reaching the decoder is already band-limited. That is also why
+    /// [`EQ_MODE`] sits next to it: the filter's skirt tilts the
+    /// passband, and local equalisation is what flattens it again.
     pub const SNIPER: u32 = 1 << 1;
     /// A-priori hint on the narrow-band search (`SniperRequest::ap_hint`).
     pub const AP_NARROW: u32 = 1 << 2;
     /// A-priori hint on the *wide-band* search (`SupportsWideBandAp`).
-    /// FT8 only, and deliberately: the shared AP engine early-exits
-    /// after the first hit, which is only correct when hunting one
-    /// target (`msg::pipeline_ap`).
+    ///
+    /// FT8 only — but this is an artefact, not a property of the other
+    /// protocols. The shared AP engine breaks out of its candidate loop
+    /// on `if has_ap`, i.e. **the presence of a hint is what makes the
+    /// search single-target**, so handing one to a wide-band search
+    /// would stop it after the first decode. FT8 escapes because it has
+    /// its own AP path and never enters that engine. Gating the
+    /// early-exit on "this is a narrow-band single-target search"
+    /// instead of on "a hint was supplied" is what would let FT4 and
+    /// FST4 take a hint over the whole band — new, and needing a
+    /// false-decode measurement before it could be claimed here.
     pub const AP_WIDEBAND: u32 = 1 << 3;
     /// Flat successive-interference cancellation (`SupportsSicRounds`).
     pub const SIC_ROUNDS: u32 = 1 << 4;
@@ -96,6 +113,19 @@ pub mod caps {
     /// "does not have it".
     pub const OSD: u32 = 1 << 6;
     /// `.eq_mode()` reaches the decoder.
+    ///
+    /// A property of the *input audio*, not of the search: local
+    /// equalisation flattens a passband that an analogue filter has
+    /// tilted. It therefore matters on both builders — the narrow-band
+    /// one because a roofing filter is the reason that path exists, and
+    /// the wide-band one because filtered audio can be handed to it
+    /// too. FT8's `eq_mode_recovers_bpf_edge_signal` pins exactly that
+    /// case: a signal at the band-pass edge that decodes with `Local`
+    /// and not with `Off`, through the wide-band SIC engine.
+    ///
+    /// On flat-spectrum input it can only cost: on the `ft4sim`-
+    /// generated FT4 golden, which has no receiver filter at all,
+    /// `Local` loses two decodes of fourteen.
     pub const EQ_MODE: u32 = 1 << 7;
     /// `.strictness()` changes an acceptance threshold that the
     /// protocol's non-AP path actually reads. FST4 does not have this:

@@ -160,6 +160,7 @@ impl SupportsSicRounds for Ft4 {
             req.depth,
             req.max_cand,
             req.strictness,
+            req.eq_mode,
             req.sic_rounds,
             SYNC_Q_MIN,
             // lpf_half/end-correction match WSJT-X `subtractft4.f90`:

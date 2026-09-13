@@ -768,7 +768,11 @@ points, §6.3/§6.5):
   `.decode()` to get a
   `DecodeOutcome<P>` (`.results: Vec<P::DecodeResult>`, `.fft_cache`
   for a follow-up call, and `.budget: BudgetReport`).
-* **`SniperRequest<P>`** — narrow-band, single-target search.
+* **`SniperRequest<P>`** — narrow-band, single-target search. **Read
+  "Sniper mode is a roofing-filter mode" below before using it** — it is
+  not a general "hunt one known station" convenience, and the A-priori
+  hint sitting on it is an implementation accident rather than a
+  statement about where AP applies.
   `DecodeRequest::<P>::sniper(audio, target_freq_hz, max_cand)` or
   `SniperRequest::<P>::new(...)` directly; `.osd(bool)`,
   `.strictness(...)`, `.eq_mode(...)`, `.ap_hint(...)` where the
@@ -780,6 +784,50 @@ points, §6.3/§6.5):
 This replaced FT8's `decode_frame*`/`decode_frame_subtract*`/
 `decode_sniper*` family (15 public functions) and FT4/FST4's own
 suffix-exploded equivalents — see §6.2/§6.4 for worked examples.
+
+#### Sniper mode is a roofing-filter mode, and AP is not part of it
+
+Two things about `SniperRequest` are repeatedly misread, including by
+people working on this repository. Both have cost real design decisions,
+so they are stated here rather than left in a doc comment.
+
+**1. The ±250 Hz window is hardware, not cleverness.** Sniper mode is the
+software half of narrowing the *analogue* roofing filter on a transceiver
+that has one at that width — the Yaesu FTDX101MP and FTDX10 are the
+usual examples. The operator selects a ~500 Hz analogue filter, points it
+at a DX station whose carrier is already known, and the audio reaching
+the decoder is already band-limited to that slice. Searching ±250 Hz is
+the decoder matching what the hardware left in the passband. It is a
+special-purpose path for specific radios, not the natural shape for
+"any mode where you know who you are working".
+
+`.eq_mode(EqMode::Local)` lives beside it for the same reason: an
+analogue filter's skirt tilts the passband and local equalisation
+flattens it again. EQ is therefore a property of the **input audio**,
+which is why `DecodeRequest` carries it too — filtered audio can be fed
+to a wide-band decode, and FT8's `eq_mode_recovers_bpf_edge_signal` pins
+a band-pass-edge signal that decodes with `Local` and not with `Off`
+through the wide-band SIC engine. On flat synthetic input EQ can only
+cost: the `ft4sim`-generated FT4 golden has no receiver filter, and
+`Local` loses two decodes of fourteen there. Default `Off` is right for
+recordings and simulations and wrong for a narrowed receiver.
+
+**2. A-priori decoding is a general option that got coupled to it.** AP
+locks high-confidence bits and lowers the threshold by 1-3 dB. Nothing
+about it is narrow-band. But the shared AP engine
+(`msg::pipeline_ap::decode_sniper_ap`) breaks out of its candidate loop
+on `if has_ap` — **the presence of a hint is what makes the search
+single-target**, not the width of the search — so handing a hint to a
+wide-band search through that engine stops it after the first decode.
+FT8 escapes only because it has its own AP path and never enters that
+engine, which is the whole content of the `SupportsWideBandAp` trait
+being FT8-only.
+
+So `SupportsWideBandAp` does not mean "FT4 and FST4 cannot do wide-band
+AP". It means one early-exit is gated on the wrong condition. Fixing
+that is small; validating it is not, because wide-band AP on those two
+protocols is unmeasured capability and AP's whole risk profile is false
+decodes.
 
 #### Compute budget: `.budget(check)`
 

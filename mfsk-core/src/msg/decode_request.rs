@@ -221,6 +221,25 @@ impl<'a, P: FrameDecodable> DecodeRequest<'a, P> {
         self.strictness = s;
         self
     }
+    /// Local per-symbol equalisation of the symbol spectra.
+    ///
+    /// **A property of the input audio, not of the search.** It exists
+    /// to flatten a passband that an *analogue* filter has tilted — a
+    /// transceiver's roofing filter, or any band-pass ahead of the
+    /// decoder. That is why it appears on both request types: the
+    /// narrow-band one because a roofing filter is the reason that path
+    /// exists at all, and this one because filtered audio can equally
+    /// be handed to a wide-band decode.
+    ///
+    /// Measured both ways. `Local` recovers an FT8 signal sitting at a
+    /// band-pass edge that `Off` misses entirely, through the wide-band
+    /// SIC engine (`ft8::decode`'s `eq_mode_recovers_bpf_edge_signal`).
+    /// On flat input it can only cost: the `ft4sim`-generated FT4
+    /// golden has no receiver filter at all, and `Local` loses two
+    /// decodes of fourteen there.
+    ///
+    /// Default `Off`, which is right for recorded or simulated audio
+    /// and wrong for a narrowed receiver.
     pub fn eq_mode(mut self, e: EqMode) -> Self {
         self.eq_mode = e;
         self
@@ -371,12 +390,28 @@ impl<'a, P: FrameDecodable> DecodeRequest<'a, P> {
 impl<'a, P: SupportsWideBandAp> DecodeRequest<'a, P> {
     /// A-priori callsign/grid/report hint applied to every candidate.
     ///
-    /// `Ft8` only — see [`SupportsWideBandAp`]'s doc comment for why
-    /// (FT4/FST4's AP sniper has an early-exit-after-first-hit
-    /// optimization only valid for single-target search, so wide-band AP
-    /// there would be new, unvalidated capability). For FT4/FST4/Q65, use
-    /// [`SniperRequest::ap_hint`] instead — narrow-band AP is already
-    /// validated for all three.
+    /// `Ft8` only today — and that restriction is an **artefact of one
+    /// line**, not a property of the other protocols. A priori decoding
+    /// is a general technique: it locks high-confidence bits and lowers
+    /// the threshold by 1-3 dB, and there is nothing about FT4 or FST4
+    /// that makes it inapplicable across a whole band.
+    ///
+    /// What blocks it is that the shared AP engine
+    /// (`msg::pipeline_ap::decode_sniper_ap`) breaks out of its
+    /// candidate loop on `if has_ap` — **the presence of a hint is what
+    /// makes the search single-target**, not the width of the search.
+    /// Hand a hint to a wide-band search through that engine and it
+    /// stops after the first decode. FT8 escapes only because it has its
+    /// own AP path and never enters it.
+    ///
+    /// Gating that early exit on "this is a narrow-band single-target
+    /// search" rather than on "a hint was supplied" is what would
+    /// decouple the two. It is a small change and an unvalidated one:
+    /// wide-band AP on FT4/FST4 needs a false-decode measurement before
+    /// it can be offered. Until then, FT4/FST4/Q65 reach AP through
+    /// [`SniperRequest::ap_hint`], which is validated — but note that
+    /// this couples a generally-useful option to a path that exists for
+    /// a specific piece of radio hardware. See [`SniperRequest`].
     pub fn ap_hint(mut self, ap: &'a ApHint) -> Self {
         self.ap_hint = Some(ap);
         self
@@ -468,11 +503,39 @@ impl<'a, P: SupportsSicEarly> DecodeRequest<'a, P> {
 /// Narrow-band (±250 Hz), single-target decode request. Construct with
 /// [`DecodeRequest::sniper`] or [`SniperRequest::new`] directly.
 ///
-/// Intended for use after a 500 Hz hardware BPF (or when hunting one known
-/// station): `sync_min` defaults to 0.8 (looser than
-/// [`DecodeRequest`]'s typical 1.0-2.0) since the narrow band already
-/// excludes the strong adjacent signals a low threshold would otherwise
-/// admit.
+/// # What this is for, because it is repeatedly misread
+///
+/// **This is the software half of narrowing the radio's analogue
+/// roofing filter.** The operator selects a ~500 Hz analogue roofing
+/// filter — available only on the few transceivers that offer one at
+/// that width, e.g. the Yaesu FTDX101MP and FTDX10 — points it at a DX
+/// station whose carrier frequency is already known, and the audio
+/// reaching this decoder is therefore *already* band-limited to that
+/// slice. Searching ±250 Hz is not the decoder being clever about where
+/// to look; it is the decoder matching what the hardware left in the
+/// passband.
+///
+/// Two consequences follow, and both are load-bearing:
+///
+/// - **[`SniperRequest::eq_mode`] is here because of the filter.** An
+///   analogue filter's skirt tilts the passband, and local equalisation
+///   is what flattens it again. EQ is a property of the *input audio*,
+///   not of this search strategy — which is why
+///   [`DecodeRequest::eq_mode`] exists too, and why on flat synthetic
+///   input (an `ft4sim` corpus has no receiver filter at all) it can
+///   only cost decodes.
+/// - **A-priori hints are not part of this**, however much the API
+///   currently suggests otherwise. See [`SniperRequest::ap_hint`].
+///
+/// It is **not** a general "hunt one known station" convenience. Reading
+/// it that way — which an earlier version of this comment invited, by
+/// offering "or when hunting one known station" as an alternative —
+/// leads to treating it as the natural shape for any sked-style mode
+/// and to concluding that AP belongs to it. Neither follows.
+///
+/// `sync_min` defaults to 0.8 (looser than [`DecodeRequest`]'s typical
+/// 1.0-2.0) because the narrow band already excludes the strong
+/// adjacent signals a low threshold would otherwise admit.
 ///
 /// Replaces FT8's `decode_sniper`/`decode_sniper_eq`/`decode_sniper_ap`
 /// and FT4's `decode_sniper_ap`/`_with_options` (issue #191). FT8's
@@ -531,6 +594,25 @@ impl<'a, P: FrameDecodable> SniperRequest<'a, P> {
         self.strictness = s;
         self
     }
+    /// Local per-symbol equalisation of the symbol spectra.
+    ///
+    /// **A property of the input audio, not of the search.** It exists
+    /// to flatten a passband that an *analogue* filter has tilted — a
+    /// transceiver's roofing filter, or any band-pass ahead of the
+    /// decoder. That is why it appears on both request types: the
+    /// narrow-band one because a roofing filter is the reason that path
+    /// exists at all, and this one because filtered audio can equally
+    /// be handed to a wide-band decode.
+    ///
+    /// Measured both ways. `Local` recovers an FT8 signal sitting at a
+    /// band-pass edge that `Off` misses entirely, through the wide-band
+    /// SIC engine (`ft8::decode`'s `eq_mode_recovers_bpf_edge_signal`).
+    /// On flat input it can only cost: the `ft4sim`-generated FT4
+    /// golden has no receiver filter at all, and `Local` loses two
+    /// decodes of fourteen there.
+    ///
+    /// Default `Off`, which is right for recorded or simulated audio
+    /// and wrong for a narrowed receiver.
     pub fn eq_mode(mut self, e: EqMode) -> Self {
         self.eq_mode = e;
         self
@@ -565,6 +647,13 @@ where
     /// bits at high confidence, effectively reducing the number of
     /// unknown bits and lowering the decode threshold by 1-3 dB when the
     /// hint matches a station actually on air.
+    ///
+    /// **AP is not a narrow-band technique**, and its living on this
+    /// builder for FT4/FST4 is an accident of implementation rather than
+    /// a statement about where it applies — see
+    /// [`DecodeRequest::ap_hint`] for the one line responsible. Do not
+    /// infer from this method's location that a station must be
+    /// frequency-known, or that AP belongs with a roofing filter.
     pub fn ap_hint(mut self, ap: &'a ApHint) -> Self {
         self.ap_hint = Some(ap);
         self
