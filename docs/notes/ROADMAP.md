@@ -1,4 +1,4 @@
-# Roadmap (post-0.9.0)
+# Roadmap (post-0.11.0)
 
 ## Strategic state (2026-08-10)
 
@@ -153,7 +153,13 @@ the next cycle's centre of gravity is **finishing the embedded product**
 host-UI consumers** (extend track 2). The two aren't exclusive, but
 attention is.
 
-## Current line — 0.9.0 shipped
+## Current line — tagged through 0.10.1; 0.11.0 bumped, not yet tagged
+
+**Do not quote this section for release state.** It is a written
+record of what each release contained, and it rots between cuts —
+it headed "0.9.0 shipped" for four releases. `scripts/release-status.sh`
+computes the state (version, tag, CHANGELOG agreement, cadence, which
+protocols owe a sweep) from the repository; run it instead.
 
 - **0.8.0** — legacy BASIS `fill_symbol_spectra_into` path removed
   (#162; a breaking FFI change to `mfsk_ft8_decode_i16`'s signature),
@@ -183,7 +189,45 @@ attention is.
     `claude/streaming-interface-docs-vuet32`, held unmerged until a real
     consumer (a desktop UI, or a refactor of the embedded `audio.rs`
     slot statics onto it) validates the `push`/`poll`/`mark_slot_start`
-    API shape. See track 2 above.
+    API shape. See track 2 above. **Still parked as of 0.11.0** —
+    nothing in `mfsk-core/src` defines `SlotAssembler`, and the branch
+    is still only on `origin`.
+- **0.9.1 — WSPR parity with `wsprd` (#275)** plus phantom
+  elimination, TX envelope ramps (#259), FT4 sniper aim (#257), the SNR
+  formula close-out (#255), the test-taxonomy rework and FST4/Q65
+  sub-mode coverage. Tagged 2026-08-11, **one day** after v0.9.0 — an
+  escape-hatch follow-up patch, not a cadence cut, and one of the two
+  same-week patches that used to drag the cadence average down (see
+  `CLAUDE.md`'s release-cadence note).
+- **0.10.0 — search windows denominated in seconds (#282, breaking).**
+  FT8's coarse-sync lag window matched to WSJT-X (#278/#280),
+  early-frame decode (#283), WSPR host/embedded parity + the streaming
+  front end + **the CoreS3 receiver decoding off a radio** (#163/#260),
+  FST4 npre1/npre2 OSD + i0±1 timing retry + rung-major scheduling
+  (#198/#306/#308), the code-sharing audit (#290-298) and the
+  FT8/generic OSD-gate ratchet (#285). Minor bump for three public
+  search-parameter type changes — structural, per the same convention
+  0.7.0 set. Tagged 2026-08-24, 13 days after v0.9.1.
+- **0.10.1 — ハムフェア2026 booth material**, the 12 kHz literal
+  classification (#323), release tooling that runs on macOS, and FT4
+  embedded fitting its slot. Tagged 2026-09-06, 13 days after v0.10.0 —
+  on the biweekly target, not overdue.
+- **0.11.0 — a new C ABI for every mode (breaking); FT4/FST4 a-priori
+  decoding fixed.** `mfsk-ffi` rewritten so FT8, FT4 and all five FST4
+  sub-modes are addressed, configured and reported identically, with
+  capabilities published rather than guessed; `mfsk-ffi-ft8` retired;
+  maintained Kotlin **and Swift** bindings, both CI-run; a
+  caller-supplied wall-clock decode budget; the sniper gated on
+  `SupportsSniper` and so FT8-only (breaking). Sensitivity moves for the
+  first time in several releases: FT4's AP had been locking about half
+  its bits to the *opposite* of the truth and ran no blind CQ pass, and
+  fixing it takes FT4's AWGN threshold **−16.89 → −18.00 dB** — from
+  0.6 dB behind WSJT-X's published figure to 0.5 dB ahead. FST4
+  unchanged across all twenty sweep cells, FT8 across all four, both
+  measured.
+  - **Version bumped and CHANGELOG written; no tag as of 2026-09-15.**
+    Nothing has reached crates.io — CD runs on the tag push. Held for
+    the next scheduled cut rather than blocked on anything.
 
 ## Prior line (0.7.x) — shipped through 0.7.4 (2026-07-19)
 
@@ -837,13 +881,13 @@ log` for the fix commit, not re-derived here):
 - ~~**#116**~~ — FT8: classify JTDX 5/18 misses on `qso3_busy.wav`.
 - ~~**#117**~~ — FT8: auto-AP iaptype-2 from same-slot decoded callsigns.
 - ~~**#146**~~ — FST4 AWGN sensitivity gap vs. WSJT-X's published table
-  (0.7.1/0.7.2 close-out, see *Current line* above).
+  (0.7.1/0.7.2 close-out, see *Prior line (0.7.x)* below).
 - ~~**#147**~~ — docs: `CHANGELOG.md` size + docs/ reader-facing vs.
   internal-notes split.
 - ~~**#150**~~ — FT8 JTDX-only extra decodes ground-truth question
   (resolved as a side effect of 0.7.3's `OSD_HARDERRORS_MAX` widening).
 - ~~**#156**~~ — MSK144 SNR sensitivity verification against real
-  WSJT-X (0.7.4, see *Current line* above).
+  WSJT-X (0.7.4, see *Prior line (0.7.x)* below).
 - ~~**#72**~~ — `DecodeStrictness` duplicate definition + uncalibrated
   copy for FT4/FST4. Turned out almost entirely resolved already
   (2026-07-18, before this closure): FT4's copy was retuned against
@@ -963,8 +1007,8 @@ hints; the live worklist is the **Open follow-ups** section above.
   remain deferred indefinitely (no user demand). **Update**: even
   without a real-audio golden, all five sub-modes now have a
   rigorous AWGN-sensitivity characterization vs. WSJT-X's published
-  thresholds (issue #146, closed 0.7.1/0.7.2 — see *Current line*
-  above and `docs/notes/FST4_BENCHMARK.md`), so "synth-only" no
+  thresholds (issue #146, closed 0.7.1/0.7.2 — see *Prior line
+  (0.7.x)* above and `docs/notes/FST4_BENCHMARK.md`), so "synth-only" no
   longer means "unquantified."
 
 ## Phase B — embedded controller line
