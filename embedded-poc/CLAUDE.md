@@ -101,7 +101,8 @@ installs beyond the usual `espup` / `~/export-esp.sh`:
 
 ```sh
 cargo install espflash          # not bundled with the esp toolchain
-brew install coreutils          # optional — see the watchdog note below
+brew install coreutils          # optional — supplies GNU `timeout`;
+                                #   without it a bash watchdog stands in
 ```
 
 What differs, and why it is not a new code path so much as the same one
@@ -116,11 +117,17 @@ without a layer:
 - **The port is `/dev/cu.usbmodem*`**, globbed for, since the suffix is
   per-board. `cu.` and not `tty.`: opening `tty.*` blocks waiting on
   DCD, which is not asserted here. `PORT=` overrides.
-- **`timeout` is not in the BSD userland.** With coreutils installed
-  the scripts use `gtimeout`; without it they fall back to a bash
-  watchdog that TERMs the `script` process (then KILLs after 5 s). The
+- **`timeout` is not in the BSD userland.** Homebrew's coreutils
+  installs it as plain `timeout` — only the commands that collide with
+  macOS's own (`dir`, `dircolors`, `vdir`) get the `g` prefix, and
+  `timeout` is not one of them — so `/opt/homebrew/bin/timeout` is GNU
+  and `--foreground` works. `gtimeout` is tried second, for a setup that
+  does have the prefix. With neither, the scripts fall back to a bash
+  watchdog that TERMs the `script` process and KILLs after 5 s. The
   watchdog is what `timeout --foreground` was for — the signal has to
-  reach the pty owner, or espflash is left holding the port.
+  reach the pty owner, or espflash is left holding the port. Both paths
+  were exercised here: the watchdog before coreutils was installed, GNU
+  `timeout` after.
 - **`script(1)` takes its command differently.** GNU wants one string
   after `-c`, BSD wants the file first and the command as argv. The
   BSD form is the better one and is what the helper builds; the GNU
