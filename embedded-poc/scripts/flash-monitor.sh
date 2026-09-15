@@ -49,13 +49,20 @@
 #
 # Defaults:
 #   DURATION_SEC = 90
-#   PORT         = /dev/ttyACM0
+#   PORT         = /dev/ttyACM0 (WSL/Linux) or the first /dev/cu.usbmodem*
+#                  (macOS) — see lib-platform.sh; `PORT=` in the
+#                  environment overrides, as the 4th argument always did
 #   PARTITIONS   = ./partitions.csv
 #   FLASH_SIZE   = (unset — auto-detected from the connected chip via `espflash board-info`)
 #
 # Requires `source ~/export-esp.sh` to have been run in the parent shell.
 
 set -euo pipefail
+
+# GNU/BSD divergences (`script`, `timeout`, `sed -i`) and the serial
+# node's name, in one place — this script runs on both machines.
+# shellcheck source=embedded-poc/scripts/lib-platform.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-platform.sh"
 
 ELF=${1:?usage: flash-monitor.sh <ELF> <LOG_FILE> [DURATION] [PORT] [PARTITIONS] [FLASH_SIZE]}
 LOG=${2:?usage: flash-monitor.sh <ELF> <LOG_FILE> [DURATION] [PORT] [PARTITIONS] [FLASH_SIZE]}
@@ -66,7 +73,7 @@ LOG=${2:?usage: flash-monitor.sh <ELF> <LOG_FILE> [DURATION] [PORT] [PARTITIONS]
 # and none to watch it run — and a window that expires mid-write kills
 # `espflash` partway through, which is worse than useless.
 DURATION=${3:-180}
-PORT=${4:-/dev/ttyACM0}
+PORT=${4:-${PORT:-$(mfsk_default_port)}}
 PARTITIONS=${5:-./partitions.csv}
 # Positional wins, then the environment. It was positional-only, and
 # `FLASH_SIZE=16mb flash-monitor.sh ...` — which is how the name reads —
@@ -81,6 +88,16 @@ if [[ ! -f "$ELF" ]]; then
 fi
 if [[ ! -f "$PARTITIONS" ]]; then
     echo "Partitions CSV not found: $PARTITIONS" >&2
+    exit 1
+fi
+# Checked here rather than left to `script`, which reports a missing
+# command on the child's stderr *inside the transcript* — so the run
+# then fails the "Flashing has completed" check below and reports a
+# window shorter than the write, which is the wrong instruction.
+if ! command -v espflash >/dev/null 2>&1; then
+    echo "[flash-monitor] espflash not on PATH." >&2
+    echo "[flash-monitor]   cargo install espflash   (then ensure ~/.cargo/bin is on PATH)" >&2
+    echo "[flash-monitor]   and 'source ~/export-esp.sh' in this shell." >&2
     exit 1
 fi
 
@@ -114,25 +131,26 @@ if [[ -z "$FLASH_SIZE" ]]; then
     fi
 fi
 
-FLASH_SIZE_FLAG=""
+# An array, not a string: the command now crosses a function boundary as
+# argv, and a two-word string would need an unquoted expansion to split
+# back — which also splits a path with a space in it.
+FLASH_SIZE_FLAG=()
 if [[ -n "$FLASH_SIZE" ]]; then
-    FLASH_SIZE_FLAG="--flash-size $FLASH_SIZE"
+    FLASH_SIZE_FLAG=(--flash-size "$FLASH_SIZE")
 fi
 
-echo "[flash-monitor] running 'espflash flash --monitor' under pty for ${DURATION}s → $LOG${FLASH_SIZE_FLAG:+ (--flash-size $FLASH_SIZE)}"
+echo "[flash-monitor] running 'espflash flash --monitor' under pty for ${DURATION}s → $LOG${FLASH_SIZE:+ (--flash-size $FLASH_SIZE)}"
 
-# `script -qfc CMD FILE`     : run CMD under pty, append transcript to FILE.
-# `timeout --foreground`      : SIGTERM cleanly via the pty, not the parent.
-# stdin from /dev/null        : monitor will not block on input.
-timeout --foreground "$DURATION" \
-    script -qfc \
-        "espflash flash --monitor --port '$PORT' --partition-table '$PARTITIONS' $FLASH_SIZE_FLAG '$ELF'" \
-        "$LOG" \
-        </dev/null \
-    || true
+# Under a pty, bounded by DURATION, transcript to $LOG. The GNU/BSD
+# `script` and `timeout` split — and the bash watchdog for a macOS
+# without coreutils — are in mfsk_run_pty.
+mfsk_run_pty "$DURATION" "$LOG" \
+    espflash flash --monitor --port "$PORT" --partition-table "$PARTITIONS" \
+        ${FLASH_SIZE_FLAG+"${FLASH_SIZE_FLAG[@]}"} "$ELF"
 
-# Strip CR injected by the pty so logs are pure LF.
-sed -i 's/\r$//' "$LOG"
+# Strip the CR the pty injects (and BSD `script`'s EOF marker) so logs
+# are pure LF.
+mfsk_strip_cr "$LOG"
 
 # Say whether this actually flashed.
 #

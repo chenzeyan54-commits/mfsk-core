@@ -379,6 +379,45 @@ suite on a Mac rather than by CI, which still has Linux runners only.
   freshly-regenerated copy, never the committed one, so a stale header
   could merge green.
 
+- **The flash-and-capture scripts only ran on WSL, and one of their
+  diagnostics never ran anywhere.** `flash-monitor.sh` and `capture.sh`
+  were written against GNU coreutils and usbipd passthrough:
+  `timeout --foreground` (absent from the BSD userland),
+  `script -qfc CMD FILE` (GNU's argument order — BSD takes the file
+  first and the command as argv), `sed -i` without the backup suffix
+  BSD requires, and `/dev/ttyACM0` hard-coded as the port. They now
+  source `embedded-poc/scripts/lib-platform.sh`, which holds each
+  divergence once: the serial node per platform (`/dev/cu.usbmodem*`
+  on macOS, globbed — `cu.` not `tty.`, which would block on DCD), a
+  pty runner that picks the right `script` form and falls back to a
+  bash watchdog when neither `timeout` nor `gtimeout` is installed, and
+  a CR strip that writes-and-moves instead of `sed -i`. `capture.sh`
+  skips the usbipd attach step off `mfsk_is_wsl` — macOS addresses the
+  board directly, the CoreS3's console being the S3's own
+  USB-Serial-JTAG — while its other four guards are platform-independent
+  and still run. `flash-monitor.sh` also now checks for `espflash` up
+  front: without it, `script` reported the missing command *inside the
+  transcript*, which then failed the "Flashing has completed" check and
+  told the operator their capture window was too short.
+
+  Found while doing this, unrelated to platform: `capture.sh` dispatched
+  its usbipd diagnostics with `case $?` after `if ! attach_if_needed`,
+  where `$?` is the *negated* status and so always 0. The two arms that
+  name the physical step — power-cycle the board, or `usbipd bind` from
+  an admin shell — had been unreachable for as long as the block
+  existed, and every failure printed the generic "check the cable". The
+  status is captured on the failing branch now.
+
+  Two claims in `embedded-poc/CLAUDE.md` corrected while there: that
+  `flash-monitor.sh` passes `--before no-reset` (it passes no
+  `--before`/`--after` at all, and `no-reset` would stop it reaching the
+  bootloader — the repo-root CLAUDE.md already said so), and that the
+  CoreS3 enumerates "via CH9102 bridge" (it is native USB-Serial-JTAG:
+  the crate enables the `usb-serial-jtag` feature for
+  `usb_serial_jtag_is_connected`, and `usb_host_install()` detaches the
+  console, which a bridge could not do). Everything above is verified
+  on macOS without a board; nothing that needs the CoreS3 plugged in is.
+
 ### Added
 
 - **The tier-C sweeps every decode-path change in this section asked

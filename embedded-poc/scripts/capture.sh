@@ -21,6 +21,12 @@
 #    `usbipd attach`, and if that cannot be fixed from here (device gone
 #    from Windows, or unbound and needing an admin `usbipd bind`) says
 #    exactly which physical step is needed rather than retrying.
+#
+#    **WSL only.** macOS has no passthrough layer to go wrong: the
+#    CoreS3 wires USB-C straight to the ESP32-S3's native USB, which
+#    enumerates as a CDC-ACM /dev/cu.usbmodem* with no driver. The
+#    whole step is skipped there and the port check below stands on its
+#    own. The other four failure modes are platform-independent.
 # 3. **Log files are never overwritten.** A rerun that reuses a name
 #    destroys the measurement it was meant to compare against; that
 #    happened. `-2`, `-3`, … are appended.
@@ -40,12 +46,20 @@ LOGBASE=${2:?}
 SECS=${3:-120}
 MARKER=${4:-}
 
+here=$(cd "$(dirname "$0")" && pwd)
+
+# GNU/BSD divergences and the serial node's name.
+# shellcheck source=embedded-poc/scripts/lib-platform.sh
+. "$here/lib-platform.sh"
+
 USBIPD=${USBIPD:-/mnt/c/Program Files/usbipd-win/usbipd.exe}
 VIDPID=${VIDPID:-303a:1001}
-PORT=${PORT:-/dev/ttyACM0}
+PORT=${PORT:-$(mfsk_default_port)}
+# flash-monitor.sh takes PORT positionally or from the environment, and
+# this script passes only three arguments — so export, or the child
+# re-derives a default that may not match the one checked here.
+export PORT
 export FLASH_SIZE=${FLASH_SIZE:-16mb}
-
-here=$(cd "$(dirname "$0")" && pwd)
 
 say() { printf '[capture] %s\n' "$*"; }
 die() { printf '[capture] %s\n' "$*" >&2; exit 1; }
@@ -82,8 +96,17 @@ attach_if_needed() {
     lsusb 2>/dev/null | grep -qi "$VIDPID"
 }
 
-if ! attach_if_needed; then
-    case $? in
+# `rc=$?` on the failing branch, not `case $?` after `if ! ...`: the
+# status of `! cmd` is the *negated* one, so `$?` inside that `then` was
+# always 0 and every failure fell to the `*` arm. The two arms that name
+# the physical step — power-cycle, or `usbipd bind` from an admin shell —
+# were unreachable for as long as this block has existed, which is the
+# opposite of what the script is for.
+if mfsk_is_wsl; then
+    rc=0
+    attach_if_needed || rc=$?
+    case $rc in
+      0) ;;
       2) die "the board is not enumerated on Windows at all.
    Unplug USB, hold the CoreS3 power button ~6 s to power it down,
    plug it back in, then press the power button to switch it on." ;;
@@ -92,7 +115,16 @@ if ! attach_if_needed; then
       *) die "could not attach the board to WSL; check 'usbipd list' and the cable." ;;
     esac
 fi
-[ -e "$PORT" ] || die "$PORT missing even after attach"
+if [ ! -e "$PORT" ]; then
+    if mfsk_is_wsl; then
+        die "$PORT missing even after attach"
+    fi
+    die "no serial port at $PORT.
+   The board is not on USB, or it booted into USB-host mode and took
+   the port with it (see failure mode 5). Plugged into a Mac it should
+   appear within a second or two as /dev/cu.usbmodem*; check with
+   'ls /dev/cu.*'. Set PORT= to override."
+fi
 
 # ── 3. a fresh log name ─────────────────────────────────────────────
 log="$LOGBASE"

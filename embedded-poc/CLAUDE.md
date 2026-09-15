@@ -75,7 +75,8 @@ around the call, all of it learned the expensive way in one session
   `lsusb` sees nothing and `/dev/ttyACM0` is a stale node; espflash
   then says "Error while connecting to device". The wrapper detaches
   and re-attaches, and when it cannot fix it from WSL it names the
-  physical step instead of retrying.
+  physical step instead of retrying. **WSL only** — skipped elsewhere,
+  see below.
 - **Never overwrites a log.** A rerun that reuses a filename destroys
   the measurement it was meant to compare against.
 - **Fails when nothing was captured.** With a marker regex, an empty
@@ -92,6 +93,55 @@ around the call, all of it learned the expensive way in one session
 (espflash auto-detects a single port). The explicit 3-step form
 is what the user types under tee / piped redirection.
 
+### Flashing from macOS
+
+Both scripts run on macOS as of 2026-09-15; `scripts/lib-platform.sh`
+holds every divergence and both scripts source it. Setup is two
+installs beyond the usual `espup` / `~/export-esp.sh`:
+
+```sh
+cargo install espflash          # not bundled with the esp toolchain
+brew install coreutils          # optional — see the watchdog note below
+```
+
+What differs, and why it is not a new code path so much as the same one
+without a layer:
+
+- **No passthrough.** The usbipd step exists because WSL cannot see a
+  USB device Windows has enumerated. macOS addresses the board
+  directly, so `capture.sh` skips that block entirely (`mfsk_is_wsl`).
+  The other four things it does — wait for the port, never overwrite a
+  log, fail on an empty capture, name the download-mode case — are
+  platform-independent and still apply.
+- **The port is `/dev/cu.usbmodem*`**, globbed for, since the suffix is
+  per-board. `cu.` and not `tty.`: opening `tty.*` blocks waiting on
+  DCD, which is not asserted here. `PORT=` overrides.
+- **`timeout` is not in the BSD userland.** With coreutils installed
+  the scripts use `gtimeout`; without it they fall back to a bash
+  watchdog that TERMs the `script` process (then KILLs after 5 s). The
+  watchdog is what `timeout --foreground` was for — the signal has to
+  reach the pty owner, or espflash is left holding the port.
+- **`script(1)` takes its command differently.** GNU wants one string
+  after `-c`, BSD wants the file first and the command as argv. The
+  BSD form is the better one and is what the helper builds; the GNU
+  branch re-quotes with `printf %q`.
+- **`sed -i` is not portable** (BSD needs the backup suffix as its own
+  argument), so the CR-stripping pass writes to a temp file and moves
+  it. It also strips the `^D` BSD `script` emits when its stdin is
+  already at EOF, which would otherwise land on the log's first line.
+
+**Verified without a board**: port derivation, the WSL block being
+skipped, the pty capture, the watchdog bounding a long-running command,
+the transcript ending up pure LF, and the missing-`espflash` message.
+**Not verified**: anything that needs the CoreS3 to be plugged in — that
+`/dev/cu.usbmodem*` appears with no driver follows from the console
+being native USB-Serial-JTAG (CDC-ACM), but it has not been observed.
+
+One thing macOS does not change: **the CoreS3 decides host-vs-peripheral
+once, at boot, from VBUS**. Plugged into a Mac it is a peripheral —
+flashable, and unable to talk to a radio. Running as a USB host needs
+the DIN base on M5Bus so the USB-C port is free, exactly as on WSL.
+
 ## LX6 (Core2) vs LX7 (S3) — comparison table
 
 | | M5Stack Core2 (LX6) | M5StickS3 / S3-app (LX7) | M5Stack CoreS3 / CoreS3-app (LX7) |
@@ -103,7 +153,8 @@ is what the user types under tee / piped redirection.
 | Flash / PSRAM | 16 MB / 8 MB (default) | 8 MB / 8 MB Octal (`CONFIG_SPIRAM_MODE_OCT=y`, ~80 MB/s); Quad on M5Stamp S3 | 16 MB / 8 MB **Quad** (`CONFIG_SPIRAM_MODE_QUAD=y`) |
 | Internal DRAM | ~280 KB usable | ~512 KB | ~512 KB |
 | USB host capable | No (no USB peripheral; flashes via CP210x UART) | **No** (silicon yes, board no — no VBUS source, ID pin unwired, see memory `project_m5stick_s3_no_usb_host`) | **Yes**, but see "USB host VBUS on CoreS3" below — the enable pins are not the ones this table used to name |
-| Port enumeration | `/dev/ttyACM0` (CP2104) | `/dev/ttyACM0` (USB-Serial-JTAG, native S3) | `/dev/ttyACM0` (USB-Serial-JTAG via CH9102 bridge on CoreS3) |
+| Port enumeration | `/dev/ttyACM0` (CP2104) | `/dev/ttyACM0` (USB-Serial-JTAG, native S3) | `/dev/ttyACM0` (USB-Serial-JTAG, **native S3** — this cell used to say "via CH9102 bridge", which is both wrong and self-contradictory: the crate enables the `usb-serial-jtag` feature (`m5stack-cores3-app/Cargo.toml:255`, "CoreS3 has native USB-JTAG"), and `usb_host_install()` *detaches the console* — which only a native USB peripheral can do. A bridge would be unaffected, which is exactly why the Core2/CP2104 case is called out separately) |
+| Port on macOS | — (untested) | — (untested) | `/dev/cu.usbmodem*`, no driver: native USB-Serial-JTAG is CDC-ACM. **Not yet confirmed on hardware** — see "Flashing from macOS" above |
 | SIMD | None | esp-dsp `_ae32_` asm (LX6/LX7 shared, scalar single-issue) — LX7 PIE `_aes3_` migration pending, see `docs/notes/PHASE_D_PIE_SIMD.md` | esp-dsp `_ae32_` asm (same Phase D D1 migration applies) |
 | LCD | ILI9342C 320×240 landscape | ST7789P3 135×240 portrait | ILI9342C 320×240 landscape (same as Core2) + FT6336U capacitive touch |
 | Audio codec | none | ES8311 (mono mic + speaker amp) | ES7210 (dual mic) + AW88298 speaker amp |
@@ -369,9 +420,12 @@ is GPIO0 low at reset release.
 
 You usually do not need the button at all: `espflash`'s default
 `--before default-reset` pulses DTR/RTS and enters download mode by
-itself. `flash-monitor.sh` passes `--before no-reset` precisely to stop
-that happening by accident, so reach for the button only when the port
-does not enumerate.
+itself, and that default is what `flash-monitor.sh` relies on — it
+passes **no** `--before`/`--after` flags, and could not: `no-reset`
+would stop it reaching the bootloader to write at all. (This paragraph
+claimed the opposite until 2026-09-15; `grep -n before
+scripts/flash-monitor.sh` returns only comments.) Reach for the button
+only when the port does not enumerate.
 
 **If the port does not enumerate at all**, download mode is not the
 problem — nothing is presenting USB. The board is powered off, or it is
@@ -402,8 +456,8 @@ there is no serial device to find.
   previous binary. Touch a source file (e.g. bump a `log::info!`
   line) to force a real rewrite; expect ~15-25 s for a real
   factory-partition write. See repo-root CLAUDE.md for full
-  context on this and the `--before no-reset` flag that
-  `scripts/flash-monitor.sh` passes.
+  context, including why `flash-monitor.sh` passes no
+  `--before`/`--after` flags and wants espflash's own defaults.
 
 ## Crates under `embedded-poc/`
 
@@ -511,7 +565,10 @@ there is no serial device to find.
 - **`idf-component/`** — esp-idf component shim that wraps
   `mfsk-ffi-ft8` so C-only ESP-IDF projects can pull the FT8
   decoder in without writing Rust glue.
-- **`scripts/`** — `flash-monitor.sh`, `udp-log-listen.sh`.
+- **`scripts/`** — `capture.sh` (the wrapper to reach for),
+  `flash-monitor.sh` (the espflash flags), `lib-platform.sh`
+  (WSL/macOS divergences, sourced by both), `udp-log-listen.sh`,
+  `wsl-attach-board.sh`.
   Both actively used; see repo-root CLAUDE.md for why.
 - **`assets/`** — vendored WSJT-X reference WAVs used by host
   integration tests (`asset_path!` macro) and by the embedded
