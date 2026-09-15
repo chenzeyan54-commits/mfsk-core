@@ -139,6 +139,11 @@ if [[ -n "$FLASH_SIZE" ]]; then
     FLASH_SIZE_FLAG=(--flash-size "$FLASH_SIZE")
 fi
 
+# espflash wraps its errors in ANSI colour, which lands in the transcript
+# as escape sequences around the very strings the checks below grep for.
+# Honoured by 4.6.0; harmless on a build that ignores it.
+export NO_COLOR=1
+
 echo "[flash-monitor] running 'espflash flash --monitor' under pty for ${DURATION}s → $LOG${FLASH_SIZE:+ (--flash-size $FLASH_SIZE)}"
 
 # Under a pty, bounded by DURATION, transcript to $LOG. The GNU/BSD
@@ -160,7 +165,15 @@ mfsk_strip_cr "$LOG"
 # good run unless someone read the transcript. Two sessions'
 # measurements were taken against a board still running the previous
 # binary because of it.
-if grep -q "Serial port not found\|Device or resource busy\|connection_failed" "$LOG"; then
+# `Error while connecting to device` is what espflash 4.x prints for a
+# port that is not there — verified against 4.6.0 on 2026-09-15 with
+# `--port /dev/cu.nonexistent`. It was missing from this list, so the
+# most ordinary failure of all (board not plugged in, or booted into USB
+# host mode and holding the port) fell through to the check below and
+# was reported as a capture window shorter than the write. The string is
+# the one `embedded-poc/CLAUDE.md` already quoted; only the script did
+# not know it.
+if grep -q "Serial port not found\|Device or resource busy\|connection_failed\|Error while connecting to device" "$LOG"; then
     echo "[flash-monitor] FAILED: could not open $PORT — the board is not on USB, or another" >&2
     echo "[flash-monitor]   flash-monitor still holds it. NOTHING WAS WRITTEN." >&2
     exit 2

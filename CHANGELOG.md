@@ -400,6 +400,19 @@ suite on a Mac rather than by CI, which still has Linux runners only.
   transcript*, which then failed the "Flashing has completed" check and
   told the operator their capture window was too short.
 
+  The same misdiagnosis had a second cause, found by installing espflash
+  and watching it fail: the port-failure check grepped for `Serial port
+  not found`, `Device or resource busy` and `connection_failed`, none of
+  which is what espflash 4.x prints. It says **`Error while connecting
+  to device`** — the string `embedded-poc/CLAUDE.md` already quoted, so
+  only the script did not know it. The most ordinary failure there is
+  (board not plugged in, or booted into USB host mode and holding the
+  port) therefore reported "the write did not finish" instead of
+  "NOTHING WAS WRITTEN", pointing the operator at the capture window
+  rather than at the cable. Verified against espflash 4.6.0. Logs are
+  also written with `NO_COLOR=1` now, since espflash wrapped those very
+  strings in ANSI escapes.
+
   Found while doing this, unrelated to platform: `capture.sh` dispatched
   its usbipd diagnostics with `case $?` after `if ! attach_if_needed`,
   where `$?` is the *negated* status and so always 0. The two arms that
