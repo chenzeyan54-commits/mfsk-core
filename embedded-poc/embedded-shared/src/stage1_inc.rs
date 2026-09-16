@@ -55,11 +55,32 @@ const TARGET_PEAK: i32 = (NFFT_SPEC * 2) as i32;
 // Emitting at pair 86 (m=0..173) leaves m=174..175 zero in both
 // the spec and the per-half allsum, which silently flattens
 // block-2's contribution for candidates whose lag lands on ±jz
-// (= dt near ±1.0 s). On NTP-synced operation dt is well inside
-// ±0.5 s, and the dt median auto-sync (`time_sync::record_decode_dt`)
-// re-anchors the slot phase so the lag range can stay tight in
-// steady state — taking the pair-86 emit, the 160 ms audio-tail
-// overlap gain shows up directly as -160 ms post_slotend.
+// (= dt near ±1.0 s). Taking the pair-86 emit, the 160 ms
+// audio-tail overlap gain shows up directly as -160 ms
+// post_slotend.
+//
+// **What keeps dt away from that edge is no longer a servo.** This
+// comment used to say the dt median auto-sync
+// (`time_sync::record_decode_dt`) re-anchored the slot phase, so
+// the lag range could stay tight in steady state. That feedback was
+// removed on 2026-09-05 (lock-and-hold — see
+// `m5stack-cores3-app/src/decode_pipeline.rs`, "no
+// `set_bootstrap_slot_shift_12k` from decode DTs at all, in any
+// branch"): a decode's DT is *that station's* clock error, and
+// feeding it back oscillated the grid to ±0.6 s with `dec` falling
+// 8 -> 4. `record_decode_dt` still runs, but what it feeds is the
+// panel readout and the lock/re-acquire policy's decode counts, not
+// the grid.
+//
+// So the margin has two sources now, and neither trims: NTP/RTC
+// when a clock is disciplined (dt well inside ±0.5 s), and cold
+// acquisition's one-shot placement when it is not. Measured on
+// hardware 2026-09-16 (`MFSK_CORES3_SIM`): a grid that locked
+// 0.16 s — one FT8 symbol — from the fixture's own DT held there
+// for eleven consecutive slots at `dec=6`, where an earlier run of
+// the same image at +0.201 s held `dec=8`. Nothing in the steady
+// path noticed, because `grid_state::observe` re-acquires only at
+// `n_dec == 0`.
 //
 // **Semantics of this constant** (Gemini PR #123 round-14 misread
 // guard): the value is compared `next_pair >= SPEC_EMIT_PAIR` in

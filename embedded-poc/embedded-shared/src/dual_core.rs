@@ -62,11 +62,19 @@ use crate::pipeline::{self, Slot, SpecBundle};
 /// candidates and the whole 160 ms audio-tail overlap gain would be
 /// built on a bound that no longer holds.
 ///
-/// Both boards also run NTP/GPS-synced with dt well inside ±0.5 s,
-/// and `time_sync::record_decode_dt` re-anchors slot phase, so the
-/// tight window is right here on its own merits too — and it keeps
-/// [`SpeculativeOut::bootstrap_dt_med`] valid, which a ±2.5 s list
-/// would not be (issue #280).
+/// With a disciplined clock both boards run dt well inside ±0.5 s,
+/// so the tight window is right here on its own merits too — and it
+/// keeps [`SpeculativeOut::bootstrap_dt_med`] valid, which a ±2.5 s
+/// list would not be (issue #280).
+///
+/// This doc used to add "and `time_sync::record_decode_dt`
+/// re-anchors slot phase". It does not, since 2026-09-05: the
+/// per-slot DT feedback was removed (lock-and-hold, see
+/// `m5stack-cores3-app/src/decode_pipeline.rs`), and what places the
+/// phase now is NTP/RTC or a one-shot cold acquisition, held
+/// thereafter. Without a clock the window's margin is therefore
+/// whatever acquisition left — measured 0.16 s off on hardware
+/// 2026-09-16 and held there, `dec=6` against 8 at a better phase.
 const EMBEDDED_SYNC_LAG_S: f32 = 1.0;
 
 /// One slot's Phase-C output. Both apps consume it identically:
@@ -85,11 +93,20 @@ pub struct SpeculativeOut {
     /// budget is disabled or the slot finished inside it.
     pub n_cut: usize,
     /// DT median over the top-5 highest-score pass1 candidates.
-    /// `None` if pass1 was empty. Used by the controller's auto-sync
-    /// path as a cold-start fallback when zero confirmed decodes
-    /// land — empirically lines up with the confirmed-decode median
-    /// to within ±70 ms on reference fixtures, gated by the
-    /// `ft8_coarse_sync_bootstrap` integration test.
+    /// `None` if pass1 was empty. Empirically lines up with the
+    /// confirmed-decode median to within ±70 ms on reference
+    /// fixtures, gated by the `ft8_coarse_sync_bootstrap`
+    /// integration test.
+    ///
+    /// **No controller reads it any more** — both apps destructure it
+    /// as `bootstrap_dt_med: _`. It was the auto-sync path's
+    /// cold-start fallback for slots with zero confirmed decodes;
+    /// lock-and-hold (2026-09-05) dropped that ±0.2 s/slot nudge
+    /// because its own doc admitted it is "essentially always
+    /// `Some`, just a small near-random value when the true signal is
+    /// outside ±1 s" — a random walk rather than an acquisition, and
+    /// acquisition is `ft8::acquire`'s job. Kept as a measurement the
+    /// bench and the test still pin, not as a live input.
     pub bootstrap_dt_med: Option<f32>,
     /// `esp_timer_get_time()` right after `recv_box::<SpecBundle>` returns.
     pub t_post_recv: i64,
