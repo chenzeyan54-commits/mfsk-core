@@ -79,7 +79,9 @@ and optimisations land once and apply everywhere.
     anything DSP-side. `Q11i16` (~1/2048 LSB) closes that gap fully on
     host; on real silicon it is worth one entry (6/18 → 7), the rest of
     the host gap being NSTEP-half, coarse-sync simplifications and the
-    absent `fine_refine_pass1`. BP scratch doubles from ~6 KB to
+    absent `fine_refine_pass1` (the CoreS3 per-slot pipeline now has an
+    equivalent — see [Per-slot decode on the
+    CoreS3](#per-slot-decode-on-the-cores3-fine-sync-retries-the-key-up-bound)). BP scratch doubles from ~6 KB to
     ~12 KB, still inside the S3 / Core2 internal-DRAM budget. `Q3i8`
     stays in `engine::scalar` for the comparison path. (The sweep above
     predates the 0.6.3 OSD tightening, which later dropped 3 CRC-luck
@@ -513,14 +515,19 @@ stage1_inc worker (APP_CPU, prio 3)
   │  SlotEnd) so main can start stage 2 during the tail of capture
   │
   ├──▶ spec_q (depth 2): SpecBundle { spec, allsum_head, allsum_tail }
-  └──▶ slot_q (depth 2): Slot { audio, wav_idx, inc_total_us }
+  └──▶ slot_q (depth 2): Slot { audio, wav_idx, inc_total_us, slotend_us }
        (after the SlotEnd ChunkMsg)
        │
        ▼
 main / decode task (PRO_CPU, prio 6)
        │  recv spec_q → stage 2 (coarse_sync_split_with_allsum, dual-core)
-       │  recv slot_q → pass 2 (refine_candidates, dual-core)
-       │              → stage 3 (work-stealing per-cand, dual-core)
+       │              → fine sync (fine_sync_12k, dual-core; CoreS3 only)
+       │              → pass 2 + stage 3 on the audio prefix, "ready"
+       │                candidates; then coarse retries in the tail
+       │                window, stopping when slot_q holds the slot
+       │  recv slot_q → pass 2 + stage 3 on the full slot, "deferred"
+       │                candidates → remaining coarse retries
+       │              → one row per message
        ▼
 DecodeResult[]
 ```
@@ -546,6 +553,73 @@ See `embedded-poc/embedded-shared/src/pipeline.rs` (queue helpers +
 `ChunkMsg` / `SpecBundle` / `Slot` types) and
 `embedded-poc/embedded-shared/src/dual_core.rs` (the work-stealing
 stage 3 dispatch + Job enum).
+
+### Per-slot decode on the CoreS3: fine sync, retries, the key-up bound
+
+`decode_block`'s embedded body has skipped the host's per-candidate
+fine refine since 0.6.3 — upstream computes it on a baseband cut by a
+192 000-point FFT the embedded planner does not carry — so candidates
+were decoded from coarse sync's 3.125 Hz / 40 ms grid. The CoreS3
+per-slot pipeline now runs
+`mfsk_core::ft8::decode_block::fine_sync_12k` between coarse sync
+and the prefix partition (`DecodeConfig::fine_sync`): `ft8b.f90`'s
+Stages A/B/C on the 12 kHz audio, each Costas symbol mixed once into
+60-sample bins so every stage is a re-sum.
+
+Three things come with it, all in `dual_core::run_speculative_slot`:
+
+- **A coarse-position retry.** A candidate that fails stage 3 at its
+  refined position is tried once at its coarse one. Fine sync alone
+  erased stations the coarse position decodes; the retry is what makes
+  it a strict addition. Retries are the lowest-value work — 0.26-0.46
+  decodes a slot from 7-13 retries on the host mirror — so the early
+  path's run only in the tail window and stop claiming the moment the
+  slot arrives, and the rest wait until every first attempt, deferred
+  candidates included, has had its turn.
+- **One row per message.** Fine sync pulls adjacent coarse cells onto
+  one carrier; results are deduplicated before they reach the slot
+  count, the grid-lock policy and the QSO state machine.
+- **A stage-3 bound anchored to key-up** (`DecodeConfig::key_up_guard_ms`,
+  `Stage3Stop`). `budget_ms` counts from the SpecBundle's arrival and
+  assumed that is ≥ 1 336 ms before slot end; it measured 1 027-1 936 ms
+  depending on grid position, and below 1 336 ms its deadline fell after
+  this station's key-up (slot end + 0.5 s). Claiming now also stops at
+  key-up minus a guard, with slot end peeked from `slot_q` before the
+  slot is received. The guard is 320 ms because a deadline only stops
+  *claiming*: a candidate already in BP ran on by up to 313 ms.
+
+| `qso3_busy` through the CoreS3 pipeline | decodes a slot | finished after slot end |
+|---|---:|---:|
+| before (2026-09-16) | 6 | ~80-100 ms |
+| fine sync + retries + key-up bound (2026-09-18) | **10** | 158-291 ms |
+
+Board figures are `MFSK_CORES3_SIM` captures
+(`embedded-poc/m5stack-cores3-app/logs/sim_*_2026-09-1{6,8}.log`); the
+host reproduction that measured the design, call for call against the
+board's own `p1/ready/defer/dec`, is
+`mfsk-core/tests/ft8_embedded_pipeline_mirror.rs`. Only the CoreS3
+enables these (`MFSK_FT8_FINE_SYNC`, `MFSK_FT8_KEY_UP_GUARD_MS`); the S3
+and Core2 apps keep them off, their slot budgets unmeasured with them.
+
+### Slot grid acquisition on the CoreS3
+
+Without a disciplined clock the FT8 controller places its slot grid
+from the air (#356): lock once a slot decodes enough, hold, and
+re-acquire from a 25 s capture after a run of slots that do not. Three
+corrections, all found on the board:
+
+- **The capture's offset into its slot is counted.** The capture starts
+  whenever acquisition is armed, part-way into a slot, and its phases are
+  measured from that first sample. Uncounted, a capture ~1 s into its
+  slot left the grid 1.1 s short — outside the ±1.0 s per-slot search —
+  and cost a second acquisition, about three minutes without a decode.
+  What remains is the trial decodes' median bias, ~0.2 s either way.
+- **Every trial phase is ranked by decode count**, rather than the first
+  that decodes anything setting the grid.
+- **Only full slots vote.** The partial slot after the clock anchor holds
+  whatever audio remained, so its decodes say nothing about the grid;
+  it is shown but neither locks nor counts as under par. This one has
+  not yet been observed on hardware in the case it guards against.
 
 ## Binary footprint (Core2 reference, `xtensa-esp32-elf-size -A`)
 
@@ -575,7 +649,7 @@ that allocation now succeeds on the first try.
 
 | Protocol | Route to hardware | Status |
 |---|---|---|
-| **FT8** | `ft8::decode_block`, `fixed-point` integer pipeline | **Decoding off the air.** Six to eight stations per slot against an IC-705 on 40 m (CoreS3, 2026-08-23/24). The reference target; every number in [Performance benchmark](#performance-benchmark) is FT8 |
+| **FT8** | `ft8::decode_block`, `fixed-point` integer pipeline | **Decoding off the air.** Six to eight stations per slot against an IC-705 on 40 m (CoreS3, 2026-08-23/24). `qso3_busy` through the same pipeline: 10 a slot with fine sync (2026-09-18, [details](#per-slot-decode-on-the-cores3-fine-sync-retries-the-key-up-bound)). The reference target; every number in [Performance benchmark](#performance-benchmark) is FT8 |
 | **FST4** | generic `engine::pipeline` + `fft-extern` — **no `decode_block` port** | **Decoding off the air** on CoreS3. FST4-60 on-device: `no8_osd` 13.6 s, ≈1.95× over the ~7 s slot budget at the deadline-tight default |
 | **FT4** | generic `engine::pipeline`, host f32 (`fixed-point` measured *slower* on LX7, #198) | **Decoding off the air** on CoreS3 |
 | **WSPR** | host `wspr::decode` f32 via `fft-extern`, plus `wspr::ddc` | **Decoding off the air.** `slot 1 src=uac decoded 1 station(s)`. Decode lands at 82.8–90.1 s against a 110 s deadline |

@@ -76,7 +76,9 @@ DSP / FEC パイプライン全体は **scalar trait** でパラメータ化さ�
     その ~0.875 の量子化ステップが recall 天井を決めていた — DSP 側では
     ない。`Q11i16`（~1/2048 LSB）は host ではその差を完全に埋める。実機
     では上乗せは1件（6/18 → 7）で、残る host との差は NSTEP-half・
-    coarse-sync の簡略化・`fine_refine_pass1` 不在による。BP scratch は
+    coarse-sync の簡略化・`fine_refine_pass1` 不在による（CoreS3 の
+    per-slot パイプラインには現在その代替がある — [CoreS3 の per-slot
+    デコード](#cores3-の-per-slot-デコード-fine-sync再試行key-up-基準の打ち切り)参照）。BP scratch は
     ~6 KB から ~12 KB に倍増するが、S3 / Core2 の内蔵 DRAM 予算内に
     収まる。`Q3i8` 型は比較経路用に `engine::scalar` に残置。（上記の
     sweep は 0.6.3 の OSD tightening 以前の計測で、その後 f32 host
@@ -493,14 +495,19 @@ stage1_inc worker (APP_CPU, prio 3)
   │  送出し、main がキャプチャ尾部で stage 2 を開始できる
   │
   ├──▶ spec_q (depth 2): SpecBundle { spec, allsum_head, allsum_tail }
-  └──▶ slot_q (depth 2): Slot { audio, wav_idx, inc_total_us }
+  └──▶ slot_q (depth 2): Slot { audio, wav_idx, inc_total_us, slotend_us }
        (SlotEnd ChunkMsg 後)
        │
        ▼
 main / decode タスク (PRO_CPU, prio 6)
        │  spec_q recv → stage 2 (coarse_sync_split_with_allsum, dual-core)
-       │  slot_q recv → pass 2 (refine_candidates, dual-core)
-       │              → stage 3 (work-stealing per-cand, dual-core)
+       │              → fine sync (fine_sync_12k, dual-core; CoreS3 のみ)
+       │              → 音声 prefix 上で "ready" 候補の pass 2 + stage 3、
+       │                続いてテールウィンドウで粗位置再試行
+       │                (slot_q にスロットが届いたら停止)
+       │  slot_q recv → フルスロットで "deferred" 候補の pass 2 + stage 3
+       │              → 残りの粗位置再試行
+       │              → メッセージごとに 1 行
        ▼
 DecodeResult[]
 ```
@@ -526,6 +533,69 @@ semantics。
 `ChunkMsg` / `SpecBundle` / `Slot` 型) と
 `embedded-poc/embedded-shared/src/dual_core.rs` (work-stealing
 stage 3 dispatch + Job enum) 参照。
+
+### CoreS3 の per-slot デコード: fine sync、再試行、key-up 基準の打ち切り
+
+`decode_block` の組込み本体は 0.6.3 以降、host の per-candidate fine
+refine を省いていた — 上流はそれを組込みプランナが持たない 192 000 点
+FFT で切り出したベースバンド上で計算する — ので、候補は coarse sync の
+3.125 Hz / 40 ms グリッドのままデコードされていた。CoreS3 の per-slot
+パイプラインは coarse sync と prefix 分割の間で
+`mfsk_core::ft8::decode_block::fine_sync_12k` を実行する
+（`DecodeConfig::fine_sync`）。`ft8b.f90` の Stage A/B/C を 12 kHz 音声
+上で行い、各 Costas シンボルを 60 サンプル bin に 1 回だけ混合して、各
+Stage はその再加算で済ませる。
+
+これに伴う 3 点は、すべて `dual_core::run_speculative_slot` にある:
+
+- **粗位置での再試行。** refine 位置で stage 3 に失敗した候補を、粗位置で
+  1 回だけ試し直す。fine sync 単独では粗位置なら復号できる局を消して
+  いた。再試行があって初めて純粋な上積みになる。再試行は最も価値の低い
+  仕事（host ミラーで 7〜13 件から 1 スロットあたり 0.26〜0.46 局）なので、
+  early 経路の再試行はテールウィンドウでのみ走り、スロット到着と同時に
+  取得を止める。残りは deferred 候補を含むすべての初回試行が終わってから。
+- **メッセージごとに 1 行。** fine sync は隣接する粗セルを同じ搬送波に
+  寄せる。結果はスロット数・グリッドロック判定・QSO 状態機械に渡る前に
+  重複除去される。
+- **key-up に固定した stage 3 の打ち切り**（`DecodeConfig::key_up_guard_ms`、
+  `Stage3Stop`）。`budget_ms` は SpecBundle 到着から数え、それが slot end の
+  1 336 ms 以上前だと仮定していた。実測はグリッド位置により 1 027〜1 936 ms
+  で、1 336 ms を下回ると締切自体が自局の key-up（slot end + 0.5 s）より後に
+  来た。現在は key-up からガードを引いた時点でも取得を止め、slot end は
+  スロット受信前から `slot_q` を peek して得る。締切は取得を止めるだけで
+  BP 中の候補は最後まで走り、それが最大 313 ms 続いたので、ガードは 320 ms。
+
+| `qso3_busy` を CoreS3 パイプラインで | 1 スロットの復号数 | slot end からの終了 |
+|---|---:|---:|
+| 変更前（2026-09-16） | 6 | ~80〜100 ms |
+| fine sync + 再試行 + key-up 打ち切り（2026-09-18） | **10** | 158〜291 ms |
+
+基板の数値は `MFSK_CORES3_SIM` のキャプチャ
+（`embedded-poc/m5stack-cores3-app/logs/sim_*_2026-09-1{6,8}.log`）。設計を
+計測した host 再現は基板自身の `p1/ready/defer/dec` と呼び出し単位で照合
+した `mfsk-core/tests/ft8_embedded_pipeline_mirror.rs`。有効にしているのは
+CoreS3 のみ（`MFSK_FT8_FINE_SYNC`、`MFSK_FT8_KEY_UP_GUARD_MS`）で、S3 と
+Core2 のアプリは、これを入れた場合のスロット予算が未計測のため無効のまま。
+
+### CoreS3 のスロットグリッド取得
+
+時刻が同期していない場合、FT8 コントローラはスロットグリッドを電波から
+決める（#356）: 十分デコードできたスロットでロックして保持し、そうでない
+スロットが続けば 25 s のキャプチャから再取得する。基板で見つかった修正が
+3 つある:
+
+- **キャプチャのスロット内オフセットを加算する。** キャプチャは取得が
+  arm された時点、つまりスロットの途中から始まり、位相はその先頭サンプル
+  から測られる。加算しないと、スロット内 ~1 s から始まったキャプチャで
+  グリッドが 1.1 s 足りず（per-slot の ±1.0 s 探索の外）、2 回目の取得が
+  必要になり、約 3 分デコードが出なかった。残る誤差は試行デコードの
+  中央値バイアスで、どちら向きにも ~0.2 s。
+- **すべての試行位相をデコード数で順位付けする。** 何か 1 つでもデコード
+  できた最初の位相でグリッドを決めない。
+- **フルスロットだけが判定に加わる。** クロックアンカー直後の部分スロット
+  は残った音声だけを持つので、そのデコードはグリッドの正しさを示さない。
+  表示はするがロックにも不調カウントにも使わない。この修正が防ぐ状況は、
+  基板ではまだ観測できていない。
 
 ## バイナリフットプリント (Core2 リファレンス、`xtensa-esp32-elf-size -A`)
 
@@ -555,7 +625,7 @@ Qso モードの双方向 I2S DMA に必要な量。この alloc が今は初回
 
 | プロトコル | 実機への経路 | 状況 |
 |---|---|---|
-| **FT8** | `ft8::decode_block`、`fixed-point` 整数パイプライン | **オンエアでデコード中。** IC-705 の 40 m で1スロットあたり6〜8局（CoreS3、2026-08-23/24）。基準ターゲットであり、[性能ベンチマーク](#性能ベンチマーク)の数値はすべて FT8 |
+| **FT8** | `ft8::decode_block`、`fixed-point` 整数パイプライン | **オンエアでデコード中。** IC-705 の 40 m で1スロットあたり6〜8局（CoreS3、2026-08-23/24）。同じパイプラインで `qso3_busy` は fine sync 込みで1スロット10局（2026-09-18、[詳細](#cores3-の-per-slot-デコード-fine-sync再試行key-up-基準の打ち切り)）。基準ターゲットであり、[性能ベンチマーク](#性能ベンチマーク)の数値はすべて FT8 |
 | **FST4** | 汎用 `engine::pipeline` + `fft-extern` — **`decode_block` の移植なし** | **オンエアでデコード中**（CoreS3）。FST4-60 の実機時間は `no8_osd` で 13.6 s、締切重視の既定値で ~7 s 予算の約 1.95 倍 |
 | **FT4** | 汎用 `engine::pipeline`、ホスト f32（LX7 では `fixed-point` の方が*遅かった*、#198） | **オンエアでデコード中**（CoreS3） |
 | **WSPR** | `fft-extern` 経由のホスト `wspr::decode` f32 と `wspr::ddc` | **オンエアでデコード中。** `slot 1 src=uac decoded 1 station(s)`。110 s の締切に対し 82.8〜90.1 s で decode 完了 |
