@@ -9,9 +9,11 @@
 はなく素の同期コールバックなのか**、そして Tokio 非同期クライアントへ
 橋渡しする完全な実例。
 
-ライブラリ全体（トレイト階層、DSP プリミティブ、C ABI）については
-[LIBRARY.ja.md](LIBRARY.ja.md) を参照。本ドキュメントはそのうち §4 の
-「ストリーミング配信」を深掘りし、非同期橋渡しの実例を追加したもの。
+ライブラリ全体（トレイト階層、DSP プリミティブ）は
+[LIBRARY.ja.md](LIBRARY.ja.md)、C ABI は
+[BINDINGS.ja.md](BINDINGS.ja.md) を参照。本ドキュメントは
+LIBRARY.ja.md の §2.4「ストリーミング配信」を深掘りし、非同期橋渡しの
+実例を追加したもの。
 
 ---
 
@@ -467,7 +469,7 @@ while let Some(msg) = stream.next().await {
 
 ## 6. 関連
 
-- [LIBRARY.ja.md](LIBRARY.ja.md) §4 —— ライブラリ API リファレンス内の
+- [LIBRARY.ja.md](LIBRARY.ja.md) §2.4 —— ライブラリ API リファレンス内の
   ストリーミング節、およびそれが属する `DecodeRequest` /
   `SniperRequest` ビルダ面。
 - `DecodeRequest::on_result` の doc コメント
@@ -479,6 +481,6 @@ while let Some(msg) = stream.next().await {
   `fft-rustfft` 版 `decode_block_streaming` の完全一致テスト（issue #243）。
 - `mfsk-core/tests/wspr_wsjtx_samples.rs` —— 実信号に対する WSPR
   `decode_scan_streaming` / `decode_scan_subtract_streaming`。
-- [EMBEDDED.ja.md](EMBEDDED.ja.md) —— `mfsk-ffi-ft8` FFI 成果物向けの
-  C ABI ストリーミングチュートリアル（同じ移植性の理由で、C 境界越しに
-  も同じストリーミングの考え方をコールバックベースで実現）。
+- [BINDINGS.ja.md](BINDINGS.ja.md) —— C 境界越しの同じ考え方:
+  `mfsk_stream_*` のリングと `mfsk_session_set_on_decode`。同じ移植性の
+  理由からコールバックベースになっている。

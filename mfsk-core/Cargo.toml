@@ -36,11 +36,11 @@ full         = ["std", "fft-rustfft", "ft8", "ft4", "fst4", "wspr", "jt9", "jt65
 # round-trip.
 serde        = ["dep:serde"]
 
-# FFT backend selection. `mfsk-core::core::fft::FftPlanner` is the
+# FFT backend selection. `mfsk_core::engine::fft::FftPlanner` is the
 # trait every decode-side caller talks to; one of these features must
 # be on whenever decode-side code is compiled (host gets rustfft;
 # embedded targets bring their own backend through the extern Rust
-# factory `mfsk_core_make_default_fft_planner` — see core::fft docs).
+# factory `mfsk_core_make_default_fft_planner` — see engine::fft docs).
 fft-rustfft  = ["std", "dep:rustfft"]
 fft-extern   = ["alloc"]
 
@@ -67,7 +67,7 @@ dotprod-extern = []
 # but only 9/18 with Q3i8. The active hot-loop type has been Q11i16
 # (i16, ±16, ~1/2048 LSB, ~12 KB BP scratch) since the LlrScalar
 # trait unification in `a6425ee` (2026-05-02, shipped 0.6.2). Q3i8
-# stays in `core::scalar` for the comparison path.
+# stays in `engine::scalar` for the comparison path.
 #
 # **`fixed-point` implies `nstep-half`** (Phase 1.7.7b, 2026-05-17).
 # The two were independent features for historical reasons but are
@@ -195,7 +195,7 @@ wspr-ddc-cascade = []
 # against both WSJT-X `samples/MSK144/*.wav` recordings passes 3/3
 # (`tests/msk144_wsjtx_samples.rs`). No `Protocol`-trait ZST is wired
 # (MSK144 isn't FSK — its own top-level driver bypasses
-# `core::pipeline` entirely by design), so it doesn't appear in
+# `engine::pipeline` entirely by design), so it doesn't appear in
 # `PROTOCOLS`/`protocol_invariants.rs`; that's an intentional
 # architectural difference from the other WSJT-family modes, not a
 # gap.
@@ -246,7 +246,7 @@ q65          = ["fft-rustfft"]
 uvpacket     = ["fst4", "std"]
 parallel     = ["std", "dep:rayon"]
 
-# Test-only visibility escape hatch (issue #203). `core::pipeline`'s
+# Test-only visibility escape hatch (issue #203). `engine::pipeline`'s
 # pre-#191 raw engine functions (`decode_frame`, `process_candidate_basic`,
 # `osd_escalation_gates`, the `GenericPipelineProtocol` trait) are
 # `pub(crate)` by default so downstream consumers can't bypass

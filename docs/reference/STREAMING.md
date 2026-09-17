@@ -9,9 +9,10 @@ guarantees, **why it is a plain synchronous callback rather than an
 `async fn` / `Future` / channel-based API**, and a complete worked
 example of bridging it into a Tokio async client.
 
-For the wider library surface (trait hierarchy, DSP primitives, the C
-ABI) see [LIBRARY.md](LIBRARY.md) — this doc drills into one section
-of it (§4's "Streaming delivery") and adds the async-bridge example.
+For the wider library surface (trait hierarchy, DSP primitives) see
+[LIBRARY.md](LIBRARY.md), and [BINDINGS.md](BINDINGS.md) for the C ABI
+— this doc drills into one section of LIBRARY.md (§2.4, "Streaming
+delivery") and adds the async-bridge example.
 
 ---
 
@@ -489,7 +490,7 @@ while let Some(msg) = stream.next().await {
 
 ## 6. See also
 
-- [LIBRARY.md](LIBRARY.md) §4 — the streaming section in the wider API
+- [LIBRARY.md](LIBRARY.md) §2.4 — the streaming section in the wider API
   reference, and the `DecodeRequest` / `SniperRequest` builder surface
   it sits in.
 - `DecodeRequest::on_result` doc comment
@@ -502,6 +503,6 @@ while let Some(msg) = stream.next().await {
 - `mfsk-core/tests/wspr_wsjtx_samples.rs` — WSPR
   `decode_scan_streaming` / `decode_scan_subtract_streaming` against
   real signals.
-- [EMBEDDED.md](EMBEDDED.md) — the C ABI streaming tutorial for the
-  `mfsk-ffi-ft8` FFI artifact (the same streaming idea across the C
-  boundary, callback-based for the same portability reasons).
+- [BINDINGS.md](BINDINGS.md) — the same streaming idea across the C
+  boundary: the `mfsk_stream_*` ring and `mfsk_session_set_on_decode`,
+  callback-based for the same portability reasons.
