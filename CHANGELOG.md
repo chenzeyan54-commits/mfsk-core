@@ -708,6 +708,29 @@ suite on a Mac rather than by CI, which still has Linux runners only.
 
 ### Added
 
+- **`ft8::decode_block::fine_sync_12k` — WSJT-X's per-candidate fine
+  sync, on 12 kHz audio.** `ft8b.f90`'s Stage A (DT ±50 ms in 5 ms),
+  Stage B (frequency ±2.5 Hz in 0.5 Hz, via `ctwk`) and Stage C (DT
+  ±20 ms at the new frequency), with upstream's step sizes and
+  first-maximum tie rule. Upstream computes them on a 200 Hz baseband
+  cut by a 192 000-point FFT the embedded planner does not carry, so the
+  embedded path had skipped all three since 0.6.3 and decoded from
+  coarse sync's 3.125 Hz / 40 ms grid. Here each Costas symbol is mixed
+  once into 60-sample bins — one per cd0 sample — and every stage re-sums
+  them, ~76 k two-multiply steps a candidate instead of ~1.65 M.
+
+  Measured on `tests/ft8_embedded_pipeline_mirror.rs`, which reproduces
+  the CoreS3 per-slot pipeline call for call (checked against the
+  board's own `p1/ready/defer/dec` and message set), with the caller
+  retrying a failed candidate once at its coarse position: `qso3_busy`
+  goes from 6.35 to 8.53 decodes a slot across 201 grid phases, and from
+  5.79 (none reaching 8) to 8.29 (96 % reaching 8) including acquisition
+  from 30 starting misalignments. On the held-out recordings the same
+  acquisition-inclusive score holds (`qso1` 3.88 → 3.88) or rises
+  (`qso2` 4.43 → 4.96). The station it adds on `qso3_busy` is
+  `K1JT EA3AGB`, whose decodable region sits 1.0-1.5 Hz below its coarse
+  bin. No host decode path calls it, so no host sensitivity moves.
+
 - **The tier-C sweeps every decode-path change in this section asked
   for, run before the tag.** `scripts/release-status.sh` named FT8, FT4
   and FST4; FST4 was already covered (its sweep ran after the AP-engine

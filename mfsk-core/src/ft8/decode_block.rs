@@ -60,6 +60,7 @@
 // owns only module declarations + re-exports + tests.
 mod coarse_sync;
 mod fill_symbol_spectra;
+mod fine_sync_12k;
 mod osd_strategy;
 mod process_candidates;
 mod spectrogram;
@@ -77,6 +78,7 @@ pub use fill_symbol_spectra::{
     SymMask, fill_symbol_spectra, fill_symbol_spectra_generic, fill_symbol_spectra_goertzel,
     goertzel_window_end_sample, symbol_spectra_direct,
 };
+pub use fine_sync_12k::fine_sync_12k;
 pub use process_candidates::decode_block_streaming;
 /// Phase 1.7.7-Stick: fill-closure variant for host research /
 /// regression tests (spec-lookup vs BASIS dot product comparison).
