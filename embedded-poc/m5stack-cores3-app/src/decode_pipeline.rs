@@ -247,6 +247,36 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
     // correction is what decouples them. Left here as well because the
     // earliest rule is the obvious-looking change, it was made, and
     // only a sweep that modelled the narrow window caught it.
+    //
+    // **And not some other average of the same sample.** The median is
+    // taken over whichever stations one trial decoded, and a band's
+    // stations do not share a clock (`qso3_busy` spreads 1.07 s end to
+    // end), so the statistic moves with the mix. Four alternatives were
+    // scored on the steady pipeline's own decodes over 24 capture
+    // phases per recording, 2026-09-18
+    // (`ft8_embedded_pipeline_mirror::mirror_acquisition_dt_statistic`):
+    //
+    // ```text
+    //             qso3            qso1    qso2     landing sd (qso3/1/2)
+    //   median    8.00 (88% >=8)  3.88    4.74     0.204 / 0.014 / 0.027
+    //   midrange  8.38 (88%)      3.17    4.74     0.167 / 0.017 / 0.043
+    //   trimmed   7.29 (38%)      3.88    4.39     0.188 / 0.013 / 0.035
+    //   snrtop    8.04 (79%)      3.88    4.74     0.205 / 0.021 / 0.033
+    //   pooled    7.96 (92%)      3.83    4.70     0.203 / 0.025 / 0.022
+    // ```
+    //
+    // Nothing beats the median on more than one recording — midrange's
+    // +0.38 on `qso3` is -0.71 on `qso1`, i.e. it lands 0.4 s earlier
+    // and that happens to suit this one slot. The scatter the table
+    // reports is not the mix either: on `qso3` all but one capture
+    // phase land inside +0.10..+0.26 s, and the outlier is the one
+    // trial that decoded a single station. Between `qso1` and `qso2`,
+    // adjacent slots of one real session, the landing moves 29 ms.
+    //
+    // It costs little in any case: the phase response is flat at 7-9
+    // decodes from -0.40 to +0.40 s, so the +-0.2 s this lands within
+    // is worth about one station, and a landing bad enough to matter
+    // decodes under `LOCK_MIN_DECODES` and re-acquires by itself.
     loop {
         let cfg = dual_core::DecodeConfig {
             freq_min: 100.0,
@@ -586,7 +616,11 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                     // band stayed dark ~3 minutes. The next run recorded
                     // the offset directly: 0.395 s, with the grid landing
                     // ~0.2 s short. The remainder is the trial median's
-                    // own station-mix bias, which this does not remove.
+                    // own station-mix bias, which this does not remove —
+                    // measured since at ~0.2 s worst case and ~0.03 s
+                    // between adjacent real slots, and no cheaper to
+                    // remove by averaging differently (see the note
+                    // beside `ACQUIRE_MAX_TRIALS`).
                     let start_s = crate::uac::acquisition_start_in_slot()
                         .map_or(0.0, |n| n as f32 / 12_000.0);
                     for (trial, &(centre, _)) in phases.iter().enumerate() {

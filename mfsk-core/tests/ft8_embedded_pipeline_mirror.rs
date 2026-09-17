@@ -1782,3 +1782,238 @@ fn mirror_stage3_cost() {
         }
     }
 }
+
+/// Where does the acquisition trial's DT statistic actually land, and
+/// does the choice of statistic matter? (`decode_pipeline.rs`, the
+/// acquisition block's `med`.)
+///
+/// The board applies `centre + median(trial DTs) + capture offset`. The
+/// median is over whichever stations that one trial decoded, and a real
+/// band's stations do not share a clock: on `qso3_busy` they spread
+/// 1.07 s end to end (#358). So the statistic moves with the mix, and
+/// two hardware acquisitions of the same recording landed at +0.385 and
+/// -0.015 where the recording's own best phase is around +0.20.
+///
+/// This prints, per capture start: the winning trial's DT sample (n,
+/// min, median, max) and, for each candidate statistic, the phase it
+/// lands on and what the *steady* per-slot pipeline then decodes there
+/// — the same scoring `mirror_acquisition_methods` uses, because the
+/// grid is only as good as the slots that follow it.
+///
+/// `pooled` is the one estimator that is not a different average of the
+/// same sample: every trial that decoded describes the same physical
+/// grid, so their `centre + dt` values can be pooled into one larger
+/// sample before the median is taken.
+#[test]
+#[ignore = "diagnostic — acquisition DT statistic: landing bias and what it costs"]
+fn mirror_acquisition_dt_statistic() {
+    use mfsk_core::ft8::acquire::{REQUIRED_SAMPLES, acquire_slot_phases};
+    use mfsk_core::ft8::decode_block::decode_block_tuned;
+
+    const ACQ_MAX_CAND: usize = 200;
+    const ACQ_MAX_TRIALS: usize = 5;
+
+    let slot = load_slot();
+    let mut loopbuf = Vec::with_capacity(SLOT * 3);
+    for _ in 0..3 {
+        loopbuf.extend_from_slice(&slot);
+    }
+    let wrap = |mut dt: f32| {
+        while dt > 7.5 {
+            dt -= 15.0;
+        }
+        while dt <= -7.5 {
+            dt += 15.0;
+        }
+        dt
+    };
+    let trial = |audio: &[i16], offset_s: f32| -> Option<Vec<DecodeResult>> {
+        let off = ((offset_s * 12_000.0).round() as i64).rem_euclid(SLOT as i64) as usize;
+        if audio.len() < off + SLOT {
+            return None;
+        }
+        Some(decode_block_tuned(
+            &audio[off..off + SLOT],
+            FREQ_MIN,
+            FREQ_MAX,
+            SYNC_MIN,
+            DecodeDepth::EMBEDDED,
+            MAX_CAND_TRIAL,
+            DEFAULT_BP_MAX_ITER,
+        ))
+    };
+    let unique = |rs: &[DecodeResult]| -> usize {
+        let mut m: Vec<String> = rs.iter().filter_map(|r| unpack77(r.message77())).collect();
+        m.sort();
+        m.dedup();
+        m.len()
+    };
+    let sorted = |rs: &[DecodeResult]| -> Vec<f32> {
+        let mut v: Vec<f32> = rs.iter().map(|r| r.dt_sec).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+        v
+    };
+    // The statistics, all over one trial's DT sample except `pooled`,
+    // which is fed the whole acquisition's.
+    const NAMES: [&str; 5] = ["median", "midrange", "trimmed", "snrtop", "pooled"];
+    let stat = |name: &str, rs: &[DecodeResult]| -> f32 {
+        let v = sorted(rs);
+        match name {
+            "median" => v[v.len() / 2],
+            // Centre of the band's spread rather than of its population:
+            // immune to a mix that happens to be all-early or all-late,
+            // exposed instead to one outlier station (F5RXL, -0.77 s).
+            "midrange" => 0.5 * (v[0] + v[v.len() - 1]),
+            // The compromise: drop the extremes, average the rest.
+            "trimmed" => {
+                let inner = if v.len() >= 3 {
+                    &v[1..v.len() - 1]
+                } else {
+                    &v[..]
+                };
+                inner.iter().sum::<f32>() / inner.len() as f32
+            }
+            // The loudest half only — their DT estimates are the ones
+            // coarse sync places best.
+            "snrtop" => {
+                let mut by_snr: Vec<&DecodeResult> = rs.iter().collect();
+                by_snr.sort_by(|a, b| {
+                    b.snr_db
+                        .partial_cmp(&a.snr_db)
+                        .unwrap_or(core::cmp::Ordering::Equal)
+                });
+                let keep = by_snr.len().div_ceil(2);
+                let mut d: Vec<f32> = by_snr[..keep].iter().map(|r| r.dt_sec).collect();
+                d.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+                d[d.len() / 2]
+            }
+            _ => unreachable!(),
+        }
+    };
+
+    // `at_phase` is the expensive half; the statistics often agree.
+    //
+    // Each landing is scored twice: the unique decodes the steady path
+    // gets there, and that path's own median decode DT — the number the
+    // board logs as `median DT` and the one hardware runs were read as
+    // "the grid landed 0.2 s out". Whether it can be read that way is
+    // the question: it is a median over the *steady* window's station
+    // mix, not over the trial's.
+    let mut cache: std::collections::HashMap<i32, (usize, f32)> = std::collections::HashMap::new();
+    let mut steady = |slot: &[i16], land: f32| -> (usize, f32) {
+        let key = (land * 1000.0).round() as i32;
+        *cache.entry(key).or_insert_with(|| {
+            let out = at_phase(slot, land);
+            let med = if out.results.is_empty() {
+                f32::NAN
+            } else {
+                sorted(&out.results)[out.results.len() / 2]
+            };
+            (unique(&out.results), med)
+        })
+    };
+
+    println!(
+        "  start  trial sample (n  min  med  max) | {}",
+        NAMES
+            .iter()
+            .map(|n| format!("{n:>8}: land dec  medDT"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let mut sum = [0usize; NAMES.len()];
+    let mut ge8 = [0usize; NAMES.len()];
+    let mut lands: [Vec<f32>; NAMES.len()] = Default::default();
+    let mut steady_med: [Vec<f32>; NAMES.len()] = Default::default();
+    let mut n_starts = 0usize;
+    for step in 0..30 {
+        let start = step as f32 * 0.5;
+        let cap_k = (start * 12_000.0) as usize;
+        let audio = &loopbuf[cap_k..cap_k + REQUIRED_SAMPLES];
+        let phases = acquire_slot_phases(
+            audio,
+            FREQ_MIN,
+            FREQ_MAX,
+            SYNC_MIN,
+            ACQ_MAX_CAND,
+            ACQ_MAX_TRIALS,
+        );
+
+        // The board's selection rule: every cluster is tried, the one
+        // that decoded most wins, ties to the higher-scoring cluster.
+        let mut best: Option<(usize, f32, Vec<DecodeResult>)> = None;
+        let mut pool: Vec<f32> = Vec::new();
+        for &(centre, _) in phases.iter() {
+            let Some(got) = trial(audio, centre) else {
+                continue;
+            };
+            if got.is_empty() {
+                continue;
+            }
+            for r in got.iter() {
+                pool.push(wrap(centre + r.dt_sec));
+            }
+            if best.as_ref().is_none_or(|(bn, _, _)| got.len() > *bn) {
+                best = Some((got.len(), centre, got));
+            }
+        }
+        let Some((_, centre, got)) = best else {
+            println!("  {start:5.1}   (nothing decoded)");
+            continue;
+        };
+        n_starts += 1;
+
+        let v = sorted(&got);
+        let mut line = format!(
+            "  {start:5.1}         {:2} {:+.3} {:+.3} {:+.3} |",
+            v.len(),
+            v[0],
+            v[v.len() / 2],
+            v[v.len() - 1]
+        );
+        for (i, name) in NAMES.iter().enumerate() {
+            let dt = if *name == "pooled" {
+                // Pooled values are already grid-relative; the median is
+                // taken after unwrapping onto the winner's branch so two
+                // trials 15 s apart do not average to nothing.
+                let mut p: Vec<f32> = pool.iter().map(|&x| wrap(x - centre)).collect();
+                p.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+                centre + p[p.len() / 2]
+            } else {
+                centre + stat(name, &got)
+            };
+            let land = (start + wrap(dt)).rem_euclid(15.0);
+            let (dec, med) = steady(&slot, land);
+            sum[i] += dec;
+            ge8[i] += (dec >= 8) as usize;
+            lands[i].push(if land > 7.5 { land - 15.0 } else { land });
+            steady_med[i].push(med);
+            line.push_str(&format!(
+                " {:+6.2} {dec:3} {med:+.2} ",
+                if land > 7.5 { land - 15.0 } else { land }
+            ));
+        }
+        println!("{line}");
+    }
+
+    println!("\n  over {n_starts} starts:");
+    for (i, name) in NAMES.iter().enumerate() {
+        let n = lands[i].len().max(1) as f32;
+        let mean = lands[i].iter().sum::<f32>() / n;
+        let sd = (lands[i].iter().map(|l| (l - mean).powi(2)).sum::<f32>() / n).sqrt();
+        let med_ok: Vec<f32> = steady_med[i]
+            .iter()
+            .cloned()
+            .filter(|m| m.is_finite())
+            .collect();
+        let med_mean = med_ok.iter().sum::<f32>() / med_ok.len().max(1) as f32;
+        println!(
+            "    {name:>8}: dec {:.2}  >=8 {:3.0}%   landing mean {mean:+.3} sd {sd:.3} \
+             (min {:+.3} max {:+.3})   steady median DT mean {med_mean:+.3}",
+            sum[i] as f32 / n,
+            100.0 * ge8[i] as f32 / n,
+            lands[i].iter().cloned().fold(f32::INFINITY, f32::min),
+            lands[i].iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+        );
+    }
+}
