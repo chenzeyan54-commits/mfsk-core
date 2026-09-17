@@ -2017,3 +2017,162 @@ fn mirror_acquisition_dt_statistic() {
         );
     }
 }
+
+/// What a cheaper cold acquisition would cost in grid quality (#357).
+///
+/// Acquisition runs every cluster the tiles propose — five full-slot
+/// decodes on top of three tiled searches — and on hardware that is
+/// **15.2 s of compute on the decode task**, one whole slot period
+/// (`logs/sim_acqstart_noclock_offset3000_2026-09-18.log`, 77.3 s to
+/// 92.5 s, `CPU 1: IDLE1` throughout). The next slot's SpecBundle
+/// therefore waits in the queue and is picked up 174 ms before that
+/// slot ends, leaving no room for the unguarded `coarse` + `fine`
+/// that follow: the slot finishes 763-1344 ms past key-up with
+/// `dec=0`.
+///
+/// Best-of-N exists for a reason — stopping at the first trial that
+/// decoded *anything* set the grid from one decode and was measured
+/// costing whole minutes of dark band (see `decode_pipeline.rs`). But
+/// "anything" is not the only stopping rule available: `grid_state`
+/// already names three decodes as the bar a grid has to clear
+/// (`LOCK_MIN_DECODES`), so a trial that clears it is, by the
+/// receiver's own standard, a grid.
+///
+/// This scores the stopping rules against each other on the steady
+/// pipeline's decodes, and reports the trials each one runs — the
+/// number the board pays in seconds.
+#[test]
+#[ignore = "diagnostic — acquisition stopping rule: grid quality against trials run"]
+fn mirror_acquisition_early_stop() {
+    use mfsk_core::ft8::acquire::{REQUIRED_SAMPLES, acquire_slot_phases};
+    use mfsk_core::ft8::decode_block::decode_block_tuned;
+
+    const ACQ_MAX_CAND: usize = 200;
+    const ACQ_MAX_TRIALS: usize = 5;
+    /// Stop as soon as a trial decodes this many, `usize::MAX` for
+    /// "try them all". `1` is what the board did before best-of-N.
+    const RULES: [(&str, usize); 4] = [("all-5", usize::MAX), (">=5", 5), (">=3", 3), (">=1", 1)];
+
+    let slot = load_slot();
+    let mut loopbuf = Vec::with_capacity(SLOT * 3);
+    for _ in 0..3 {
+        loopbuf.extend_from_slice(&slot);
+    }
+    let wrap = |mut dt: f32| {
+        while dt > 7.5 {
+            dt -= 15.0;
+        }
+        while dt <= -7.5 {
+            dt += 15.0;
+        }
+        dt
+    };
+    let unique = |rs: &[DecodeResult]| -> usize {
+        let mut m: Vec<String> = rs.iter().filter_map(|r| unpack77(r.message77())).collect();
+        m.sort();
+        m.dedup();
+        m.len()
+    };
+    let mut cache: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+
+    println!(
+        "  start  trial decodes      | {}",
+        RULES
+            .iter()
+            .map(|(n, _)| format!("{n:>5}: trials land  dec"))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
+    let mut sum = [0usize; RULES.len()];
+    let mut trials_run = [0usize; RULES.len()];
+    let mut n_starts = 0usize;
+    for step in 0..30 {
+        let start = step as f32 * 0.5;
+        let cap_k = (start * 12_000.0) as usize;
+        let audio = &loopbuf[cap_k..cap_k + REQUIRED_SAMPLES];
+        let phases = acquire_slot_phases(
+            audio,
+            FREQ_MIN,
+            FREQ_MAX,
+            SYNC_MIN,
+            ACQ_MAX_CAND,
+            ACQ_MAX_TRIALS,
+        );
+
+        // Every trial once; the rules then read this same list, since a
+        // stopping rule only ever truncates it.
+        let mut got: Vec<(usize, f32)> = Vec::new(); // (decodes, dt applied)
+        for &(centre, _) in phases.iter() {
+            let off = ((centre * 12_000.0).round() as i64).rem_euclid(SLOT as i64) as usize;
+            if audio.len() < off + SLOT {
+                got.push((0, 0.0));
+                continue;
+            }
+            let rs = decode_block_tuned(
+                &audio[off..off + SLOT],
+                FREQ_MIN,
+                FREQ_MAX,
+                SYNC_MIN,
+                DecodeDepth::EMBEDDED,
+                MAX_CAND_TRIAL,
+                DEFAULT_BP_MAX_ITER,
+            );
+            if rs.is_empty() {
+                got.push((0, 0.0));
+                continue;
+            }
+            let mut dts: Vec<f32> = rs.iter().map(|r| r.dt_sec).collect();
+            dts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+            got.push((rs.len(), wrap(centre + dts[dts.len() / 2])));
+        }
+        if got.iter().all(|&(n, _)| n == 0) {
+            println!("  {start:5.1}   (nothing decoded)");
+            continue;
+        }
+        n_starts += 1;
+
+        let mut line = format!(
+            "  {start:5.1}  {:16} |",
+            got.iter()
+                .map(|&(n, _)| n.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        for (i, &(_, stop_at)) in RULES.iter().enumerate() {
+            // Best-of-N over the trials the rule actually ran.
+            let mut best: Option<(usize, f32)> = None;
+            let mut ran = 0usize;
+            for &(n, dt) in got.iter() {
+                ran += 1;
+                if n > 0 && best.is_none_or(|(bn, _)| n > bn) {
+                    best = Some((n, dt));
+                }
+                if n >= stop_at {
+                    break;
+                }
+            }
+            let (_, dt) = best.expect("a start with no decodes was skipped above");
+            let land = (start + wrap(dt)).rem_euclid(15.0);
+            let key = (land * 1000.0).round() as i32;
+            let dec = *cache
+                .entry(key)
+                .or_insert_with(|| unique(&at_phase(&slot, land).results));
+            sum[i] += dec;
+            trials_run[i] += ran;
+            line.push_str(&format!(
+                " {ran:6} {:+6.2} {dec:3} ",
+                if land > 7.5 { land - 15.0 } else { land }
+            ));
+        }
+        println!("{line}");
+    }
+
+    println!("\n  over {n_starts} starts:");
+    for (i, (name, _)) in RULES.iter().enumerate() {
+        println!(
+            "    {name:>5}: dec {:.2}   trials {:.2}/acquisition",
+            sum[i] as f32 / n_starts as f32,
+            trials_run[i] as f32 / n_starts as f32,
+        );
+    }
+}
