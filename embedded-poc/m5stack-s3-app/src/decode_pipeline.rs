@@ -204,6 +204,10 @@ where
             // No wall-clock deadline — the acoustic/wav_sim source does
             // not backlog. #357's knob lives on the CoreS3.
             budget_ms: 0,
+            // Fine sync is measured on the CoreS3 only (2026-09-17);
+            // this board's slot budget has not been checked against it.
+            fine_sync: false,
+            key_up_guard_ms: 0,
         };
         let out = dual_core::run_speculative_slot(spec_q, slot_q, &cfg);
         let dual_core::SpeculativeOut {
@@ -214,9 +218,11 @@ where
             n_ready,
             n_deferred,
             n_cut: _,
+            n_fallback: _,
             bootstrap_dt_med,
             t_post_recv,
             t_coarse_done,
+            t_fine_done: _,
             t_early_done,
             t_slot_recv,
             t_done,

@@ -708,6 +708,39 @@ suite on a Mac rather than by CI, which still has Linux runners only.
 
 ### Added
 
+- **Embedded FT8 (CoreS3): per-candidate fine sync in the per-slot
+  pipeline, a coarse-position retry, one row per message, and a stage-3
+  bound anchored to key-up.** `embedded-shared::dual_core` now runs
+  `fine_sync_12k` on both cores between coarse sync and the prefix
+  partition (`DecodeConfig::fine_sync`). A candidate that fails stage 3
+  at its refined position is retried once at its coarse one — fine sync
+  alone erased stations the coarse position decodes (`N1PJT HB9CQK`,
+  `CQ LZ1JZ KN22`), and the retry is what makes it a strict addition.
+  Retries are the lowest-value work (0.26-0.46 decodes a slot recovered
+  from 7-13 retries on the host mirror), so the early path's run only in
+  the tail window and yield the cores the moment the slot arrives; the
+  rest follow every first attempt, deferred ones included.
+
+  Results are deduplicated by message: fine sync pulls adjacent coarse
+  cells onto one carrier (31 duplicate rows over 201 phases of `qso2`,
+  against 7), and the slot count, the grid-lock policy and the QSO state
+  machine all read the unfiltered list.
+
+  `DecodeConfig::key_up_guard_ms` stops stage 3 claiming candidates that
+  long before this station's key-up (slot end + 0.5 s), peeking the slot
+  end from `slot_q` before the slot is received. `budget_ms` alone was
+  derived assuming the SpecBundle arrives ≥1 336 ms before slot end;
+  measured 1 027-1 936 ms depending on grid position, and below 1 336 ms
+  its deadline fell after key-up — slots finished up to 472 ms past it.
+  A candidate already in BP runs on after any deadline, by up to 313 ms
+  here, hence a 320 ms guard. The slot-log warning now fires on key-up
+  rather than on zero idle, which fine sync makes routine.
+
+  On the board (`MFSK_CORES3_SIM`, `qso3_busy`), steady-state decodes
+  went from 6 to 10 a slot, finishing 158-291 ms after slot end. Only
+  the CoreS3 sets these; the S3 and Core2 apps keep `fine_sync: false`
+  and `key_up_guard_ms: 0`, their slot budgets unmeasured with it.
+
 - **`ft8::decode_block::fine_sync_12k` — WSJT-X's per-candidate fine
   sync, on 12 kHz audio.** `ft8b.f90`'s Stage A (DT ±50 ms in 5 ms),
   Stage B (frequency ±2.5 Hz in 0.5 Hz, via `ctwk`) and Stage C (DT

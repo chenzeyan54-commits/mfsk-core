@@ -32,8 +32,8 @@ use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use esp_idf_svc::sys::{
-    xQueueGenericCreate, xQueueGenericSend, xQueueReceive, xTaskCreatePinnedToCore, xTaskGetCoreID,
-    QueueHandle_t,
+    uxQueueMessagesWaiting, xQueueGenericCreate, xQueueGenericSend, xQueuePeek, xQueueReceive,
+    xTaskCreatePinnedToCore, xTaskGetCoreID, QueueHandle_t,
 };
 
 use alloc::boxed::Box;
@@ -43,8 +43,8 @@ use alloc::vec::Vec;
 use mfsk_core::engine::sync::{bootstrap_dt_median, SyncCandidate};
 use mfsk_core::ft8::decode::{DecodeDepth, DecodeResult};
 use mfsk_core::ft8::decode_block::{
-    coarse_sync_with_lag, process_candidates_into_with_cs_scratch_tuned, refine_candidates_into,
-    RefinedCandidate, Spectrogram,
+    coarse_sync_with_lag, fine_sync_12k, process_candidates_into_with_cs_scratch_tuned,
+    refine_candidates_into, RefinedCandidate, Spectrogram,
 };
 
 use crate::internal_pool::{cs_scratch_main, cs_scratch_worker};
@@ -89,9 +89,14 @@ pub struct SpeculativeOut {
     pub n_ready: usize,
     pub n_deferred: usize,
     /// Stage-3 candidates the [`DecodeConfig::budget_ms`] deadline
-    /// stopped from being tried (speculative + deferred). `0` when the
-    /// budget is disabled or the slot finished inside it.
+    /// stopped from being tried (speculative + deferred, first attempts
+    /// and coarse-position retries alike). `0` when the budget is
+    /// disabled or the slot finished inside it.
     pub n_cut: usize,
+    /// Candidates whose fine-synced position failed stage 3 and were
+    /// tried again at their coarse position ([`DecodeConfig::fine_sync`]).
+    /// `0` when fine sync is off.
+    pub n_fallback: usize,
     /// DT median over the top-5 highest-score pass1 candidates.
     /// `None` if pass1 was empty. Empirically lines up with the
     /// confirmed-decode median to within ±70 ms on reference
@@ -112,6 +117,9 @@ pub struct SpeculativeOut {
     pub t_post_recv: i64,
     /// after `coarse_sync_split_with_allsum`.
     pub t_coarse_done: i64,
+    /// after [`fine_sync_split`]; equal to `t_coarse_done` when
+    /// [`DecodeConfig::fine_sync`] is off.
+    pub t_fine_done: i64,
     /// after the speculative pass-2 + stage-3 on `audio_prefix` finish
     /// (or immediately, if `ready` was empty).
     pub t_early_done: i64,
@@ -157,6 +165,110 @@ pub struct DecodeConfig {
     /// are *not* bounded — stage 3 is where the wall-clock variance is
     /// (`project_phasewise_hotspot_survey_246`).
     pub budget_ms: i64,
+    /// Refine every pass-1 candidate's frequency and DT with WSJT-X's
+    /// `ft8b.f90` Stages A/B/C before the prefix partition
+    /// ([`mfsk_core::ft8::decode_block::fine_sync_12k`]), and give a
+    /// candidate that then fails stage 3 one more attempt at its coarse
+    /// position.
+    ///
+    /// The retry is not optional decoration. Fine sync alone erased
+    /// stations the coarse position decodes — `N1PJT HB9CQK` on
+    /// `qso3_busy` and `CQ LZ1JZ KN22` on `qso2`, at every phase — and
+    /// the retry is what makes it a strict addition: measured on the
+    /// host mirror of this function (`mfsk-core/tests/
+    /// ft8_embedded_pipeline_mirror.rs`, 2026-09-17), acquisition plus
+    /// decode on `qso2` falls from 4.96 to 4.65 without it, and
+    /// `qso3_busy` from 8.29 to 8.00.
+    pub fine_sync: bool,
+    /// Stop claiming stage-3 candidates this many milliseconds before
+    /// this station's key-up, [`FT8_KEY_UP_AFTER_SLOT_END_US`] past the
+    /// slot boundary. `0` leaves only [`budget_ms`](Self::budget_ms).
+    ///
+    /// `budget_ms` is anchored to the SpecBundle's arrival and was
+    /// derived assuming that arrival is at least 1 336 ms before slot
+    /// end. It is not: measured on hardware 2026-09-18 it runs anywhere
+    /// from 1 027 to 1 936 ms depending on where the grid sits, and
+    /// below 1 336 ms the budget's own deadline falls after key-up.
+    /// That alone put slots 472 ms past key-up. This bound is anchored
+    /// to the slot boundary itself instead, and applies from the moment
+    /// the slot is known — peeked from `slot_q` while the early path is
+    /// still running, exact once it has been received.
+    ///
+    /// It has to be a margin rather than key-up itself because a
+    /// deadline only stops *claiming*: a candidate already in BP runs to
+    /// the end. Across the same captures (three runs, 60 slots), work
+    /// finished up to 313 ms past the deadline that stopped it.
+    pub key_up_guard_ms: i64,
+}
+
+/// This station's key-up relative to the FT8 slot boundary:
+/// `TX_START_OFFSET_S` = 0.5 s. Results after it cannot be answered in
+/// the next period.
+pub const FT8_KEY_UP_AFTER_SLOT_END_US: i64 = 500_000;
+
+/// When stage 3 stops claiming candidates. Both cores check it once per
+/// candidate.
+#[derive(Clone, Copy)]
+pub struct Stage3Stop {
+    /// Absolute `now_us()` deadline. `i64::MAX` when disabled.
+    pub deadline_us: i64,
+    /// The pipeline's `slot_q`, or null. While the slot sits in it
+    /// unreceived, its `slotend_us` is peeked for the key-up bound.
+    pub slot_q: QueueHandle_t,
+    /// Also stop as soon as `slot_q` holds the slot — the early path's
+    /// retries, which must hand the cores back to the deferred path.
+    pub yield_on_slot: bool,
+    /// [`DecodeConfig::key_up_guard_ms`] in µs; `0` disables the peek.
+    pub key_up_guard_us: i64,
+}
+
+impl Stage3Stop {
+    /// No deadline, no slot: run every candidate.
+    pub const fn never() -> Self {
+        Self {
+            deadline_us: i64::MAX,
+            slot_q: ptr::null_mut(),
+            yield_on_slot: false,
+            key_up_guard_us: 0,
+        }
+    }
+
+    /// `true` once no further candidate may be claimed.
+    fn reached(&self) -> bool {
+        let now = now_us();
+        if now >= self.deadline_us {
+            return true;
+        }
+        if self.slot_q.is_null() {
+            return false;
+        }
+        if self.key_up_guard_us > 0 {
+            let mut raw: *mut Slot = ptr::null_mut();
+            // SAFETY: non-blocking peek of a depth-1 queue of `*mut Slot`;
+            // only this pipeline's decode task ever receives from it, and
+            // it is blocked here, so the pointee cannot be freed under us.
+            let got = unsafe {
+                xQueuePeek(
+                    self.slot_q,
+                    (&mut raw as *mut *mut Slot) as *mut core::ffi::c_void,
+                    0,
+                )
+            };
+            if got == PD_PASS
+                && !raw.is_null()
+                && now >= key_up_deadline(unsafe { (*raw).slotend_us }, self.key_up_guard_us)
+            {
+                return true;
+            }
+        }
+        self.yield_on_slot && unsafe { uxQueueMessagesWaiting(self.slot_q) } > 0
+    }
+}
+
+/// The claim deadline [`DecodeConfig::key_up_guard_ms`] implies for a
+/// slot that ended at `slotend_us`.
+fn key_up_deadline(slotend_us: i64, guard_us: i64) -> i64 {
+    slotend_us + FT8_KEY_UP_AFTER_SLOT_END_US - guard_us
 }
 
 /// `esp_timer_get_time()`, monotonic microseconds. The stage-3 deadline
@@ -195,7 +307,20 @@ pub fn run_speculative_slot(
     let t_coarse_done = unsafe { esp_timer_get_time() };
 
     let n_pass1 = pass1.len();
+    // Taken from the coarse positions: it is documented against them,
+    // and the fixture that pins it measures them.
     let bootstrap_dt_med = bootstrap_dt_median(&pass1, 5);
+    // Fine sync runs on the audio prefix the speculative path already
+    // has. Symbols past it contribute nothing, which costs the late
+    // candidates some Stage A power but not their place: they still
+    // partition into `deferred` on the refined DT below.
+    let (pass1, coarse) = if cfg.fine_sync {
+        let refined = fine_sync_split(spec.audio_prefix(), &pass1);
+        (refined, pass1)
+    } else {
+        (pass1, Vec::new())
+    };
+    let t_fine_done = unsafe { esp_timer_get_time() };
     // Absolute stage-3 deadline. From `t_post_recv`, not from slot end —
     // slot end is not known until `recv_box::<Slot>` below, and the
     // early speculative path is where a slow slot overruns. When the
@@ -203,12 +328,22 @@ pub fn run_speculative_slot(
     // end (the SpecBundle send blocked on a full `spec_q`), so the
     // effective budget shrinks exactly when the pipeline is behind —
     // which is what breaks the compounding-backlog loop (#357).
-    let deadline_us: i64 = if cfg.budget_ms > 0 {
+    let mut deadline_us: i64 = if cfg.budget_ms > 0 {
         t_post_recv + cfg.budget_ms * 1_000
     } else {
         i64::MAX
     };
+    let key_up_guard_us = cfg.key_up_guard_ms.max(0) * 1_000;
+    // Before the slot is received its end is only known by peeking
+    // `slot_q`; the stop condition does that per candidate.
+    let early_stop = |yield_on_slot: bool| Stage3Stop {
+        deadline_us,
+        slot_q,
+        yield_on_slot,
+        key_up_guard_us,
+    };
     let mut n_cut = 0usize;
+    let mut n_fallback = 0usize;
     let snap_fill = spec.audio_len();
     // Partition by audio-window fit only.
     //
@@ -225,6 +360,13 @@ pub fn run_speculative_slot(
     // `max_cand_late` keeps the union ≤ max_cand. High-score /
     // high-dt cands that don't fit the prefix still naturally
     // land in `deferred` and compete for a slot there.
+    // The partition consumes pass 1; the retry needs the refined
+    // positions to match failures back to `coarse` by index.
+    let refined: Vec<SyncCandidate> = if cfg.fine_sync {
+        pass1.clone()
+    } else {
+        Vec::new()
+    };
     let (ready, deferred): (Vec<SyncCandidate>, Vec<SyncCandidate>) = pass1
         .into_iter()
         .partition(|c| SpecBundle::audio_end_for_dt(c.dt_sec) <= snap_fill);
@@ -232,13 +374,50 @@ pub fn run_speculative_slot(
     let n_deferred = deferred.len();
 
     let mut n_early_refined = 0usize;
+    // Early-path retries that the slot's arrival stopped; they join the
+    // late path's retries on the full slot below.
+    let mut retry_leftover: Vec<RefinedCandidate> = Vec::new();
     let mut results = if !ready.is_empty() {
         let partial_audio: &[i16] = spec.audio_prefix();
         let p2 = pass2_split(partial_audio, ready, cfg.max_cand);
         n_early_refined = p2.len();
-        let (r, cut) =
-            stage3_split(partial_audio, p2, cfg.depth, cfg.q_thresh, cfg.bp_max_iter, deadline_us);
-        n_cut += cut;
+        let first = stage3_split(
+            partial_audio,
+            p2,
+            cfg.depth,
+            cfg.q_thresh,
+            cfg.bp_max_iter,
+            early_stop(false),
+        );
+        n_cut += first.unclaimed.len();
+        let mut r = first.results;
+        // **Retries run only on time no first attempt can use.** Before
+        // the slot arrives the deferred candidates cannot start — their
+        // audio does not exist yet — so the tail window is free, and the
+        // retries stop claiming the moment `slot_q` holds the slot.
+        // Retries are the lowest-value work here (on the host mirror,
+        // 0.26-0.46 decodes a slot recovered from 7-13 retries), and
+        // they used to run straight through to the deadline, which on a
+        // slot with deferred candidates would have skipped those
+        // candidates' first attempts altogether.
+        let retry = coarse_retry_candidates(&first.failed, &refined, &coarse);
+        if !retry.is_empty() && !early_stop(true).reached() {
+            let n = retry.len();
+            let p2 = pass2_split(partial_audio, retry, n);
+            let fb = stage3_split(
+                partial_audio,
+                p2,
+                cfg.depth,
+                cfg.q_thresh,
+                cfg.bp_max_iter,
+                early_stop(true),
+            );
+            n_fallback += n - fb.unclaimed.len();
+            r.extend(fb.results);
+            retry_leftover = fb.unclaimed;
+        } else {
+            n_cut += retry.len();
+        }
         r
     } else {
         Vec::new()
@@ -247,7 +426,18 @@ pub fn run_speculative_slot(
 
     let slot = pipeline::recv_box::<Slot>(slot_q);
     let t_slot_recv = unsafe { esp_timer_get_time() };
+    let slot_audio: &[i16] = slot.audio();
+    if key_up_guard_us > 0 {
+        deadline_us = deadline_us.min(key_up_deadline(slot.slotend_us, key_up_guard_us));
+    }
+    let late_stop = Stage3Stop {
+        deadline_us,
+        slot_q: ptr::null_mut(),
+        yield_on_slot: false,
+        key_up_guard_us: 0,
+    };
 
+    let mut late_retry: Vec<SyncCandidate> = Vec::new();
     if !deferred.is_empty() {
         // Budget cap (Gemini PR #123 round 8/9): stage-3's wallclock
         // is roughly linear in the number of refined candidates
@@ -263,12 +453,18 @@ pub fn run_speculative_slot(
         // auto-anchor keeps dt within ±0.5 s in steady state.
         let max_cand_late = cfg.max_cand.saturating_sub(n_early_refined);
         if max_cand_late > 0 && now_us() < deadline_us {
-            let slot_audio: &[i16] = slot.audio();
             let p2 = pass2_split(slot_audio, deferred, max_cand_late);
-            let (late, cut) =
-                stage3_split(slot_audio, p2, cfg.depth, cfg.q_thresh, cfg.bp_max_iter, deadline_us);
-            n_cut += cut;
-            results.extend(late);
+            let late = stage3_split(
+                slot_audio,
+                p2,
+                cfg.depth,
+                cfg.q_thresh,
+                cfg.bp_max_iter,
+                late_stop,
+            );
+            n_cut += late.unclaimed.len();
+            results.extend(late.results);
+            late_retry = coarse_retry_candidates(&late.failed, &refined, &coarse);
         } else if max_cand_late > 0 {
             // Out of budget before the deferred path even started — the
             // speculative half used all of it. Every candidate that
@@ -276,6 +472,42 @@ pub fn run_speculative_slot(
             n_cut += n_deferred.min(max_cand_late);
         }
     }
+
+    // Every first attempt has now had its turn. What is left of the
+    // early retries, then the late path's, share the rest of the budget
+    // on the whole slot. A leftover early retry keeps its pass-2
+    // spectrum: block 0 is the same samples in the prefix and the slot,
+    // and stage 3 refills everything else from the audio it is given.
+    let n_late_retry = late_retry.len();
+    let mut tail_retries = retry_leftover;
+    if n_late_retry > 0 && now_us() < deadline_us {
+        tail_retries.extend(pass2_split(slot_audio, late_retry, n_late_retry));
+    } else {
+        n_cut += n_late_retry;
+    }
+    if !tail_retries.is_empty() {
+        let n = tail_retries.len();
+        let fb = stage3_split(
+            slot_audio,
+            tail_retries,
+            cfg.depth,
+            cfg.q_thresh,
+            cfg.bp_max_iter,
+            late_stop,
+        );
+        n_fallback += n - fb.unclaimed.len();
+        n_cut += fb.unclaimed.len();
+        results.extend(fb.results);
+    }
+    // One row per message. Duplicates were possible before — two
+    // coarse cells on one strong carrier both decoding — and fine sync
+    // makes them common, since it pulls adjacent 3.125 Hz cells onto the
+    // same carrier: on the host mirror, 31 duplicate rows over 201 phases
+    // of `qso2` against 7 without it. The UI already dedups by text; the
+    // count in the slot log, the grid-lock policy that reads it, and the
+    // QSO state machine did not. The first row is kept, which is the
+    // higher pass-2 rank within whichever path produced it first.
+    dedup_by_message(&mut results);
     let t_done = unsafe { esp_timer_get_time() };
 
     SpeculativeOut {
@@ -286,13 +518,81 @@ pub fn run_speculative_slot(
         n_ready,
         n_deferred,
         n_cut,
+        n_fallback,
         bootstrap_dt_med,
         t_post_recv,
         t_coarse_done,
+        t_fine_done,
         t_early_done,
         t_slot_recv,
         t_done,
     }
+}
+
+/// Keep the first [`DecodeResult`] per 77-bit message.
+fn dedup_by_message(results: &mut Vec<DecodeResult>) {
+    let mut i = 0;
+    while i < results.len() {
+        if results[..i]
+            .iter()
+            .any(|r| r.message77() == results[i].message77())
+        {
+            results.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// The coarse positions to retry for the candidates whose fine-synced
+/// position failed stage 3 ([`DecodeConfig::fine_sync`]).
+///
+/// `refined[i]` is `coarse[i]` after fine sync, so a failure is matched
+/// back by its exact refined position. Two coarse cells that fine sync
+/// moved onto the same position share one retry — the first cell's —
+/// which is what the host mirror this was measured on does too. A
+/// candidate fine sync did not move has nothing different to retry.
+fn coarse_retry_candidates(
+    failed: &[SyncCandidate],
+    refined: &[SyncCandidate],
+    coarse: &[SyncCandidate],
+) -> Vec<SyncCandidate> {
+    let same = |a: &SyncCandidate, b: &SyncCandidate| {
+        a.freq_hz.to_bits() == b.freq_hz.to_bits() && a.dt_sec.to_bits() == b.dt_sec.to_bits()
+    };
+    let mut retry: Vec<SyncCandidate> = Vec::new();
+    if coarse.is_empty() {
+        return retry;
+    }
+    for f in failed {
+        let Some(i) = refined.iter().position(|r| same(r, f)) else {
+            continue;
+        };
+        if !same(&coarse[i], f) {
+            retry.push(coarse[i].clone());
+        }
+    }
+    retry
+}
+
+/// [`fine_sync_12k`] over pass 1, halves on main and worker. Output is
+/// in input order.
+pub fn fine_sync_split(audio: &[i16], pass1: &[SyncCandidate]) -> Vec<SyncCandidate> {
+    let mid = pass1.len() / 2;
+    let tail: Vec<SyncCandidate> = pass1[mid..].to_vec();
+    let job = Box::new(Job::FineSync {
+        audio: audio.as_ptr(),
+        audio_len: audio.len(),
+        cands: tail,
+    });
+    unsafe { queue_send_ptr(JOB_Q.get(), Box::into_raw(job)) };
+
+    let mut local = fine_sync_12k(audio, &pass1[..mid]);
+
+    let worker_ptr = unsafe { queue_recv_ptr::<Vec<SyncCandidate>>(FINE_RESULT_Q.get()) };
+    let worker = unsafe { *Box::from_raw(worker_ptr) };
+    local.extend(worker);
+    local
 }
 
 const PD_PASS: i32 = 1;
@@ -322,9 +622,13 @@ enum Job {
         slots_ptr: *mut Option<RefinedCandidate>,
         slots_len: usize,
         next_idx: *const AtomicUsize,
-        /// Absolute `now_us()` deadline; the loop stops claiming
-        /// candidates once it passes. `i64::MAX` when disabled.
-        deadline_us: i64,
+        /// When the loop stops claiming candidates.
+        stop: Stage3Stop,
+    },
+    FineSync {
+        audio: *const i16,
+        audio_len: usize,
+        cands: Vec<SyncCandidate>,
     },
     CoarseSyncWithAllsum {
         spec: *const Spectrogram,
@@ -362,6 +666,7 @@ static JOB_Q: QueueCell = QueueCell::new();
 static PASS2_RESULT_Q: QueueCell = QueueCell::new();
 static STAGE3_RESULT_Q: QueueCell = QueueCell::new();
 static COARSE_RESULT_Q: QueueCell = QueueCell::new();
+static FINE_RESULT_Q: QueueCell = QueueCell::new();
 
 #[inline]
 unsafe fn queue_create(item_size: usize) -> QueueHandle_t {
@@ -433,7 +738,7 @@ extern "C" fn worker_main(_arg: *mut core::ffi::c_void) {
                 slots_ptr,
                 slots_len,
                 next_idx,
-                deadline_us,
+                stop,
             } => {
                 let audio_slice = unsafe { core::slice::from_raw_parts(audio, audio_len) };
                 #[allow(static_mut_refs)]
@@ -446,12 +751,22 @@ extern "C" fn worker_main(_arg: *mut core::ffi::c_void) {
                         depth,
                         q_thresh,
                         bp_max_iter,
-                        deadline_us,
+                        stop,
                         cs_scratch_worker(),
                     )
                 };
                 let raw = Box::into_raw(Box::new(result));
                 unsafe { queue_send_ptr(STAGE3_RESULT_Q.get(), raw) };
+            }
+            Job::FineSync {
+                audio,
+                audio_len,
+                cands,
+            } => {
+                let audio_slice = unsafe { core::slice::from_raw_parts(audio, audio_len) };
+                let result = fine_sync_12k(audio_slice, &cands);
+                let raw = Box::into_raw(Box::new(result));
+                unsafe { queue_send_ptr(FINE_RESULT_Q.get(), raw) };
             }
             Job::CoarseSyncWithAllsum {
                 spec,
@@ -493,8 +808,9 @@ pub fn init() {
         PASS2_RESULT_Q.set(queue_create(
             core::mem::size_of::<*mut Vec<RefinedCandidate>>(),
         ));
-        STAGE3_RESULT_Q.set(queue_create(core::mem::size_of::<*mut Vec<DecodeResult>>()));
+        STAGE3_RESULT_Q.set(queue_create(core::mem::size_of::<*mut Stage3Out>()));
         COARSE_RESULT_Q.set(queue_create(core::mem::size_of::<*mut Vec<SyncCandidate>>()));
+        FINE_RESULT_Q.set(queue_create(core::mem::size_of::<*mut Vec<SyncCandidate>>()));
 
         let r = xTaskCreatePinnedToCore(
             Some(worker_main),
@@ -624,14 +940,17 @@ pub fn pass2_split(
 /// on one core doesn't stall the other. Compared to the old
 /// fixed head/tail split, this absorbs the per-cand BP wall-clock
 /// variance (qso3 ~7 of 15 cands fail and run all 4 LLR variants).
+///
+/// Both cores stop claiming once `stop` says so ([`Stage3Stop`]). A
+/// candidate already being decoded finishes either way.
 pub fn stage3_split(
     audio: &[i16],
     pass2: Vec<RefinedCandidate>,
     depth: DecodeDepth,
     q_thresh: u32,
     bp_max_iter: u32,
-    deadline_us: i64,
-) -> (Vec<DecodeResult>, usize) {
+    stop: Stage3Stop,
+) -> Stage3Split {
     let mut slots: Vec<Option<RefinedCandidate>> = pass2.into_iter().map(Some).collect();
     let next_idx = AtomicUsize::new(0);
 
@@ -649,7 +968,7 @@ pub fn stage3_split(
         slots_ptr,
         slots_len,
         next_idx: next_idx_ptr,
-        deadline_us,
+        stop,
     });
     unsafe { queue_send_ptr(JOB_Q.get(), Box::into_raw(job)) };
 
@@ -664,25 +983,47 @@ pub fn stage3_split(
             depth,
             q_thresh,
             bp_max_iter,
-            deadline_us,
+            stop,
             cs_scratch_main(),
         )
     };
 
-    let worker_ptr = unsafe { queue_recv_ptr::<Vec<DecodeResult>>(STAGE3_RESULT_Q.get()) };
+    let worker_ptr = unsafe { queue_recv_ptr::<Stage3Out>(STAGE3_RESULT_Q.get()) };
     let worker = unsafe { *Box::from_raw(worker_ptr) };
 
     // Both cores have joined; `next_idx` is final. Each claim past
     // `slots_len` is a core's last `fetch_add` before it saw the end,
-    // so clamp. Whatever was never claimed is what the deadline cut.
+    // so clamp. Claims are a contiguous prefix, so whatever was never
+    // claimed is the tail — still `Some`, handed back to the caller.
     let claimed = next_idx.load(Ordering::Acquire).min(slots_len);
-    let cut = slots_len - claimed;
-
-    // `slots` is now drained (all Options taken); drop is fine.
+    let unclaimed: Vec<RefinedCandidate> = slots.drain(claimed..).flatten().collect();
     drop(slots);
 
-    local.extend(worker);
-    (local, cut)
+    local.results.extend(worker.results);
+    local.failed.extend(worker.failed);
+    Stage3Split {
+        results: local.results,
+        failed: local.failed,
+        unclaimed,
+    }
+}
+
+/// What [`stage3_split`] did with its candidates.
+pub struct Stage3Split {
+    pub results: Vec<DecodeResult>,
+    /// Tried and decoded nothing, by position — for
+    /// [`DecodeConfig::fine_sync`]'s coarse retry.
+    pub failed: Vec<SyncCandidate>,
+    /// Never claimed: the deadline or `yield_to` stopped both cores
+    /// first. On the first-attempt paths these are the deadline's cuts.
+    pub unclaimed: Vec<RefinedCandidate>,
+}
+
+/// One core's share of a stage-3 drain.
+struct Stage3Out {
+    results: Vec<DecodeResult>,
+    /// Tried and decoded nothing.
+    failed: Vec<SyncCandidate>,
 }
 
 /// Pop candidates from a shared atomic-indexed slot array and process
@@ -700,16 +1041,19 @@ unsafe fn drain_stage3_queue(
     depth: DecodeDepth,
     q_thresh: u32,
     bp_max_iter: u32,
-    deadline_us: i64,
+    stop: Stage3Stop,
     cs_scratch: &mut [[mfsk_core::engine::scalar::Cmplx<f32>; 8]; 79],
-) -> Vec<DecodeResult> {
-    let mut out: Vec<DecodeResult> = Vec::new();
+) -> Stage3Out {
+    let mut out = Stage3Out {
+        results: Vec::new(),
+        failed: Vec::new(),
+    };
     loop {
         // Checked before the claim so `next_idx` reflects exactly what
         // was processed — `stage3_split` derives the cut count from it.
         // The check is once per candidate (BP/OSD is 10-100 ms each), so
-        // an `esp_timer_get_time()` here is free.
-        if now_us() >= deadline_us {
+        // a timer read and a non-blocking queue peek here are free.
+        if stop.reached() {
             break;
         }
         let i = next_idx.fetch_add(1, Ordering::AcqRel);
@@ -720,6 +1064,7 @@ unsafe fn drain_stage3_queue(
         // ownership of slot `i` for the duration of this iteration.
         let cand = unsafe { (*slots_ptr.add(i)).take() };
         let Some(cand) = cand else { continue };
+        let pos = cand.0.clone();
         let mut single = vec![cand];
         let mut results = process_candidates_into_with_cs_scratch_tuned(
             audio,
@@ -729,7 +1074,11 @@ unsafe fn drain_stage3_queue(
             bp_max_iter,
             cs_scratch,
         );
-        out.append(&mut results);
+        if results.is_empty() {
+            out.failed.push(pos);
+        } else {
+            out.results.append(&mut results);
+        }
     }
     out
 }

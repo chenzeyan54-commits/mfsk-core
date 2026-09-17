@@ -111,6 +111,27 @@ const MAX_CAND: usize = match option_env!("MFSK_FT8_MAX_CAND") {
 /// and cold acquisition (#358); shortening it needs the same care FT4's
 /// `want_skip` carry-forward took, not a quick constant change. Left
 /// alone here on purpose.
+/// Per-candidate fine sync (WSJT-X `ft8b.f90` Stages A/B/C) plus a
+/// coarse-position retry — `dual_core::DecodeConfig::fine_sync`, whose
+/// doc carries the measurement. On unless `MFSK_FT8_FINE_SYNC=0`, which
+/// is there to A/B the cost on this board against the same audio.
+const FT8_FINE_SYNC: bool = match option_env!("MFSK_FT8_FINE_SYNC") {
+    Some(s) => parse_u32(s) != 0,
+    None => true,
+};
+
+/// `dual_core::DecodeConfig::key_up_guard_ms`: stop claiming stage-3
+/// candidates this long before key-up (slot end + 0.5 s), so a candidate
+/// already in BP when the bound hits still finishes before it. 320 ms
+/// clears the largest run-on past a stopping deadline measured on this
+/// board, 313 ms over three captures and 60 slots (2026-09-18,
+/// `logs/sim_finesync_{fullslotvote,offset3000,noclock_offset3000}_*`).
+/// `MFSK_FT8_KEY_UP_GUARD_MS=0` turns it off, leaving `FT8_BUDGET_MS`.
+const FT8_KEY_UP_GUARD_MS: i64 = match option_env!("MFSK_FT8_KEY_UP_GUARD_MS") {
+    Some(s) => parse_u32(s) as i64,
+    None => 320,
+};
+
 const FT8_BUDGET_MS: i64 = match option_env!("MFSK_FT8_BUDGET_MS") {
     Some(s) => parse_u32(s) as i64,
     None => 1_836,
@@ -217,6 +238,8 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             bp_max_iter: mfsk_core::ft8::params::DEFAULT_BP_MAX_ITER,
             depth: DecodeDepth::EMBEDDED,
             budget_ms: FT8_BUDGET_MS,
+            fine_sync: FT8_FINE_SYNC,
+            key_up_guard_ms: FT8_KEY_UP_GUARD_MS,
         };
         let out = dual_core::run_speculative_slot(spec_q, slot_q, &cfg);
         let dual_core::SpeculativeOut {
@@ -225,6 +248,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             results,
             n_pass1,
             n_cut,
+            n_fallback,
             n_ready,
             n_deferred,
             // Not read any more: the ±0.2 s/slot nudge it fed was a
@@ -233,6 +257,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             bootstrap_dt_med: _,
             t_post_recv,
             t_coarse_done,
+            t_fine_done,
             t_early_done,
             t_slot_recv,
             t_done,
@@ -244,48 +269,57 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         let coarse_us = t_coarse_done - t_post_recv;
         let tail_use = (slotend.min(t_early_done) - t_coarse_done).max(0);
         let post_slotend = (t_done - slotend).max(0);
-        // `slot_wait` near zero means the pipeline never got to wait for
-        // the next slot — it was still working when the slot ended.
+        // **Warn only past key-up.** The line used to fire whenever
+        // `slot_wait` was near zero — no idle before the next slot. With
+        // per-candidate fine sync that is every slot: its coarse retries
+        // are the lowest-value work and are meant to fill whatever the
+        // budget leaves, and on hardware (2026-09-17,
+        // `logs/sim_finesync_2026-09-17.log`) they did, finishing
+        // 260-505 ms past slot end on each of seven slots that all
+        // decoded 8. A warning that fires every slot teaches its reader
+        // to skip it — two partial slots doing that is why `full_slot`
+        // below exists.
         //
-        // On FT8 that is an operating limit rather than a fault: 15 s
-        // is genuinely tight, `coarse` scales with how much signal is
-        // on the band, and stations transmit in alternating periods, so
-        // the busier of the two runs out of time and defers candidates.
-        // Measured 2026-08-23 on 40 m: seven decodes on one period,
-        // one or two on the other, with `coarse` at 101 ms against
-        // 180 ms. Worth surfacing precisely because it is expected —
-        // the alternative is reading it out of one field in seven.
+        // What the operator actually loses is the reply: the budget runs
+        // to this station's own key-up, `TX_START_OFFSET_S` = 0.5 s after
+        // the slot boundary (`FT8_BUDGET_MS`'s derivation). A decode that
+        // lands later cannot be answered this period. So that is the
+        // line — the deadline stops *claiming* candidates there, and a
+        // candidate already in BP can still carry the slot past it.
         //
-        // WSPR and FST4 are the other case: their monitor loops are
-        // built with deliberate slack, so an over-budget slot there
-        // means a fault. Do not carry this framing across.
-        let slot_wait_us = t_slot_recv - t_early_done;
-        // Only judge a full slot.
+        // Busy periods crossing it are still an operating limit on FT8,
+        // not a fault: stations alternate periods, and the denser one is
+        // the one that runs out (measured 2026-08-23 on 40 m, seven
+        // decodes on one period against one or two on the other).
+        // WSPR's and FST4's monitor loops are the other case — built
+        // with deliberate slack, so an overrun there is a fault. Do not
+        // carry this framing across.
         //
-        // The first slots after the grid anchors to UTC are partial by
-        // construction — the anchor shortens the current one so the
-        // next boundary lands on the grid — and comparing a truncated
-        // slot against a whole slot's budget produces a warning about
-        // nothing. Two of them fired within seconds of adding this,
-        // which is exactly how an indicator teaches its reader to skip
-        // it.
+        // Only full slots are judged: the first slots after the grid
+        // anchors to UTC are partial by construction, and comparing one
+        // against a whole slot's budget produces a warning about nothing.
         const FULL_SLOT_SAMPLES: usize = 180_000;
         let full_slot = slot.audio().len() >= FULL_SLOT_SAMPLES;
-        if full_slot && slot_wait_us < 10_000 {
+        const KEY_UP_AFTER_SLOT_END_US: i64 = dual_core::FT8_KEY_UP_AFTER_SLOT_END_US;
+        if full_slot && post_slotend > KEY_UP_AFTER_SLOT_END_US {
             log::warn!(
-                "SLOT[{wav_idx}] src={source} OVER BUDGET — no idle before the next slot \
-                 ({post_slotend} us past slot end, {n_deferred} candidates deferred)"
+                "SLOT[{wav_idx}] src={source} PAST KEY-UP — finished {post_slotend} us after slot \
+                 end, {} ms past key-up ({n_cut} candidates cut, {n_deferred} deferred)",
+                (post_slotend - KEY_UP_AFTER_SLOT_END_US) / 1_000
             );
         }
         log::info!(
             "SLOT[{wav_idx}] src={source} grid={} p1={n_pass1} ready={n_ready} defer={n_deferred} \
-             cut={n_cut} dec={} budget={FT8_BUDGET_MS}ms \
-             tail_win={}us coarse={}us early={}us tail_use={}us post_slotend={}us \
+             cut={n_cut} fb={n_fallback} dec={} budget={FT8_BUDGET_MS}ms \
+             tail_win={}us coarse={}us fine={}us early={}us tail_use={}us post_slotend={}us \
              slot_wait={}us late={}us",
             mfsk_app_shared::time_sync::grid_lock().label(),
             results.len(),
             tail_window,
             coarse_us,
+            // Inside `early` below, which keeps its historical meaning
+            // (from coarse done) so logs from before fine sync compare.
+            t_fine_done - t_coarse_done,
             t_early_done - t_coarse_done,
             tail_use,
             post_slotend,

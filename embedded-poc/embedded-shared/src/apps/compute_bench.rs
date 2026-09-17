@@ -302,14 +302,15 @@ fn decode_one(slot: &[i16], max_cand: usize, _dt_grid: u8, _df_grid: u8, _q_thre
         mfsk_core::ft8::decode::DecodeDepth::BP_ONLY
     };
     let t4 = now_us();
-    let (results, _cut) = dual_core::stage3_split(
+    let results = dual_core::stage3_split(
         slot,
         pass2,
         depth,
         mfsk_core::ft8::decode_block::DEFAULT_Q_THRESH,
         mfsk_core::ft8::params::DEFAULT_BP_MAX_ITER,
-        i64::MAX,
-    );
+        dual_core::Stage3Stop::never(),
+    )
+    .results;
     let t5 = now_us();
     log::info!(
         "  stage 3 (refine+BP):  {:>8} us  ({} result(s))",

@@ -103,6 +103,10 @@ pub fn run_sweep(wavs: &'static [&'static [u8]], cfgs: &'static [RxSweepCfg]) ->
             bp_max_iter: rx_cfg.bp_max_iter,
             depth: DecodeDepth::EMBEDDED,
             budget_ms: 0,
+            // Fine sync is measured on the CoreS3 only (2026-09-17);
+            // this board's slot budget has not been checked against it.
+            fine_sync: false,
+            key_up_guard_ms: 0,
         };
         let out = dual_core::run_speculative_slot(spec_q, slot_q, &dc);
         let dual_core::SpeculativeOut {
@@ -113,9 +117,11 @@ pub fn run_sweep(wavs: &'static [&'static [u8]], cfgs: &'static [RxSweepCfg]) ->
             n_ready,
             n_deferred,
             n_cut: _,
+            n_fallback: _,
             bootstrap_dt_med: _,
             t_post_recv,
             t_coarse_done,
+            t_fine_done: _,
             t_early_done,
             t_slot_recv,
             t_done,

@@ -92,6 +92,10 @@ pub fn run() -> ! {
             // radio, so it never backlogs. The knob is #357's, on the
             // CoreS3.
             budget_ms: 0,
+            // Fine sync is measured on the CoreS3 only (2026-09-17);
+            // this board's slot budget has not been checked against it.
+            fine_sync: false,
+            key_up_guard_ms: 0,
         };
         let out = dual_core::run_speculative_slot(spec_q, slot_q, &cfg);
         let dual_core::SpeculativeOut {
@@ -100,11 +104,13 @@ pub fn run() -> ! {
             results,
             n_pass1,
             n_cut: _,
+            n_fallback: _,
             n_ready,
             n_deferred,
             bootstrap_dt_med: _,
             t_post_recv,
             t_coarse_done,
+            t_fine_done: _,
             t_early_done,
             t_slot_recv,
             t_done,
