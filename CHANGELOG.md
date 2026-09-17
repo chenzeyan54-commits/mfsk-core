@@ -159,6 +159,39 @@ suite on a Mac rather than by CI, which still has Linux runners only.
 
 ### Fixed
 
+- **CoreS3 FT8 grid acquisition: the capture's own offset was dropped,
+  one decode set the grid, and a partial slot could lock it.** Three
+  ways the embedded controller's slot grid (#356) landed wrong, found on
+  the board under `MFSK_CORES3_SIM`:
+
+  *The capture offset.* The 25 s acquisition ring starts filling when
+  `arm_acquisition` runs — part-way into a slot — and every phase is
+  measured from the capture's first sample, but it was applied as a
+  shift from a slot boundary. Clockless with the feed 3.000 s late, an
+  acquisition armed ~0.98 s into its slot applied +1.90 s, left the grid
+  1.10 s short (outside the ±1.0 s per-slot search), and needed a second
+  acquisition: about three minutes with nothing decoded. `uac` now
+  records where in its slot the capture began and the phase counts it;
+  the same case then locked on one acquisition, 10 decodes a slot. What
+  remains is the trial decodes' own median bias, ~0.2 s either way.
+
+  *First decode wins.* Trial phases were accepted at the first that
+  decoded anything, so one decode could set the grid — the thing
+  `grid_state` refuses by name (`LOCK_MIN_DECODES`). Measured: accepted
+  trials decoded 7, 2, 1 and 6, the 1 from trial 3 of 5 with two better
+  phases untried. All trials are now ranked by decode count.
+
+  *A partial slot voted.* The first slot after the clock anchor holds
+  whatever audio remained, so its signals sit where no full slot on that
+  grid puts them. Twice it decoded 8 and 5 and locked; every full slot
+  on that grid then decoded 0 until the six-slot relock ran out. Partial
+  slots are still decoded and shown but neither lock nor count as under
+  par. **Not yet seen fixing that case**: the three runs since happened
+  not to produce a partial slot on a wrong grid.
+
+  Also: acquisition yields a tick between its pieces (the task watchdog
+  fired seven times in one capture), and each trial's result is logged.
+
 - **A grid correction the gap could not hold was applied twice** (#376,
   follow-up to #369). `SlotGrid::fill` cleared `clock_trim` at every
   window close, including the close that clamped `want_skip` and

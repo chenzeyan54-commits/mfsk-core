@@ -474,6 +474,24 @@ const ACQUIRE_RING_CAP: usize = mfsk_core::ft8::acquire::REQUIRED_SAMPLES + CHUN
 static ACQUIRE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ACQUIRE_RING: Mutex<Vec<i16>> = Mutex::new(Vec::new());
 
+/// Samples into its slot the capture's first sample was, or
+/// `usize::MAX` before a capture has started. Diagnostic (2026-09-18):
+/// the ring starts filling at whatever point `arm_acquisition` is
+/// called, and the phase acquisition returns is measured from the
+/// capture's start, not from a slot boundary. Recorded as an atomic in
+/// the audio path — no log call there, whose stack has overflowed
+/// before — and printed by `decode_pipeline` beside the phase.
+static ACQUIRE_START_IN_SLOT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// See [`ACQUIRE_START_IN_SLOT`]. `None` until a capture has started.
+pub fn acquisition_start_in_slot() -> Option<usize> {
+    match ACQUIRE_START_IN_SLOT.load(Ordering::Acquire) {
+        usize::MAX => None,
+        n => Some(n),
+    }
+}
+
 /// Start filling the acquisition ring from scratch.
 pub fn arm_acquisition() {
     if let Ok(mut r) = ACQUIRE_RING.lock() {
@@ -759,6 +777,10 @@ impl AudioSink for Ft8ChunkSink {
         // let the pipeline pick it up.
         if ACQUIRE_ARMED.load(Ordering::Acquire) {
             if let Ok(mut r) = ACQUIRE_RING.lock() {
+                if r.is_empty() {
+                    ACQUIRE_START_IN_SLOT
+                        .store(self.slot_samples + self.chunk.len(), Ordering::Release);
+                }
                 if r.len() < ACQUIRE_RING_CAP {
                     let room = ACQUIRE_RING_CAP - r.len();
                     r.extend_from_slice(&samples[..samples.len().min(room)]);

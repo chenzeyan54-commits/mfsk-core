@@ -227,6 +227,26 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
     const ACQUIRE_MAX_TRIALS: usize = 5;
     /// One slot at 12 kHz — the window the acceptance trial decodes.
     const SLOT_TRIAL_SAMPLES: usize = 180_000;
+    // **Why the correction is the median and not the earliest.**
+    //
+    // A frame that starts before the capture window is clipped and one
+    // that ends early is not, so aligning on the *earliest* decode
+    // looks right and measures right — until the measurement uses the
+    // wrong search width. On the block driver's own +-2.5 s coarse
+    // search it wins by 0.8 decodes a slot and reaches this
+    // recording's best phase (`mfsk-core/tests/ft8_embedded_grid_
+    // phase.rs`, 2026-09-16). But the per-slot path is not that
+    // driver: `stage1_inc` runs `SYNC_LAG_S = 1.0`, and the earliest
+    // rule pushes the station spread to +0.45..+1.75 s, where its late
+    // half is outside the window the steady loop can see. Counting
+    // only decodes at |dt| <= 1.0, the same sweep puts that phase at
+    // **1** decode against the median rule's landing at **7**.
+    //
+    // Which is what this file already said, one screen down: the trial
+    // searches +-2.5 s, the per-slot path does not, and the median
+    // correction is what decouples them. Left here as well because the
+    // earliest rule is the obvious-looking change, it was made, and
+    // only a sweep that modelled the narrow window caught it.
     loop {
         let cfg = dual_core::DecodeConfig {
             freq_min: 100.0,
@@ -424,7 +444,32 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             // acquisition) are reachable from a short sequence of
             // decode counts, and finding them by reflashing the board
             // cost several cycles apiece.
-            match grid.observe(n_dec) {
+            //
+            // **Only full slots vote.** A partial slot — the first after
+            // the grid anchors, whose audio starts wherever the anchor
+            // fell — places the signals somewhere a full slot on the
+            // same grid does not, so what it decodes says nothing about
+            // the grid. On hardware (`logs/sim_finesync_2026-09-17.log`,
+            // `sim_finesync_retryorder_2026-09-18.log`) slot 0 held
+            // 153 600 and 134 400 samples, decoded 8 and 5, and locked;
+            // every full slot on that grid then decoded 0, and the
+            // six-slot relock wait plus the acquisition kept the band
+            // dark for about 2.5 minutes. The run before (2026-09-16)
+            // had a slot 0 of 87 600 samples that decoded nothing, did
+            // not lock, and reached steady decoding four slots sooner.
+            // The partial slot's decodes are still shown; it just
+            // neither locks nor counts as under par.
+            let action = if full_slot {
+                grid.observe(n_dec)
+            } else {
+                log::info!(
+                    "  air-sync: partial slot ({} samples, {n_dec} decoded) — not counted \
+                     toward the grid",
+                    slot.audio().len()
+                );
+                mfsk_app_shared::grid_state::GridAction::Hold
+            };
+            match action {
                 mfsk_app_shared::grid_state::GridAction::Lock { n_dec } => {
                     log::info!(
                         "  air-sync: grid locked (N={n_dec} ≥ {}) — holding",
@@ -495,6 +540,27 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                     // decouples the two windows — measured, a 2.5 s
                     // trial with it accepts nothing outside ±1.0 s,
                     // where without it four of forty were.
+                    // **Let the idle task run between the pieces.**
+                    //
+                    // Everything below is one uninterrupted stretch of
+                    // compute on this task: three tiled searches inside
+                    // `acquire_slot_phases` (543-635 ms each, measured
+                    // on hardware 2026-09-16) and then up to
+                    // `ACQUIRE_MAX_TRIALS` full-slot decodes at ~1.1 s.
+                    // 10-15 s in total, during which `IDLE1` never gets
+                    // scheduled and the task watchdog fires every 5 s —
+                    // seven times in one 180 s capture the first time
+                    // this path ran on a board at all. Nothing is
+                    // wedged (`CONFIG_ESP_TASK_WDT_PANIC` is off, and
+                    // the acquisition completes and locks), but the
+                    // log then carries a backtrace per event, and that
+                    // reads as a fault to whoever finds it next.
+                    //
+                    // One tick, four or five times per acquisition, is
+                    // enough for `IDLE1` to feed its own watchdog. The
+                    // slot-budget path never sees it: acquisition runs
+                    // between slots, not inside one.
+                    unsafe { esp_idf_svc::sys::vTaskDelay(1) };
                     let phases = mfsk_core::ft8::acquire::acquire_slot_phases(
                         &audio,
                         100.0,
@@ -504,7 +570,27 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                         ACQUIRE_MAX_TRIALS,
                     );
                     let mut applied: Option<(f32, usize, usize)> = None;
+                    // **Where in its slot the capture began.** The ring
+                    // starts filling whenever `arm_acquisition` ran —
+                    // after the slot that triggered it had decoded, so
+                    // part-way into the next — and every phase below is
+                    // measured from the capture's first sample. The grid
+                    // shift is relative to a slot boundary, so the
+                    // capture's own offset into its slot belongs in it.
+                    //
+                    // It was missing. On hardware (2026-09-18, clockless,
+                    // feed 3.000 s late) the first acquisition armed
+                    // ~0.98 s into a slot and applied +1.90 s, leaving the
+                    // grid 1.10 s short — outside the per-slot ±1.0 s
+                    // search, so a second acquisition was needed and the
+                    // band stayed dark ~3 minutes. The next run recorded
+                    // the offset directly: 0.395 s, with the grid landing
+                    // ~0.2 s short. The remainder is the trial median's
+                    // own station-mix bias, which this does not remove.
+                    let start_s = crate::uac::acquisition_start_in_slot()
+                        .map_or(0.0, |n| n as f32 / 12_000.0);
                     for (trial, &(centre, _)) in phases.iter().enumerate() {
+                        unsafe { esp_idf_svc::sys::vTaskDelay(1) };
                         let off = ((centre * 12_000.0).round() as i64)
                             .rem_euclid(SLOT_TRIAL_SAMPLES as i64)
                             as usize;
@@ -524,7 +610,10 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                             continue;
                         }
                         // The trial's own decodes place the grid far
-                        // better than the cluster centre does.
+                        // better than the cluster centre does. The
+                        // median of them, not the earliest — see the
+                        // note beside the acquisition constants for the
+                        // measurement that says so.
                         let mut dts: heapless::Vec<f32, 32> = heapless::Vec::new();
                         for r in got.iter() {
                             let _ = dts.push(r.dt_sec);
@@ -533,15 +622,55 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                             a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal)
                         });
                         let med = dts[dts.len() / 2];
-                        let mut dt = centre + med;
+                        let mut dt = centre + med + start_s;
                         while dt > 7.5 {
                             dt -= 15.0;
                         }
                         while dt <= -7.5 {
                             dt += 15.0;
                         }
-                        applied = Some((dt, trial + 1, got.len()));
-                        break;
+                        // **Best of the trials, not the first that
+                        // decodes anything.**
+                        //
+                        // This used to `break` here. One decode was
+                        // therefore enough to set the grid for the
+                        // session — the same "one decode is not a
+                        // lock" that `grid_state` refuses by name
+                        // (`LOCK_MIN_DECODES = 3`, and its doc: a grid
+                        // a full second out still decodes the odd
+                        // station). Measured 2026-09-16 across four
+                        // acquisitions on the board, the accepted
+                        // trial decoded 7, 2, 1 and 6; the 1 came from
+                        // trial 3 of 5, so two better phases were
+                        // computed, ranked, and never tried. The grid
+                        // it set then decoded 0-1 per slot until the
+                        // next acquisition three minutes later.
+                        //
+                        // Ranking by decode count is the same evidence
+                        // the acceptance rule already uses, applied to
+                        // all of the candidates instead of to the
+                        // first. The extra cost is bounded and small
+                        // against what acquisition already spends: at
+                        // most `ACQUIRE_MAX_TRIALS - 1` further
+                        // full-slot decodes (~1.1 s each on this
+                        // board) on top of a 25 s capture.
+                        //
+                        // Ties keep the earlier trial, which is the
+                        // higher-scoring cluster from
+                        // `acquire_slot_phases`.
+                        if applied.is_none_or(|(_, _, best_n)| got.len() > best_n) {
+                            applied = Some((dt, trial + 1, got.len()));
+                        }
+                        // Per-trial, because the summary below reports
+                        // only the winner: the log that found this bug
+                        // said "trial 3/5, 1 decoded" and could not say
+                        // what 4 and 5 would have given.
+                        log::info!(
+                            "    acq trial {}/{}: centre={centre:+.3} decoded={} dt={dt:+.3}",
+                            trial + 1,
+                            phases.len(),
+                            got.len(),
+                        );
                     }
                     // An applied phase restarts the under-par run — the
                     // grid just moved, so the slots that led here say
@@ -602,6 +731,10 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                                 "  cold-acquisition: grid phase {dt:+.2} s → shift {shift:+} samples \
                                  (trial {trial}/{}, {n} decoded)",
                                 phases.len()
+                            );
+                            log::warn!(
+                                "  cold-acquisition: capture began {start_s:.3} s into its slot \
+                                 (counted in the phase)"
                             );
                         }
                         None => log::warn!(
