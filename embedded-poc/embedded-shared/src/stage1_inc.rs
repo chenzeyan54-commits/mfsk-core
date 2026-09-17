@@ -540,6 +540,7 @@ fn emit_spec_bundle(ctx: &mut WorkerCtx) {
         usize::MAX,
         audio_ptr,
         audio_len,
+        unsafe { esp_idf_svc::sys::esp_timer_get_time() },
     ));
     send_box(ctx.spec_q, bundle);
     ctx.cur.spec_sent = true;

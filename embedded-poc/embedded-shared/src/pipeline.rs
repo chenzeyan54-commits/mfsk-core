@@ -83,6 +83,14 @@ pub struct SpecBundle {
     /// pair-86's audio requirement (168 000 samples = 14.0 s @
     /// 12 kHz) when emit fires at `SPEC_EMIT_PAIR`.
     audio_len: usize,
+    /// `esp_timer_get_time()` when stage1_inc emitted this bundle —
+    /// **not** when the decode task received it. The two differ by
+    /// however long the bundle waited in `spec_q`, which is how a
+    /// decode task busy elsewhere (cold acquisition, #357) shows up:
+    /// the slot it is about to decode may be nearly over. With
+    /// `audio_len` this dates the slot itself, since emit fires a
+    /// known number of samples before the boundary.
+    pub emit_us: i64,
 }
 
 // SAFETY: `audio_ptr` references a long-lived `AudioBuf` allocation
@@ -130,6 +138,7 @@ impl SpecBundle {
         wav_idx: usize,
         audio_ptr: *const i16,
         audio_len: usize,
+        emit_us: i64,
     ) -> Self {
         Self {
             spec,
@@ -138,7 +147,22 @@ impl SpecBundle {
             wav_idx,
             audio_ptr,
             audio_len,
+            emit_us,
         }
+    }
+
+    /// When this slot's boundary is due, from the emit timestamp and
+    /// the audio the bundle was emitted with: stage1_inc emits at
+    /// `SPEC_EMIT_PAIR`, `NMAX - audio_len` samples before the end.
+    ///
+    /// An estimate, and nominal — a slot the sink is stretching to move
+    /// the grid (`uac.rs`'s acquisition shift) ends later than this
+    /// says, which makes the answer conservative in the direction that
+    /// matters: it never claims more time than there is.
+    pub fn nominal_slotend_us(&self) -> i64 {
+        const SAMPLE_RATE_HZ: i64 = 12_000;
+        let remaining = mfsk_core::ft8::params::NMAX.saturating_sub(self.audio_len) as i64;
+        self.emit_us + remaining * 1_000_000 / SAMPLE_RATE_HZ
     }
 }
 

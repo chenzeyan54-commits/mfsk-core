@@ -127,6 +127,12 @@ pub struct SpeculativeOut {
     pub t_slot_recv: i64,
     /// after the deferred pass-2 + stage-3 on `slot.audio` finish.
     pub t_done: i64,
+    /// This slot was dropped without decoding: its SpecBundle reached
+    /// the decode task too late to finish before key-up
+    /// ([`DecodeConfig::slot_floor_ms`]). `results` is empty and every
+    /// candidate count is `0`; the audio was received and dropped, so
+    /// the pipeline stays drained.
+    pub skipped: bool,
 }
 
 /// Per-slot decoder configuration shared between Phase-C speculative
@@ -199,6 +205,26 @@ pub struct DecodeConfig {
     /// the end. Across the same captures (three runs, 60 slots), work
     /// finished up to 313 ms past the deadline that stopped it.
     pub key_up_guard_ms: i64,
+    /// Least time a slot may have before key-up and still be worth
+    /// starting, in milliseconds. `0` disables the check.
+    ///
+    /// [`Self::key_up_guard_ms`] bounds stage 3 only — `coarse_sync`
+    /// and fine sync run to completion whatever the clock says, and on
+    /// this board they are ~370 ms together. A slot whose bundle
+    /// arrives with less than that left therefore cannot help
+    /// overrunning key-up, and it was measured doing exactly that:
+    /// after a cold acquisition (15.2 s of compute on this same task)
+    /// the next bundle was picked up 174 ms before its slot ended and
+    /// the slot finished 763-1344 ms past key-up with `dec=0`
+    /// (`m5stack-cores3-app/logs/sim_*_2026-09-18.log`, every run).
+    ///
+    /// Below this floor the slot is dropped instead: its `Slot` is
+    /// received and freed, nothing is decoded, and the cores go to the
+    /// audio pipeline, which after an acquisition has a backlog to
+    /// clear. It costs no decodes — the slots this fires on decoded
+    /// zero — and it is what makes the key-up bound true for the whole
+    /// slot rather than for stage 3 alone.
+    pub slot_floor_ms: i64,
 }
 
 /// This station's key-up relative to the FT8 slot boundary:
@@ -295,6 +321,41 @@ pub fn run_speculative_slot(
 
     let spec = pipeline::recv_box::<SpecBundle>(spec_q);
     let t_post_recv = unsafe { esp_timer_get_time() };
+    // Is there time to finish this slot before key-up? The bundle
+    // carries the moment stage1_inc emitted it, so a bundle that waited
+    // in `spec_q` dates itself; `slot_floor_ms` says how much of the
+    // remaining time the un-deadlined work ahead (coarse + fine sync)
+    // needs.
+    if cfg.slot_floor_ms > 0 {
+        let key_up_at = key_up_deadline(
+            spec.nominal_slotend_us(),
+            cfg.key_up_guard_ms.max(0) * 1_000,
+        );
+        if t_post_recv + cfg.slot_floor_ms * 1_000 > key_up_at {
+            // Take the slot so stage1_inc's buffer is released on the
+            // usual schedule, then hand the answer back empty.
+            let slot = pipeline::recv_box::<Slot>(slot_q);
+            let t_slot_recv = unsafe { esp_timer_get_time() };
+            return SpeculativeOut {
+                spec,
+                slot,
+                results: Vec::new(),
+                n_pass1: 0,
+                n_ready: 0,
+                n_deferred: 0,
+                n_cut: 0,
+                n_fallback: 0,
+                bootstrap_dt_med: None,
+                t_post_recv,
+                t_coarse_done: t_post_recv,
+                t_fine_done: t_post_recv,
+                t_early_done: t_post_recv,
+                t_slot_recv,
+                t_done: unsafe { esp_timer_get_time() },
+                skipped: true,
+            };
+        }
+    }
     let pass1: Vec<SyncCandidate> = coarse_sync_split_with_allsum(
         &spec.spec,
         cfg.freq_min,
@@ -526,6 +587,7 @@ pub fn run_speculative_slot(
         t_early_done,
         t_slot_recv,
         t_done,
+        skipped: false,
     }
 }
 

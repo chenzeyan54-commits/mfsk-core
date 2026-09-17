@@ -107,6 +107,9 @@ pub fn run_sweep(wavs: &'static [&'static [u8]], cfgs: &'static [RxSweepCfg]) ->
             // this board's slot budget has not been checked against it.
             fine_sync: false,
             key_up_guard_ms: 0,
+            // Off with the key-up guard: these boards do not transmit
+            // and their wav_sim sources are not paced to a slot clock.
+            slot_floor_ms: 0,
         };
         let out = dual_core::run_speculative_slot(spec_q, slot_q, &dc);
         let dual_core::SpeculativeOut {
@@ -125,6 +128,9 @@ pub fn run_sweep(wavs: &'static [&'static [u8]], cfgs: &'static [RxSweepCfg]) ->
             t_early_done,
             t_slot_recv,
             t_done,
+            // `slot_floor_ms` is 0 on this board, so a slot is never
+            // dropped for arriving late.
+            skipped: _,
         } = out;
 
         let slotend = slot.slotend_us;

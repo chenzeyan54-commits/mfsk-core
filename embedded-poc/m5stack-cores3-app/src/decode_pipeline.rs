@@ -132,6 +132,25 @@ const FT8_KEY_UP_GUARD_MS: i64 = match option_env!("MFSK_FT8_KEY_UP_GUARD_MS") {
     None => 320,
 };
 
+/// `dual_core::DecodeConfig::slot_floor_ms`: the least time a slot may
+/// have before key-up and still be worth starting.
+///
+/// 500 ms. `coarse` and fine sync run outside every deadline this
+/// pipeline has, and on this board they measure 100-120 ms and 250-275
+/// ms — ~370 ms together, to which one stage-3 candidate adds ~50-300
+/// ms. A steady slot's bundle arrives 1.45 s before its boundary, i.e.
+/// 1.63 s before the [`FT8_KEY_UP_GUARD_MS`]-adjusted key-up, so the
+/// floor is nowhere near it; the slot after a cold acquisition arrived
+/// with 354 ms and overran key-up by 763-1344 ms on every run of
+/// 2026-09-18. Anything between ~0.4 s and ~1.3 s separates the two
+/// cases; 500 ms is the low end of that, so the floor never costs a
+/// slot that could have decoded. `MFSK_FT8_SLOT_FLOOR_MS=0` turns it
+/// off.
+const FT8_SLOT_FLOOR_MS: i64 = match option_env!("MFSK_FT8_SLOT_FLOOR_MS") {
+    Some(s) => parse_u32(s) as i64,
+    None => 500,
+};
+
 const FT8_BUDGET_MS: i64 = match option_env!("MFSK_FT8_BUDGET_MS") {
     Some(s) => parse_u32(s) as i64,
     None => 1_836,
@@ -290,6 +309,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             budget_ms: FT8_BUDGET_MS,
             fine_sync: FT8_FINE_SYNC,
             key_up_guard_ms: FT8_KEY_UP_GUARD_MS,
+            slot_floor_ms: FT8_SLOT_FLOOR_MS,
         };
         let out = dual_core::run_speculative_slot(spec_q, slot_q, &cfg);
         let dual_core::SpeculativeOut {
@@ -311,8 +331,27 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             t_early_done,
             t_slot_recv,
             t_done,
+            skipped,
         } = out;
         let wav_idx = slot.wav_idx;
+
+        // Nothing was decoded and nothing should be read from this slot:
+        // its bundle reached this task with less time than the
+        // un-deadlined coarse + fine sync need (`FT8_SLOT_FLOOR_MS`).
+        // The audio has been received and dropped; say so and wait for
+        // the next bundle, which frees the cores for the audio pipeline
+        // — after a cold acquisition it has a backlog to clear.
+        if skipped {
+            let margin = (slot.slotend_us + dual_core::FT8_KEY_UP_AFTER_SLOT_END_US
+                - FT8_KEY_UP_GUARD_MS * 1_000
+                - t_post_recv)
+                / 1_000;
+            log::warn!(
+                "SLOT[{wav_idx}] src={source} skipped — bundle arrived with {margin} ms to                  key-up, under the {FT8_SLOT_FLOOR_MS} ms floor"
+            );
+            slot_seq = slot_seq.wrapping_add(1);
+            continue;
+        }
 
         let slotend = slot.slotend_us;
         let tail_window = (slotend - t_post_recv).max(0);
@@ -694,6 +733,32 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                         // `acquire_slot_phases`.
                         if applied.is_none_or(|(_, _, best_n)| got.len() > best_n) {
                             applied = Some((dt, trial + 1, got.len()));
+                        }
+                        // **Stop once a trial clears the lock bar.**
+                        //
+                        // Best-of-N is about not settling for a trial
+                        // that decoded one station; it is not about
+                        // trying every cluster for its own sake, and
+                        // trying them all is expensive: acquisition
+                        // measured 15.2 s of compute on this task
+                        // (2026-09-18), one whole slot period, which is
+                        // what pushes the next slot past key-up.
+                        //
+                        // `LOCK_MIN_DECODES` is the receiver's own
+                        // statement of what counts as a grid, so a
+                        // trial that reaches it is not a lucky single
+                        // decode and the remaining clusters have
+                        // nothing to prove. Measured on the host mirror
+                        // (`mirror_acquisition_early_stop`, 24 capture
+                        // phases per recording): identical decodes on
+                        // all three recordings — qso3 8.00, qso1 3.88,
+                        // qso2 4.74, the same as trying all five — for
+                        // 2.3 trials per acquisition instead of 5.0.
+                        // Stopping at one decode instead, which is what
+                        // this loop did before best-of-N, is the rule
+                        // that cost minutes of dark band on hardware.
+                        if got.len() >= mfsk_app_shared::grid_state::LOCK_MIN_DECODES {
+                            break;
                         }
                         // Per-trial, because the summary below reports
                         // only the winner: the log that found this bug
