@@ -924,6 +924,19 @@ impl AudioSink for Ft8ChunkSink {
                             }
                         }
                     }
+
+                    // The slot just started now has its final length —
+                    // nominal, or shifted by one of the two branches
+                    // above. Publish it beside the boundary so the
+                    // decode task can tell how much of its slot is
+                    // left (`decode_pipeline::slot_end_hint`); a slot
+                    // lengthened by acquisition carries seconds of
+                    // extra decode time that the nominal length would
+                    // hide.
+                    mfsk_app_shared::time_sync::publish_capture_slot_len_us(
+                        self.slot_target as i64 * (SLOT_SECS as i64 * 1_000_000)
+                            / SLOT_SAMPLES_12K as i64,
+                    );
                 }
             }
         }

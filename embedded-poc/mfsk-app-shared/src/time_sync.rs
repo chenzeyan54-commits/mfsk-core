@@ -331,7 +331,22 @@ pub fn reset_slot_phase() {
 // the TX scheduler skips this iteration rather than firing on parity
 // bit 0 of an undefined counter.
 
-static CAPTURE_SLOT: Mutex<Option<(u32, i64)>> = Mutex::new(None);
+/// The capture slot the audio source is filling right now.
+///
+/// `len_us` is the slot's *own* length, which is not always the
+/// nominal 15 s: cold acquisition lengthens one slot by up to a whole
+/// period to move the grid, and air-sync nudges it by up to ±200 ms.
+/// A source that knows its next boundary publishes it through
+/// [`publish_capture_slot_len_us`]; one that does not leaves `None`
+/// and readers fall back to the nominal length.
+#[derive(Clone, Copy)]
+struct CaptureSlot {
+    wav_idx: u32,
+    start_us: i64,
+    len_us: Option<i64>,
+}
+
+static CAPTURE_SLOT: Mutex<Option<CaptureSlot>> = Mutex::new(None);
 
 /// Audio source side. Call once per slot boundary, AT slot START
 /// (i.e. when capture of the new slot's audio begins). `wav_idx` is
@@ -340,14 +355,35 @@ static CAPTURE_SLOT: Mutex<Option<(u32, i64)>> = Mutex::new(None);
 /// `esp_timer_get_time()` (or equivalent monotonic μs).
 pub fn publish_capture_slot(wav_idx: u32, now_mono_us: i64) {
     if let Ok(mut g) = CAPTURE_SLOT.lock() {
-        *g = Some((wav_idx, now_mono_us));
+        *g = Some(CaptureSlot {
+            wav_idx,
+            start_us: now_mono_us,
+            len_us: None,
+        });
+    }
+}
+
+/// Audio source side, optional companion to [`publish_capture_slot`]:
+/// how long the slot just started will run. Call it after the
+/// boundary has been published and after any shift has been applied
+/// to the new slot's target, so the value is the one the source will
+/// actually count to.
+///
+/// Sources that never shift a slot can skip it — readers treat a
+/// missing length as the nominal one.
+pub fn publish_capture_slot_len_us(len_us: i64) {
+    let Ok(mut g) = CAPTURE_SLOT.lock() else {
+        return;
+    };
+    if let Some(slot) = g.as_mut() {
+        slot.len_us = Some(len_us);
     }
 }
 
 /// Current capture slot's `wav_idx`, or `None` before the audio
 /// source has published any boundary.
 pub fn current_capture_wav_idx() -> Option<u32> {
-    CAPTURE_SLOT.lock().ok().and_then(|g| g.map(|(w, _)| w))
+    CAPTURE_SLOT.lock().ok().and_then(|g| g.map(|s| s.wav_idx))
 }
 
 /// Parity of the current capture slot. `None` before first publish.
@@ -362,7 +398,7 @@ pub fn time_into_capture_slot_us(now_mono_us: i64) -> Option<i64> {
     CAPTURE_SLOT
         .lock()
         .ok()
-        .and_then(|g| g.map(|(_, start)| (now_mono_us - start).max(0)))
+        .and_then(|g| g.map(|s| (now_mono_us - s.start_us).max(0)))
 }
 
 /// Atomic combined read of `(wav_idx, time_into_slot_us)`. Callers
@@ -374,10 +410,45 @@ pub fn time_into_capture_slot_us(now_mono_us: i64) -> Option<i64> {
 /// boundary crosses between them, yielding `(slot N, time_into_N+1)`.
 /// `None` before the audio source has published any boundary.
 pub fn current_capture_info(now_mono_us: i64) -> Option<(u32, i64)> {
+    current_capture_info_with_len(now_mono_us).map(|(w, into, _)| (w, into))
+}
+
+/// [`current_capture_info`] plus the slot's own length, when the
+/// audio source published one ([`publish_capture_slot_len_us`]).
+/// Same single-lock guarantee: all three values describe one slot.
+pub fn current_capture_info_with_len(now_mono_us: i64) -> Option<(u32, i64, Option<i64>)> {
     CAPTURE_SLOT
         .lock()
         .ok()
-        .and_then(|g| g.map(|(w, start)| (w, (now_mono_us - start).max(0))))
+        .and_then(|g| g.map(|s| (s.wav_idx, (now_mono_us - s.start_us).max(0), s.len_us)))
+}
+
+/// Where the slot a decoder is *working on* ends, on the monotonic
+/// clock, given how far `now` is into the slot the audio source is
+/// capturing (`into`) and that slot's length.
+///
+/// A decoder gets a slot's audio shortly before the audio source
+/// finishes capturing it, so the slot it holds is normally the one
+/// being captured and ends `len_us - into` from now. If the source
+/// has already crossed the boundary, the slot the decoder holds is
+/// the one that ended `into` ago.
+///
+/// The discriminator is half a slot, and the distance from it is the
+/// whole point. An earlier version of this in the CoreS3 pipeline
+/// compared `into` against the emit point itself (14.0 s of 15) —
+/// which is exactly where the decoder reads it, so a few ms of jitter
+/// either way flipped the answer by a whole slot. Hardware
+/// (`sim_slotendhint_noclock_offset3000_2026-09-18.log`) alternated:
+/// every other slot was reported as long over when it had ~1.1 s
+/// left, and the key-up floor threw it away. Both real readings —
+/// just before the boundary, or shortly after it — are seconds clear
+/// of `len/2`.
+pub fn decoded_slot_end_us(now_mono_us: i64, into_us: i64, len_us: i64) -> i64 {
+    if into_us >= len_us / 2 {
+        now_mono_us + (len_us - into_us)
+    } else {
+        now_mono_us - into_us
+    }
 }
 
 /// Test-only reset. The statics persist for the whole process so
@@ -755,5 +826,91 @@ mod slot_phase_tests {
         assert_eq!(samples_to_next_slot_12k_from(3_750, 7_500), 45_000);
         // 7 499 ms in → 1 ms → 12 samples.
         assert_eq!(samples_to_next_slot_12k_from(7_499, 7_500), 12);
+    }
+}
+
+#[cfg(test)]
+mod capture_slot_end_tests {
+    use super::*;
+
+    /// One FT8 slot, and where stage1_inc emits its SpecBundle inside
+    /// one — 168 000 of 180 000 samples at 12 kHz.
+    const SLOT_US: i64 = 15_000_000;
+    const EMIT_INTO_SLOT_US: i64 = 14_000_000;
+
+    #[test]
+    fn a_bundle_read_before_the_boundary_ends_at_that_boundary() {
+        let now = 1_000_000_000;
+        assert_eq!(
+            decoded_slot_end_us(now, EMIT_INTO_SLOT_US, SLOT_US),
+            now + 1_000_000
+        );
+    }
+
+    #[test]
+    fn a_few_milliseconds_either_side_of_the_emit_point_read_the_same() {
+        // The regression this rule exists for: the CoreS3 hint used to
+        // split at the emit point, so 13.997 s in — the audio source a
+        // chunk ahead of stage1_inc — reported a slot that had ended
+        // 14 s ago, and the key-up floor dropped a slot with 1.1 s left.
+        let now = 1_000_000_000;
+        for into in [
+            EMIT_INTO_SLOT_US - 3_000,
+            EMIT_INTO_SLOT_US,
+            EMIT_INTO_SLOT_US + 3_000,
+        ] {
+            let end = decoded_slot_end_us(now, into, SLOT_US);
+            assert!(
+                (end - now - 1_000_000).abs() <= 3_000,
+                "into={into} gave end-now={}",
+                end - now
+            );
+        }
+    }
+
+    #[test]
+    fn a_bundle_read_after_the_boundary_ended_that_long_ago() {
+        // The decoder was busy: the bundle is picked up 0.3 s into the
+        // next capture slot, so its own slot ended 0.3 s ago.
+        let now = 1_000_000_000;
+        assert_eq!(decoded_slot_end_us(now, 300_000, SLOT_US), now - 300_000);
+    }
+
+    #[test]
+    fn the_slot_a_cold_acquisition_lengthened_ends_where_it_says() {
+        // Acquisition shifts the grid by lengthening one slot — here by
+        // 38 093 samples (+3.17 s). The bundle still leaves stage1_inc
+        // 14.0 s in, and the extra 3.17 s of tail is real decode time:
+        // reading it as a nominal slot would throw it away.
+        let now = 1_000_000_000;
+        let len = SLOT_US + 3_174_000;
+        assert_eq!(
+            decoded_slot_end_us(now, EMIT_INTO_SLOT_US, len),
+            now + 4_174_000
+        );
+    }
+
+    #[test]
+    fn a_published_length_travels_with_its_boundary() {
+        reset_capture_slot_for_test();
+        publish_capture_slot(7, 500_000);
+        assert_eq!(
+            current_capture_info_with_len(500_000 + 14_000_000),
+            Some((7, 14_000_000, None)),
+            "a source that publishes no length must not invent one"
+        );
+        publish_capture_slot_len_us(18_174_000);
+        assert_eq!(
+            current_capture_info_with_len(500_000 + 14_000_000),
+            Some((7, 14_000_000, Some(18_174_000)))
+        );
+        // A new boundary clears the previous slot's length rather than
+        // carrying it into a slot that may be nominal again.
+        publish_capture_slot(8, 18_674_000);
+        assert_eq!(
+            current_capture_info_with_len(18_674_000),
+            Some((8, 0, None))
+        );
+        reset_capture_slot_for_test();
     }
 }

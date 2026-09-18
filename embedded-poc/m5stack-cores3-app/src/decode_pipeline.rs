@@ -162,24 +162,29 @@ const FT8_SLOT_FLOOR_MS: i64 = match option_env!("MFSK_FT8_SLOT_FLOOR_MS") {
 /// instead slides late exactly when the decode task is busy — measured,
 /// and the reason this function exists (see `SpecBundle::emit_us`).
 ///
-/// stage1_inc emits a bundle `SPEC_EMIT_INTO_SLOT_US` into its slot, so
-/// while the sink is still capturing that same slot the boundary is
-/// that far ahead; once the sink has moved on, the slot being decoded
-/// ended `into` ago. The emit point is the threshold between the two
-/// readings.
+/// While the sink is still capturing the slot being decoded its
+/// boundary is ahead; once the sink has moved on, that slot ended
+/// `into` ago. `time_sync::decoded_slot_end_us` picks between the two
+/// at half a slot — deliberately far from both readings, because an
+/// earlier version split at the emit point itself and a few ms of
+/// jitter there flipped the answer by a whole slot (it threw away
+/// every other slot on hardware; see that function).
+///
+/// The length comes from the sink too, so the one slot a cold
+/// acquisition lengthens is measured as the longer slot it is instead
+/// of losing its extra seconds of tail. Before the sink has published
+/// a length — and on a board whose sink publishes none — the nominal
+/// slot stands in.
 fn slot_end_hint() -> Option<i64> {
     /// One FT8 slot in µs.
     const SLOT_US: i64 = 15_000_000;
-    /// Where in its slot stage1_inc emits the SpecBundle:
-    /// `SPEC_EMIT_PAIR` = 168 000 samples at 12 kHz.
-    const SPEC_EMIT_INTO_SLOT_US: i64 = 14_000_000;
     let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
-    let (_, into) = mfsk_app_shared::time_sync::current_capture_info(now)?;
-    Some(if into >= SPEC_EMIT_INTO_SLOT_US {
-        now + (SLOT_US - into)
-    } else {
-        now - into
-    })
+    let (_, into, len) = mfsk_app_shared::time_sync::current_capture_info_with_len(now)?;
+    Some(mfsk_app_shared::time_sync::decoded_slot_end_us(
+        now,
+        into,
+        len.unwrap_or(SLOT_US),
+    ))
 }
 
 const FT8_BUDGET_MS: i64 = match option_env!("MFSK_FT8_BUDGET_MS") {
@@ -364,6 +369,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             t_slot_recv,
             t_done,
             skipped,
+            slot_end_hint_us,
         } = out;
         let wav_idx = slot.wav_idx;
 
@@ -374,13 +380,25 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         // the next bundle, which frees the cores for the audio pipeline
         // — after a cold acquisition it has a backlog to clear.
         if skipped {
-            let margin = (slot.slotend_us + dual_core::FT8_KEY_UP_AFTER_SLOT_END_US
-                - FT8_KEY_UP_GUARD_MS * 1_000
-                - t_post_recv)
-                / 1_000;
+            // Two readings of the same margin: the one the floor
+            // decided on (the audio sink's clock, the only one
+            // available before the slot ends) and the one stage1_inc's
+            // own boundary gives once the Slot arrives. They agreeing
+            // is what makes a skip right; the first run of this floor
+            // skipped every other slot and only the second number
+            // showed it (2026-09-18).
+            let margin_at = |slotend: i64| {
+                (slotend + dual_core::FT8_KEY_UP_AFTER_SLOT_END_US
+                    - FT8_KEY_UP_GUARD_MS * 1_000
+                    - t_post_recv)
+                    / 1_000
+            };
             log::warn!(
-                "SLOT[{wav_idx}] src={source} skipped — bundle arrived with {margin} ms \
-                 to key-up, under the {FT8_SLOT_FLOOR_MS} ms floor (q_wait={} us)",
+                "SLOT[{wav_idx}] src={source} skipped — bundle arrived with {} ms \
+                 to key-up, under the {FT8_SLOT_FLOOR_MS} ms floor \
+                 (slot says {} ms, q_wait={} us)",
+                slot_end_hint_us.map(margin_at).unwrap_or(0),
+                margin_at(slot.slotend_us),
                 t_post_recv - spec.emit_us
             );
             slot_seq = slot_seq.wrapping_add(1);
@@ -431,11 +449,19 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                 (post_slotend - KEY_UP_AFTER_SLOT_END_US) / 1_000
             );
         }
+        // The key-up floor reads the boundary from the audio sink
+        // before the slot ends; this is that reading against
+        // stage1_inc's own, the only check on it that costs nothing.
+        // A slot's worth of error here is the bug of 2026-09-18.
+        let hint_err = match slot_end_hint_us {
+            Some(h) => format!("{:+}ms", (h - slotend) / 1_000),
+            None => "na".to_string(),
+        };
         log::info!(
             "SLOT[{wav_idx}] src={source} grid={} p1={n_pass1} ready={n_ready} defer={n_deferred} \
              cut={n_cut} fb={n_fallback} dec={} budget={FT8_BUDGET_MS}ms \
-             tail_win={}us q_wait={}us coarse={}us fine={}us early={}us tail_use={}us \
-             post_slotend={}us slot_wait={}us late={}us",
+             tail_win={}us q_wait={}us hint_err={hint_err} coarse={}us fine={}us early={}us \
+             tail_use={}us post_slotend={}us slot_wait={}us late={}us",
             mfsk_app_shared::time_sync::grid_lock().label(),
             results.len(),
             tail_window,

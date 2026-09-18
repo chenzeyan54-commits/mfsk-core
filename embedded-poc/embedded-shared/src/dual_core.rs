@@ -133,6 +133,13 @@ pub struct SpeculativeOut {
     /// candidate count is `0`; the audio was received and dropped, so
     /// the pipeline stays drained.
     pub skipped: bool,
+    /// What [`DecodeConfig::slot_end_hint`] answered when this slot
+    /// arrived, or `None` if the caller supplies no hint. Reported so
+    /// a caller can log it against `slot.slotend_us` — the two date
+    /// the same boundary from the audio sink's clock and from
+    /// stage1_inc's, and [`Self::skipped`] is decided on the first of
+    /// them before the second exists.
+    pub slot_end_hint_us: Option<i64>,
 }
 
 /// Per-slot decoder configuration shared between Phase-C speculative
@@ -347,12 +354,8 @@ pub fn run_speculative_slot(
     // Is there time to finish this slot before key-up? `slot_end_hint`
     // says where the slot ends; `slot_floor_ms` says how much of what
     // is left the un-deadlined work ahead (coarse + fine sync) needs.
-    let slot_end_hint = if cfg.slot_floor_ms > 0 {
-        cfg.slot_end_hint.and_then(|f| f())
-    } else {
-        None
-    };
-    if let Some(slotend) = slot_end_hint {
+    let slot_end_hint = cfg.slot_end_hint.and_then(|f| f());
+    if let (true, Some(slotend)) = (cfg.slot_floor_ms > 0, slot_end_hint) {
         let key_up_at = key_up_deadline(slotend, cfg.key_up_guard_ms.max(0) * 1_000);
         if t_post_recv + cfg.slot_floor_ms * 1_000 > key_up_at {
             // Take the slot so stage1_inc's buffer is released on the
@@ -376,6 +379,7 @@ pub fn run_speculative_slot(
                 t_slot_recv,
                 t_done: unsafe { esp_timer_get_time() },
                 skipped: true,
+                slot_end_hint_us: slot_end_hint,
             };
         }
     }
@@ -611,6 +615,7 @@ pub fn run_speculative_slot(
         t_slot_recv,
         t_done,
         skipped: false,
+        slot_end_hint_us: slot_end_hint,
     }
 }
 

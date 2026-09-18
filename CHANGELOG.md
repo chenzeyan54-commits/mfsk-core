@@ -159,6 +159,43 @@ suite on a Mac rather than by CI, which still has Linux runners only.
 
 ### Fixed
 
+- **CoreS3 FT8: a slot that cannot finish before key-up is dropped
+  before it starts, and the boundary that decides it comes from the
+  audio clock.** Cold acquisition occupies the decode core for ~10 s, so
+  the slot behind it reaches the decoder with a fraction of its tail
+  left. It then ran coarse and fine sync — which no deadline bounds; the
+  key-up bound stops stage-3 *claims* — and finished up to 1.34 s past
+  this station's key-up having decoded nothing.
+  `dual_core::DecodeConfig::slot_floor_ms` (500 ms here,
+  `MFSK_FT8_SLOT_FLOOR_MS=0` to disable) now drops such a slot up front,
+  receiving its audio so the pipeline stays drained.
+
+  Locating the boundary took two tries, both measured on the board. The
+  first estimate was the SpecBundle's own — emit timestamp plus the
+  audio it carried — but that sample count is what stage1_inc has
+  *consumed*, and acquisition starves stage1_inc too: under exactly the
+  condition the floor exists for, the estimate slid late with it and the
+  floor never fired. The second read the boundary from the audio sink's
+  clock, but split "the slot being decoded" from "the one before it" at
+  the point the bundle is emitted (14.0 s of 15) — which is where the
+  decoder reads it, so a few ms of jitter flipped the answer by a whole
+  slot: every other slot was reported long over and thrown away, 8 of 18
+  in one run, each with ~1.1 s left. The sink now publishes each slot's
+  start **and its length**, the split sits at half a slot — seconds from
+  either real reading — and the one slot a cold acquisition lengthens is
+  measured as the longer slot it is rather than losing its extra 3 s of
+  tail. `time_sync::decoded_slot_end_us` is that arithmetic, pinned by
+  host tests; the per-slot log gained `hint_err` (the same boundary as
+  stage1_inc later dates it, −36..−46 ms in steady state) and `q_wait`.
+
+  Also: acquisition stops at the first trial reaching `LOCK_MIN_DECODES`
+  (3). Scored on the host over 24 start phases per recording, the decode
+  count is identical to running all five trials (qso3 8.00, qso1 3.88,
+  qso2 4.74) for 5.0 → 2.3 trials, and on the board the stall it causes
+  halved, 15.2 → 10.4 s. Steady state on `qso3_busy` under
+  `MFSK_CORES3_SIM`: 10 decodes a slot, finishing ~255 ms after slot end
+  against a key-up at +500 ms, no slot dropped and none past key-up.
+
 - **CoreS3 FT8 grid acquisition: the capture's own offset was dropped,
   one decode set the grid, and a partial slot could lock it.** Three
   ways the embedded controller's slot grid (#356) landed wrong, found on

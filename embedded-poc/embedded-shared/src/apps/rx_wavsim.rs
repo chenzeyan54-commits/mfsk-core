@@ -132,6 +132,8 @@ pub fn run_sweep(wavs: &'static [&'static [u8]], cfgs: &'static [RxSweepCfg]) ->
             // `slot_floor_ms` is 0 on this board, so a slot is never
             // dropped for arriving late.
             skipped: _,
+            // No hint on this board, so nothing to log it against.
+            slot_end_hint_us: _,
         } = out;
 
         let slotend = slot.slotend_us;
