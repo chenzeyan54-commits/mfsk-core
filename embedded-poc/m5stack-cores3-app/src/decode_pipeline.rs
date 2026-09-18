@@ -1004,7 +1004,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             );
             if !late.is_empty() {
                 log::info!(
-                    "SLOT[{wav_idx}] src={source} past key-up: {} of {n_left} carried candidates                      decoded on the idle tail",
+                    "SLOT[{wav_idx}] src={source} past key-up: {}/{n_left} carried candidates decoded on the idle tail",
                     late.len(),
                 );
                 if let Ok(mut ui) = UI.lock() {
