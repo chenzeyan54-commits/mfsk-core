@@ -159,6 +159,51 @@ suite on a Mac rather than by CI, which still has Linux runners only.
 
 ### Fixed
 
+- **CoreS3: the audio task now outranks the decoder, and what that
+  exposed.** Both were priority 5 — the decode pipeline and the
+  UAC reader are `std::thread`s, so they took
+  `CONFIG_PTHREAD_TASK_PRIO_DEFAULT` (5) and
+  `CONFIG_PTHREAD_TASK_CORE_DEFAULT` (no affinity), while the raw
+  FreeRTOS tasks around them were placed deliberately (`stage1_inc` at
+  6 to preempt `dsp_worker` at 5; `net` pinned to core 1, "never core
+  0, which carries capture"). Equal priority means FreeRTOS rotates
+  them per 10 ms tick on whichever core they share, so a decoder
+  running long took half the audio task's core: over one ~13 s cold
+  acquisition the sink's slot-boundary publishes fell **4.06 s**
+  behind, enough for the key-up floor to read the wrong slot's
+  boundary. On the harness that is lag; on a radio it is loss — the
+  reader drains a 16 KB (85 ms at 48 kHz stereo) ring and blocks
+  rather than drops when the queue behind it is full. The audio task
+  (reader and `MFSK_CORES3_SIM` feeder alike) is now priority 6, and
+  the decode thread is pinned to core 0, where it already ran and
+  where it must stay for the two-core split to be two cores.
+
+  **The decode count on `qso3_busy` fell from 10 a slot to 5.5, and
+  that number is the honest one.** With the feeder starved, the last
+  12 000 samples of each slot took 1.52 s to arrive instead of 1.00 s,
+  and the decoder spent that slack: `tail_win` was 1.56 s where the
+  geometry says 1.00 s (the SpecBundle leaves stage1_inc at 168 000 of
+  180 000 samples). It now measures 924-928 ms across every steady
+  slot, 75 ms under nominal for stage1_inc's own lag, and `hint_err`
+  is ±0 ms against stage1_inc's boundary. A station's key-up comes on
+  UTC whatever our buffering does, so the slack was never ours: the
+  real budget for answering in the next slot is ~1.1 s (0.93 s of tail
+  + 0.5 s to key-up − the 320 ms guard), not the 1.8 s the board had
+  been given. Per-slot `tail_win` in the 2026-08-23 IC-705 capture
+  averaged 1.44 s with a 0.88-2.07 s spread — the same distortion,
+  measured on a radio with the reader still at priority 5, so it does
+  not settle what a radio gives at priority 6. That run is still to
+  come.
+
+  A consequence, measured the same day and not yet acted on:
+  per-candidate fine sync costs 292 ms of that 1.1 s and now **loses**
+  decodes — 5.50 a slot with it against 6.00 without, 9-10 candidates
+  cut by the deadline against 4. It earned its place when the budget
+  was 1.8 s (`MFSK_FT8_FINE_SYNC=0` A/Bs it), and `qso3_busy` is a
+  crowded recording; on a band carrying six signals rather than
+  eighteen the arithmetic may come back. Left on by default until
+  that is measured rather than assumed.
+
 - **CoreS3 FT8: a slot that cannot finish before key-up is dropped
   before it starts, and the boundary that decides it comes from the
   audio clock.** Cold acquisition occupies the decode core for ~10 s, so

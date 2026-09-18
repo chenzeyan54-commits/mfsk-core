@@ -128,6 +128,7 @@ use mfsk_core::engine::dsp::resample::LinearResamplerI16To12k;
 fn spawn_psram_thread<F>(
     name: &'static core::ffi::CStr,
     stack_size: usize,
+    priority: Option<u8>,
     f: F,
 ) -> std::io::Result<std::thread::JoinHandle<()>>
 where
@@ -138,11 +139,13 @@ where
     // here reported as 'pthread' — and a coredump that says
     // `task 'pthread'` cannot tell four candidate threads apart, which
     // is where a stack-overflow hunt stalls. Refs #163.
+    let default_cfg_for_prio = ThreadSpawnConfiguration::default();
     let psram_cfg = ThreadSpawnConfiguration {
         name: Some(name),
         stack_size,
         stack_alloc_caps: MallocCap::Spiram | MallocCap::Cap8bit,
-        ..Default::default()
+        priority: priority.unwrap_or(default_cfg_for_prio.priority),
+        ..default_cfg_for_prio
     };
     if let Err(e) = psram_cfg.set() {
         log::warn!("uac: ThreadSpawnConfiguration::set (PSRAM stack) failed for {name:?}: {e:?} — falling back to internal-DRAM stack");
@@ -184,6 +187,34 @@ const UAC_DRIVER_TASK_CORE: sys::BaseType_t = 0;
 /// spawn reader. 4 KB is overkill but keeps headroom for the OnceLock
 /// + sender state and any future device-cleanup paths.
 const APP_TASK_STACK: usize = 4096;
+
+/// Priority of whichever task is feeding the [`AudioSink`] — the USB
+/// reader on a radio, the `MFSK_CORES3_SIM` feeder without one.
+///
+/// **6, above the decode thread's 5**, for the reason `stage1_inc`
+/// takes 6 above `dsp_worker`'s 5: the audio path must be able to
+/// preempt the decoder, because its work cannot be deferred and then
+/// caught up on.
+///
+/// Both were priority 5 until 2026-09-19, and pthreads take
+/// `CONFIG_PTHREAD_TASK_CORE_DEFAULT` = no affinity, so the audio task
+/// and the decode task time-sliced one core at 100 Hz whenever the
+/// decoder ran long. Cold acquisition runs ~13 s on the decode thread
+/// with two `vTaskDelay(1)`s in it, and the sink's slot-boundary
+/// publishes fell **4.06 s** behind over one
+/// (`logs/sim_slotlen_rerun_noclock_offset3000_2026-09-19.log`, the
+/// per-slot `hint_err` field) — enough to make
+/// `decode_pipeline::slot_end_hint` name the wrong slot's boundary.
+///
+/// On the SIM feeder that is lag and nothing worse; it paces itself
+/// and the audio is a `&'static [u8]`. On a radio it is loss: the
+/// reader drains the IDF UAC ring, [`STREAM_BUFFER_BYTES`] = 16 KB =
+/// **85 ms** at 48 kHz stereo, and `pipeline::send_box` into a
+/// four-chunk (400 ms) queue blocks rather than dropping, so a
+/// starved reader stops reading and the ring overruns. That is the
+/// case a busy band brings on — more candidates, a longer decode —
+/// and it is why this is a priority rather than a tuning knob.
+const AUDIO_TASK_PRIORITY: u8 = 6;
 
 /// `uac_reader` task stack.
 ///
@@ -625,7 +656,7 @@ pub fn spawn_sim_feed(wav: &'static [u8], lead_silence: usize) {
             c"uac_sim".as_ptr(),
             4096,
             cfg,
-            5,
+            AUDIO_TASK_PRIORITY as u32,
             core::ptr::null_mut(),
             0,
         )
@@ -1147,9 +1178,12 @@ fn handle_rx_connected(addr: u8, iface_num: u8) -> Result<()> {
     RX_ERRORS.store(0, Ordering::Relaxed);
 
     let handle_wrapped = DeviceHandle(handle);
-    if let Err(e) = spawn_psram_thread(c"uac_reader", READER_TASK_STACK, move || {
-        reader_thread(handle_wrapped, addr, iface_num)
-    }) {
+    if let Err(e) = spawn_psram_thread(
+        c"uac_reader",
+        READER_TASK_STACK,
+        Some(AUDIO_TASK_PRIORITY),
+        move || reader_thread(handle_wrapped, addr, iface_num),
+    ) {
         let stop_err = unsafe { sys::uac::uac_host_device_stop(handle) };
         let close_err = unsafe { sys::uac::uac_host_device_close(handle) };
         if stop_err != sys::ESP_OK as sys::esp_err_t {
@@ -1666,7 +1700,7 @@ pub fn start_host() -> Result<()> {
     EVENT_SENDER
         .set(tx)
         .map_err(|_| anyhow!("uac: EVENT_SENDER double init — start_host called twice?"))?;
-    spawn_psram_thread(c"uac_app", APP_TASK_STACK, move || app_task(rx))
+    spawn_psram_thread(c"uac_app", APP_TASK_STACK, None, move || app_task(rx))
         .map_err(|e| anyhow!("uac_app spawn failed: {e}"))?;
     log::info!("uac: app_task spawned (stack={APP_TASK_STACK} B)");
 
@@ -1688,7 +1722,7 @@ pub fn start_host() -> Result<()> {
         return Err(anyhow!("usb_host_install failed (err={err:#x})"));
     }
 
-    if let Err(e) = spawn_psram_thread(c"usb_events", USB_EVENTS_TASK_STACK, usb_events_task) {
+    if let Err(e) = spawn_psram_thread(c"usb_events", USB_EVENTS_TASK_STACK, None, usb_events_task) {
         let uninstall_err = unsafe { sys::usb_host_uninstall() };
         if uninstall_err != sys::ESP_OK as sys::esp_err_t {
             log::error!(

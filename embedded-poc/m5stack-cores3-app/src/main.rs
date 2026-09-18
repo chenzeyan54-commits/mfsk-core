@@ -338,8 +338,22 @@ fn main() -> ! {
     match mode {
         boot_mode::BootMode::Decode => {
             log_free_internal("pre-thread-spawn");
-            let pipeline_spawn =
-                crate::board::spawn_named(c"decode", 32 * 1024, || decode_pipeline::run());
+            // **Pinned to PRO_CPU.** The two-core decode split is this
+            // thread on one core and `dsp_worker` on the other, and
+            // `dsp_worker` is pinned to APP_CPU: left unpinned this
+            // thread can be scheduled there too, and the half-and-half
+            // of coarse sync and stage 3 becomes serial. It has in
+            // practice always run on core 0 (every watchdog dump during
+            // acquisition reads `CPU 0: decode`, `CPU 1: IDLE1`), so
+            // this pins where it already sits rather than moving it —
+            // it is the guarantee that is new, not the placement.
+            let pipeline_spawn = crate::board::spawn_named_tuned(
+                c"decode",
+                32 * 1024,
+                None,
+                Some(esp_idf_svc::hal::cpu::Core::Core0),
+                || decode_pipeline::run(),
+            );
             if let Err(e) = pipeline_spawn {
                 log::error!("decode_pipeline spawn failed ({e})");
             }
@@ -374,9 +388,22 @@ fn main() -> ! {
                 uac::spawn_sim_feed(decode_pipeline::QSO_WAVS[0], offset_ms * 12);
             }
 
-            let pipeline_spawn = crate::board::spawn_named(c"decode", 32 * 1024, || {
-                decode_pipeline::run_with_source("uac", |q| uac::set_chunk_q(q))
-            });
+            // **Pinned to PRO_CPU.** The two-core decode split is this
+            // thread on one core and `dsp_worker` on the other, and
+            // `dsp_worker` is pinned to APP_CPU: left unpinned this
+            // thread can be scheduled there too, and the half-and-half
+            // of coarse sync and stage 3 becomes serial. It has in
+            // practice always run on core 0 (every watchdog dump during
+            // acquisition reads `CPU 0: decode`, `CPU 1: IDLE1`), so
+            // this pins where it already sits rather than moving it —
+            // it is the guarantee that is new, not the placement.
+            let pipeline_spawn = crate::board::spawn_named_tuned(
+                c"decode",
+                32 * 1024,
+                None,
+                Some(esp_idf_svc::hal::cpu::Core::Core0),
+                || decode_pipeline::run_with_source("uac", |q| uac::set_chunk_q(q)),
+            );
             if let Err(e) = pipeline_spawn {
                 log::error!("decode_pipeline (Uac) spawn failed ({e})");
             }

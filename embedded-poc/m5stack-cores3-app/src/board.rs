@@ -147,12 +147,39 @@ pub fn spawn_named<F>(
 where
     F: FnOnce() + Send + 'static,
 {
+    spawn_named_tuned(name, stack_size, None, None, f)
+}
+
+/// [`spawn_named`] with the scheduling left explicit: priority, core,
+/// or both.
+///
+/// A plain pthread here takes `CONFIG_PTHREAD_TASK_PRIO_DEFAULT` (5)
+/// and `CONFIG_PTHREAD_TASK_CORE_DEFAULT` (-1, no affinity), which is
+/// what every thread on this board had until 2026-09-19 — including
+/// the two whose relative scheduling decides whether audio keeps its
+/// cadence. The raw FreeRTOS tasks around them were never left that
+/// way: `stage1_inc` takes priority 6 *because* it must preempt
+/// `dsp_worker` at 5, and `net` is pinned to core 1 "never core 0,
+/// which carries capture". This is the same control for the threads.
+pub fn spawn_named_tuned<F>(
+    name: &'static core::ffi::CStr,
+    stack_size: usize,
+    priority: Option<u8>,
+    pin_to_core: Option<esp_idf_svc::hal::cpu::Core>,
+    f: F,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
     use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
 
+    let default = ThreadSpawnConfiguration::default();
     let cfg = ThreadSpawnConfiguration {
         name: Some(name),
         stack_size,
-        ..Default::default()
+        priority: priority.unwrap_or(default.priority),
+        pin_to_core: pin_to_core.or(default.pin_to_core),
+        ..default
     };
     if let Err(e) = cfg.set() {
         log::warn!("spawn_named: config set failed for {name:?}: {e:?} — task will be 'pthread'");
