@@ -159,6 +159,27 @@ suite on a Mac rather than by CI, which still has Linux runners only.
 
 ### Added
 
+- **CoreS3 FT8: fine sync moved to after key-up, where there is time
+  for it.** Per-candidate fine sync (`ft8b.f90` Stages A/B/C) costs
+  ~292 ms of a ~1.1 s pre-key-up budget, and inside that budget it is
+  a net loss: 5.50 decodes a slot with it against 6.00 without, 9-10
+  candidates cut by the deadline against 4 (2026-09-19, hardware). It
+  was adopted on a host mirror that by its own header does not model
+  the deadline, and on board runs whose slot boundary was sliding late.
+
+  `DecodeConfig::fine_sync_late` (on by default on the CoreS3,
+  `MFSK_FT8_FINE_SYNC_LATE=0` to put it back) runs the pre-key-up path
+  on coarse positions alone, and `continue_leftovers` fine syncs what
+  failed and retries on the idle tail — the existing coarse-fallback
+  arrangement inverted: cheap first, refinement for what needs it, and
+  on the whole slot rather than the prefix.
+
+  On hardware the pre-key-up path drops from 292 ms of fine sync to
+  none, candidates cut by the deadline go 9-10 → 3, and decodes before
+  key-up go 5 → 6 with 2 more on the tail. Which is the point: the
+  reply this period is decided from what decodes before key-up, and
+  the marginal stations fine sync recovers are next period's contacts.
+
 - **CoreS3 FT8: what the key-up bound cuts is finished on the idle
   time after it, instead of being thrown away.** The decode task
   blocks on the next SpecBundle for ~13 s of every 15, and the slot's

@@ -144,6 +144,9 @@ pub struct SpeculativeOut {
     /// what the next period's choice is made from, which on a CQ-first
     /// portable station is most of the value of decoding at all.
     pub leftover: Vec<RefinedCandidate>,
+    /// Coarse positions stage 3 failed to decode, for
+    /// [`DecodeConfig::fine_sync_late`]. Empty unless that is set.
+    pub failed_coarse: Vec<SyncCandidate>,
     /// What [`DecodeConfig::slot_end_hint`] answered when this slot
     /// arrived, or `None` if the caller supplies no hint. Reported so
     /// a caller can log it against `slot.slotend_us` — the two date
@@ -243,6 +246,24 @@ pub struct DecodeConfig {
     /// zero — and it is what makes the key-up bound true for the whole
     /// slot rather than for stage 3 alone.
     ///
+    /// Run [`Self::fine_sync`] *after* the key-up bound rather than
+    /// before it, on what the cheap coarse-position attempt failed to
+    /// decode.
+    ///
+    /// Fine sync costs ~292 ms of a ~1.1 s pre-key-up budget on the
+    /// CoreS3 and, measured there on 2026-09-19, is a net loss inside
+    /// it: 5.50 decodes a slot against 6.00 without it, with 9-10
+    /// candidates cut by the deadline against 4. It earns its place
+    /// when there is time — the host mirror puts `qso3_busy` at 8.04
+    /// with it against 6.44 without, and what it adds are the marginal
+    /// stations, which on a CQ-first station are next period's
+    /// contacts rather than this period's reply.
+    ///
+    /// So with this set the pre-key-up path runs on coarse positions
+    /// alone, and [`continue_leftovers`] fine syncs whatever failed and
+    /// tries again on the idle tail. It is the existing coarse-fallback
+    /// arrangement inverted: cheap first, refinement for what needs it.
+    pub fine_sync_late: bool,
     /// Share the stage-3 candidate budget across both halves by coarse
     /// rank, instead of letting the early half take all of it.
     ///
@@ -417,6 +438,7 @@ pub fn run_speculative_slot(
                 t_done: unsafe { esp_timer_get_time() },
                 skipped: true,
                 leftover: Vec::new(),
+                failed_coarse: Vec::new(),
                 slot_end_hint_us: slot_end_hint,
             };
         }
@@ -440,7 +462,9 @@ pub fn run_speculative_slot(
     // has. Symbols past it contribute nothing, which costs the late
     // candidates some Stage A power but not their place: they still
     // partition into `deferred` on the refined DT below.
-    let (pass1, coarse) = if cfg.fine_sync {
+    // `coarse` is empty unless fine sync moved the candidates, since
+    // it exists only to map a failure back to where it started.
+    let (pass1, coarse) = if cfg.fine_sync && !cfg.fine_sync_late {
         let refined = fine_sync_split(spec.audio_prefix(), &pass1);
         (refined, pass1)
     } else {
@@ -471,6 +495,10 @@ pub fn run_speculative_slot(
     let mut n_cut = 0usize;
     let mut n_fallback = 0usize;
     let mut leftover: Vec<RefinedCandidate> = Vec::new();
+    // Candidates stage 3 tried and could not decode. With
+    // `fine_sync_late` they are what the idle tail fine syncs and
+    // retries; otherwise nothing reads them.
+    let mut failed_coarse: Vec<SyncCandidate> = Vec::new();
     let snap_fill = spec.audio_len();
     // Partition by audio-window fit only.
     //
@@ -531,6 +559,9 @@ pub fn run_speculative_slot(
         );
         n_cut += first.unclaimed.len();
         leftover.extend(first.unclaimed);
+        if cfg.fine_sync_late {
+            failed_coarse.extend(first.failed.iter().cloned());
+        }
         let mut r = first.results;
         // **Retries run only on time no first attempt can use.** Before
         // the slot arrives the deferred candidates cannot start — their
@@ -609,6 +640,9 @@ pub fn run_speculative_slot(
             );
             n_cut += late.unclaimed.len();
             leftover.extend(late.unclaimed);
+            if cfg.fine_sync_late {
+                failed_coarse.extend(late.failed.iter().cloned());
+            }
             results.extend(late.results);
             late_retry = coarse_retry_candidates(&late.failed, &refined, &coarse);
         } else if max_cand_late > 0 {
@@ -675,6 +709,7 @@ pub fn run_speculative_slot(
         t_done,
         skipped: false,
         leftover,
+        failed_coarse,
         slot_end_hint_us: slot_end_hint,
     }
 }
@@ -695,26 +730,43 @@ pub fn continue_leftovers(
     spec_q: esp_idf_svc::sys::QueueHandle_t,
     audio: &[i16],
     leftover: Vec<RefinedCandidate>,
+    failed_coarse: Vec<SyncCandidate>,
     cfg: &DecodeConfig,
     already: &[DecodeResult],
 ) -> Vec<DecodeResult> {
-    if leftover.is_empty() {
-        return Vec::new();
+    let stop = || Stage3Stop {
+        deadline_us: i64::MAX,
+        slot_q: spec_q,
+        yield_on_slot: true,
+        key_up_guard_us: 0,
+    };
+    let mut results: Vec<DecodeResult> = Vec::new();
+    // Candidates the bound stopped before they were claimed: their
+    // pass-2 spectra are already computed, so this is stage 3 alone.
+    if !leftover.is_empty() {
+        results.extend(
+            stage3_split(
+                audio,
+                leftover,
+                cfg.depth,
+                cfg.q_thresh,
+                cfg.bp_max_iter,
+                stop(),
+            )
+            .results,
+        );
     }
-    let out = stage3_split(
-        audio,
-        leftover,
-        cfg.depth,
-        cfg.q_thresh,
-        cfg.bp_max_iter,
-        Stage3Stop {
-            deadline_us: i64::MAX,
-            slot_q: spec_q,
-            yield_on_slot: true,
-            key_up_guard_us: 0,
-        },
-    );
-    let mut results = out.results;
+    // Then the refinement the pre-key-up path skipped, for the
+    // candidates it tried and failed — on the whole slot now, not the
+    // prefix, so the late symbols count too.
+    if cfg.fine_sync && cfg.fine_sync_late && !failed_coarse.is_empty() && !stop().reached() {
+        let refined = fine_sync_split(audio, &failed_coarse);
+        let n = refined.len();
+        let p2 = pass2_split(audio, refined, n);
+        results.extend(
+            stage3_split(audio, p2, cfg.depth, cfg.q_thresh, cfg.bp_max_iter, stop()).results,
+        );
+    }
     results.retain(|r| !already.iter().any(|a| a.message77() == r.message77()));
     dedup_by_message(&mut results);
     results

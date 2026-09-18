@@ -146,6 +146,17 @@ const FT8_KEY_UP_GUARD_MS: i64 = match option_env!("MFSK_FT8_KEY_UP_GUARD_MS") {
 /// cases; 500 ms is the low end of that, so the floor never costs a
 /// slot that could have decoded. `MFSK_FT8_SLOT_FLOOR_MS=0` turns it
 /// off.
+/// `dual_core::DecodeConfig::fine_sync_late` — on unless
+/// `MFSK_FT8_FINE_SYNC_LATE=0`. Its 292 ms does not fit the ~1.1 s
+/// before key-up (5.50 decodes a slot with it there against 6.00
+/// without, 2026-09-19); on the idle tail after key-up it has thirteen
+/// seconds and what it adds — the marginal stations — is next period's
+/// contact list rather than this period's reply.
+const FT8_FINE_SYNC_LATE: bool = match option_env!("MFSK_FT8_FINE_SYNC_LATE") {
+    Some(s) => parse_u32(s) != 0,
+    None => true,
+};
+
 /// `dual_core::DecodeConfig::share_cand_budget` — off unless
 /// `MFSK_FT8_SHARE_CAND=1`, pending the board measurement its doc asks
 /// for (the mirror's gain is on `qso1`/`qso2`, and it is spent after
@@ -354,6 +365,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             budget_ms: FT8_BUDGET_MS,
             fine_sync: FT8_FINE_SYNC,
             key_up_guard_ms: FT8_KEY_UP_GUARD_MS,
+            fine_sync_late: FT8_FINE_SYNC_LATE,
             share_cand_budget: FT8_SHARE_CAND,
             slot_floor_ms: FT8_SLOT_FLOOR_MS,
             slot_end_hint: Some(slot_end_hint),
@@ -380,6 +392,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             t_done,
             skipped,
             leftover,
+            failed_coarse,
             slot_end_hint_us,
         } = out;
         let wav_idx = slot.wav_idx;
@@ -994,12 +1007,13 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         // policy question, not a side effect of where the decode
         // finished.
         let mut late_response = false;
-        if !leftover.is_empty() {
-            let n_left = leftover.len();
+        if !leftover.is_empty() || !failed_coarse.is_empty() {
+            let n_left = leftover.len() + failed_coarse.len();
             let late = dual_core::continue_leftovers(
                 spec_q,
                 slot.audio(),
                 leftover,
+                failed_coarse,
                 &cfg,
                 &results,
             );

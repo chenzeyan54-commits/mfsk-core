@@ -98,6 +98,7 @@ pub fn run() -> ! {
             key_up_guard_ms: 0,
             // Off with the key-up guard: these boards do not transmit
             // and their wav_sim sources are not paced to a slot clock.
+            fine_sync_late: false,
             share_cand_budget: false,
             slot_floor_ms: 0,
             slot_end_hint: None,
@@ -126,6 +127,7 @@ pub fn run() -> ! {
             slot_end_hint_us: _,
             // This board has no key-up bound, so nothing is cut for later.
             leftover: _,
+            failed_coarse: _,
         } = out;
         let wav_idx = slot.wav_idx;
 
