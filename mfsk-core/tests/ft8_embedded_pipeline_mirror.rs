@@ -27,7 +27,19 @@
 //!
 //! What it does not reproduce: the stage-3 deadline (the board's `cut`),
 //! and the exact audio fill at emit time, taken here as the 168 000
-//! samples `SpecBundle`'s own doc names as its floor.
+//! samples `SpecBundle`'s own doc names as its floor
+//! (`MFSK_MIRROR_PREFIX` overrides it; the board's real fill is 170 400,
+//! and setting it changes no decode count measured so far).
+//!
+//! **Sweep the phase at 0.01 s or finer when the count matters.** A
+//! weak station's decode is a 5 ms-scale comb in dt, so a 0.02 s grid
+//! aliases it: over −0.40..+0.40 without fine sync, a 0.02 s sweep
+//! peaked at 7 and a 0.005 s sweep found 8 at φ = +0.190 — the board's
+//! own eight, message for message, at the phase its log recorded as
+//! +0.201 (`m5stack-cores3-app/logs/hw_maxcand15_2026-09-05.log`).
+//! The header of this file used to say the board "has run at 8" where
+//! this mirror could not; it can, at a phase a coarse sweep steps
+//! over.
 //!
 //! ```sh
 //! cargo test -p mfsk-core --release --no-default-features \
@@ -143,7 +155,21 @@ fn spec_valid_rows() -> usize {
 
 /// The audio prefix that goes with that emit point — the shipping
 /// prefix moved by the same number of rows.
+///
+/// `MFSK_MIRROR_PREFIX=<samples>` overrides it outright. The board's
+/// own fill at emit is **not** the 168 000 this file has always used:
+/// pair 86 fills rows 172-173, row 173 reads to sample
+/// `173 * 960 + 3840` = 169 920, and stage1_inc is fed in 1 200-sample
+/// chunks, so the fill when the emit fires is 170 400. 2 400 samples —
+/// 200 ms of audio — that the board's early path has and this mirror
+/// did not.
 fn prefix_samples() -> usize {
+    if let Some(n) = std::env::var("MFSK_MIRROR_PREFIX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return n.min(SLOT);
+    }
     let rows = spec_valid_rows() as i64 - 2 * SHIP_EMIT_PAIR as i64;
     (SHIP_PREFIX_SAMPLES as i64 + rows * NSTEP_SAMPLES as i64).clamp(0, SLOT as i64) as usize
 }
@@ -2272,8 +2298,9 @@ fn mirror_emit_earlier() {
                 assert_eq!(f.len(), 3, "MFSK_GRID_PHASE wants start,end,step");
                 (f[0], f[1], f[2])
             }
-            // The plateau the board locks within.
-            Err(_) => (-0.4, 0.4, 0.1),
+            // The plateau the board locks within, at a step fine
+            // enough not to alias the 5 ms comb (see the header).
+            Err(_) => (-0.4, 0.4, 0.01),
         };
         let mut v = Vec::new();
         let mut step = 0i32;
