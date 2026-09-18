@@ -47,6 +47,80 @@ pub static FANOUT: LogFanout = LogFanout::new();
 /// なるだけ。Refs #163.
 pub static WIFI_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Where this boot takes the slot grid's phase from — the CONFIG page's
+/// setting, read once at startup and published here so the picker can
+/// mark it and `main` can act on it without re-opening NVS.
+static GRID_SOURCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_grid_source(src: mfsk_app_shared::grid_src::GridSource) {
+    GRID_SOURCE.store(
+        match src {
+            mfsk_app_shared::grid_src::GridSource::Ntp => 0,
+            mfsk_app_shared::grid_src::GridSource::AirDt => 1,
+        },
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+pub fn grid_source() -> mfsk_app_shared::grid_src::GridSource {
+    match GRID_SOURCE.load(std::sync::atomic::Ordering::Acquire) {
+        1 => mfsk_app_shared::grid_src::GridSource::AirDt,
+        _ => mfsk_app_shared::grid_src::GridSource::Ntp,
+    }
+}
+
+/// Persist a CONFIG-page choice and restart into it.
+///
+/// Same shape as `boot_mode::commit_and_restart`, and for the same
+/// reason: the panel tasks run on PSRAM stacks and an NVS write
+/// disables the flash cache, which a PSRAM stack must not be holding.
+pub fn commit_grid_src_and_restart(
+    nvs: std::sync::Arc<std::sync::Mutex<esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>>>,
+    src: mfsk_app_shared::grid_src::GridSource,
+) {
+    struct Req {
+        nvs: std::sync::Arc<
+            std::sync::Mutex<esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>>,
+        >,
+        src: mfsk_app_shared::grid_src::GridSource,
+    }
+
+    extern "C" fn entry(arg: *mut core::ffi::c_void) {
+        // SAFETY: `commit_grid_src_and_restart` leaked exactly this pointer.
+        let req = unsafe { Box::from_raw(arg as *mut Req) };
+        match req.nvs.lock() {
+            Ok(nvs) => match mfsk_app_shared::grid_src::write(&nvs, req.src) {
+                Ok(()) => log::warn!("grid source: committed {} — restarting", req.src.label()),
+                Err(e) => log::error!("grid source write failed: {e} — not restarting"),
+            },
+            Err(e) => log::error!("grid source: NVS lock poisoned: {e} — not restarting"),
+        }
+        drop(req);
+        // Let the line reach the log sink; in UAC mode that is the only
+        // channel out of this board.
+        unsafe { esp_idf_svc::sys::vTaskDelay(40) };
+        // SAFETY: no arguments, does not return.
+        unsafe { esp_idf_svc::sys::esp_restart() };
+    }
+
+    let ptr = Box::into_raw(Box::new(Req { nvs, src })) as *mut core::ffi::c_void;
+    let created = unsafe {
+        esp_idf_svc::sys::xTaskCreatePinnedToCore(
+            Some(entry),
+            c"grid_src_save".as_ptr(),
+            4096,
+            ptr,
+            5,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if created != 1 {
+        log::error!("could not spawn the grid-source save task");
+        drop(unsafe { Box::from_raw(ptr as *mut Req) });
+    }
+}
+
 pub fn wifi_enabled_for_this_boot() -> bool {
     WIFI_ENABLED.load(std::sync::atomic::Ordering::Acquire)
 }

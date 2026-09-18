@@ -38,6 +38,19 @@
 //! tap a mode to arm, tap it again to commit, tap outside to dismiss.
 //! Nothing is reserved when it is closed.
 //!
+//! ## Two levels, because there are two kinds of setting
+//!
+//! The root names the two: **MODE** (which receiver boots) and
+//! **CONFIG** (how the slot grid finds its phase — NTP, or the air).
+//! A tap on either opens that page; the commit bar then works exactly
+//! as it did, on whichever kind of thing the page holds. Both commits
+//! restart the board, so both are worth a confirmation, and neither is
+//! reachable by a single stray touch.
+//!
+//! The pages share one geometry: rows are drawn from the top and the
+//! commit bar stays where it was, so the widget does not move under
+//! the finger when the page changes. Unused rows are painted out.
+//!
 //! On dismissal the app has to repaint whatever the overlay covered —
 //! [`ModePicker::take_just_closed`] says when.
 
@@ -50,6 +63,29 @@ use embedded_graphics::{
 };
 
 use crate::boot_mode::BootMode;
+use crate::grid_src::GridSource;
+
+/// Which page the overlay is showing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Page {
+    Root,
+    Mode,
+    Config,
+}
+
+/// The root's two rows, in draw order.
+const ROOT: [(Page, &str); 2] = [(Page::Mode, "MODE"), (Page::Config, "CONFIG")];
+
+/// What [`ModePicker::update`] hands back when the commit bar fires.
+/// Both restart the board; the caller writes the one it is given.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Commit {
+    Mode(BootMode),
+    Grid(GridSource),
+}
+
+/// The CONFIG page's rows.
+pub const GRID_SOURCES: [GridSource; 2] = [GridSource::Ntp, GridSource::AirDt];
 
 /// The receivers this binary can boot into, in draw order.
 /// Five rows is 5 x [`PITCH`] + [`COMMIT_H`] = 280 px, against a
@@ -122,7 +158,7 @@ enum Target {
 /// elsewhere rather than one that is nearly right.
 const SLOP: i32 = 14;
 
-fn hit(origin: Point, x: u16, y: u16) -> Option<Target> {
+fn hit(origin: Point, x: u16, y: u16, rows: usize) -> Option<Target> {
     let (x, y) = (x as i32, y as i32);
     if x < origin.x - SLOP || x >= origin.x + WIDTH as i32 + SLOP {
         return None;
@@ -132,9 +168,16 @@ fn hit(origin: Point, x: u16, y: u16) -> Option<Target> {
         return None;
     }
     if dy >= commit_top() {
-        Some(Target::Commit)
+        return Some(Target::Commit);
+    }
+    let idx = (dy / PITCH) as usize;
+    // A page with fewer rows than the widget has bands: the empty ones
+    // are painted out, and a press there is a press on nothing — not
+    // on the last row, which is how a mis-hit turns into a commit.
+    if idx < rows {
+        Some(Target::Mode(idx))
     } else {
-        Some(Target::Mode((dy / PITCH) as usize))
+        None
     }
 }
 
@@ -142,6 +185,7 @@ fn hit(origin: Point, x: u16, y: u16) -> Option<Target> {
 /// between the three receivers.
 pub struct ModePicker {
     origin: Point,
+    page: Page,
     open: bool,
     just_closed: bool,
     /// When the current press began, for the hold-to-open gesture.
@@ -160,7 +204,7 @@ pub struct ModePicker {
     /// until it arrives, the bar says so rather than sitting there
     /// looking unpressed.
     committing: bool,
-    drawn: Option<usize>,
+    drawn: Option<(Page, Option<usize>)>,
     needs_draw: bool,
 }
 
@@ -168,6 +212,7 @@ impl ModePicker {
     pub fn new(origin: Point) -> Self {
         Self {
             origin,
+            page: Page::Root,
             open: false,
             just_closed: false,
             press_since: None,
@@ -195,7 +240,25 @@ impl ModePicker {
     ///
     /// `pressed` is the current contact state; `x`/`y` are only read
     /// while it is true.
-    pub fn update(&mut self, pressed: bool, x: u16, y: u16) -> Option<BootMode> {
+    /// Rows the current page holds.
+    fn rows(&self) -> usize {
+        match self.page {
+            Page::Root => ROOT.len(),
+            Page::Mode => MODES.len(),
+            Page::Config => GRID_SOURCES.len(),
+        }
+    }
+
+    /// The label of row `i` on the current page.
+    fn row_label(&self, i: usize) -> &'static str {
+        match self.page {
+            Page::Root => ROOT[i].1,
+            Page::Mode => MODES[i].1,
+            Page::Config => GRID_SOURCES[i].label(),
+        }
+    }
+
+    pub fn update(&mut self, pressed: bool, x: u16, y: u16) -> Option<Commit> {
         let now = std::time::Instant::now();
         let was_pressed = self.press_since.is_some();
 
@@ -207,7 +270,7 @@ impl ModePicker {
         } else if !was_pressed {
             self.press_since = Some(now);
             if self.open {
-                let t = hit(self.origin, x, y);
+                let t = hit(self.origin, x, y, self.rows());
                 // One line per press, only while the overlay is up, so
                 // it is bounded by how fast a finger can tap. Every
                 // remaining way this widget can fail to commit is
@@ -216,10 +279,11 @@ impl ModePicker {
                 // selection was standing when it did. Three flashes
                 // were spent guessing between those instead.
                 log::info!(
-                    "picker: press ({x}, {y}) origin=({}, {}) -> {t:?}, armed={:?}",
+                    "picker: press ({x}, {y}) origin=({}, {}) page={:?} -> {t:?}, armed={:?}",
                     self.origin.x,
                     self.origin.y,
-                    self.armed.map(|(i, _)| MODES[i].1),
+                    self.page,
+                    self.armed.map(|(i, _)| self.row_label(i)),
                 );
                 if self.pressed != t {
                     self.pressed = t;
@@ -227,24 +291,43 @@ impl ModePicker {
                 }
                 match t {
                     Some(Target::Mode(idx)) => {
-                        // Selecting only selects. The label stays
-                        // readable; the commit bar below says what
-                        // pressing it will do.
-                        self.armed = Some((idx, now));
-                        self.needs_draw = true;
+                        if self.page == Page::Root {
+                            // The root only navigates: there is
+                            // nothing to confirm about opening a page,
+                            // and asking would put two taps between
+                            // the operator and every setting.
+                            self.page = ROOT[idx].0;
+                            self.armed = None;
+                            self.needs_draw = true;
+                        } else {
+                            // Selecting only selects. The label stays
+                            // readable; the commit bar below says what
+                            // pressing it will do.
+                            self.armed = Some((idx, now));
+                            self.needs_draw = true;
+                        }
                     }
                     Some(Target::Commit) => {
-                        if let Some((idx, _)) = self.armed {
+                        if self.page == Page::Root {
+                            // Nothing on the root can be committed;
+                            // the bar says so.
+                            log::info!("picker: commit pressed on the root page");
+                        } else if let Some((idx, _)) = self.armed {
                             self.committing = true;
                             self.needs_draw = true;
-                            return Some(MODES[idx].0);
+                            return Some(match self.page {
+                                Page::Mode => Commit::Mode(MODES[idx].0),
+                                Page::Config => Commit::Grid(GRID_SOURCES[idx]),
+                                Page::Root => unreachable!("handled above"),
+                            });
+                        } else {
+                            // Pressing commit with nothing selected is
+                            // a real state (the bar says "pick a mode
+                            // above"), not a fault — but it is also
+                            // indistinguishable on screen from a press
+                            // that was never seen, so say which it was.
+                            log::info!("picker: commit pressed with no selection standing");
                         }
-                        // Pressing commit with nothing selected is a
-                        // real state (the bar says "pick a mode
-                        // above"), not a fault — but it is also
-                        // indistinguishable on screen from a press
-                        // that was never seen, so say which it was.
-                        log::info!("picker: commit pressed with no selection standing");
                     }
                     None => self.close(),
                 }
@@ -272,6 +355,10 @@ impl ModePicker {
 
     fn close(&mut self) {
         self.open = false;
+        // Next open starts at the root rather than wherever the last
+        // one was left — an overlay that reappears on a page nobody
+        // chose is how a stray tap lands on a setting.
+        self.page = Page::Root;
         self.armed = None;
         self.pressed = None;
         self.committing = false;
@@ -281,7 +368,15 @@ impl ModePicker {
     }
 
     /// Draw, but only while open and only when something changed.
-    pub fn render<D>(&mut self, display: &mut D, current: BootMode) -> Result<(), D::Error>
+    /// `current` / `current_grid` are what this boot is running, marked
+    /// with a `*` on their pages so the operator can see the setting
+    /// before changing it.
+    pub fn render<D>(
+        &mut self,
+        display: &mut D,
+        current: BootMode,
+        current_grid: GridSource,
+    ) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = Rgb565>,
     {
@@ -291,8 +386,9 @@ impl ModePicker {
         let armed_idx = self.armed.map(|(i, _)| i);
         // `needs_draw` is what carries a pressed/released edge here —
         // neither changes `armed_idx`, so gating on the selection alone
-        // is exactly what made a press invisible.
-        if !self.needs_draw && self.drawn == armed_idx {
+        // is exactly what made a press invisible. The page is in the
+        // same key because navigating changes neither.
+        if !self.needs_draw && self.drawn == Some((self.page, armed_idx)) {
             return Ok(());
         }
         let text = |fg: Rgb565, bg: Rgb565| {
@@ -303,8 +399,24 @@ impl ModePicker {
                 .build()
         };
 
-        for (i, (target, label)) in MODES.iter().enumerate() {
+        for i in 0..MODES.len() {
             let top = self.origin.y + i as i32 * PITCH;
+            // Rows past this page's end are painted out, so a shorter
+            // page does not leave the previous one's labels standing.
+            if i >= self.rows() {
+                Rectangle::new(Point::new(self.origin.x, top), Size::new(WIDTH, BUTTON_H))
+                    .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+                    .draw(display)?;
+                continue;
+            }
+            let label = self.row_label(i);
+            // The row that names what this boot is already running, or
+            // on the root, the page that leads to it.
+            let is_current = match self.page {
+                Page::Root => false,
+                Page::Mode => MODES[i].0 == current,
+                Page::Config => GRID_SOURCES[i] == current_grid,
+            };
             let selected = armed_idx == Some(i);
             // Palette borrowed whole from `decoded_list`, which is
             // already proven on this panel: GREEN for the current
@@ -330,7 +442,7 @@ impl ModePicker {
             )
             .draw(display)?;
             // Where this boot already is.
-            if *target == current {
+            if is_current {
                 Text::with_baseline(
                     "*",
                     Point::new(
@@ -361,17 +473,23 @@ impl ModePicker {
             .into_styled(PrimitiveStyle::with_fill(cbg))
             .draw(display)?;
         let mut line: heapless::String<32> = heapless::String::new();
-        match armed_idx {
-            Some(i) if self.committing => {
-                let _ = line.push_str("SWITCHING TO ");
-                let _ = line.push_str(MODES[i].1);
+        match (self.page, armed_idx) {
+            (Page::Root, _) => {
+                let _ = line.push_str("pick a page above");
             }
-            Some(i) => {
-                let _ = line.push_str("SWITCH TO ");
-                let _ = line.push_str(MODES[i].1);
+            (_, Some(i)) => {
+                let _ = line.push_str(if self.committing {
+                    "APPLYING "
+                } else {
+                    "APPLY "
+                });
+                let _ = line.push_str(self.row_label(i));
             }
-            None => {
+            (Page::Mode, None) => {
                 let _ = line.push_str("pick a mode above");
+            }
+            (Page::Config, None) => {
+                let _ = line.push_str("pick a time source");
             }
         }
         Text::with_baseline(
@@ -382,7 +500,7 @@ impl ModePicker {
         )
         .draw(display)?;
 
-        self.drawn = armed_idx;
+        self.drawn = Some((self.page, armed_idx));
         self.needs_draw = false;
         Ok(())
     }

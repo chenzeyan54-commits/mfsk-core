@@ -15,9 +15,9 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use mfsk_app_shared::{boot_mode, udp_log, wifi};
 
 use mfsk_core_m5stack_cores3_app::{
-    apps, board, coredump, decode_pipeline, display, log_free_internal, uac, BOOT_MODE_DEFAULT,
-    FANOUT, LOGGER, NTP_SERVER, NTP_SYNC_TIMEOUT_MS, UDP_LOG_PORT, UDP_LOG_TARGET, WIFI_ENABLED,
-    WIFI_PSK, WIFI_SSID,
+    apps, board, coredump, decode_pipeline, display, log_free_internal, set_grid_source, uac,
+    BOOT_MODE_DEFAULT, FANOUT, LOGGER, NTP_SERVER, NTP_SYNC_TIMEOUT_MS, UDP_LOG_PORT,
+    UDP_LOG_TARGET, WIFI_ENABLED, WIFI_PSK, WIFI_SSID,
 };
 
 fn main() -> ! {
@@ -165,6 +165,17 @@ fn main() -> ! {
     //
     // WiFi buffers were also sized down for this workload — see
     // `sdkconfig.defaults`. Refs #163.
+    // **Where the slot grid's phase comes from** — the CONFIG page's
+    // setting, read once here. `AirDt` suppresses the clock before
+    // anything can consult it, so a later NTP sync cannot take the
+    // phase away from a grid the air is holding.
+    let grid_src = mfsk_app_shared::grid_src::read(&nvs);
+    set_grid_source(grid_src);
+    if grid_src == mfsk_app_shared::grid_src::GridSource::AirDt {
+        mfsk_app_shared::time_sync::suppress_clock(true);
+    }
+    log::info!("grid source: {}", grid_src.label());
+
     let needs_wifi = matches!(mode, boot_mode::BootMode::Wifi | boot_mode::BootMode::Uac);
     WIFI_ENABLED.store(needs_wifi, std::sync::atomic::Ordering::Release);
     if needs_wifi && WIFI_SSID.is_empty() {
@@ -302,7 +313,17 @@ fn main() -> ! {
                     // written. `time_sync`'s own doc comment says
                     // "NTP is already in every app that has WiFi";
                     // this was the app where that was not true.
-                    let _sntp = match mfsk_app_shared::ntp::start(NTP_SERVER) {
+                    // The CONFIG page's choice. `AirDt` means the
+                    // operator has said the phase comes from the band,
+                    // so there is nothing to wait for here — and
+                    // starting NTP anyway would spend the timeout and
+                    // then discipline a clock `suppress_clock` makes
+                    // invisible, which is cost without effect.
+                    let _sntp = if grid_src == mfsk_app_shared::grid_src::GridSource::AirDt {
+                        log::info!("NTP not started — grid source is the air (CONFIG page)");
+                        None
+                    } else {
+                        match mfsk_app_shared::ntp::start(NTP_SERVER) {
                         Ok(sntp) => {
                             if mfsk_app_shared::ntp::wait_synced(&sntp, NTP_SYNC_TIMEOUT_MS) {
                                 log::info!("NTP synced — FT8 slot grid can anchor to UTC");
@@ -317,6 +338,7 @@ fn main() -> ! {
                         Err(e) => {
                             log::warn!("NTP start failed: {e:#} — slot grid free-running");
                             None
+                        }
                         }
                     };
 
@@ -379,7 +401,7 @@ fn main() -> ! {
             let sim = option_env!("MFSK_CORES3_SIM").is_some();
             if sim {
                 if option_env!("MFSK_SIM_NO_CLOCK").is_some() {
-                    mfsk_app_shared::time_sync::sim_suppress_clock(true);
+                    mfsk_app_shared::time_sync::suppress_clock(true);
                     log::warn!("SIM: clock suppressed — grid must recover from the air");
                 }
                 let offset_ms: usize = option_env!("MFSK_SIM_OFFSET_MS")

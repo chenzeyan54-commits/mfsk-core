@@ -209,11 +209,19 @@ fn poll_touch(
         }
         *last_contact = c;
     }
-    if let Some(target) = picker.update(c.points > 0, c.x, c.y) {
-        log::warn!("boot_mode -> {} (touch), restarting", target.label());
-        // Not written here: this task's stack is in PSRAM, and a flash
-        // write aborts from one. See `boot_mode::commit_and_restart`.
-        boot_mode::commit_and_restart(nvs.clone(), target);
+    match picker.update(c.points > 0, c.x, c.y) {
+        Some(mode_picker::Commit::Mode(target)) => {
+            log::warn!("boot_mode -> {} (touch), restarting", target.label());
+            // Not written here: this task's stack is in PSRAM, and a
+            // flash write aborts from one. See
+            // `boot_mode::commit_and_restart`.
+            boot_mode::commit_and_restart(nvs.clone(), target);
+        }
+        Some(mode_picker::Commit::Grid(src)) => {
+            log::warn!("grid source -> {} (touch), restarting", src.label());
+            crate::commit_grid_src_and_restart(nvs.clone(), src);
+        }
+        None => {}
     }
 }
 
@@ -396,7 +404,7 @@ pub fn run<P: SpotPanel>(ctx: DisplayCtx) -> ! {
         // on change, so a repaint underneath erases it and it never
         // comes back.
         if picker.is_open() {
-            picker.render(&mut display, P::MODE).ok();
+            picker.render(&mut display, P::MODE, crate::grid_source()).ok();
             FreeRtos::delay_ms(50);
             poll_touch(
                 &mut picker,
@@ -532,7 +540,7 @@ pub fn run<P: SpotPanel>(ctx: DisplayCtx) -> ! {
                     &mut last_contact,
                     &ctx.nvs,
                 );
-                picker.render(&mut display, P::MODE).ok();
+                picker.render(&mut display, P::MODE, crate::grid_source()).ok();
                 if picker.take_just_closed() {
                     last_dirty = u32::MAX;
                 }

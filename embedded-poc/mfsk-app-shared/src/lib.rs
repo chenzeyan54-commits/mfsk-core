@@ -8,6 +8,7 @@
 
 pub mod adif;
 pub mod boot_mode;
+pub mod grid_src;
 pub mod capture_window;
 pub mod civil_time;
 pub mod flash_log;

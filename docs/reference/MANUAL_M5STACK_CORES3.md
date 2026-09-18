@@ -209,20 +209,43 @@ image, off every flash.
 
 ---
 
-## 5. Changing mode
+## 5. The menu — mode and settings
 
-Hold a finger anywhere on the screen for about **0.8 s**. An overlay
-appears listing the four receivers, with `*` on the current one.
+Hold a finger anywhere on the screen for about **0.8 s**. The overlay
+opens on a two-row **root**:
 
-1. **Tap a mode.** The row turns green. The name stays readable — the
+| Row | What it holds |
+|---|---|
+| `MODE` | which receiver boots (FT8/UAC, FT4, WSPR, FST4, DECODE) |
+| `CONFIG` | where the slot phase comes from (NTP, or the air's DT) |
+
+A root row only navigates — opening a page needs no confirmation. Inside
+a page it works as it always has: **select, then commit**.
+
+1. **Tap a row.** It turns green. The name stays readable — the
    confirmation step exists to let you check it.
-2. **Press the bar underneath**, which reads `SWITCH TO <mode>`. It
-   goes amber while pressed, then green with `SWITCHING TO <mode>`.
-3. The board writes NVS and restarts into the chosen receiver.
+2. **Press the bar underneath**, which reads `APPLY <what you picked>`.
+   It goes amber while pressed, then green with `APPLYING …`.
+3. The board writes NVS and restarts (both kinds of setting restart).
 
-Tapping outside the overlay dismisses it. There is 14 px of slop around
-the edges, so a press that is nearly right commits rather than
-dismissing.
+The setting this boot is running carries a `*`. Tapping outside
+dismisses the overlay, and the next open starts at the root again — an
+overlay that reappears on a page nobody chose is how a stray tap lands
+on a setting. There is 14 px of slop around the edges, so a press that
+is nearly right commits rather than dismissing.
+
+### CONFIG — where the time comes from
+
+| Row | Meaning |
+|---|---|
+| `TIME: NTP` | start NTP at boot; once it syncs, UTC owns the slot phase. The default |
+| `TIME: AIR DT` | **suppress the clock**; the phase comes from the air (cold acquisition, then lock-and-hold) |
+
+`AIR DT` does more than skip the wait: it makes the system clock
+invisible. A clock that syncs halfway through would flip
+`clock_is_disciplined()` mid-session and take the phase away from a grid
+that was working. It is the setting for a hilltop with no network — or
+with a hotspot that associates but cannot reach a time server.
 
 To change mode without the panel: erase NVS, and set `boot_mode` in
 `cfg.toml`.

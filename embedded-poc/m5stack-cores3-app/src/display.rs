@@ -542,17 +542,43 @@ pub fn run_log_panel(
                         }
                         let _ = last_touch_points;
                         {
-                            if let Some(target) = picker.update(c.points > 0, c.x, c.y) {
-                                log::warn!("boot_mode -> {} (touch), restarting", target.label());
-                                if let Err(e) = boot_mode::write(&nvs, target) {
-                                    log::error!("boot_mode write failed: {e} — not restarting");
-                                } else {
-                                    // Let the line reach the log sink; in
-                                    // UAC mode that is the only channel.
-                                    std::thread::sleep(std::time::Duration::from_millis(400));
-                                    // SAFETY: no arguments, does not return.
-                                    unsafe { esp_idf_svc::sys::esp_restart() };
+                            match picker.update(c.points > 0, c.x, c.y) {
+                                Some(mode_picker::Commit::Mode(target)) => {
+                                    log::warn!(
+                                        "boot_mode -> {} (touch), restarting",
+                                        target.label()
+                                    );
+                                    if let Err(e) = boot_mode::write(&nvs, target) {
+                                        log::error!(
+                                            "boot_mode write failed: {e} — not restarting"
+                                        );
+                                    } else {
+                                        // Let the line reach the log sink;
+                                        // in UAC mode that is the only
+                                        // channel.
+                                        std::thread::sleep(std::time::Duration::from_millis(400));
+                                        // SAFETY: no arguments, does not return.
+                                        unsafe { esp_idf_svc::sys::esp_restart() };
+                                    }
                                 }
+                                Some(mode_picker::Commit::Grid(src)) => {
+                                    log::warn!(
+                                        "grid source -> {} (touch), restarting",
+                                        src.label()
+                                    );
+                                    if let Err(e) =
+                                        mfsk_app_shared::grid_src::write(&nvs, src)
+                                    {
+                                        log::error!(
+                                            "grid source write failed: {e} — not restarting"
+                                        );
+                                    } else {
+                                        std::thread::sleep(std::time::Duration::from_millis(400));
+                                        // SAFETY: no arguments, does not return.
+                                        unsafe { esp_idf_svc::sys::esp_restart() };
+                                    }
+                                }
+                                None => {}
                             }
                         }
                     }
@@ -576,7 +602,7 @@ pub fn run_log_panel(
         if last_touch.points == 0 {
             let _ = picker.update(false, 0, 0);
         }
-        picker.render(&mut display, mode).ok();
+        picker.render(&mut display, mode, crate::grid_source()).ok();
         if picker.take_just_closed() {
             // The overlay covered the panel; force everything back.
             last_usb_panel.clear();
@@ -690,7 +716,7 @@ pub fn run_log_panel(
         // over it stays painted over it — which is why the picker
         // vanished a moment after opening.
         if picker.is_open() {
-            picker.render(&mut display, mode).ok();
+            picker.render(&mut display, mode, crate::grid_source()).ok();
             std::thread::sleep(std::time::Duration::from_millis(50));
             tick = tick.wrapping_add(1);
             continue;

@@ -469,14 +469,21 @@ pub fn reset_capture_slot_for_test() {
 const PLAUSIBLE_UNIX_SECS: u64 = 1_600_000_000;
 
 /// When set, [`utc_now_ms`] reports no clock regardless of the real
-/// one — the on-device `MFSK_CORES3_SIM` harness uses it to reproduce
-/// the clockless hilltop the grid-alignment code is for, without
-/// having to stop `pmic::init` seeding the system clock from the RTC.
+/// one.
+///
+/// Two callers, one reason. The on-device `MFSK_CORES3_SIM` harness
+/// uses it to reproduce the clockless hilltop the grid-alignment code
+/// is for, without having to stop `pmic::init` seeding the system
+/// clock from the RTC. And `grid_src::GridSource::AirDt` — the
+/// operator choosing the air over UTC — uses it so the choice cannot
+/// be undone mid-session by a clock that syncs later: a phase handed
+/// to UTC halfway through is a phase taken away from a grid that was
+/// working.
 static SIM_SUPPRESS_CLOCK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Force [`utc_now_ms`] to report no clock. Test/sim only.
-pub fn sim_suppress_clock(on: bool) {
+/// Force [`utc_now_ms`] to report no clock.
+pub fn suppress_clock(on: bool) {
     SIM_SUPPRESS_CLOCK.store(on, Ordering::Release);
 }
 
