@@ -968,9 +968,9 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             }
         }
 
-        if !had_response_this_slot && qso.state != QsoState::Idle {
-            let _ = qso.on_period_end();
-        }
+        // **This period's transmission is decided here** — before
+        // key-up, from what decoded before key-up. That is the bound's
+        // whole purpose.
         if qso.state == QsoState::Idle {
             qso.call_cq(None);
         }
@@ -993,6 +993,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         // key-up should enter the state machine a period late is a
         // policy question, not a side effect of where the decode
         // finished.
+        let mut late_response = false;
         if !leftover.is_empty() {
             let n_left = leftover.len();
             let late = dual_core::continue_leftovers(
@@ -1036,10 +1037,38 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                                 r.snr_db,
                                 text
                             );
+                            qso.set_rx_snr(snr_i8);
+                            let parity_lock_ok =
+                                mfsk_app_shared::parity::framing_settled_for_parity_lock();
+                            if qso
+                                .process_message(&text, wav_idx as u32, parity_lock_ok)
+                                .is_some()
+                            {
+                                had_response_this_slot = true;
+                                late_response = true;
+                            }
                         }
                     }
                 }
             }
+        }
+
+        // **The retry count waits for the whole slot.** A partner whose
+        // reply decodes 200 ms after key-up answered — counting that
+        // period as unanswered spends a retry, and at the limit
+        // `on_period_end` resets the QSO outright, throwing away a
+        // contact whose reply is on the screen. This period's
+        // transmission is already chosen either way (above), so the
+        // only thing that moves is the bookkeeping: at the retry limit
+        // the reset now lands one period later, which costs one repeat
+        // and saves the QSOs the old order abandoned.
+        if !had_response_this_slot && qso.state != QsoState::Idle {
+            let _ = qso.on_period_end();
+        }
+        if late_response {
+            // `next_tx` is a pure read; this only refreshes what the
+            // panel shows for the *next* period.
+            push_tx_line(&qso, qso.next_tx().as_ref());
         }
     }
 }
