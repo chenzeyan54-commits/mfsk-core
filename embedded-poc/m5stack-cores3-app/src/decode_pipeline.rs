@@ -146,6 +146,15 @@ const FT8_KEY_UP_GUARD_MS: i64 = match option_env!("MFSK_FT8_KEY_UP_GUARD_MS") {
 /// cases; 500 ms is the low end of that, so the floor never costs a
 /// slot that could have decoded. `MFSK_FT8_SLOT_FLOOR_MS=0` turns it
 /// off.
+/// `dual_core::DecodeConfig::share_cand_budget` — off unless
+/// `MFSK_FT8_SHARE_CAND=1`, pending the board measurement its doc asks
+/// for (the mirror's gain is on `qso1`/`qso2`, and it is spent after
+/// SlotEnd where this board has ~180 ms).
+const FT8_SHARE_CAND: bool = match option_env!("MFSK_FT8_SHARE_CAND") {
+    Some(s) => parse_u32(s) != 0,
+    None => false,
+};
+
 const FT8_SLOT_FLOOR_MS: i64 = match option_env!("MFSK_FT8_SLOT_FLOOR_MS") {
     Some(s) => parse_u32(s) as i64,
     None => 500,
@@ -345,6 +354,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             budget_ms: FT8_BUDGET_MS,
             fine_sync: FT8_FINE_SYNC,
             key_up_guard_ms: FT8_KEY_UP_GUARD_MS,
+            share_cand_budget: FT8_SHARE_CAND,
             slot_floor_ms: FT8_SLOT_FLOOR_MS,
             slot_end_hint: Some(slot_end_hint),
         };

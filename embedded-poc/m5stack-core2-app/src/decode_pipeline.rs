@@ -98,6 +98,7 @@ pub fn run() -> ! {
             key_up_guard_ms: 0,
             // Off with the key-up guard: these boards do not transmit
             // and their wav_sim sources are not paced to a slot clock.
+            share_cand_budget: false,
             slot_floor_ms: 0,
             slot_end_hint: None,
         };

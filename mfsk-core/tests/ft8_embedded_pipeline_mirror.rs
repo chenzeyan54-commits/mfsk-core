@@ -755,24 +755,53 @@ fn run_slot(slot: &[i16]) -> SlotOut {
         pass1 = fine_refine(fine_refine_audio(slot), pass1);
     }
     let n_pass1 = pass1.len();
-    let (ready, deferred): (Vec<_>, Vec<_>) = pass1
-        .into_iter()
-        .partition(|c| goertzel_window_end_sample(c.dt_sec) <= prefix_samples());
+    // **How the stage-3 budget is split between the two halves.**
+    //
+    // Shipping (`half`): the early half takes up to `max_cand` and the
+    // late half gets what is left, which is nothing whenever the early
+    // half fills it — `dual_core`'s own comment says so, and
+    // `mirror_emit_earlier` puts a number on it: emitting 320 ms
+    // earlier costs 0.83 decodes this way and 0.14 when the budget is
+    // shared.
+    //
+    // `MFSK_MIRROR_CAND_ALLOC=value`: take the top `max_cand` of pass 1
+    // by coarse score — the ranking both halves already share, and the
+    // only one available before the slot arrives — and give each half
+    // as many slots as it holds of that set. Same total, so the same
+    // stage-3 cost; only *which* candidates get it changes.
+    let by_value = std::env::var("MFSK_MIRROR_CAND_ALLOC").as_deref() == Ok("value");
+    let is_ready = |c: &SyncCandidate| goertzel_window_end_sample(c.dt_sec) <= prefix_samples();
+    let (early_budget, late_budget) = if by_value {
+        let mut early = 0usize;
+        for c in pass1.iter().take(max_cand()) {
+            if is_ready(c) {
+                early += 1;
+            }
+        }
+        (early, max_cand() - early)
+    } else {
+        (max_cand(), 0)
+    };
+    let (ready, deferred): (Vec<_>, Vec<_>) = pass1.into_iter().partition(&is_ready);
     let (n_ready, n_deferred) = (ready.len(), deferred.len());
 
     let prefix = &slot[..prefix_samples()];
     let mut n_early_refined = 0;
-    let mut results = if ready.is_empty() {
+    let mut results = if ready.is_empty() || early_budget == 0 {
         Vec::new()
     } else {
-        let p2 = pass2_split(prefix, ready, max_cand());
+        let p2 = pass2_split(prefix, ready, early_budget);
         n_early_refined = p2.len();
         stage3(prefix, p2)
     };
 
     results.extend(coarse_retry_round(prefix));
 
-    let max_cand_late = max_cand().saturating_sub(n_early_refined);
+    let max_cand_late = if by_value {
+        late_budget
+    } else {
+        max_cand().saturating_sub(n_early_refined)
+    };
     if max_cand_late > 0 && !deferred.is_empty() {
         let p2 = pass2_split(slot, deferred, max_cand_late);
         results.extend(stage3(slot, p2));

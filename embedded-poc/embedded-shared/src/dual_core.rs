@@ -232,6 +232,32 @@ pub struct DecodeConfig {
     /// zero — and it is what makes the key-up bound true for the whole
     /// slot rather than for stage 3 alone.
     ///
+    /// Share the stage-3 candidate budget across both halves by coarse
+    /// rank, instead of letting the early half take all of it.
+    ///
+    /// Off, the early half refines up to [`Self::max_cand`] and the
+    /// late half gets `max_cand - n_early_refined`, which is nothing
+    /// whenever the early half fills it — so a candidate whose audio
+    /// window does not fit the prefix is never refined at all, however
+    /// strong it is. On, the top `max_cand` of pass 1 by coarse score
+    /// decides the split: each half gets as many stage-3 slots as it
+    /// holds of that set. **The total is unchanged**, so this is a
+    /// reallocation, not more work.
+    ///
+    /// Measured on the host mirror (`mirror_emit_earlier`, 81 phases,
+    /// fine sync on, `max_cand` 15): at the shipping emit point
+    /// `qso3_busy` is unchanged at 8.04 while `qso1` goes 1.83 → 2.60
+    /// and `qso2` 1.96 → 3.07, and it is what makes an earlier emit
+    /// nearly free (`qso3` at 320 ms earlier: 7.21 → 7.79).
+    ///
+    /// What the mirror cannot say, and the board must: the slots it
+    /// moves to the late half are spent *after* SlotEnd, where only
+    /// `FT8_KEY_UP_AFTER_SLOT_END_US` minus the guard remains. Round
+    /// 19 tried a different route to the same end — an `i < max_cand`
+    /// guard that pushed high-dt candidates into `deferred` — and it
+    /// grew post-SlotEnd wallclock by 190-400 ms for no recall, which
+    /// is why this is a flag and not a rewrite.
+    pub share_cand_budget: bool,
     /// Needs [`Self::slot_end_hint`]; without one the floor cannot be
     /// applied and is ignored.
     pub slot_floor_ms: i64,
@@ -455,9 +481,22 @@ pub fn run_speculative_slot(
     } else {
         Vec::new()
     };
-    let (ready, deferred): (Vec<SyncCandidate>, Vec<SyncCandidate>) = pass1
-        .into_iter()
-        .partition(|c| SpecBundle::audio_end_for_dt(c.dt_sec) <= snap_fill);
+    let is_ready = |c: &SyncCandidate| SpecBundle::audio_end_for_dt(c.dt_sec) <= snap_fill;
+    // See `DecodeConfig::share_cand_budget`. `pass1` is in coarse-score
+    // order (`coarse_sync_split_with_allsum` sorts before truncating),
+    // so its first `max_cand` entries are the set to divide.
+    let (early_budget, late_budget) = if cfg.share_cand_budget {
+        let early = pass1
+            .iter()
+            .take(cfg.max_cand)
+            .filter(|c| is_ready(c))
+            .count();
+        (early, cfg.max_cand - early)
+    } else {
+        (cfg.max_cand, 0)
+    };
+    let (ready, deferred): (Vec<SyncCandidate>, Vec<SyncCandidate>) =
+        pass1.into_iter().partition(&is_ready);
     let n_ready = ready.len();
     let n_deferred = deferred.len();
 
@@ -465,9 +504,9 @@ pub fn run_speculative_slot(
     // Early-path retries that the slot's arrival stopped; they join the
     // late path's retries on the full slot below.
     let mut retry_leftover: Vec<RefinedCandidate> = Vec::new();
-    let mut results = if !ready.is_empty() {
+    let mut results = if !ready.is_empty() && early_budget > 0 {
         let partial_audio: &[i16] = spec.audio_prefix();
-        let p2 = pass2_split(partial_audio, ready, cfg.max_cand);
+        let p2 = pass2_split(partial_audio, ready, early_budget);
         n_early_refined = p2.len();
         let first = stage3_split(
             partial_audio,
@@ -539,7 +578,11 @@ pub fn run_speculative_slot(
         // are dropped. Acceptable on FT8 — operational dt clusters
         // tightly under NTP sync; `time_sync`'s slot phase
         // auto-anchor keeps dt within ±0.5 s in steady state.
-        let max_cand_late = cfg.max_cand.saturating_sub(n_early_refined);
+        let max_cand_late = if cfg.share_cand_budget {
+            late_budget
+        } else {
+            cfg.max_cand.saturating_sub(n_early_refined)
+        };
         if max_cand_late > 0 && now_us() < deadline_us {
             let p2 = pass2_split(slot_audio, deferred, max_cand_late);
             let late = stage3_split(
