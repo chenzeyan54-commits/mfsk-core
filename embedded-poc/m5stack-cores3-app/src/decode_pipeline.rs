@@ -379,6 +379,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             t_slot_recv,
             t_done,
             skipped,
+            leftover,
             slot_end_hint_us,
         } = out;
         let wav_idx = slot.wav_idx;
@@ -975,6 +976,71 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         }
         let intent = qso.next_tx();
         push_tx_line(&qso, intent.as_ref());
+
+        // **What key-up cut, finished on the idle time after it.**
+        //
+        // The reply for *this* period has just been decided, which is
+        // what the key-up bound protects. Everything the bound stopped
+        // is still worth having — on a CQ-first portable station it is
+        // the queue the next period's call is chosen from — and the
+        // decode task is about to block on `spec_q` for ~13 s with the
+        // slot's audio still valid. So it runs there, yielding the
+        // moment the next SpecBundle lands.
+        //
+        // These rows reach the panel and the DT statistics. They are
+        // deliberately **not** fed to `QsoManager`: its intent for this
+        // period is already out, and whether a caller decoded after
+        // key-up should enter the state machine a period late is a
+        // policy question, not a side effect of where the decode
+        // finished.
+        if !leftover.is_empty() {
+            let n_left = leftover.len();
+            let late = dual_core::continue_leftovers(
+                spec_q,
+                slot.audio(),
+                leftover,
+                &cfg,
+                &results,
+            );
+            if !late.is_empty() {
+                log::info!(
+                    "SLOT[{wav_idx}] src={source} past key-up: {} of {n_left} carried candidates                      decoded on the idle tail",
+                    late.len(),
+                );
+                if let Ok(mut ui) = UI.lock() {
+                    for r in late.iter() {
+                        if let Some(text) = unpack77(r.message77()) {
+                            let mut msg: heapless::String<22> = heapless::String::new();
+                            let take = text.len().min(msg.capacity());
+                            let _ = msg.push_str(&text[..take]);
+                            const FP_SPEC_SHIFT: u32 = 12;
+                            let cell_scale = (1u32 << FP_SPEC_SHIFT) as f32;
+                            let calibrated_snr = mfsk_core::ft8::decode_block::xsnr2_db_simple(
+                                &spec.spec,
+                                r,
+                                cell_scale,
+                            );
+                            let snr_i8 = calibrated_snr.round().clamp(-128.0, 127.0) as i8;
+                            ui.push_decode(DecodedRow {
+                                df_hz: r.freq_hz.round().clamp(0.0, 65_535.0) as u16,
+                                snr_db: snr_i8,
+                                hard_errors: r.hard_errors.min(255) as u8,
+                                msg,
+                                slot_seq,
+                                first_seq: slot_seq,
+                            });
+                            log::info!(
+                                "{:4.0}Hz {:+5.1}dB (raw={:+5.1}) {} [late]",
+                                r.freq_hz,
+                                calibrated_snr,
+                                r.snr_db,
+                                text
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

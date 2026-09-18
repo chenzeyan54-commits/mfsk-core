@@ -124,6 +124,8 @@ pub fn run() -> ! {
             skipped: _,
             // No hint on this board, so nothing to log it against.
             slot_end_hint_us: _,
+            // This board has no key-up bound, so nothing is cut for later.
+            leftover: _,
         } = out;
         let wav_idx = slot.wav_idx;
 

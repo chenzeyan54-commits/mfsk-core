@@ -157,6 +157,32 @@ suite on a Mac rather than by CI, which still has Linux runners only.
   exist. Section-number citations in `src/`, `tests/`, `release.yml`,
   `README.md` and `CLAUDE.md` are renumbered to match.
 
+### Added
+
+- **CoreS3 FT8: what the key-up bound cuts is finished on the idle
+  time after it, instead of being thrown away.** The decode task
+  blocks on the next SpecBundle for ~13 s of every 15, and the slot's
+  audio stays valid until the next SlotEnd, so the candidates the
+  bound stopped can run there at no cost to anything:
+  `dual_core::continue_leftovers` takes them with their pass-2 spectra
+  intact and yields the moment the next bundle lands — the rule the
+  early path's retries already used for the Slot.
+
+  On `qso3_busy` under `MFSK_CORES3_SIM` this turns 5 decodes a slot
+  into 8 (5 before key-up, 3 after, no duplicates), with the per-slot
+  timing unchanged: still nothing past key-up, still ~200 ms after
+  slot end. Which matters because the bound exists for one thing —
+  having the reply ready before this station keys up — and everything
+  else it was cutting is the queue a CQ-first portable station picks
+  its next contact from. One of the three recovered on every slot of
+  that run is a `CQ`.
+
+  The late rows reach the panel and the DT statistics but deliberately
+  **not** `QsoManager`: the TX intent for that period is already out,
+  and whether a caller decoded after key-up should enter the state
+  machine a period late is a policy question rather than a side effect
+  of where the decode happened to finish.
+
 ### Fixed
 
 - **CoreS3: the audio task now outranks the decoder, and what that

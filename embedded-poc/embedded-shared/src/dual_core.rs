@@ -133,6 +133,17 @@ pub struct SpeculativeOut {
     /// candidate count is `0`; the audio was received and dropped, so
     /// the pipeline stays drained.
     pub skipped: bool,
+    /// Refined candidates the key-up bound stopped before they were
+    /// claimed, with their pass-2 spectra intact.
+    ///
+    /// They are not lost, only late: [`continue_leftovers`] runs them
+    /// on the same slot's audio while the decode task would otherwise
+    /// be blocked waiting for the next SpecBundle — about 13 s of
+    /// every 15. A station decoded there is too late to answer in this
+    /// period (that is what the key-up bound means) but is exactly
+    /// what the next period's choice is made from, which on a CQ-first
+    /// portable station is most of the value of decoding at all.
+    pub leftover: Vec<RefinedCandidate>,
     /// What [`DecodeConfig::slot_end_hint`] answered when this slot
     /// arrived, or `None` if the caller supplies no hint. Reported so
     /// a caller can log it against `slot.slotend_us` — the two date
@@ -405,6 +416,7 @@ pub fn run_speculative_slot(
                 t_slot_recv,
                 t_done: unsafe { esp_timer_get_time() },
                 skipped: true,
+                leftover: Vec::new(),
                 slot_end_hint_us: slot_end_hint,
             };
         }
@@ -458,6 +470,7 @@ pub fn run_speculative_slot(
     };
     let mut n_cut = 0usize;
     let mut n_fallback = 0usize;
+    let mut leftover: Vec<RefinedCandidate> = Vec::new();
     let snap_fill = spec.audio_len();
     // Partition by audio-window fit only.
     //
@@ -517,6 +530,7 @@ pub fn run_speculative_slot(
             early_stop(false),
         );
         n_cut += first.unclaimed.len();
+        leftover.extend(first.unclaimed);
         let mut r = first.results;
         // **Retries run only on time no first attempt can use.** Before
         // the slot arrives the deferred candidates cannot start — their
@@ -594,6 +608,7 @@ pub fn run_speculative_slot(
                 late_stop,
             );
             n_cut += late.unclaimed.len();
+            leftover.extend(late.unclaimed);
             results.extend(late.results);
             late_retry = coarse_retry_candidates(&late.failed, &refined, &coarse);
         } else if max_cand_late > 0 {
@@ -628,6 +643,7 @@ pub fn run_speculative_slot(
         );
         n_fallback += n - fb.unclaimed.len();
         n_cut += fb.unclaimed.len();
+        leftover.extend(fb.unclaimed);
         results.extend(fb.results);
     }
     // One row per message. Duplicates were possible before — two
@@ -658,8 +674,50 @@ pub fn run_speculative_slot(
         t_slot_recv,
         t_done,
         skipped: false,
+        leftover,
         slot_end_hint_us: slot_end_hint,
     }
+}
+
+/// Run what the key-up bound cut, on the idle time after it.
+///
+/// The decode task blocks on `spec_q` for ~13 s of every 15 while the
+/// next slot is captured, and the slot's audio stays valid until the
+/// next SlotEnd (stage1_inc's double buffer). So the candidates the
+/// bound stopped can finish there at no cost to anything: the stop
+/// condition is the next SpecBundle's arrival, checked per candidate,
+/// which is the same rule the early path's retries already use for the
+/// Slot.
+///
+/// Returns what decoded, deduped against `already` — the caller's own
+/// results — so a message decoded twice is reported once.
+pub fn continue_leftovers(
+    spec_q: esp_idf_svc::sys::QueueHandle_t,
+    audio: &[i16],
+    leftover: Vec<RefinedCandidate>,
+    cfg: &DecodeConfig,
+    already: &[DecodeResult],
+) -> Vec<DecodeResult> {
+    if leftover.is_empty() {
+        return Vec::new();
+    }
+    let out = stage3_split(
+        audio,
+        leftover,
+        cfg.depth,
+        cfg.q_thresh,
+        cfg.bp_max_iter,
+        Stage3Stop {
+            deadline_us: i64::MAX,
+            slot_q: spec_q,
+            yield_on_slot: true,
+            key_up_guard_us: 0,
+        },
+    );
+    let mut results = out.results;
+    results.retain(|r| !already.iter().any(|a| a.message77() == r.message77()));
+    dedup_by_message(&mut results);
+    results
 }
 
 /// Keep the first [`DecodeResult`] per 77-bit message.
