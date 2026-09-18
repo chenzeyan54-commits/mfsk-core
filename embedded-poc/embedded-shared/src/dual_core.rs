@@ -224,7 +224,30 @@ pub struct DecodeConfig {
     /// clear. It costs no decodes — the slots this fires on decoded
     /// zero — and it is what makes the key-up bound true for the whole
     /// slot rather than for stage 3 alone.
+    ///
+    /// Needs [`Self::slot_end_hint`]; without one the floor cannot be
+    /// applied and is ignored.
     pub slot_floor_ms: i64,
+    /// Where the slot now being decoded ends, in `esp_timer_get_time()`
+    /// microseconds, or `None` if the caller cannot say yet.
+    ///
+    /// Called once per slot, right after the SpecBundle arrives, and
+    /// only to apply [`Self::slot_floor_ms`].
+    ///
+    /// **It has to come from the audio thread's clock.** The obvious
+    /// source — the bundle's own emit timestamp plus the audio it was
+    /// emitted with — is wrong in exactly the case the floor exists
+    /// for: `SpecBundle::audio_len` counts audio stage1_inc has
+    /// *consumed*, and a decode task hogging a core (cold acquisition)
+    /// starves stage1_inc too, so it emits late with the same sample
+    /// count and the estimate slides late with it. Measured
+    /// 2026-09-18: the estimate landed ~0.8 s past the real boundary
+    /// and the floor never fired, on the very slot that then finished
+    /// 738 ms past key-up. A hint anchored to
+    /// `mfsk_app_shared::time_sync`'s capture-slot publish — stamped
+    /// by the audio sink, which is never behind — does not have that
+    /// failure mode.
+    pub slot_end_hint: Option<fn() -> Option<i64>>,
 }
 
 /// This station's key-up relative to the FT8 slot boundary:
@@ -321,16 +344,16 @@ pub fn run_speculative_slot(
 
     let spec = pipeline::recv_box::<SpecBundle>(spec_q);
     let t_post_recv = unsafe { esp_timer_get_time() };
-    // Is there time to finish this slot before key-up? The bundle
-    // carries the moment stage1_inc emitted it, so a bundle that waited
-    // in `spec_q` dates itself; `slot_floor_ms` says how much of the
-    // remaining time the un-deadlined work ahead (coarse + fine sync)
-    // needs.
-    if cfg.slot_floor_ms > 0 {
-        let key_up_at = key_up_deadline(
-            spec.nominal_slotend_us(),
-            cfg.key_up_guard_ms.max(0) * 1_000,
-        );
+    // Is there time to finish this slot before key-up? `slot_end_hint`
+    // says where the slot ends; `slot_floor_ms` says how much of what
+    // is left the un-deadlined work ahead (coarse + fine sync) needs.
+    let slot_end_hint = if cfg.slot_floor_ms > 0 {
+        cfg.slot_end_hint.and_then(|f| f())
+    } else {
+        None
+    };
+    if let Some(slotend) = slot_end_hint {
+        let key_up_at = key_up_deadline(slotend, cfg.key_up_guard_ms.max(0) * 1_000);
         if t_post_recv + cfg.slot_floor_ms * 1_000 > key_up_at {
             // Take the slot so stage1_inc's buffer is released on the
             // usual schedule, then hand the answer back empty.

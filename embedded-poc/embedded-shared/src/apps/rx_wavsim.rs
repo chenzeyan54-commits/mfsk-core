@@ -110,6 +110,7 @@ pub fn run_sweep(wavs: &'static [&'static [u8]], cfgs: &'static [RxSweepCfg]) ->
             // Off with the key-up guard: these boards do not transmit
             // and their wav_sim sources are not paced to a slot clock.
             slot_floor_ms: 0,
+            slot_end_hint: None,
         };
         let out = dual_core::run_speculative_slot(spec_q, slot_q, &dc);
         let dual_core::SpeculativeOut {

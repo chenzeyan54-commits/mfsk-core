@@ -84,12 +84,18 @@ pub struct SpecBundle {
     /// 12 kHz) when emit fires at `SPEC_EMIT_PAIR`.
     audio_len: usize,
     /// `esp_timer_get_time()` when stage1_inc emitted this bundle —
-    /// **not** when the decode task received it. The two differ by
-    /// however long the bundle waited in `spec_q`, which is how a
-    /// decode task busy elsewhere (cold acquisition, #357) shows up:
-    /// the slot it is about to decode may be nearly over. With
-    /// `audio_len` this dates the slot itself, since emit fires a
-    /// known number of samples before the boundary.
+    /// **not** when the decode task received it. The difference is how
+    /// long the bundle waited in `spec_q`, which separates the two ways
+    /// a slot can reach the decoder late: a busy decode task (the
+    /// bundle waits) or a starved stage1_inc (it is emitted late). The
+    /// per-slot log carries it as `q_wait`.
+    ///
+    /// It does **not** date the slot's boundary, and an earlier version
+    /// of this file's `nominal_slotend_us()` was wrong to try:
+    /// `audio_len` counts audio stage1_inc has consumed, so under the
+    /// starvation that makes a bundle late the timestamp slides late
+    /// and the sample count does not. Slot boundaries come from the
+    /// audio sink's own clock — `DecodeConfig::slot_end_hint`.
     pub emit_us: i64,
 }
 
@@ -151,19 +157,6 @@ impl SpecBundle {
         }
     }
 
-    /// When this slot's boundary is due, from the emit timestamp and
-    /// the audio the bundle was emitted with: stage1_inc emits at
-    /// `SPEC_EMIT_PAIR`, `NMAX - audio_len` samples before the end.
-    ///
-    /// An estimate, and nominal — a slot the sink is stretching to move
-    /// the grid (`uac.rs`'s acquisition shift) ends later than this
-    /// says, which makes the answer conservative in the direction that
-    /// matters: it never claims more time than there is.
-    pub fn nominal_slotend_us(&self) -> i64 {
-        const SAMPLE_RATE_HZ: i64 = 12_000;
-        let remaining = mfsk_core::ft8::params::NMAX.saturating_sub(self.audio_len) as i64;
-        self.emit_us + remaining * 1_000_000 / SAMPLE_RATE_HZ
-    }
 }
 
 /// Audio + slot metadata, sent by stage1_inc at SlotEnd. Pairs with the

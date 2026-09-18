@@ -151,6 +151,37 @@ const FT8_SLOT_FLOOR_MS: i64 = match option_env!("MFSK_FT8_SLOT_FLOOR_MS") {
     None => 500,
 };
 
+/// `dual_core::DecodeConfig::slot_end_hint` — when the slot now being
+/// decoded ends, on `esp_timer_get_time()`'s clock.
+///
+/// Read from the capture-slot boundary the **audio sink** publishes
+/// (`time_sync::publish_capture_slot`, called from `Ft8ChunkSink` as it
+/// emits `SlotEnd`). That is the one clock here that cannot fall
+/// behind: it advances with arriving audio, whatever the decode task
+/// and stage1_inc are doing. Anything derived from the SpecBundle
+/// instead slides late exactly when the decode task is busy — measured,
+/// and the reason this function exists (see `SpecBundle::emit_us`).
+///
+/// stage1_inc emits a bundle `SPEC_EMIT_INTO_SLOT_US` into its slot, so
+/// while the sink is still capturing that same slot the boundary is
+/// that far ahead; once the sink has moved on, the slot being decoded
+/// ended `into` ago. The emit point is the threshold between the two
+/// readings.
+fn slot_end_hint() -> Option<i64> {
+    /// One FT8 slot in µs.
+    const SLOT_US: i64 = 15_000_000;
+    /// Where in its slot stage1_inc emits the SpecBundle:
+    /// `SPEC_EMIT_PAIR` = 168 000 samples at 12 kHz.
+    const SPEC_EMIT_INTO_SLOT_US: i64 = 14_000_000;
+    let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+    let (_, into) = mfsk_app_shared::time_sync::current_capture_info(now)?;
+    Some(if into >= SPEC_EMIT_INTO_SLOT_US {
+        now + (SLOT_US - into)
+    } else {
+        now - into
+    })
+}
+
 const FT8_BUDGET_MS: i64 = match option_env!("MFSK_FT8_BUDGET_MS") {
     Some(s) => parse_u32(s) as i64,
     None => 1_836,
@@ -310,6 +341,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             fine_sync: FT8_FINE_SYNC,
             key_up_guard_ms: FT8_KEY_UP_GUARD_MS,
             slot_floor_ms: FT8_SLOT_FLOOR_MS,
+            slot_end_hint: Some(slot_end_hint),
         };
         let out = dual_core::run_speculative_slot(spec_q, slot_q, &cfg);
         let dual_core::SpeculativeOut {
@@ -347,7 +379,9 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                 - t_post_recv)
                 / 1_000;
             log::warn!(
-                "SLOT[{wav_idx}] src={source} skipped — bundle arrived with {margin} ms to                  key-up, under the {FT8_SLOT_FLOOR_MS} ms floor"
+                "SLOT[{wav_idx}] src={source} skipped — bundle arrived with {margin} ms \
+                 to key-up, under the {FT8_SLOT_FLOOR_MS} ms floor (q_wait={} us)",
+                t_post_recv - spec.emit_us
             );
             slot_seq = slot_seq.wrapping_add(1);
             continue;
@@ -400,11 +434,15 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         log::info!(
             "SLOT[{wav_idx}] src={source} grid={} p1={n_pass1} ready={n_ready} defer={n_deferred} \
              cut={n_cut} fb={n_fallback} dec={} budget={FT8_BUDGET_MS}ms \
-             tail_win={}us coarse={}us fine={}us early={}us tail_use={}us post_slotend={}us \
-             slot_wait={}us late={}us",
+             tail_win={}us q_wait={}us coarse={}us fine={}us early={}us tail_use={}us \
+             post_slotend={}us slot_wait={}us late={}us",
             mfsk_app_shared::time_sync::grid_lock().label(),
             results.len(),
             tail_window,
+            // How long this bundle sat in `spec_q` — a busy decode
+            // task. Small while `tail_win` is also small means the
+            // other case: stage1_inc emitted late, starved.
+            t_post_recv - spec.emit_us,
             coarse_us,
             // Inside `early` below, which keeps its historical meaning
             // (from coarse done) so logs from before fine sync compare.
@@ -757,9 +795,6 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                         // Stopping at one decode instead, which is what
                         // this loop did before best-of-N, is the rule
                         // that cost minutes of dark band on hardware.
-                        if got.len() >= mfsk_app_shared::grid_state::LOCK_MIN_DECODES {
-                            break;
-                        }
                         // Per-trial, because the summary below reports
                         // only the winner: the log that found this bug
                         // said "trial 3/5, 1 decoded" and could not say
@@ -770,6 +805,17 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                             phases.len(),
                             got.len(),
                         );
+                        // Stop once a trial clears the lock bar — the
+                        // measurement is in the note beside
+                        // `ACQUIRE_MAX_TRIALS`. After the log line: the
+                        // trial that ends the search is the one the log
+                        // can least afford to be missing, and putting
+                        // the break first silently dropped it
+                        // (`logs/sim_slotfloor_*_2026-09-18.log` says
+                        // "trial 3/5, 6 decoded" with no trial-3 line).
+                        if got.len() >= mfsk_app_shared::grid_state::LOCK_MIN_DECODES {
+                            break;
+                        }
                     }
                     // An applied phase restarts the under-par run — the
                     // grid just moved, so the slots that led here say
