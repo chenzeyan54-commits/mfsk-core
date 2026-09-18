@@ -87,15 +87,73 @@ fn max_cand() -> usize {
         .unwrap_or(15)
 }
 
-/// `embedded-shared/src/dual_core.rs`'s `EMBEDDED_SYNC_LAG_S`.
-const SYNC_LAG_S: f32 = 1.0;
+/// `embedded-shared/src/dual_core.rs`'s `EMBEDDED_SYNC_LAG_S`, and
+/// `stage1_inc`'s `SPEC_EMIT_PAIR`. Both ship as constants; here they
+/// are the two axes of the emit-point question, so they are read
+/// through accessors that a sweep can override.
+///
+/// The board ties them together: `SPEC_EMIT_PAIR = 87` is chosen from
+/// `needed_m = 162 + jz`, where `jz` is `SYNC_LAG_S` in time rows
+/// (`NSTEP` = 960 samples = 80 ms, so a 1.0 s lag is 13 rows).
+/// Emitting earlier without narrowing the lag leaves the rows the
+/// large-lag half of block 2 would have used zero, which is a
+/// measurement, not a guess — that is what this axis is for.
+const SHIP_EMIT_PAIR: usize = 87;
+const SHIP_SYNC_LAG_S: f32 = 1.0;
+/// `SpecBundle`'s audio prefix at the shipping emit point: "always >=
+/// 168 000 samples".
+const SHIP_PREFIX_SAMPLES: usize = 168_000;
+/// One time row, in samples (`NSTEP` = `NSPS`/2 under `nstep-half`).
+const NSTEP_SAMPLES: usize = 960;
 
-/// `stage1_inc`'s `SPEC_EMIT_PAIR = 87` fills time rows `0..=173`; the
-/// spectrogram the board's coarse search sees has the rest zero.
-const SPEC_VALID_ROWS: usize = 174;
+thread_local! {
+    static EMIT_PAIR_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static SYNC_LAG_OVERRIDE: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+}
 
-/// `SpecBundle`'s audio prefix at emit: "always >= 168 000 samples".
-const PREFIX_SAMPLES: usize = 168_000;
+/// Which pair stage1_inc emits the SpecBundle at. `MFSK_MIRROR_EMIT_PAIR`,
+/// or a sweep's override.
+fn emit_pair() -> usize {
+    EMIT_PAIR_OVERRIDE
+        .with(|c| c.get())
+        .or_else(|| {
+            std::env::var("MFSK_MIRROR_EMIT_PAIR")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(SHIP_EMIT_PAIR)
+}
+
+fn sync_lag_s() -> f32 {
+    SYNC_LAG_OVERRIDE
+        .with(|c| c.get())
+        .or_else(|| {
+            std::env::var("MFSK_MIRROR_SYNC_LAG")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(SHIP_SYNC_LAG_S)
+}
+
+/// Time rows the emitted spectrogram has: pair *k* fills rows 2k and
+/// 2k+1, and the emit fires once pairs `0..emit_pair` are done.
+fn spec_valid_rows() -> usize {
+    2 * emit_pair()
+}
+
+/// The audio prefix that goes with that emit point — the shipping
+/// prefix moved by the same number of rows.
+fn prefix_samples() -> usize {
+    let rows = spec_valid_rows() as i64 - 2 * SHIP_EMIT_PAIR as i64;
+    (SHIP_PREFIX_SAMPLES as i64 + rows * NSTEP_SAMPLES as i64).clamp(0, SLOT as i64) as usize
+}
+
+/// How much earlier than the shipping emit point this is, in ms —
+/// exactly the wall-clock the board's decoder would gain, since it
+/// blocks on the SpecBundle and nothing else moves.
+fn emit_gain_ms() -> i64 {
+    (SHIP_PREFIX_SAMPLES as i64 - prefix_samples() as i64) / 12
+}
 
 struct SlotOut {
     n_pass1: usize,
@@ -127,7 +185,7 @@ fn fine_refine_enabled() -> bool {
 fn fine_refine_audio(slot: &[i16]) -> &[i16] {
     match std::env::var("MFSK_MIRROR_FINE_REFINE").as_deref() {
         Ok("full") => slot,
-        _ => &slot[..PREFIX_SAMPLES],
+        _ => &slot[..prefix_samples()],
     }
 }
 
@@ -401,14 +459,14 @@ fn coarse_fallback_enabled() -> bool {
 /// `dual_core::coarse_sync_split_with_allsum`, sequential.
 fn coarse_split(spec: &mfsk_core::ft8::decode_block::Spectrogram) -> Vec<SyncCandidate> {
     let mid = 0.5 * (FREQ_MIN + FREQ_MAX);
-    let mut all = coarse_sync_with_lag(spec, FREQ_MIN, mid, SYNC_MIN, pass1_limit(), SYNC_LAG_S);
+    let mut all = coarse_sync_with_lag(spec, FREQ_MIN, mid, SYNC_MIN, pass1_limit(), sync_lag_s());
     all.extend(coarse_sync_with_lag(
         spec,
         mid,
         FREQ_MAX,
         SYNC_MIN,
         pass1_limit(),
-        SYNC_LAG_S,
+        sync_lag_s(),
     ));
     all.sort_by(|a, b| {
         b.score
@@ -658,7 +716,7 @@ fn run_slot(slot: &[i16]) -> SlotOut {
     COARSE_DT.with(|m| m.borrow_mut().clear());
     PENDING_FB.with(|p| p.borrow_mut().clear());
     let mut spec = compute_spectrogram(slot, FREQ_MAX);
-    for t in SPEC_VALID_ROWS..spec.n_time {
+    for t in spec_valid_rows()..spec.n_time {
         let row = t * spec.n_freq;
         for cell in &mut spec.data[row..row + spec.n_freq] {
             *cell = SpecCell::default();
@@ -666,17 +724,17 @@ fn run_slot(slot: &[i16]) -> SlotOut {
     }
 
     let mut pass1 = coarse_split(&spec);
-    if apply_12k_refine(&slot[..PREFIX_SAMPLES], &mut pass1) {
+    if apply_12k_refine(&slot[..prefix_samples()], &mut pass1) {
     } else if fine_refine_enabled() {
         pass1 = fine_refine(fine_refine_audio(slot), pass1);
     }
     let n_pass1 = pass1.len();
     let (ready, deferred): (Vec<_>, Vec<_>) = pass1
         .into_iter()
-        .partition(|c| goertzel_window_end_sample(c.dt_sec) <= PREFIX_SAMPLES);
+        .partition(|c| goertzel_window_end_sample(c.dt_sec) <= prefix_samples());
     let (n_ready, n_deferred) = (ready.len(), deferred.len());
 
-    let prefix = &slot[..PREFIX_SAMPLES];
+    let prefix = &slot[..prefix_samples()];
     let mut n_early_refined = 0;
     let mut results = if ready.is_empty() {
         Vec::new()
@@ -933,7 +991,7 @@ fn mirror_where_stations_are_lost() {
 
         // The same stages as `run_slot`, keeping the intermediate sets.
         let mut spec = compute_spectrogram(&rot, FREQ_MAX);
-        for t in SPEC_VALID_ROWS..spec.n_time {
+        for t in spec_valid_rows()..spec.n_time {
             let row = t * spec.n_freq;
             for cell in &mut spec.data[row..row + spec.n_freq] {
                 *cell = SpecCell::default();
@@ -941,15 +999,15 @@ fn mirror_where_stations_are_lost() {
         }
         COARSE_DT.with(|m| m.borrow_mut().clear());
         let mut pass1 = coarse_split(&spec);
-        if apply_12k_refine(&rot[..PREFIX_SAMPLES], &mut pass1) {
+        if apply_12k_refine(&rot[..prefix_samples()], &mut pass1) {
         } else if fine_refine_enabled() {
             pass1 = fine_refine(fine_refine_audio(&rot), pass1);
         }
         let (ready, deferred): (Vec<_>, Vec<_>) = pass1
             .clone()
             .into_iter()
-            .partition(|c| goertzel_window_end_sample(c.dt_sec) <= PREFIX_SAMPLES);
-        let prefix = &rot[..PREFIX_SAMPLES];
+            .partition(|c| goertzel_window_end_sample(c.dt_sec) <= prefix_samples());
+        let prefix = &rot[..prefix_samples()];
         let p2_early = if ready.is_empty() {
             Vec::new()
         } else {
@@ -1040,7 +1098,7 @@ fn mirror_refine_moves() {
 
     let slot = load_slot();
     let mut spec = compute_spectrogram(&slot, FREQ_MAX);
-    for t in SPEC_VALID_ROWS..spec.n_time {
+    for t in spec_valid_rows()..spec.n_time {
         let row = t * spec.n_freq;
         for cell in &mut spec.data[row..row + spec.n_freq] {
             *cell = SpecCell::default();
@@ -1131,7 +1189,7 @@ fn mirror_dt_window() {
     slot.rotate_left(k);
 
     let mut spec = compute_spectrogram(&slot, FREQ_MAX);
-    for t in SPEC_VALID_ROWS..spec.n_time {
+    for t in spec_valid_rows()..spec.n_time {
         let row = t * spec.n_freq;
         for cell in &mut spec.data[row..row + spec.n_freq] {
             *cell = SpecCell::default();
@@ -1398,14 +1456,14 @@ const MAX_CAND_TRIAL: usize = 15;
 fn mirror_stage_a_12k_positions() {
     let slot = load_slot();
     let mut spec = compute_spectrogram(&slot, FREQ_MAX);
-    for t in SPEC_VALID_ROWS..spec.n_time {
+    for t in spec_valid_rows()..spec.n_time {
         let row = t * spec.n_freq;
         for cell in &mut spec.data[row..row + spec.n_freq] {
             *cell = SpecCell::default();
         }
     }
     let pass1 = coarse_split(&spec);
-    let refined = stage_a_12k(&slot[..PREFIX_SAMPLES], pass1.clone());
+    let refined = stage_a_12k(&slot[..prefix_samples()], pass1.clone());
     for (c, r) in pass1.iter().zip(refined.iter()) {
         println!(
             "  {:7.1} Hz  coarse {:+.3}  stageA12k {:+.3}  ({:+.0} ms)",
@@ -1475,14 +1533,14 @@ fn mirror_lost_station_grid() {
         let mut slot = base.clone();
         slot.rotate_left(k);
         let mut spec = compute_spectrogram(&slot, FREQ_MAX);
-        for t in SPEC_VALID_ROWS..spec.n_time {
+        for t in spec_valid_rows()..spec.n_time {
             let row = t * spec.n_freq;
             for cell in &mut spec.data[row..row + spec.n_freq] {
                 *cell = SpecCell::default();
             }
         }
         let pass1 = coarse_split(&spec);
-        let staged = stage_a_12k(&slot[..PREFIX_SAMPLES], pass1.clone());
+        let staged = stage_a_12k(&slot[..prefix_samples()], pass1.clone());
         println!("\n=== phi={phi:+.3}");
         for &(msg, f_ref) in STATIONS.iter() {
             if only.is_some_and(|o| o != f_ref) {
@@ -1592,15 +1650,15 @@ fn mirror_lost_station_grid() {
 fn mirror_fine_sync_lib_matches_prototype() {
     let slot = load_slot();
     let mut spec = compute_spectrogram(&slot, FREQ_MAX);
-    for t in SPEC_VALID_ROWS..spec.n_time {
+    for t in spec_valid_rows()..spec.n_time {
         let row = t * spec.n_freq;
         for cell in &mut spec.data[row..row + spec.n_freq] {
             *cell = SpecCell::default();
         }
     }
     let pass1 = coarse_split(&spec);
-    let proto = stage_abc_12k_binned(&slot[..PREFIX_SAMPLES], pass1.clone());
-    let lib = mfsk_core::ft8::decode_block::fine_sync_12k(&slot[..PREFIX_SAMPLES], &pass1);
+    let proto = stage_abc_12k_binned(&slot[..prefix_samples()], pass1.clone());
+    let lib = mfsk_core::ft8::decode_block::fine_sync_12k(&slot[..prefix_samples()], &pass1);
     let mut differ = 0;
     for ((c, p), l) in pass1.iter().zip(proto.iter()).zip(lib.iter()) {
         let same = p.freq_hz == l.freq_hz && (p.dt_sec - l.dt_sec).abs() < 1e-4;
@@ -1649,9 +1707,9 @@ fn mirror_stage3_cost() {
         let k = ((phi * 12_000.0).round() as i64).rem_euclid(SLOT as i64) as usize;
         let mut slot = base.clone();
         slot.rotate_left(k);
-        let prefix = &slot[..PREFIX_SAMPLES];
+        let prefix = &slot[..prefix_samples()];
         let mut spec = compute_spectrogram(&slot, FREQ_MAX);
-        for t in SPEC_VALID_ROWS..spec.n_time {
+        for t in spec_valid_rows()..spec.n_time {
             let row = t * spec.n_freq;
             for cell in &mut spec.data[row..row + spec.n_freq] {
                 *cell = SpecCell::default();
@@ -1670,7 +1728,7 @@ fn mirror_stage3_cost() {
             let (ready, deferred): (Vec<_>, Vec<_>) = pass1
                 .iter()
                 .cloned()
-                .partition(|c| goertzel_window_end_sample(c.dt_sec) <= PREFIX_SAMPLES);
+                .partition(|c| goertzel_window_end_sample(c.dt_sec) <= prefix_samples());
             let t1 = Instant::now();
             let p2 = pass2_split(prefix, ready.clone(), max_cand());
             let t_p2 = t1.elapsed();
@@ -2174,5 +2232,149 @@ fn mirror_acquisition_early_stop() {
             sum[i] as f32 / n_starts as f32,
             trials_run[i] as f32 / n_starts as f32,
         );
+    }
+}
+
+/// **What emitting the SpecBundle earlier costs — the cost side only.**
+///
+/// The board's decoder blocks on the SpecBundle, so every row earlier
+/// that `stage1_inc` emits is 80 ms more wall clock before key-up:
+/// with the audio clock accurate the whole budget is ~1.1 s
+/// (0.93 s of tail + 0.5 s to key-up − the 320 ms guard), and six
+/// rows would be half of it again. What it buys is arithmetic and
+/// needs no test. What it *costs* is not, and this measures that:
+///
+/// - the coarse search runs on a spectrogram with the tail rows zero,
+///   so block 2's large-lag half is flattened (the board's own
+///   `SPEC_EMIT_PAIR` comment: `needed_m = 162 + jz`, 13 rows at
+///   `SYNC_LAG_S` = 1.0), and
+/// - a shorter prefix moves candidates from ready to deferred, whose
+///   first attempt cannot start until the slot ends.
+///
+/// **This mirror does not model the deadline** (see the header) — so
+/// read the decode counts here as "what the pipeline can still find",
+/// never as what the board will decode. Pairing a cost measured here
+/// with the gain computed above is the whole point; the 2026-09-17
+/// fine-sync decision came from this file's decode counts alone and
+/// was wrong on the board for exactly that reason.
+///
+/// `MFSK_MIRROR_EMIT_PAIRS=87,85,83` picks the emit points,
+/// `MFSK_MIRROR_SYNC_LAGS=1.0,0.6` the lag windows to cross them with,
+/// `MFSK_GRID_PHASE=start,end,step` the phases each is averaged over.
+#[test]
+#[ignore = "diagnostic — the cost of emitting the SpecBundle earlier"]
+fn mirror_emit_earlier() {
+    let slot = load_slot();
+    let phases: Vec<f32> = {
+        let (lo, hi, dphi) = match std::env::var("MFSK_GRID_PHASE") {
+            Ok(v) => {
+                let f: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                assert_eq!(f.len(), 3, "MFSK_GRID_PHASE wants start,end,step");
+                (f[0], f[1], f[2])
+            }
+            // The plateau the board locks within.
+            Err(_) => (-0.4, 0.4, 0.1),
+        };
+        let mut v = Vec::new();
+        let mut step = 0i32;
+        while lo + step as f32 * dphi <= hi + 1e-6 {
+            v.push(lo + step as f32 * dphi);
+            step += 1;
+        }
+        v
+    };
+    let list = |var: &str, default: &str| -> Vec<String> {
+        std::env::var(var)
+            .unwrap_or_else(|_| default.to_string())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let pairs: Vec<usize> = list("MFSK_MIRROR_EMIT_PAIRS", "87,86,85,84,83,82")
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    let lags: Vec<f32> = list("MFSK_MIRROR_SYNC_LAGS", "1.0")
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+
+    // One run of a configuration over every phase: the decode count per
+    // phase, and the message set per phase so a loss can be named.
+    let run_cfg = |pair: usize, lag: f32| -> (Vec<usize>, Vec<Vec<String>>, f32, f32) {
+        EMIT_PAIR_OVERRIDE.with(|c| c.set(Some(pair)));
+        SYNC_LAG_OVERRIDE.with(|c| c.set(Some(lag)));
+        let mut counts = Vec::new();
+        let mut sets = Vec::new();
+        let (mut ready, mut defer) = (0f32, 0f32);
+        for &phi in &phases {
+            let out = at_phase(&slot, phi);
+            counts.push(out.results.len());
+            ready += out.n_ready as f32;
+            defer += out.n_deferred as f32;
+            let mut msgs: Vec<String> = out
+                .results
+                .iter()
+                .filter_map(|r| unpack77(r.message77()))
+                .map(|m| m.trim().to_string())
+                .collect();
+            msgs.sort();
+            msgs.dedup();
+            sets.push(msgs);
+        }
+        EMIT_PAIR_OVERRIDE.with(|c| c.set(None));
+        SYNC_LAG_OVERRIDE.with(|c| c.set(None));
+        let n = phases.len() as f32;
+        (counts, sets, ready / n, defer / n)
+    };
+
+    let mean = |v: &[usize]| v.iter().sum::<usize>() as f32 / v.len() as f32;
+    let (base_counts, base_sets, _, _) = run_cfg(SHIP_EMIT_PAIR, SHIP_SYNC_LAG_S);
+    println!(
+        "recording: {}  phases: {} ({:+.2}..{:+.2})",
+        std::env::var("MFSK_MIRROR_WAV").unwrap_or_else(|_| "qso3_busy.wav".into()),
+        phases.len(),
+        phases[0],
+        phases[phases.len() - 1],
+    );
+    println!(
+        "  baseline (pair {SHIP_EMIT_PAIR}, lag {SHIP_SYNC_LAG_S:.2}): mean dec {:.2}",
+        mean(&base_counts)
+    );
+    println!("  pair  gain(ms)  lag   mean dec   ready  defer   lost  gained");
+
+    let mut losses: Vec<(String, usize)> = Vec::new();
+    for &lag in &lags {
+        for &pair in &pairs {
+            EMIT_PAIR_OVERRIDE.with(|c| c.set(Some(pair)));
+            let gain = emit_gain_ms();
+            EMIT_PAIR_OVERRIDE.with(|c| c.set(None));
+            let (counts, sets, ready, defer) = run_cfg(pair, lag);
+            let (mut lost, mut gained) = (0usize, 0usize);
+            for (base, now) in base_sets.iter().zip(sets.iter()) {
+                for m in base {
+                    if !now.contains(m) {
+                        lost += 1;
+                        match losses.iter_mut().find(|(k, _)| k == m) {
+                            Some((_, n)) => *n += 1,
+                            None => losses.push((m.clone(), 1)),
+                        }
+                    }
+                }
+                gained += now.iter().filter(|m| !base.contains(m)).count();
+            }
+            println!(
+                "  {pair:>4}  {gain:>8}  {lag:.2}   {:>8.2}   {ready:>5.1}  {defer:>5.1}   {lost:>4}  {gained:>6}",
+                mean(&counts),
+            );
+        }
+    }
+    if !losses.is_empty() {
+        losses.sort_by(|a, b| b.1.cmp(&a.1));
+        println!("  stations lost at least once (phase-count):");
+        for (m, n) in losses.iter().take(12) {
+            println!("    {n:>3}x  {m}");
+        }
     }
 }
