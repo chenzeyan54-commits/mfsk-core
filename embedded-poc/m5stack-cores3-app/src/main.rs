@@ -20,6 +20,22 @@ use mfsk_core_m5stack_cores3_app::{
     UDP_LOG_TARGET, WIFI_ENABLED, WIFI_PSK, WIFI_SSID,
 };
 
+/// How old a persisted air fix may be and still seed FT8's grid.
+///
+/// The ESP crystal is specified at −3.3 ppm, which is 11.9 ms of phase
+/// an hour. FT8 here decodes across a plateau of about ±0.4 s (the
+/// mirror's phase response, 2026-09-19), and the per-slot coarse search
+/// is ±1.0 s. Twelve hours is 0.14 s — a third of the plateau, so an
+/// overnight fix still lands where the band is. A day is 0.29 s, which
+/// fits but spends most of the margin on holdover alone; past that,
+/// acquiring from the air is both cheap and certain.
+///
+/// FT4's own limit (`apps/ft4.rs`) is two hours, and correctly so: its
+/// grid is 7.5 s and its symbols a quarter the length.
+const GRID_FIX_MAX_AGE_S: i64 = 12 * 3600;
+/// Minimum acquisition confidence to seed from — the same bar FT4 uses.
+const GRID_FIX_MIN_R: f32 = 0.55;
+
 fn main() -> ! {
     esp_idf_svc::sys::link_patches();
     LOGGER.install();
@@ -165,16 +181,58 @@ fn main() -> ! {
     //
     // WiFi buffers were also sized down for this workload — see
     // `sdkconfig.defaults`. Refs #163.
-    // **Where the slot grid's phase comes from** — the CONFIG page's
-    // setting, read once here. `AirDt` suppresses the clock before
-    // anything can consult it, so a later NTP sync cannot take the
-    // phase away from a grid the air is holding.
+    // **How the slot grid's phase is kept** — the CONFIG page's
+    // setting, read once here.
+    //
+    // It does *not* choose a time source. The clock is the log's, and
+    // it comes from NTP when there is a network and from the RTC when
+    // there is not; FT8 logging wants the minute right, which the RTC
+    // holds for weeks. What drifts into trouble is the *slot phase*:
+    // seconds of it after days off the network, against a mode whose
+    // coarse search is ±1 s. `AirDt` says to correct that from the air
+    // rather than by waiting on a time server that is not there —
+    // which is why it also skips NTP, and why it leaves the clock
+    // alone.
     let grid_src = mfsk_app_shared::grid_src::read(&nvs);
     set_grid_source(grid_src);
-    if grid_src == mfsk_app_shared::grid_src::GridSource::AirDt {
-        mfsk_app_shared::time_sync::suppress_clock(true);
-    }
     log::info!("grid source: {}", grid_src.label());
+
+    // A phase this station acquired from the air before — yesterday's
+    // session, or the FT8 run before a switch to FT4 and back. The RTC
+    // puts the boundary within a second of right; this puts it within
+    // milliseconds, and a station that has one does not spend a minute
+    // acquiring what it already knows. `correction_for` refuses a fix
+    // that is stale or weak, and if the seed is wrong anyway the
+    // under-par policy re-acquires from the air, whole seconds and all.
+    if grid_src == mfsk_app_shared::grid_src::GridSource::AirDt {
+        if let Some(fix) = mfsk_app_shared::grid_fix::load(&nvs) {
+            let now_epoch = mfsk_app_shared::time_sync::utc_now_ms()
+                .map(|ms| (ms / 1000) as i64)
+                .unwrap_or(0);
+            match fix.correction_for(
+                now_epoch,
+                15.0,
+                GRID_FIX_MAX_AGE_S,
+                GRID_FIX_MIN_R,
+            ) {
+                Some(p) => {
+                    uac::seed_grid_fix_us((p * 1_000_000.0) as i32);
+                    log::info!(
+                        "grid: seeding from a persisted air fix — {p:+.3} s (R {:.2}, {} s old)",
+                        fix.confidence,
+                        now_epoch - fix.epoch_at_fix,
+                    );
+                }
+                None => log::info!(
+                    "grid: persisted air fix is stale or weak (R {:.2}, {} s old) — acquiring",
+                    fix.confidence,
+                    now_epoch - fix.epoch_at_fix,
+                ),
+            }
+        } else {
+            log::info!("grid: no persisted air fix — the first lock will acquire one");
+        }
+    }
 
     let needs_wifi = matches!(mode, boot_mode::BootMode::Wifi | boot_mode::BootMode::Uac);
     WIFI_ENABLED.store(needs_wifi, std::sync::atomic::Ordering::Release);

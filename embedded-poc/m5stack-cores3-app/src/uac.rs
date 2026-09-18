@@ -835,6 +835,24 @@ impl AudioSink for Ft8ChunkSink {
         // UTC drift check below.
         if !self.coarse_anchored {
             if let Some(remain) = mfsk_app_shared::time_sync::samples_to_next_slot_12k(SLOT_SECS) {
+                // The clock puts the boundary within a second; a
+                // persisted air fix puts it within milliseconds. Same
+                // fold and the same sign as `apps/ft4.rs` does for its
+                // own grid — µs to 12 kHz samples, modulo the period.
+                let fix_us = PENDING_GRID_FIX_US.load(Ordering::Acquire);
+                let remain = if fix_us == i32::MIN {
+                    remain
+                } else {
+                    let shifted = remain as i64 + (fix_us as i64 * 12 / 1000);
+                    let r = shifted.rem_euclid(SLOT_SAMPLES_12K as i64) as usize;
+                    log::info!(
+                        "uac: folding a persisted air fix into the anchor — {:+} ms                          ({} ms to the boundary, was {})",
+                        fix_us / 1000,
+                        r / 12,
+                        remain / 12,
+                    );
+                    r
+                };
                 self.slot_samples = SLOT_SAMPLES_12K.saturating_sub(remain);
                 self.coarse_anchored = true;
                 // Grid lock state (#356b): a plausible clock, disciplined
@@ -982,6 +1000,22 @@ impl AudioSink for Ft8ChunkSink {
 pub fn set_chunk_q(q: sys::QueueHandle_t) {
     set_audio_sink(Ft8ChunkSink::new(q));
     log::info!("uac: chunk_q wired (addr={:#x})", q as usize);
+}
+
+/// A persisted grid-phase fix waiting to be folded into the first
+/// coarse anchor, in microseconds — `i32::MIN` when there is none.
+///
+/// The RTC gives the boundary to within a second; this gives the rest.
+/// It is the same record `apps/ft4.rs` reads on the FT8 → FT4 reboot,
+/// used here for the case it was always for and never wired to: a
+/// station that acquired from the air yesterday and is switched on
+/// again today, with no network to ask.
+static PENDING_GRID_FIX_US: core::sync::atomic::AtomicI32 =
+    core::sync::atomic::AtomicI32::new(i32::MIN);
+
+/// Hand the sink a persisted fix, before the first audio arrives.
+pub fn seed_grid_fix_us(offset_us: i32) {
+    PENDING_GRID_FIX_US.store(offset_us, Ordering::Release);
 }
 
 /// `SlotEnd` cadence in 12 kHz mono samples. Same as `wav_sim`'s

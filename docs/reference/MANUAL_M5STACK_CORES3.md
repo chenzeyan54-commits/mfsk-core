@@ -234,18 +234,38 @@ overlay that reappears on a page nobody chose is how a stray tap lands
 on a setting. There is 14 px of slop around the edges, so a press that
 is nearly right commits rather than dismissing.
 
-### CONFIG — where the time comes from
+### CONFIG — how the slot phase is kept
+
+**This does not choose a time source.** The clock belongs to the log:
+QSO logging needs the minute right, that comes from NTP beforehand, and
+the RTC holds it for weeks. What this chooses is how the *slot phase* —
+which drifts on its own — is kept.
 
 | Row | Meaning |
 |---|---|
-| `TIME: NTP` | start NTP at boot; once it syncs, UTC owns the slot phase. The default |
-| `TIME: AIR DT` | **suppress the clock**; the phase comes from the air (cold acquisition, then lock-and-hold) |
+| `TIME: NTP` | take NTP at boot; UTC owns the slot phase. The default |
+| `TIME: AIR DT` | do not start NTP; the phase comes from the air, the clock stays the RTC's (for the log) |
 
-`AIR DT` does more than skip the wait: it makes the system clock
-invisible. A clock that syncs halfway through would flip
-`clock_is_disciplined()` mid-session and take the phase away from a grid
-that was working. It is the setting for a hilltop with no network — or
-with a hotspot that associates but cannot reach a time server.
+What drifts: the ESP crystal at −3.3 ppm, about 11.9 ms an hour. A few
+days away from a network makes that **seconds**, against FT8's ±1.0 s
+coarse search and a usable plateau of about ±0.4 s. `AIR DT` corrects
+that from the air's DT, and leaves the clock alone — a second of clock
+error costs a minute-resolution log nothing.
+
+There is no reason to choose `AIR DT` where NTP is reachable: an
+acquisition costs a 25 s capture and a dozen seconds of arithmetic,
+where NTP gives the same phase in a few seconds.
+
+**It does not acquire on every boot.** A successful acquisition is
+written to NVS (`grid_fix`: the sub-second phase, when it was taken, and
+its confidence), and the next boot restores the grid from **the RTC's
+seconds plus that stored fraction**. The stored value is relative to the
+RTC's own grid, so a constant RTC error cancels out and only drift
+between sessions counts. A fix older than 12 hours (≈0.14 s of
+holdover) or weaker than 0.55 is not used, and the board acquires
+instead. If the seed is wrong anyway, three slots with nothing decoded
+re-acquire from the air — that search covers the whole 15 s period, so
+it recovers **whole seconds of error** as well as the fraction.
 
 To change mode without the panel: erase NVS, and set `boot_mode` in
 `cfg.toml`.
