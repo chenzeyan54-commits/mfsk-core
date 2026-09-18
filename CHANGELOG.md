@@ -192,9 +192,23 @@ suite on a Mac rather than by CI, which still has Linux runners only.
   (3). Scored on the host over 24 start phases per recording, the decode
   count is identical to running all five trials (qso3 8.00, qso1 3.88,
   qso2 4.74) for 5.0 → 2.3 trials, and on the board the stall it causes
-  halved, 15.2 → 10.4 s. Steady state on `qso3_busy` under
-  `MFSK_CORES3_SIM`: 10 decodes a slot, finishing ~255 ms after slot end
-  against a key-up at +500 ms, no slot dropped and none past key-up.
+  is 10.4 s where it was 15.2 s when trial 2 wins, 13.6 s when trial 3
+  does. Steady state on `qso3_busy` under `MFSK_CORES3_SIM`, in each of
+  two runs: eleven consecutive slots decoding 10, finishing ~256 ms
+  after slot end against a key-up at +500 ms, none past it. The second
+  run is also the first to drop a slot — the one acquisition pushed to
+  280 ms of tail, where coarse and fine sync alone need ~370 ms, and
+  which overran key-up by 738-1344 ms in every run before the floor.
+
+  One caveat, from that same slot: while acquisition occupies the core
+  the audio sink is starved with everything else, so its boundary
+  publishes lag and the hint reads seconds out either way (−4.06 s on
+  the slot before the shift, +4.44 s on the lengthened one) before
+  settling to −35..−47 ms. Neither run lost a decode to it, and both
+  readings agreed the dropped slot was under the floor, but an
+  optimistic reading is one that fails to drop a slot that should be.
+  Whether the sink lags the same way when the audio is a radio's rather
+  than the harness's is not measured yet.
 
 - **CoreS3 FT8 grid acquisition: the capture's own offset was dropped,
   one decode set the grid, and a partial slot could lock it.** Three
