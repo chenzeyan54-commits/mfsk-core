@@ -51,6 +51,30 @@ drift check — and the whole air-sync path in `decode_pipeline` is
 gated off the moment that turns true, so it costs the steady-state
 slot nothing. The `wav` source is left alone.
 
+**A clock that is a second slow looks like a decoder bug.** The
+BM8563 write has to release `STOP` on the boundary of the second it
+wrote; releasing on "the next boundary from here" puts the chip a
+second behind, because the eight-register I2C write itself crosses the
+boundary the value was chosen for. That shipped, and it was invisible
+in every mode that also runs NTP — the system clock is disciplined
+within seconds and the RTC's error never reaches the grid. `TIME: AIR
+DT` does not start NTP, so it inherited the whole second: `dt` pinned
+at −0.7 to −1.0, a trim on every slot, two 25 s captures, 2 min 9 s to
+the first decode (2026-09-19, fixed in `bb12abaa`; the same band then
+read `dt +0.04 ±0.07` with no trim and no capture).
+
+The diagnostic trap is worth more than the bug. A probe was added to
+decide whether the slot boundary was declared at the wrong *time* or
+over audio that was offset, and it reported the boundary on UTC to
+±32 ms while `dt` read −1.0. That reads as a contradiction and is not
+one: the probe calls `utc_now_ms()`, so it measures the grid against
+the board's own clock — the suspect. **An instrument that shares the
+suspect's reference cannot convict it.** What finally separated them
+was reading `dt_sec`'s definition (`engine::sync.rs`: buffer position
+minus `TX_START_OFFSET_S`, positive = late) and the `grid=ntp:rtc` →
+`grid=ntp` transition in the log, where `dt` jumps 0.88 s at the moment
+the clock stops being the RTC's.
+
 **The boot-critical logs do not reach the only console that works.**
 WiFi associates seconds after the power and USB decisions are made, and
 the fanout's staging ring — small on purpose, it was eating the audio
