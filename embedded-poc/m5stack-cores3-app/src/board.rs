@@ -308,7 +308,31 @@ pub fn log_task_stacks() {
     //
     // One task per line rather than a joined string: this is diagnostic
     // output on a 30 s cadence, and the names are what get read.
+    // **Priority and core, beside the stack.** `TaskStatus_t` carries
+    // both and they were being discarded, so every priority argument in
+    // this tree was an argument about the value *passed* rather than the
+    // one in effect — `uac_host_install`'s `task_priority`, a pthread's
+    // `ThreadSpawnConfiguration`, `xTaskCreatePinnedToCore`'s core, all
+    // asserted and none observed. That mattered on 2026-09-19, when
+    // audio was being lost during every decode and "the class driver
+    // is not being scheduled" could not be told from "the class driver
+    // runs fine and the data is dropped elsewhere". `xCoreID` reads
+    // `tskNO_AFFINITY` (0x7FFFFFFF) as `-` .
     for t in tasks.iter().take(n) {
-        log::info!("[stacks]   {:<16} free {}", name_of(t).as_str(), t.usStackHighWaterMark);
+        // `TaskStatus_t` carries the priority but not the core in this
+        // binding; `xTaskGetCoreID` does, and returns `tskNO_AFFINITY`
+        // (0x7FFFFFFF) for an unpinned task.
+        // SAFETY: the handle was populated moments ago by
+        // `uxTaskGetSystemState` and this task has not yielded since.
+        let raw = unsafe { sys::xTaskGetCoreID(t.xHandle) };
+        let core = if raw as u32 == 0x7FFF_FFFF { -1 } else { raw as i32 };
+        log::info!(
+            "[stacks]   {:<16} free {:<6} prio {:<2} base {:<2} core {}",
+            name_of(t).as_str(),
+            t.usStackHighWaterMark,
+            t.uxCurrentPriority,
+            t.uxBasePriority,
+            core,
+        );
     }
 }

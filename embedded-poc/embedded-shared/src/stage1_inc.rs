@@ -261,6 +261,9 @@ struct SlotInProgress {
     next_pair: usize,
     shift: u32,
     shift_locked: bool,
+    /// The peak the shift was locked from — kept so `finalize_slot` can
+    /// say whether the rest of the slot outgrew it.
+    peak_at_lock: i32,
     peak_abs: i32,
     inc_total_us: i64,
 }
@@ -276,6 +279,7 @@ impl SlotInProgress {
             next_pair: 0,
             shift: 0,
             shift_locked: false,
+            peak_at_lock: 0,
             peak_abs: 1,
             inc_total_us: 0,
         }
@@ -445,6 +449,22 @@ fn advance_pairs(ctx: &mut WorkerCtx) {
         // NFFT=3840 migration; see decode_block.rs:419).
         ctx.cur.shift = shift.min(8);
         ctx.cur.shift_locked = true;
+        ctx.cur.peak_at_lock = ctx.cur.peak_abs;
+        // **The gain this slot will be read at, and what set it.**
+        //
+        // The shift is locked from the slot's first second and applied
+        // to all of it, so a slot whose level rises afterwards is read
+        // clipped (`(raw << shift).clamp(i16::MIN, i16::MAX)`) and one
+        // whose level falls is read crushed. Either way the spectrogram
+        // is not the audio, and on hardware a slot that decoded nothing
+        // showed coarse scores of 20-125 against a noise floor of 1.0 —
+        // the shape of a saturated spectrogram, not of a quiet band.
+        // This line is what says whether that is what happened.
+        log::info!(
+            "stage1_inc: slot gain locked — shift={} from peak {} (target {TARGET_PEAK})",
+            ctx.cur.shift,
+            ctx.cur.peak_abs,
+        );
     }
     if !ctx.cur.shift_locked {
         return;
@@ -1081,6 +1101,28 @@ fn update_one_half(
 }
 
 fn finalize_slot(ctx: &mut WorkerCtx, wav_idx: usize, total_samples: usize) {
+    // **Did the slot outgrow the gain its first second chose?**
+    //
+    // `shift` is locked from the first 12 000 samples and applied to
+    // the whole slot as `(raw << shift).clamp(i16::MIN, i16::MAX)`, so
+    // a level that rises afterwards is read clipped — broadband
+    // rubbish into the FFT, which inflates the sync metric and ruins
+    // the LLRs. On hardware a slot that decoded nothing showed coarse
+    // scores of 20-125 against a noise floor of 1.0, which is that
+    // shape. This says whether it is that or not.
+    {
+        let c = &ctx.cur;
+        let scaled_peak = (c.peak_abs as i64) << c.shift;
+        let clipped = scaled_peak > i16::MAX as i64;
+        log::info!(
+            "stage1_inc: slot {wav_idx} gain shift={} peak_at_lock={} slot_peak={} scaled={}{}",
+            c.shift,
+            c.peak_at_lock,
+            c.peak_abs,
+            scaled_peak,
+            if clipped { " CLIPPED" } else { "" },
+        );
+    }
     let slotend_us = unsafe { esp_timer_get_time() };
     // Drain any remaining pairs that the audio supports.
     advance_pairs(ctx);
