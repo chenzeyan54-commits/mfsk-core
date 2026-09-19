@@ -254,6 +254,22 @@ fn run(mut ctx: Ctx) -> ! {
         log::warn!("{tag}: NTP never synced");
     }
     (ctx.cfg.on_ntp)(ntp_synced);
+    // **Keep watching, because the 20 s window is not the answer.**
+    //
+    // `wait_synced` counts its own delays, so a slow first exchange is
+    // not a starved poll — it is simply a sync that had not arrived
+    // yet. It then decided the clock source for the whole session:
+    // measured on a radio 2026-09-19, two consecutive host-mode boots
+    // timed out at 20 s and ran the rest of the session as `grid=rtc`,
+    // which turns off the sink's UTC phase tracking entirely — so the
+    // grid walked off at the audio path's rate error and decodes fell
+    // to nothing, from a board whose RTC had been set from NTP minutes
+    // earlier. The same SNTP handle keeps retrying underneath; nothing
+    // was reading it.
+    let mut watching_ntp = !ntp_synced && _sntp_keepalive.is_some();
+    if watching_ntp {
+        log::info!("{tag}: NTP still retrying underneath — watching for it");
+    }
 
     let _http_server = match http_config::start(ctx.nvs.clone()) {
         Ok(s) => {
@@ -270,6 +286,23 @@ fn run(mut ctx: Ctx) -> ! {
     // outlive this task — their `Drop`s tear down the association and
     // stop listening — so this task never returns.
     loop {
-        FreeRtos::delay_ms(60_000);
+        FreeRtos::delay_ms(if watching_ntp { 5_000 } else { 60_000 });
+        if !watching_ntp {
+            continue;
+        }
+        let Some(sntp) = _sntp_keepalive.as_ref() else {
+            watching_ntp = false;
+            continue;
+        };
+        // One status read at priority 2, every 5 s, until it lands. The
+        // promotion itself is `ntp::note_sync_completed` — the same
+        // `note_clock_from_ntp` the initial wait would have called, so
+        // the RTC write and the sink's phase tracking come up exactly
+        // as they do on a fast first exchange.
+        if ntp::note_sync_completed(sntp) {
+            watching_ntp = false;
+            log::info!("{tag}: NTP synced on a later attempt — UTC now owns the slot phase");
+            (ctx.cfg.on_ntp)(true);
+        }
     }
 }

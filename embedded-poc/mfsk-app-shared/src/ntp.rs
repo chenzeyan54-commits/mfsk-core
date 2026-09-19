@@ -52,6 +52,23 @@ pub fn start(server: &str) -> Result<EspSntp<'static>, EspError> {
 /// exposed to safe Rust, so — like every other `wait_*` helper this
 /// crate has rolled for a similarly callback-shaped esp-idf API —
 /// this is a plain poll loop, not a genuine blocking call.
+/// Has SNTP completed since last asked? Promotes the clock source the
+/// first time it has.
+///
+/// [`wait_synced`]'s timeout ends a *wait*, not the sync: the handle it
+/// was given keeps retrying, and a caller that stops looking runs on an
+/// undisciplined clock for the rest of the session even after the
+/// exchange lands. This is the cheap way to keep looking — one status
+/// read, no state of its own beyond `note_clock_from_ntp`'s own
+/// idempotence.
+pub fn note_sync_completed(sntp: &EspSntp<'_>) -> bool {
+    if sntp.get_sync_status() != SyncStatus::Completed {
+        return false;
+    }
+    crate::time_sync::note_clock_from_ntp();
+    true
+}
+
 pub fn wait_synced(sntp: &EspSntp<'_>, timeout_ms: u32) -> bool {
     const POLL_INTERVAL_MS: u32 = 200;
     let mut waited_ms = 0u32;
