@@ -37,15 +37,25 @@ pub const LOCK_MIN_DECODES: usize = 3;
 /// gets a chance to place the grid properly.
 pub const LOCK_MAX_PHASE_S: f32 = 0.3;
 
-/// Consecutive under-par slots before a cold acquisition, from a
-/// standing start (nothing has ever locked).
-pub const ACQUIRE_TRIGGER_SLOTS: u32 = 3;
+/// Under-par slots **that carried a signal** before a cold
+/// acquisition, from a standing start (nothing has ever locked).
+///
+/// One. The count used to be three, standing in for "is the band quiet
+/// or is the grid lost?"; [`GridState::observe_slot`] now measures
+/// that directly and a signal-less slot no longer counts, so the run
+/// no longer has to be long to mean anything. A single slot with a
+/// station in it that would not decode is the whole of the evidence,
+/// and on a mode the operator selected by hand it is evidence they
+/// have already accepted.
+pub const ACQUIRE_TRIGGER_SLOTS: u32 = 1;
 
-/// The same count once a lock has produced decodes. Higher, because
-/// after a lock a run of empty slots is usually a quiet band rather
-/// than a lost grid, and re-acquiring costs 25 s of capture plus
-/// whatever the grid would have decoded meanwhile. Six slots is 90 s
-/// of genuinely nothing heard.
+/// The same count once a lock has produced decodes. Higher, and still
+/// higher for a reason the signal test does not cover: after a lock,
+/// slots that carry signal and decode nothing are more often fading or
+/// a band full of stations this receiver cannot reach than a grid that
+/// was demonstrably working going bad. Six of them is 90 s, against
+/// re-acquiring's 25 s capture plus whatever the grid would have
+/// decoded meanwhile.
 pub const REACQUIRE_TRIGGER_SLOTS: u32 = 6;
 
 /// What the caller should do with the grid after a slot's decodes.
@@ -120,6 +130,34 @@ impl GridState {
     /// old count-only behaviour, which is what every caller without a
     /// DT median has.
     pub fn observe_with_phase(&mut self, n_dec: usize, phase_err_s: Option<f32>) -> GridAction {
+        self.observe_slot(n_dec, phase_err_s, true)
+    }
+
+    /// [`Self::observe_with_phase`] told whether the slot carried a
+    /// signal the decoder could not read.
+    ///
+    /// **This is what the slot count was standing in for.** Waiting
+    /// [`ACQUIRE_TRIGGER_SLOTS`] empty slots answered "is the band
+    /// quiet, or is the grid lost?" — a question worth asking, because
+    /// an acquisition on a quiet band is 40 s that cannot succeed
+    /// (measured twice on a radio 2026-09-19: "none of 5 candidate
+    /// phases decoded"). But the slot count is a proxy, and the direct
+    /// measurement is already in hand: coarse sync's top score, which
+    /// sits at the noise floor on a quiet band and runs tens to low
+    /// hundreds when a station is there and the grid is missing it.
+    ///
+    /// So a slot with no signal no longer counts toward the trigger at
+    /// all — it is not evidence about the grid either way — and one
+    /// with signal counts immediately. An operator who chose
+    /// `TIME: AIR DT` from the CONFIG page has already said the phase
+    /// is suspect; making them wait three slots for a receiver to
+    /// re-derive that is answering a question they answered.
+    pub fn observe_slot(
+        &mut self,
+        n_dec: usize,
+        phase_err_s: Option<f32>,
+        had_signal: bool,
+    ) -> GridAction {
         let was_locked = self.is_locked();
         // A phase this far out is not a grid worth holding, however
         // many stations came through it. See [`LOCK_MAX_PHASE_S`].
@@ -149,7 +187,16 @@ impl GridState {
             // locked can never be re-acquired either.
             n_dec < LOCK_MIN_DECODES || !phase_ok
         };
-        self.lost_slots = if below_par { self.lost_slots + 1 } else { 0 };
+        // A slot with nothing in it neither adds to the run nor clears
+        // it: it says nothing about the grid, and acquiring from it
+        // would fail for the same reason it decoded nothing.
+        if below_par {
+            if had_signal {
+                self.lost_slots += 1;
+            }
+        } else {
+            self.lost_slots = 0;
+        }
 
         if locking {
             return GridAction::Lock { n_dec };
@@ -220,12 +267,9 @@ mod tests {
     fn a_grid_that_decodes_but_is_off_centre_neither_locks_nor_holds() {
         // The 2026-09-19 case: six stations through a grid 0.68 s out.
         let mut g = GridState::new();
-        for _ in 0..ACQUIRE_TRIGGER_SLOTS - 1 {
-            assert_eq!(g.observe_with_phase(6, Some(-0.68)), GridAction::Hold);
-            assert!(!g.is_locked(), "an off-centre grid must not lock");
-        }
-        // The under-par run accumulates even though slots are decoding,
-        // so the air gets its chance.
+        assert!(!g.is_locked(), "an off-centre grid must not lock");
+        // Under par even though the slot decoded, so the air gets its
+        // chance — and with the trigger at one, on that slot.
         assert!(matches!(
             g.observe_with_phase(6, Some(-0.68)),
             GridAction::Acquire { .. }
@@ -245,13 +289,13 @@ mod tests {
     #[test]
     fn one_decode_a_slot_is_not_a_lock_and_still_reaches_acquisition() {
         let mut g = GridState::new();
-        assert_eq!(g.observe(1), GridAction::Hold);
-        assert_eq!(g.observe(1), GridAction::Hold);
         assert!(!g.is_locked(), "one decode a slot must not lock the grid");
+        // One under-par slot is now the trigger from a standing start —
+        // a slot that decoded at all carried a signal by definition.
         assert_eq!(
             g.observe(1),
             GridAction::Acquire {
-                slots: 3,
+                slots: ACQUIRE_TRIGGER_SLOTS,
                 relock: false
             }
         );
@@ -353,6 +397,12 @@ mod tests {
 
     /// A phase that was applied moved the grid, so the slots that led
     /// there say nothing about the new one — the run starts over.
+    ///
+    /// With [`ACQUIRE_TRIGGER_SLOTS`] at one the new phase is condemned
+    /// by the next signal-bearing slot that will not decode, and that
+    /// is deliberate: what keeps a failed phase from thrashing is not a
+    /// slot count but the 25 s of ring the next acquisition has to
+    /// refill before it can run at all.
     #[test]
     fn an_applied_acquisition_resets_the_run() {
         let mut g = GridState::new();
@@ -361,7 +411,26 @@ mod tests {
         }
         g.acquisition_done(true);
         assert_eq!(g.lost_slots(), 0);
-        assert_eq!(g.observe(0), GridAction::Hold);
+        assert!(matches!(g.observe(0), GridAction::Acquire { .. }));
+    }
+
+    /// A slot with nothing in it is not evidence about the grid.
+    #[test]
+    fn a_signal_less_slot_does_not_reach_acquisition() {
+        let mut g = GridState::new();
+        for _ in 0..10 {
+            assert_eq!(
+                g.observe_slot(0, None, false),
+                GridAction::Hold,
+                "a quiet band must not trigger a capture that cannot succeed"
+            );
+        }
+        assert_eq!(g.lost_slots(), 0);
+        // One slot with a station in it that would not decode is.
+        assert!(matches!(
+            g.observe_slot(0, None, true),
+            GridAction::Acquire { .. }
+        ));
     }
 
     /// The measured recovery, as a sequence: 1-of-8 for a few slots,
@@ -370,13 +439,8 @@ mod tests {
     #[test]
     fn the_hardware_recovery_sequence() {
         let mut g = GridState::new();
-        assert_eq!(g.observe(1), GridAction::Hold);
-        assert_eq!(g.observe(1), GridAction::Hold);
         assert!(matches!(g.observe(1), GridAction::Acquire { .. }));
         g.acquisition_done(true); // -5.75 s, applied, and wrong
-        for _ in 0..ACQUIRE_TRIGGER_SLOTS - 1 {
-            assert_eq!(g.observe(0), GridAction::Hold);
-        }
         assert!(matches!(g.observe(0), GridAction::Acquire { .. }));
         g.acquisition_done(true); // +6.60 s, applied, close enough
         assert_eq!(g.observe(5), GridAction::Lock { n_dec: 5 });

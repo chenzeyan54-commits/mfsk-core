@@ -17,11 +17,22 @@
 //! band is open and the air-sync path is standing by with nothing to
 //! do. So it becomes a setting.
 //!
-//! [`GridSource::AirDt`] does not merely *skip* NTP: it suppresses the
-//! clock outright ([`crate::time_sync::suppress_clock`]), because a
-//! half-set clock is worse than none — `clock_is_disciplined()` would
-//! flip mid-session and take the phase away from a grid that was
-//! working.
+//! [`GridSource::AirDt`] **skips NTP and nothing else.** It does not
+//! suppress the clock, and never did in code — this paragraph used to
+//! say it called [`crate::time_sync::suppress_clock`], which only the
+//! `MFSK_SIM_NO_CLOCK` harness does. Believing the doc over the code
+//! cost a session: it justified skipping the sink's RTC coarse anchor
+//! in this mode, and an `AIR DT` start with a good RTC then spent
+//! 2 min 9 s and two 25 s captures rediscovering a phase the clock
+//! already had (measured on a radio, 2026-09-19).
+//!
+//! The concern behind it was real but is answered elsewhere: a clock
+//! disciplined mid-session would take the phase away from a working
+//! air-placed grid. `clock_is_disciplined()` is raised only by
+//! [`crate::time_sync::note_clock_from_ntp`], and this mode does not
+//! start NTP — so the RTC is visible (the log needs the time, and the
+//! grid gets a free one-shot placement from it) while the phase
+//! authority stays with the air.
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
@@ -37,6 +48,27 @@ pub enum GridSource {
     /// Ignore the clock entirely; the phase comes from the air —
     /// cold acquisition, then lock-and-hold.
     AirDt,
+}
+
+/// What to call the grid in a log line: the source the operator chose,
+/// and — when the phase is not yet coming from it — where it is coming
+/// from instead.
+///
+/// `air:rtc` is the state that had no name: `TIME: AIR DT` selected,
+/// the sink's one-shot RTC anchor holding the phase, the air not yet
+/// having placed it. Reported as plain `rtc`, it was indistinguishable
+/// from an NTP build that had not synced.
+pub fn grid_label(src: GridSource, lock: crate::time_sync::GridLock) -> &'static str {
+    use crate::time_sync::GridLock;
+    match (src, lock) {
+        (_, GridLock::FreeRun) => "free-run",
+        (GridSource::Ntp, GridLock::Ntp) => "ntp",
+        (GridSource::Ntp, GridLock::Air) => "ntp:air",
+        (GridSource::Ntp, GridLock::Rtc) => "ntp:rtc",
+        (GridSource::AirDt, GridLock::Air) => "air",
+        (GridSource::AirDt, GridLock::Ntp) => "air:ntp",
+        (GridSource::AirDt, GridLock::Rtc) => "air:rtc",
+    }
 }
 
 impl GridSource {
