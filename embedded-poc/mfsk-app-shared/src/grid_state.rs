@@ -21,6 +21,22 @@
 /// rather than clipping one strong signal's edge.
 pub const LOCK_MIN_DECODES: usize = 3;
 
+/// How far off the grid may be and still be lockable, in seconds.
+///
+/// **A lock used to be a decode count and nothing else**, and a count
+/// is not a phase: on a live band a grid 0.68 s out decoded 6 stations
+/// on its first slot, locked on that, and then decoded 0-1 for as long
+/// as it was left alone (2026-09-19, CoreS3 with the RTC as its only
+/// clock). The decoder searches ±1.0 s and works well over about
+/// ±0.4 s, so "some stations decoded" says the grid is inside the
+/// search window, not that it is anywhere near the middle of it.
+///
+/// 0.3 s leaves the useful plateau intact while refusing a grid that
+/// is demonstrably off-centre. A slot that decodes but misses this bar
+/// counts as under par, so the acquire trigger accumulates and the air
+/// gets a chance to place the grid properly.
+pub const LOCK_MAX_PHASE_S: f32 = 0.3;
+
 /// Consecutive under-par slots before a cold acquisition, from a
 /// standing start (nothing has ever locked).
 pub const ACQUIRE_TRIGGER_SLOTS: u32 = 3;
@@ -65,6 +81,23 @@ impl GridState {
         Self::default()
     }
 
+    /// A grid that is known to be unplaced: acquire now, not after
+    /// [`ACQUIRE_TRIGGER_SLOTS`] slots of proving it.
+    ///
+    /// The trigger exists for a grid that *was* working and stopped —
+    /// three empty slots is how you tell a quiet band from a lost lock.
+    /// At a cold start with the air as the phase source there is nothing
+    /// to tell apart: the clock has not placed the grid and the only
+    /// thing that can is a capture. Waiting three slots for permission
+    /// is 45 s of a receiver that already knows what it has to do, and
+    /// was reported from the bench as exactly that.
+    pub fn new_unplaced() -> Self {
+        Self {
+            lost_slots: ACQUIRE_TRIGGER_SLOTS,
+            ..Self::default()
+        }
+    }
+
     pub fn is_locked(&self) -> bool {
         self.best_n > 0
     }
@@ -79,7 +112,18 @@ impl GridState {
 
     /// Fold in one slot's decode count.
     pub fn observe(&mut self, n_dec: usize) -> GridAction {
+        self.observe_with_phase(n_dec, None)
+    }
+
+    /// [`Self::observe`] with the slot's measured phase error, when the
+    /// caller has one (`time_sync::slot_dt_offset`). `None` keeps the
+    /// old count-only behaviour, which is what every caller without a
+    /// DT median has.
+    pub fn observe_with_phase(&mut self, n_dec: usize, phase_err_s: Option<f32>) -> GridAction {
         let was_locked = self.is_locked();
+        // A phase this far out is not a grid worth holding, however
+        // many stations came through it. See [`LOCK_MAX_PHASE_S`].
+        let phase_ok = phase_err_s.is_none_or(|e| e.abs() <= LOCK_MAX_PHASE_S);
 
         // **One decode is not a lock.** A grid a full second out still
         // decodes the odd station, and the first cut of lock-and-hold
@@ -87,8 +131,8 @@ impl GridState {
         // — `n_dec == 0` at the time — could then never fire again, so
         // the receiver sat at 1-of-8 indefinitely with nothing able to
         // correct it.
-        let locking = n_dec >= LOCK_MIN_DECODES && !was_locked;
-        if n_dec >= LOCK_MIN_DECODES {
+        let locking = n_dec >= LOCK_MIN_DECODES && !was_locked && phase_ok;
+        if n_dec >= LOCK_MIN_DECODES && phase_ok {
             self.best_n = self.best_n.max(n_dec);
         }
 
@@ -99,7 +143,11 @@ impl GridState {
         let below_par = if was_locked {
             n_dec == 0
         } else {
-            n_dec < LOCK_MIN_DECODES
+            // Decoding *and* off-centre is still under par: without
+            // this the run resets on every slot that decodes, the
+            // trigger never accumulates, and a grid that cannot be
+            // locked can never be re-acquired either.
+            n_dec < LOCK_MIN_DECODES || !phase_ok
         };
         self.lost_slots = if below_par { self.lost_slots + 1 } else { 0 };
 
@@ -151,6 +199,49 @@ mod tests {
 
     /// The bug this module was extracted for. A grid ~1 s out decodes
     /// one station per slot forever; the receiver has to notice.
+    #[test]
+    fn an_unplaced_grid_acquires_on_its_first_empty_slot() {
+        let mut g = GridState::new_unplaced();
+        assert!(matches!(g.observe(0), GridAction::Acquire { .. }));
+    }
+
+    #[test]
+    fn an_unplaced_grid_still_locks_if_the_first_slot_is_good() {
+        // Nothing is forced: a first slot that decodes well, on a
+        // centred grid, locks and no capture runs.
+        let mut g = GridState::new_unplaced();
+        assert_eq!(
+            g.observe_with_phase(6, Some(0.02)),
+            GridAction::Lock { n_dec: 6 }
+        );
+    }
+
+    #[test]
+    fn a_grid_that_decodes_but_is_off_centre_neither_locks_nor_holds() {
+        // The 2026-09-19 case: six stations through a grid 0.68 s out.
+        let mut g = GridState::new();
+        for _ in 0..ACQUIRE_TRIGGER_SLOTS - 1 {
+            assert_eq!(g.observe_with_phase(6, Some(-0.68)), GridAction::Hold);
+            assert!(!g.is_locked(), "an off-centre grid must not lock");
+        }
+        // The under-par run accumulates even though slots are decoding,
+        // so the air gets its chance.
+        assert!(matches!(
+            g.observe_with_phase(6, Some(-0.68)),
+            GridAction::Acquire { .. }
+        ));
+    }
+
+    #[test]
+    fn the_same_count_locks_once_the_phase_is_centred() {
+        let mut g = GridState::new();
+        assert_eq!(
+            g.observe_with_phase(6, Some(-0.05)),
+            GridAction::Lock { n_dec: 6 }
+        );
+        assert!(g.is_locked());
+    }
+
     #[test]
     fn one_decode_a_slot_is_not_a_lock_and_still_reaches_acquisition() {
         let mut g = GridState::new();

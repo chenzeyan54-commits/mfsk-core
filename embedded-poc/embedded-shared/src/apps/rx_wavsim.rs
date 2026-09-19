@@ -109,7 +109,7 @@ pub fn run_sweep(wavs: &'static [&'static [u8]], cfgs: &'static [RxSweepCfg]) ->
             key_up_guard_ms: 0,
             // Off with the key-up guard: these boards do not transmit
             // and their wav_sim sources are not paced to a slot clock.
-            fine_sync_late: false,
+            fine_sync_min_slack_ms: 0,
             share_cand_budget: false,
             slot_floor_ms: 0,
             slot_end_hint: None,
@@ -136,9 +136,7 @@ pub fn run_sweep(wavs: &'static [&'static [u8]], cfgs: &'static [RxSweepCfg]) ->
             skipped: _,
             // No hint on this board, so nothing to log it against.
             slot_end_hint_us: _,
-            // This board has no key-up bound, so nothing is cut for later.
-            leftover: _,
-            failed_coarse: _,
+            top3: _,
         } = out;
 
         let slotend = slot.slotend_us;

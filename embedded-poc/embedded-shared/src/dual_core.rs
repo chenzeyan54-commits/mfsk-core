@@ -77,6 +77,38 @@ use crate::pipeline::{self, Slot, SpecBundle};
 /// 2026-09-16 and held there, `dec=6` against 8 at a better phase.
 const EMBEDDED_SYNC_LAG_S: f32 = 1.0;
 
+/// The lag the next coarse search will use, in milliseconds.
+///
+/// [`EMBEDDED_SYNC_LAG_S`] is what a *working* grid needs: ±1.0 s is
+/// as far as the emitted SpecBundle can score anyway, since block 2's
+/// last Costas sits at row 162 and the emit carries rows 0..173
+/// (`162 + 1.0/0.08 = 175`).
+///
+/// But a grid that is not yet placed can be further out than that, and
+/// then the per-slot search cannot see the band at all: measured on a
+/// radio (2026-09-19) the grid sat 1.65 s out, every slot decoded 0,
+/// and the receiver spent two minutes and two cold acquisitions
+/// getting back — while the stations were in the audio the whole time.
+///
+/// So while the grid is unproven the caller widens this, and the full
+/// slot's 184 rows put the ceiling at `(184 - 162) * 0.08` = 1.76 s.
+/// Past that there is no spectrogram to score against and the answer
+/// is acquisition, which searches the whole period by construction.
+static SYNC_LAG_MS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new((EMBEDDED_SYNC_LAG_S * 1_000.0) as u32);
+
+/// Widen or narrow the coarse search. Takes effect on the next slot.
+pub fn set_sync_lag_s(lag_s: f32) {
+    SYNC_LAG_MS.store(
+        (lag_s.clamp(0.1, 1.75) * 1_000.0) as u32,
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
+fn sync_lag_s() -> f32 {
+    SYNC_LAG_MS.load(core::sync::atomic::Ordering::Acquire) as f32 / 1_000.0
+}
+
 /// One slot's Phase-C output. Both apps consume it identically:
 /// `spec` for `xsnr2_db_simple`, `slot` for `wav_idx` /
 /// `inc_total_us`, `results` for the UI + QSO FSM, and the `t_*`
@@ -133,20 +165,17 @@ pub struct SpeculativeOut {
     /// candidate count is `0`; the audio was received and dropped, so
     /// the pipeline stays drained.
     pub skipped: bool,
-    /// Refined candidates the key-up bound stopped before they were
-    /// claimed, with their pass-2 spectra intact.
+    /// The three strongest pass-1 candidates as coarse sync ranked
+    /// them: `(score, dt_sec, freq_hz)` each, `n_pass1` says how many
+    /// are real.
     ///
-    /// They are not lost, only late: [`continue_leftovers`] runs them
-    /// on the same slot's audio while the decode task would otherwise
-    /// be blocked waiting for the next SpecBundle — about 13 s of
-    /// every 15. A station decoded there is too late to answer in this
-    /// period (that is what the key-up bound means) but is exactly
-    /// what the next period's choice is made from, which on a CQ-first
-    /// portable station is most of the value of decoding at all.
-    pub leftover: Vec<RefinedCandidate>,
-    /// Coarse positions stage 3 failed to decode, for
-    /// [`DecodeConfig::fine_sync_late`]. Empty unless that is set.
-    pub failed_coarse: Vec<SyncCandidate>,
+    /// A slot that decodes nothing says nothing about *why* on its
+    /// own: `p1=30` only means the candidate list hit its limit, which
+    /// it does on noise as readily as on signal. The score does say —
+    /// `sync_min` is 1.0 because that is about where the noise floor
+    /// sits, so a top candidate at 1.x is an empty band and one at 3-5
+    /// is a station the decoder failed to read.
+    pub top3: [(f32, f32, f32); 3],
     /// What [`DecodeConfig::slot_end_hint`] answered when this slot
     /// arrived, or `None` if the caller supplies no hint. Reported so
     /// a caller can log it against `slot.slotend_us` — the two date
@@ -246,24 +275,19 @@ pub struct DecodeConfig {
     /// zero — and it is what makes the key-up bound true for the whole
     /// slot rather than for stage 3 alone.
     ///
-    /// Run [`Self::fine_sync`] *after* the key-up bound rather than
-    /// before it, on what the cheap coarse-position attempt failed to
-    /// decode.
+    /// Minimum slack before key-up, in milliseconds, for
+    /// [`Self::fine_sync`] to run at all.
     ///
-    /// Fine sync costs ~292 ms of a ~1.1 s pre-key-up budget on the
-    /// CoreS3 and, measured there on 2026-09-19, is a net loss inside
-    /// it: 5.50 decodes a slot against 6.00 without it, with 9-10
-    /// candidates cut by the deadline against 4. It earns its place
-    /// when there is time — the host mirror puts `qso3_busy` at 8.04
-    /// with it against 6.44 without, and what it adds are the marginal
-    /// stations, which on a CQ-first station are next period's
-    /// contacts rather than this period's reply.
+    /// Fine sync costs ~292 ms on this board against a budget of about
+    /// 1.1 s, and it is worth that only when stage 3 still has room
+    /// afterwards. Rather than moving it past key-up — which meant
+    /// carrying work into the next slot, and the next slot is where the
+    /// audio pipeline needs the cores — it simply does not run when the
+    /// slot arrived without the time for it.
     ///
-    /// So with this set the pre-key-up path runs on coarse positions
-    /// alone, and [`continue_leftovers`] fine syncs whatever failed and
-    /// tries again on the idle tail. It is the existing coarse-fallback
-    /// arrangement inverted: cheap first, refinement for what needs it.
-    pub fine_sync_late: bool,
+    /// 0 runs it always, which is what the boards without a key-up
+    /// bound want.
+    pub fine_sync_min_slack_ms: i64,
     /// Share the stage-3 candidate budget across both halves by coarse
     /// rank, instead of letting the early half take all of it.
     ///
@@ -437,8 +461,7 @@ pub fn run_speculative_slot(
                 t_slot_recv,
                 t_done: unsafe { esp_timer_get_time() },
                 skipped: true,
-                leftover: Vec::new(),
-                failed_coarse: Vec::new(),
+                top3: [(0.0, 0.0, 0.0); 3],
                 slot_end_hint_us: slot_end_hint,
             };
         }
@@ -455,6 +478,10 @@ pub fn run_speculative_slot(
     let t_coarse_done = unsafe { esp_timer_get_time() };
 
     let n_pass1 = pass1.len();
+    let mut top3 = [(0.0f32, 0.0f32, 0.0f32); 3];
+    for (slot, c) in top3.iter_mut().zip(pass1.iter()) {
+        *slot = (c.score, c.dt_sec, c.freq_hz);
+    }
     // Taken from the coarse positions: it is documented against them,
     // and the fixture that pins it measures them.
     let bootstrap_dt_med = bootstrap_dt_median(&pass1, 5);
@@ -462,9 +489,61 @@ pub fn run_speculative_slot(
     // has. Symbols past it contribute nothing, which costs the late
     // candidates some Stage A power but not their place: they still
     // partition into `deferred` on the refined DT below.
+    // **Fine sync only with room for it.** Its ~292 ms is worth
+    // spending when stage 3 still has time afterwards, and not when the
+    // slot arrived late. The alternative tried before this was to run
+    // it after key-up — which carried work into the next slot, and the
+    // next slot is exactly where the audio pipeline needs the cores.
+    // **Slack is time until the next slot needs the cores**, not time
+    // until key-up.
+    //
+    // WSJT-X lets a decode run to completion because a PC has the CPU
+    // to spare; this board does not. Stage 3 dispatches halves to
+    // `dsp_worker` on APP_CPU, which is where `stage1_inc` lives, so a
+    // decode that runs long competes with the next slot's spectrogram.
+    //
+    // The wall is the next SpecBundle. This slot's arrived ~1 s before
+    // its slot ended and the next one comes 14 s after that end — one
+    // slot period, 15 s, between bundles — so slack is measured from
+    // the boundary the audio sink publishes, not from key-up.
+    // Measured on a radio, 2026-09-19, with slack read against the
+    // *next bundle* instead — i.e. with no real bound at all. Stage 3
+    // ran 1.0-2.0 s past slot end; through that window the UAC reader
+    // could not keep up and ~1 s of audio was dropped (`rx tick` at
+    // 2 816-7 936 sa/s against 12 032 steady, byte totals contiguous);
+    // the sink's boundary therefore slipped ~1 s behind UTC every
+    // slot, re-anchored, and cut the slot short, so `stage1_inc` sent
+    // 58-86 of 92 pairs and nothing decoded at all. The next bundle is
+    // not the wall — the next slot's *audio* is, and it starts at the
+    // boundary.
+    // **A hint more than half a slot out is not a hint.** It is the
+    // same argument the half-slot discriminator in
+    // `decode_pipeline::slot_end_hint` makes, applied to the answer
+    // rather than the input: a deliberately abnormal slot (cold
+    // acquisition stretches one to 25 s) published a boundary that put
+    // key-up 9.2 s in the past, and a deadline already expired claims
+    // no candidates at all — `hint_err=-10775ms`, `cut=15`, `dec=0` on
+    // a slot whose audio was fine (2026-09-19). A hint that far out is
+    // wrong about which slot it names, so the budget cap stands alone
+    // until it is sane again. A second or two in the past is a
+    // different thing — that is a backlogged pipeline, it is true, and
+    // it is meant to bite.
+    const HINT_SANE_US: i64 = 7_500_000;
+    let key_up_us = cfg
+        .slot_end_hint
+        .and_then(|f| f())
+        .map(|slotend| key_up_deadline(slotend, cfg.key_up_guard_ms.max(0) * 1_000))
+        .filter(|k| (*k - t_post_recv).abs() <= HINT_SANE_US);
+    let slack_ms = key_up_us
+        .map(|d| (d - t_post_recv) / 1_000)
+        .unwrap_or(i64::MAX);
+    let fine_ok = cfg.fine_sync && slack_ms >= cfg.fine_sync_min_slack_ms;
+    if cfg.fine_sync && !fine_ok {
+        log::info!("stage1: fine sync skipped — {slack_ms} ms of slack");
+    }
     // `coarse` is empty unless fine sync moved the candidates, since
     // it exists only to map a failure back to where it started.
-    let (pass1, coarse) = if cfg.fine_sync && !cfg.fine_sync_late {
+    let (pass1, coarse) = if fine_ok {
         let refined = fine_sync_split(spec.audio_prefix(), &pass1);
         (refined, pass1)
     } else {
@@ -483,6 +562,15 @@ pub fn run_speculative_slot(
     } else {
         i64::MAX
     };
+    // **And never past this station's key-up.** `budget_ms` is the
+    // runaway cap; the operating bound is the boundary the audio sink
+    // published, which is known here — before the Slot arrives, which
+    // is where a slow slot overruns and where the `slot_q` peek in
+    // `Stage3Stop` cannot see it yet. `hint_err` measures the two
+    // against each other every slot: ±27 ms on a radio, 2026-09-19.
+    if let Some(k) = key_up_us {
+        deadline_us = deadline_us.min(k);
+    }
     let key_up_guard_us = cfg.key_up_guard_ms.max(0) * 1_000;
     // Before the slot is received its end is only known by peeking
     // `slot_q`; the stop condition does that per candidate.
@@ -494,11 +582,6 @@ pub fn run_speculative_slot(
     };
     let mut n_cut = 0usize;
     let mut n_fallback = 0usize;
-    let mut leftover: Vec<RefinedCandidate> = Vec::new();
-    // Candidates stage 3 tried and could not decode. With
-    // `fine_sync_late` they are what the idle tail fine syncs and
-    // retries; otherwise nothing reads them.
-    let mut failed_coarse: Vec<SyncCandidate> = Vec::new();
     let snap_fill = spec.audio_len();
     // Partition by audio-window fit only.
     //
@@ -558,10 +641,6 @@ pub fn run_speculative_slot(
             early_stop(false),
         );
         n_cut += first.unclaimed.len();
-        leftover.extend(first.unclaimed);
-        if cfg.fine_sync_late {
-            failed_coarse.extend(first.failed.iter().cloned());
-        }
         let mut r = first.results;
         // **Retries run only on time no first attempt can use.** Before
         // the slot arrives the deferred candidates cannot start — their
@@ -639,10 +718,6 @@ pub fn run_speculative_slot(
                 late_stop,
             );
             n_cut += late.unclaimed.len();
-            leftover.extend(late.unclaimed);
-            if cfg.fine_sync_late {
-                failed_coarse.extend(late.failed.iter().cloned());
-            }
             results.extend(late.results);
             late_retry = coarse_retry_candidates(&late.failed, &refined, &coarse);
         } else if max_cand_late > 0 {
@@ -677,7 +752,6 @@ pub fn run_speculative_slot(
         );
         n_fallback += n - fb.unclaimed.len();
         n_cut += fb.unclaimed.len();
-        leftover.extend(fb.unclaimed);
         results.extend(fb.results);
     }
     // One row per message. Duplicates were possible before — two
@@ -708,82 +782,11 @@ pub fn run_speculative_slot(
         t_slot_recv,
         t_done,
         skipped: false,
-        leftover,
-        failed_coarse,
+        top3,
         slot_end_hint_us: slot_end_hint,
     }
 }
 
-/// Run what the key-up bound cut, on the idle time after it.
-///
-/// The decode task blocks on `spec_q` for ~13 s of every 15 while the
-/// next slot is captured, and the slot's audio stays valid until the
-/// next SlotEnd (stage1_inc's double buffer). So the candidates the
-/// bound stopped can finish there at no cost to anything: the stop
-/// condition is the next SpecBundle's arrival, checked per candidate,
-/// which is the same rule the early path's retries already use for the
-/// Slot.
-///
-/// Returns what decoded, deduped against `already` — the caller's own
-/// results — so a message decoded twice is reported once.
-pub fn continue_leftovers(
-    spec_q: esp_idf_svc::sys::QueueHandle_t,
-    audio: &[i16],
-    leftover: Vec<RefinedCandidate>,
-    failed_coarse: Vec<SyncCandidate>,
-    cfg: &DecodeConfig,
-    already: &[DecodeResult],
-    deadline_us: i64,
-) -> Vec<DecodeResult> {
-    let stop = || Stage3Stop {
-        deadline_us,
-        slot_q: spec_q,
-        yield_on_slot: true,
-        key_up_guard_us: 0,
-    };
-    let mut results: Vec<DecodeResult> = Vec::new();
-    // Candidates the bound stopped before they were claimed: their
-    // pass-2 spectra are already computed, so this is stage 3 alone.
-    if !leftover.is_empty() {
-        results.extend(
-            stage3_split(
-                audio,
-                leftover,
-                cfg.depth,
-                cfg.q_thresh,
-                cfg.bp_max_iter,
-                stop(),
-            )
-            .results,
-        );
-    }
-    // Then the refinement the pre-key-up path skipped, for the
-    // candidates it tried and failed — on the whole slot now, not the
-    // prefix, so the late symbols count too.
-    if cfg.fine_sync && cfg.fine_sync_late && !failed_coarse.is_empty() {
-        // **A few candidates at a time.** `fine_sync_split` itself has
-        // no stop condition, so one call over every failure is a block
-        // of work nothing can interrupt — and this runs in the window
-        // that has to be given back before the next SpecBundle lands.
-        // Four is ~40-50 ms on this board, small against the 500 ms
-        // floor the next slot is judged by.
-        const CHUNK: usize = 4;
-        for batch in failed_coarse.chunks(CHUNK) {
-            if stop().reached() {
-                break;
-            }
-            let refined = fine_sync_split(audio, batch);
-            let n = refined.len();
-            let p2 = pass2_split(audio, refined, n);
-            results.extend(
-                stage3_split(audio, p2, cfg.depth, cfg.q_thresh, cfg.bp_max_iter, stop()).results,
-            );
-        }
-    }
-    results.retain(|r| !already.iter().any(|a| a.message77() == r.message77()));
-    dedup_by_message(&mut results);
-    results
-}
 
 /// Keep the first [`DecodeResult`] per 77-bit message.
 fn dedup_by_message(results: &mut Vec<DecodeResult>) {
@@ -1042,7 +1045,7 @@ extern "C" fn worker_main(_arg: *mut core::ffi::c_void) {
                     sync_min,
                     max_cand,
                     allsum,
-                    EMBEDDED_SYNC_LAG_S,
+                    sync_lag_s(),
                 );
                 let raw = Box::into_raw(Box::new(result));
                 unsafe { queue_send_ptr(COARSE_RESULT_Q.get(), raw) };
@@ -1099,8 +1102,8 @@ pub fn coarse_sync_split(
 ) -> Vec<SyncCandidate> {
     let mid = 0.5 * (freq_min + freq_max);
     let mut head =
-        coarse_sync_with_lag(spec, freq_min, mid, sync_min, max_cand, EMBEDDED_SYNC_LAG_S);
-    let tail = coarse_sync_with_lag(spec, mid, freq_max, sync_min, max_cand, EMBEDDED_SYNC_LAG_S);
+        coarse_sync_with_lag(spec, freq_min, mid, sync_min, max_cand, sync_lag_s());
+    let tail = coarse_sync_with_lag(spec, mid, freq_max, sync_min, max_cand, sync_lag_s());
     head.extend(tail);
     head.sort_by(|a, b| {
         b.score
@@ -1144,7 +1147,7 @@ pub fn coarse_sync_split_with_allsum(
         sync_min,
         max_cand,
         allsum_head,
-        EMBEDDED_SYNC_LAG_S,
+        sync_lag_s(),
     );
 
     let worker_ptr = unsafe { queue_recv_ptr::<Vec<SyncCandidate>>(COARSE_RESULT_Q.get()) };

@@ -61,142 +61,41 @@ const MAX_CAND: usize = match option_env!("MFSK_FT8_MAX_CAND") {
     None => 15,
 };
 
-/// Wall-clock budget for stage 3, milliseconds from the SpecBundle
-/// arriving (#357). Bounds the worst-case slot so a dense period cannot
-/// overrun and steal the next slot's headroom — the failure the live
-/// radio showed (transmit-heavy period ~0.7 s past slot end, 8–11
-/// candidates deferred and dropped, 0–2 decoded against the other
-/// period's 4–8).
+/// Wall-clock cap on stage 3, **measured from `t_post_recv`** — the
+/// moment the decode task receives the SpecBundle, 14.0 s into the
+/// slot and ~0.93 s before it ends.
 ///
-/// **1836 ms, derived from key-up — the same move FT4's
-/// `TX_TURNAROUND_BUDGET_MS` made** (`embedded-poc/embedded-shared/src/
-/// apps/ft4_rx.rs`), not a flat number chosen from a sweep. This
-/// receiver does not transmit yet, but running the constraint a
-/// QSO-capable build will have means the number on screen is the one
-/// that stays true then, same rationale as FT4's own doc comment.
+/// **A runaway guard, not the operating bound.** That bound is the
+/// slot boundary the audio sink publishes, applied in
+/// `dual_core::run_speculative_slot` (`slot_end_hint`); this only
+/// catches a decode that has gone wrong rather than long, so it is
+/// deliberately far out — consecutive bundles are one slot apart,
+/// 15 s, and 13 s from receipt still leaves 2 s.
 ///
-/// Within a slot beginning at 0, `TX_START_OFFSET_S = 0.5`:
-///
-/// ```text
-///   0.50 s  the other station's transmission starts
-///  13.14 s  its frame ends (79 symbols x 0.16 s)
-///  14.14 s  ...plus the ±1.0 s `EMBEDDED_SYNC_LAG_S` reach
-///  15.00 s  slot boundary
-///  15.50 s  THIS station's transmission must start
-/// ```
-///
-/// **But this deadline isn't anchored to that 14.14 s point — it's
-/// anchored to `t_post_recv`, the SpecBundle's arrival**, which the
-/// streaming pipeline (`stage1_inc`'s `SPEC_EMIT_PAIR`) already fires
-/// well before slot end. Measured directly (`tail_win = slotend -
-/// t_post_recv`, aligned steady-state slots, `logs/hw_*_2026-09-05.log`):
-/// consistently 1336-1350 ms, no acquisition or grid-shift dependence
-/// seen. So the budget from that real anchor to key-up is
-/// `500 + 1336 = 1836` ms (the smallest observed `tail_win`, i.e. the
-/// least slack seen) — **less than the old 2000 ms, and the old number
-/// was never measuring this**: it was chosen from the qso3_busy sweep
-/// (`logs/ft8_357_bud*`, 2026-09-04) where stage 3 measures ~985 ms and
-/// the recall-vs-budget curve is flat at `dec=7` down to 800 ms (the
-/// deadline sheds only the doomed tail — candidates run in descending
-/// coarse score and the all-LLR-variant BP failures are last). 1836 ms
-/// is still ~1.9x that measured work and clears the 800 ms floor with
-/// margin, so this derivation doesn't cost anything the sweep would
-/// show — it just replaces an arbitrary safety factor with the actual
-/// constraint. `0` disables it; `MFSK_FT8_BUDGET_MS=` overrides.
-/// Pending confirmation on a live radio (#357).
-///
-/// **What this does not do**: FT8's own audio capture still waits for
-/// the full 15.0 s slot (`Ft8ChunkSink`'s `SLOT_SAMPLES_12K`), unlike
-/// FT4's `CAPTURE_CLOSE_SAMPLES` early-close. The 0.86 s tail beyond
-/// `EMBEDDED_SYNC_LAG_S`'s reach (14.14 s) is real slack, but
-/// `Ft8ChunkSink`'s slot boundary is load-bearing for grid-lock (#356)
-/// and cold acquisition (#358); shortening it needs the same care FT4's
-/// `want_skip` carry-forward took, not a quick constant change. Left
-/// alone here on purpose.
-/// Per-candidate fine sync (WSJT-X `ft8b.f90` Stages A/B/C) plus a
-/// coarse-position retry — `dual_core::DecodeConfig::fine_sync`, whose
-/// doc carries the measurement. On unless `MFSK_FT8_FINE_SYNC=0`, which
-/// is there to A/B the cost on this board against the same audio.
-const FT8_FINE_SYNC: bool = match option_env!("MFSK_FT8_FINE_SYNC") {
-    Some(s) => parse_u32(s) != 0,
-    None => true,
-};
-
-/// `dual_core::DecodeConfig::key_up_guard_ms`: stop claiming stage-3
-/// candidates this long before key-up (slot end + 0.5 s), so a candidate
-/// already in BP when the bound hits still finishes before it. 320 ms
-/// clears the largest run-on past a stopping deadline measured on this
-/// board, 313 ms over three captures and 60 slots (2026-09-18,
-/// `logs/sim_finesync_{fullslotvote,offset3000,noclock_offset3000}_*`).
-/// `MFSK_FT8_KEY_UP_GUARD_MS=0` turns it off, leaving `FT8_BUDGET_MS`.
-const FT8_KEY_UP_GUARD_MS: i64 = match option_env!("MFSK_FT8_KEY_UP_GUARD_MS") {
+/// It was briefly the *only* bound, and a radio said what that costs
+/// within three slots (2026-09-19): stage 3 ran 1.0-2.0 s past slot
+/// end, the UAC reader lost ~1 s of audio in that window, the sink's
+/// boundary slipped ~1 s behind UTC, and every slot decoded 0. The
+/// 1836 ms it replaced shared this origin and took its value from the
+/// other end — bundle receipt to key-up measured 1.836 s — which is
+/// the same bound this one now defers to, computed per slot instead of
+/// once.
+const FT8_BUDGET_MS: i64 = match option_env!("MFSK_FT8_BUDGET_MS") {
     Some(s) => parse_u32(s) as i64,
-    None => 320,
+    None => 13_000,
 };
 
-/// `dual_core::DecodeConfig::slot_floor_ms`: the least time a slot may
-/// have before key-up and still be worth starting.
-///
-/// 500 ms. `coarse` and fine sync run outside every deadline this
-/// pipeline has, and on this board they measure 100-120 ms and 250-275
-/// ms — ~370 ms together, to which one stage-3 candidate adds ~50-300
-/// ms. A steady slot's bundle arrives 1.45 s before its boundary, i.e.
-/// 1.63 s before the [`FT8_KEY_UP_GUARD_MS`]-adjusted key-up, so the
-/// floor is nowhere near it; the slot after a cold acquisition arrived
-/// with 354 ms and overran key-up by 763-1344 ms on every run of
-/// 2026-09-18. Anything between ~0.4 s and ~1.3 s separates the two
-/// cases; 500 ms is the low end of that, so the floor never costs a
-/// slot that could have decoded. `MFSK_FT8_SLOT_FLOOR_MS=0` turns it
-/// off.
-/// `dual_core::DecodeConfig::fine_sync_late` — on unless
-/// `MFSK_FT8_FINE_SYNC_LATE=0`. Its 292 ms does not fit the ~1.1 s
-/// before key-up (5.50 decodes a slot with it there against 6.00
-/// without, 2026-09-19); on the idle tail after key-up it has thirteen
-/// seconds and what it adds — the marginal stations — is next period's
-/// contact list rather than this period's reply.
-const FT8_FINE_SYNC_LATE: bool = match option_env!("MFSK_FT8_FINE_SYNC_LATE") {
-    Some(s) => parse_u32(s) != 0,
-    None => true,
-};
-
-/// `dual_core::DecodeConfig::share_cand_budget` — off unless
-/// `MFSK_FT8_SHARE_CAND=1`, pending the board measurement its doc asks
-/// for (the mirror's gain is on `qso1`/`qso2`, and it is spent after
-/// SlotEnd where this board has ~180 ms).
-const FT8_SHARE_CAND: bool = match option_env!("MFSK_FT8_SHARE_CAND") {
-    Some(s) => parse_u32(s) != 0,
-    None => false,
-};
-
-const FT8_SLOT_FLOOR_MS: i64 = match option_env!("MFSK_FT8_SLOT_FLOOR_MS") {
-    Some(s) => parse_u32(s) as i64,
-    None => 500,
-};
 
 /// `dual_core::DecodeConfig::slot_end_hint` — when the slot now being
 /// decoded ends, on `esp_timer_get_time()`'s clock.
 ///
-/// Read from the capture-slot boundary the **audio sink** publishes
-/// (`time_sync::publish_capture_slot`, called from `Ft8ChunkSink` as it
-/// emits `SlotEnd`). That is the one clock here that cannot fall
-/// behind: it advances with arriving audio, whatever the decode task
-/// and stage1_inc are doing. Anything derived from the SpecBundle
-/// instead slides late exactly when the decode task is busy — measured,
-/// and the reason this function exists (see `SpecBundle::emit_us`).
-///
-/// While the sink is still capturing the slot being decoded its
-/// boundary is ahead; once the sink has moved on, that slot ended
-/// `into` ago. `time_sync::decoded_slot_end_us` picks between the two
-/// at half a slot — deliberately far from both readings, because an
-/// earlier version split at the emit point itself and a few ms of
-/// jitter there flipped the answer by a whole slot (it threw away
-/// every other slot on hardware; see that function).
-///
-/// The length comes from the sink too, so the one slot a cold
-/// acquisition lengthens is measured as the longer slot it is instead
-/// of losing its extra seconds of tail. Before the sink has published
-/// a length — and on a board whose sink publishes none — the nominal
-/// slot stands in.
+/// Read from the capture-slot boundary the **audio sink** publishes,
+/// which is the one clock here that cannot fall behind: it advances
+/// with arriving audio whatever the decode task is doing. The split
+/// between "this slot" and "the one before it" sits at half a slot,
+/// deliberately far from both readings — an earlier version split at
+/// the emit point, which is where the decoder reads it, so a few ms of
+/// jitter flipped the answer by a whole slot.
 fn slot_end_hint() -> Option<i64> {
     /// One FT8 slot in µs.
     const SLOT_US: i64 = 15_000_000;
@@ -209,9 +108,70 @@ fn slot_end_hint() -> Option<i64> {
     ))
 }
 
-const FT8_BUDGET_MS: i64 = match option_env!("MFSK_FT8_BUDGET_MS") {
+/// Per-candidate fine sync (WSJT-X `ft8b.f90` Stages A/B/C) plus a
+/// coarse-position retry — `dual_core::DecodeConfig::fine_sync`, whose
+/// doc carries the measurement. On unless `MFSK_FT8_FINE_SYNC=0`.
+const FT8_FINE_SYNC: bool = match option_env!("MFSK_FT8_FINE_SYNC") {
+    Some(s) => parse_u32(s) != 0,
+    None => true,
+};
+
+/// `dual_core::DecodeConfig::fine_sync_min_slack_ms` — how much of the
+/// period must still be ahead for fine sync to earn its ~292 ms.
+///
+/// 2 s, against a steady-state slack of ~1.43 s — so in an aligned
+/// slot fine sync does **not** run, and that is the measurement's
+/// answer, not an accident. With the audio path no longer lending the
+/// decoder starved time, the honest per-slot budget is ~1.1 s, and
+/// fine sync inside it cost decodes rather than winning them (10 →
+/// 5.5, 2026-09-19). What is left is a capability that switches on
+/// when a slot genuinely has room — a short partial slot after a
+/// re-anchor has less, a slot whose boundary sits further out has
+/// more.
+///
+/// WSJT-X runs its decode to completion because a PC can afford to;
+/// this board cannot, and this is where that difference is spent.
+const FT8_FINE_SYNC_MIN_SLACK_MS: i64 = match option_env!("MFSK_FT8_FINE_SYNC_MIN_SLACK_MS") {
     Some(s) => parse_u32(s) as i64,
-    None => 1_836,
+    None => 2_000,
+};
+
+/// `dual_core::DecodeConfig::key_up_guard_ms` — **0: claim right up to
+/// the deadline.**
+///
+/// This was 320 ms of clearance on top of the 500 ms key-up offset, so
+/// the decoder would be out of the way before this station transmits.
+/// That reason was wrong: WSJT-X never stops a decode for a
+/// transmission (`MainWindow::decode()` only declines to *start* one
+/// while the previous is busy), and a transmission needs a lead rather
+/// than a clearance — `txDelay` is 0.2 s between PTT and audio, 20 ms
+/// for FT4 (`mainwindow.cpp:8252`, `Configuration.cpp:1602`), and a
+/// solid-state radio switches in milliseconds.
+///
+/// The deadline itself stayed, because the thing it protects is not TX
+/// at all: it is the next slot's **audio**. `FT8_KEY_UP_AFTER_SLOT_END_US`
+/// gives stage 3's late path the ~0.5 s past the boundary it needs to
+/// use the full slot, and no more — past that the reader starts losing
+/// samples and the grid slips (`FT8_BUDGET_MS`'s note has the
+/// measurement). The constant is named after key-up; what it buys here
+/// is the audio pipeline.
+const FT8_KEY_UP_GUARD_MS: i64 = 0;
+
+/// `dual_core::DecodeConfig::slot_floor_ms` — **0, i.e. off.**
+///
+/// It dropped a slot outright when the bundle arrived too late to
+/// finish before key-up. Unnecessary now that the deadline is computed
+/// from the published boundary every slot: a bundle that arrives past
+/// it simply claims nothing and returns, which frees the cores in the
+/// same breath without a skip that has to be right about the future.
+const FT8_SLOT_FLOOR_MS: i64 = 0;
+
+/// `dual_core::DecodeConfig::share_cand_budget` — off pending a board
+/// measurement; the host mirror's gain is on `qso1`/`qso2`, which the
+/// SIM harness cannot play.
+const FT8_SHARE_CAND: bool = match option_env!("MFSK_FT8_SHARE_CAND") {
+    Some(s) => parse_u32(s) != 0,
+    None => false,
 };
 
 /// `const`-context unsigned parse — `str::parse` is not `const`. Digits
@@ -278,7 +238,27 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
     // Lock state and the under-par run that sends the receiver back
     // for a new grid (#356). The policy — and its host tests — live in
     // `mfsk_app_shared::grid_state`.
-    let mut grid = mfsk_app_shared::grid_state::GridState::new();
+    // **An unplaced grid captures from the first slot, not the fourth.**
+    //
+    // With `TIME: AIR DT` and no persisted fix, the only thing that can
+    // place the phase is a 25 s capture — so the under-par run starts
+    // pre-charged and the ring starts filling now, rather than after
+    // three slots have demonstrated what the configuration already
+    // said. Reported from the bench: "起動したのに3スロット経ってから
+    // 25s キャプチャが始まる。何を待っているのかわからない".
+    // `AIR DT` is always a cold start. A phase carried in from a stored
+    // fix or from the RTC is a phase nobody has checked, and a receiver
+    // that starts from one spends minutes finding out it was wrong —
+    // which is what the 2026-09-19 session watched happen twice. The
+    // capture costs 25 s and answers the question.
+    let unplaced = crate::grid_source() == mfsk_app_shared::grid_src::GridSource::AirDt;
+    let mut grid = if unplaced {
+        log::warn!("air-sync: AIR DT — cold start, capturing from this slot");
+        crate::uac::arm_acquisition();
+        mfsk_app_shared::grid_state::GridState::new_unplaced()
+    } else {
+        mfsk_app_shared::grid_state::GridState::new()
+    };
     /// Coarse-candidate cap for *each* of `acquire_slot_phase`'s three
     /// tiled windows. Deliberately **not** `MAX_CAND` (15, the decode
     /// candidate cap) — `MFSK_CORES3_SIM` caught reusing it here: with
@@ -355,6 +335,34 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
     // is worth about one station, and a landing bad enough to matter
     // decodes under `LOCK_MIN_DECODES` and re-acquires by itself.
     loop {
+        // **Search wide until the grid is proven.**
+        //
+        // The shipping ±1.0 s is all a placed grid needs and all the
+        // emitted SpecBundle can score. A grid that is *not* placed can
+        // be further out — 1.65 s on a radio, 2026-09-19 — and then
+        // every slot decodes nothing, so nothing can correct it either
+        // and the only way back is a 25 s acquisition. Widening while
+        // unlocked lets the ordinary slot find the band and the DT trim
+        // pull the grid to centre, with acquisition left for errors
+        // past what a spectrogram can hold.
+        // **Reverted to ±1.0 s, and the reason is the emit point.**
+        //
+        // Widening to 1.75 s looked free because the *slot* has 184
+        // rows. The SpecBundle does not: it carries rows 0..173, so a
+        // candidate past `(174 - 162) * 0.08` = 0.96 s is scored
+        // against rows that are **zero**, and a correlation against
+        // zeros does not come out small — it comes out whatever the
+        // normalisation makes of it. Measured on a radio directly after
+        // the change: top candidates at −1.64, +1.72, +1.08 s with
+        // scores of 20-30, `ready` down to 14 with 16 deferred, and
+        // nothing decoded. The junk fills the pass-1 limit and the real
+        // stations never reach stage 3.
+        //
+        // An error past ±1.0 s is acquisition's job — it searches the
+        // whole period on a full slot, which is the only place a wide
+        // search is sound.
+        dual_core::set_sync_lag_s(1.0);
+
         let cfg = dual_core::DecodeConfig {
             freq_min: 100.0,
             freq_max: 3_000.0,
@@ -367,7 +375,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             budget_ms: FT8_BUDGET_MS,
             fine_sync: FT8_FINE_SYNC,
             key_up_guard_ms: FT8_KEY_UP_GUARD_MS,
-            fine_sync_late: FT8_FINE_SYNC_LATE,
+            fine_sync_min_slack_ms: FT8_FINE_SYNC_MIN_SLACK_MS,
             share_cand_budget: FT8_SHARE_CAND,
             slot_floor_ms: FT8_SLOT_FLOOR_MS,
             slot_end_hint: Some(slot_end_hint),
@@ -393,8 +401,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             t_slot_recv,
             t_done,
             skipped,
-            leftover,
-            failed_coarse,
+            top3,
             slot_end_hint_us,
         } = out;
         let wav_idx = slot.wav_idx;
@@ -427,6 +434,9 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                 margin_at(slot.slotend_us),
                 t_post_recv - spec.emit_us
             );
+            if let Ok(mut ui) = UI.lock() {
+                ui.latest_slot_seq = slot_seq;
+            }
             slot_seq = slot_seq.wrapping_add(1);
             continue;
         }
@@ -497,26 +507,52 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             mfsk_app_shared::time_sync::grid_lock().label(),
             results.len(),
         );
+        // **In ms, and still two lines.** Even split, the µs form
+        // clipped at `slot_wait` on a radio — six seven-digit numbers
+        // do not fit in 160 characters with their labels. Nothing here
+        // is decided at µs resolution: the smallest quantity that
+        // matters is `hint_err`, already in ms.
         log::info!(
-            "SLOT[{wav_idx}] t: budget={FT8_BUDGET_MS}ms \
-             tail_win={}us q_wait={}us hint_err={hint_err} coarse={}us fine={}us early={}us \
-             tail_use={}us post_slotend={}us slot_wait={}us late={}us",
-            tail_window,
+            "SLOT[{wav_idx}] t: cap={FT8_BUDGET_MS}ms \
+             tail_win={}ms q_wait={}us hint_err={hint_err} coarse={}ms fine={}ms early={}ms",
+            tail_window / 1_000,
             // How long this bundle sat in `spec_q` — a busy decode
             // task. Small while `tail_win` is also small means the
             // other case: stage1_inc emitted late, starved.
             t_post_recv - spec.emit_us,
-            coarse_us,
+            coarse_us / 1_000,
             // Inside `early` below, which keeps its historical meaning
             // (from coarse done) so logs from before fine sync compare.
-            t_fine_done - t_coarse_done,
-            t_early_done - t_coarse_done,
-            tail_use,
-            post_slotend,
-            t_slot_recv - t_early_done,
-            t_done - t_slot_recv,
+            (t_fine_done - t_coarse_done) / 1_000,
+            (t_early_done - t_coarse_done) / 1_000,
         );
-        slot_seq = slot_seq.wrapping_add(1);
+        log::info!(
+            "SLOT[{wav_idx}] t2: tail_use={}ms post_slotend={}ms slot_wait={}ms late={}ms \
+             audio={}sa",
+            tail_use / 1_000,
+            post_slotend / 1_000,
+            (t_slot_recv - t_early_done) / 1_000,
+            (t_done - t_slot_recv) / 1_000,
+            // The slot the decoder was actually handed. A re-anchor
+            // shortens it, and a short slot is why a healthy-looking
+            // `p1` decodes nothing.
+            slot.audio().len(),
+        );
+        // **What the coarse search saw, when nothing decoded.**
+        //
+        // `p1=30` is the candidate limit, not evidence of signal: the
+        // list fills from noise just as readily. `sync_min` is 1.0
+        // because that is about where the noise floor sits, so the top
+        // score separates "an empty band or an audio problem" from "a
+        // station this decoder could not read".
+        if results.is_empty() && !skipped {
+            let n = n_pass1.min(3);
+            let mut line: heapless::String<96> = heapless::String::new();
+            for (s, dt, f) in top3.iter().take(n) {
+                let _ = write!(&mut line, " [{s:.2} @ {dt:+.2}s {f:.0}Hz]");
+            }
+            log::info!("SLOT[{wav_idx}] nothing decoded — top {n} coarse:{line}");
+        }
 
         for r in results.iter() {
             mfsk_app_shared::time_sync::record_decode_dt(r.dt_sec);
@@ -630,7 +666,11 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             // The partial slot's decodes are still shown; it just
             // neither locks nor counts as under par.
             let action = if full_slot {
-                grid.observe(n_dec)
+                // The slot's own DT median is the phase error, and the
+                // lock decision needs it: a count alone cannot tell a
+                // centred grid from one 0.7 s out that still catches
+                // the loud half of the band.
+                grid.observe_with_phase(n_dec, slot_median)
             } else {
                 log::info!(
                     "  air-sync: partial slot ({} samples, {n_dec} decoded) — not counted \
@@ -679,6 +719,78 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             // `Ft8ChunkSink` — the only writer left is cold acquisition,
             // through its own uncapped one-shot channel.
             mfsk_app_shared::time_sync::set_bootstrap_slot_shift_12k(0);
+
+            // **Trim the grid from the air, once, when the pool agrees.**
+            //
+            // This is what `TIME: AIR DT` is for and what it was not
+            // doing: with no NTP the phase comes from the RTC, whose
+            // battery life on this board is unknown and whose read is
+            // whole seconds, and nothing corrected the remainder. The
+            // DT median was measured, logged, and thrown away.
+            //
+            // Not the per-slot servo that was removed on 2026-09-05 —
+            // that fed every slot's median, including slots with one or
+            // two decodes, and oscillated the grid to ±0.6 s with `dec`
+            // falling 8 → 4. This waits for `DT_TRIM_MIN_OBS`
+            // observations pooled across slots, moves once, and clears
+            // the pool so the next move needs fresh evidence. A station's
+            // own clock error averages out over that many; a grid error
+            // does not.
+            //
+            // Saturated at `DT_TRIM_MAX_S`: more than that is not a trim
+            // and belongs to cold acquisition, which searches the whole
+            // period.
+            const DT_TRIM_MIN_OBS: usize = 8;
+            const DT_TRIM_MIN_S: f32 = 0.15;
+            const DT_TRIM_MAX_S: f32 = 1.0;
+            // **One slot with three stations in it is already a sample.**
+            //
+            // Requiring eight pooled observations had the condition
+            // upside down: the further out the grid is, the fewer slots
+            // decode at all, so the error that most needs correcting is
+            // the one that cannot raise the evidence for it. Measured on
+            // a radio (2026-09-19): one slot decoded 7 stations at a
+            // median of −0.988 s and every slot after it decoded 0 — the
+            // pool stopped one short of eight, no trim fired, and the
+            // receiver spent 100 s reaching a cold acquisition instead
+            // of moving 0.99 s on the next slot.
+            //
+            // A slot's own median over `LOCK_MIN_DECODES` stations is
+            // three different transmitters agreeing, which is what the
+            // pooled bar was reaching for. The pooled path stays for
+            // bands that decode one or two at a time.
+            let slot_sample = match (slot_median, n_dec) {
+                (Some(m), n) if n >= mfsk_app_shared::grid_state::LOCK_MIN_DECODES => Some(m),
+                _ => None,
+            };
+            let pooled_sample = if mfsk_app_shared::time_sync::dt_pool_len() >= DT_TRIM_MIN_OBS {
+                mfsk_app_shared::time_sync::pooled_dt_median()
+            } else {
+                None
+            };
+            if !mfsk_app_shared::time_sync::clock_is_disciplined() && !grid.is_acquiring() {
+                if let Some(m) = slot_sample.or(pooled_sample) {
+                    if m.abs() >= DT_TRIM_MIN_S {
+                        let applied = m.clamp(-DT_TRIM_MAX_S, DT_TRIM_MAX_S);
+                        // Same channel and the same sign as cold
+                        // acquisition's one-shot: DT > 0 means the slot
+                        // opened early, so lengthen the next one.
+                        mfsk_app_shared::time_sync::set_acquisition_shift_12k(
+                            (applied * 12_000.0).round() as i32,
+                        );
+                        log::warn!(
+                            "  air-sync: trimming the grid {applied:+.3} s from {} (median {m:+.3} s) — one shot",
+                            if slot_sample.is_some() {
+                                "this slot's decodes"
+                            } else {
+                                "the pooled decodes"
+                            },
+                        );
+                        mfsk_app_shared::time_sync::reset_dt_pool();
+                        mfsk_app_shared::time_sync::reset_slot_phase();
+                    }
+                }
+            }
 
             if grid.is_acquiring() {
                 // **Say so on the panel.** Nothing decodes for the 25 s
@@ -992,6 +1104,11 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
 
         let mut had_response_this_slot = false;
         if let Ok(mut ui) = UI.lock() {
+            // **Every slot moves the watermark, decoded or not.** It is
+            // what turns the previous slot's stations from green back to
+            // white; the list cannot derive it from its own rows,
+            // because a slot with no decode adds none.
+            ui.latest_slot_seq = slot_seq;
             for r in results.iter() {
                 if let Some(text) = unpack77(r.message77()) {
                     let mut msg: heapless::String<22> = heapless::String::new();
@@ -1039,141 +1156,17 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         let intent = qso.next_tx();
         push_tx_line(&qso, intent.as_ref());
 
-        // **What key-up cut, finished on the idle time after it.**
-        //
-        // The reply for *this* period has just been decided, which is
-        // what the key-up bound protects. Everything the bound stopped
-        // is still worth having — on a CQ-first portable station it is
-        // the queue the next period's call is chosen from — and the
-        // decode task is about to block on `spec_q` for ~13 s with the
-        // slot's audio still valid. So it runs there, yielding the
-        // moment the next SpecBundle lands.
-        //
-        // These rows reach the panel and the DT statistics. They are
-        // deliberately **not** fed to `QsoManager`: its intent for this
-        // period is already out, and whether a caller decoded after
-        // key-up should enter the state machine a period late is a
-        // policy question, not a side effect of where the decode
-        // finished.
-        let mut late_response = false;
-        // **The carry-over runs on slack, and only on slack.**
-        //
-        // It is stage-3 work, so it goes through `dsp_worker` on
-        // APP_CPU — the core `stage1_inc` lives on. Priority 6 lets
-        // stage1_inc preempt it, but the two share the PSRAM bandwidth
-        // and the FFT, and a spectrogram that has to fight for those
-        // finishes late. "Until the next SpecBundle arrives" therefore
-        // meant eleven seconds of every fifteen with that contention
-        // standing.
-        //
-        // Measured on a radio, 2026-09-19: `tail_win` 1.3-2.1 s against
-        // a geometric 0.93, `hint_err` −0.6..−1.2 s — stage1_inc a
-        // second behind the audio sink — and the next bundle then
-        // arriving inside the 500 ms floor, which dropped the slot.
-        // Every other slot on a band running 8-13 stations.
-        //
-        // Three gates, all of them "is there slack":
-        //
-        // * this slot did not already run past key-up,
-        // * stage1_inc is keeping up (`hint_err` inside
-        //   `CARRY_OVER_MAX_LAG_US` — it is the measurement that says
-        //   whether the last slot's work hurt), and
-        // * a hard cap on the slice, so even a healthy pipeline gets
-        //   the core back long before the next bundle is due.
-        const CARRY_OVER_MAX_MS: i64 = 2_000;
-        const CARRY_OVER_MAX_LAG_US: i64 = 300_000;
-        let pipeline_lag = slot_end_hint_us.map_or(0, |h| (slotend - h).abs());
-        let now_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
-        let carry_deadline = (now_us + CARRY_OVER_MAX_MS * 1_000)
-            .min(slotend + 15_000_000 - 1_500_000);
-        let carry_ok = post_slotend <= dual_core::FT8_KEY_UP_AFTER_SLOT_END_US
-            && pipeline_lag <= CARRY_OVER_MAX_LAG_US
-            && now_us < carry_deadline;
-        if !carry_ok && (!leftover.is_empty() || !failed_coarse.is_empty()) {
-            log::info!(
-                "SLOT[{wav_idx}] carry-over skipped — {} candidates held back                  (post_slotend={post_slotend}us, pipeline lag={}us)",
-                leftover.len() + failed_coarse.len(),
-                pipeline_lag,
-            );
-        }
-        if carry_ok && (!leftover.is_empty() || !failed_coarse.is_empty()) {
-            let n_left = leftover.len() + failed_coarse.len();
-            let late = dual_core::continue_leftovers(
-                spec_q,
-                slot.audio(),
-                leftover,
-                failed_coarse,
-                &cfg,
-                &results,
-                carry_deadline,
-            );
-            if !late.is_empty() {
-                log::info!(
-                    "SLOT[{wav_idx}] src={source} past key-up: {}/{n_left} carried candidates decoded on the idle tail",
-                    late.len(),
-                );
-                if let Ok(mut ui) = UI.lock() {
-                    for r in late.iter() {
-                        if let Some(text) = unpack77(r.message77()) {
-                            let mut msg: heapless::String<22> = heapless::String::new();
-                            let take = text.len().min(msg.capacity());
-                            let _ = msg.push_str(&text[..take]);
-                            const FP_SPEC_SHIFT: u32 = 12;
-                            let cell_scale = (1u32 << FP_SPEC_SHIFT) as f32;
-                            let calibrated_snr = mfsk_core::ft8::decode_block::xsnr2_db_simple(
-                                &spec.spec,
-                                r,
-                                cell_scale,
-                            );
-                            let snr_i8 = calibrated_snr.round().clamp(-128.0, 127.0) as i8;
-                            ui.push_decode(DecodedRow {
-                                df_hz: r.freq_hz.round().clamp(0.0, 65_535.0) as u16,
-                                snr_db: snr_i8,
-                                hard_errors: r.hard_errors.min(255) as u8,
-                                msg,
-                                slot_seq,
-                                first_seq: slot_seq,
-                            });
-                            log::info!(
-                                "{:4.0}Hz {:+5.1}dB (raw={:+5.1}) {} [late]",
-                                r.freq_hz,
-                                calibrated_snr,
-                                r.snr_db,
-                                text
-                            );
-                            qso.set_rx_snr(snr_i8);
-                            let parity_lock_ok =
-                                mfsk_app_shared::parity::framing_settled_for_parity_lock();
-                            if qso
-                                .process_message(&text, wav_idx as u32, parity_lock_ok)
-                                .is_some()
-                            {
-                                had_response_this_slot = true;
-                                late_response = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // **The retry count waits for the whole slot.** A partner whose
-        // reply decodes 200 ms after key-up answered — counting that
-        // period as unanswered spends a retry, and at the limit
-        // `on_period_end` resets the QSO outright, throwing away a
-        // contact whose reply is on the screen. This period's
-        // transmission is already chosen either way (above), so the
-        // only thing that moves is the bookkeeping: at the retry limit
-        // the reset now lands one period later, which costs one repeat
-        // and saves the QSOs the old order abandoned.
         if !had_response_this_slot && qso.state != QsoState::Idle {
             let _ = qso.on_period_end();
         }
-        if late_response {
-            // `next_tx` is a pure read; this only refreshes what the
-            // panel shows for the *next* period.
-            push_tx_line(&qso, qso.next_tx().as_ref());
-        }
+
+        // **Last, so this slot's decodes carry this slot's number.**
+        // It used to land mid-body, above the row push, which tagged
+        // every row with the *next* slot's sequence — so a station
+        // decoded in slot N was marked current through slot N+1. With
+        // the watermark now doing real work, that off-by-one is the
+        // difference between one green slot and two.
+        slot_seq = slot_seq.wrapping_add(1);
     }
 }
 

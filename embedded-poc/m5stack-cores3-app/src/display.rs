@@ -604,6 +604,7 @@ pub fn run_log_panel(
 
         let status_snapshot;
         let decoded_fp;
+        let latest_slot_seq: u32;
         let wf_seq;
         let tx_seq;
         let tx_line_snapshot: heapless::String<48>;
@@ -661,12 +662,16 @@ pub fn run_log_panel(
                 }
             }
             acq_line_snapshot = abuf;
-            let max_seq = decoded_snapshot
-                .iter()
-                .map(|r| r.slot_seq)
-                .max()
-                .unwrap_or(0);
-            decoded_fp = (decoded_snapshot.len(), max_seq);
+            // **The watermark is the pipeline's, not the rows'.**
+            // Deriving it from the visible rows makes the newest row
+            // green forever: a slot that decodes nothing adds no row,
+            // so `max` does not move and the previous slot's stations
+            // stay marked as heard this cycle. It is in the
+            // fingerprint for the same reason — the rows are
+            // unchanged on such a slot, and a redraw that never fires
+            // cannot repaint them white.
+            latest_slot_seq = ui.latest_slot_seq;
+            decoded_fp = (decoded_snapshot.len(), latest_slot_seq);
         }
 
         // Freeze what is underneath while the overlay is up. The
@@ -718,7 +723,7 @@ pub fn run_log_panel(
                 &mut display,
                 &decoded_snapshot,
                 None,
-                None,
+                Some(latest_slot_seq),
                 SHARED_UI_WIDTH,
                 decoded_list::ORIGIN_Y,
                 if USB_PANEL {
