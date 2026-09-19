@@ -69,6 +69,16 @@ pub struct UiState {
     decoded: heapless::Vec<DecodedRow, 16>,
     waterfall: heapless::Deque<WfLine, WF_DEPTH>,
     pub status: StatusInfo,
+    /// What the cold grid acquisition is doing, or empty.
+    ///
+    /// It shares the TX strip and takes precedence while set. The
+    /// acquisition takes a 25 s capture and a dozen seconds of
+    /// arithmetic, during which nothing decodes — and the only thing
+    /// on screen that could say why was the one-character grid anchor
+    /// in the link bar, which says what the grid *is* (`r`, `-`), not
+    /// that something is under way to change it. An operator cannot
+    /// tell a receiver that is working on it from one that has stopped.
+    acq_line: String<32>,
     /// QSO FSM intent line — formatted by `qso::format_tx_line`.
     /// Empty until the first auto-CQ fires.
     tx_line: String<48>,
@@ -148,6 +158,7 @@ impl UiState {
                 utc_sod: None,
                 free_heap_kb: 0,
             },
+            acq_line: String::new(),
             tx_line: String::new(),
             tx_seq: AtomicU32::new(0),
             dirty_seq: AtomicU32::new(0),
@@ -320,6 +331,27 @@ impl UiState {
 
     pub fn tx_line(&self) -> &str {
         self.tx_line.as_str()
+    }
+
+    /// Set (or, with an empty string, clear) the acquisition line.
+    /// Bumps the same sequence the TX strip redraws on, since that is
+    /// where it is shown.
+    pub fn set_acq_line(&mut self, s: &str) {
+        if self.acq_line.as_str() == s {
+            return;
+        }
+        self.acq_line.clear();
+        for ch in s.chars() {
+            if self.acq_line.push(ch).is_err() {
+                break;
+            }
+        }
+        self.tx_seq.fetch_add(1, Ordering::AcqRel);
+        self.bump();
+    }
+
+    pub fn acq_line(&self) -> &str {
+        self.acq_line.as_str()
     }
 
     pub fn tx_seq(&self) -> u32 {

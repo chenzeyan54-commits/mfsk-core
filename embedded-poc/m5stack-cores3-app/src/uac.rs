@@ -129,6 +129,7 @@ fn spawn_psram_thread<F>(
     name: &'static core::ffi::CStr,
     stack_size: usize,
     priority: Option<u8>,
+    pin_to_core: Option<esp_idf_svc::hal::cpu::Core>,
     f: F,
 ) -> std::io::Result<std::thread::JoinHandle<()>>
 where
@@ -145,6 +146,7 @@ where
         stack_size,
         stack_alloc_caps: MallocCap::Spiram | MallocCap::Cap8bit,
         priority: priority.unwrap_or(default_cfg_for_prio.priority),
+        pin_to_core: pin_to_core.or(default_cfg_for_prio.pin_to_core),
         ..default_cfg_for_prio
     };
     if let Err(e) = psram_cfg.set() {
@@ -543,6 +545,15 @@ pub fn disarm_acquisition() {
 /// Take the captured audio once the ring holds at least `min_samples`,
 /// leaving the ring empty; `None` while it is still filling. Also
 /// disarms — one acquisition per arm.
+/// How much of the acquisition capture is in hand, while one is armed:
+/// `(have, want)` in 12 kHz samples. `None` when nothing is armed.
+pub fn acquisition_fill(want: usize) -> Option<(usize, usize)> {
+    if !ACQUIRE_ARMED.load(Ordering::Acquire) {
+        return None;
+    }
+    ACQUIRE_RING.lock().ok().map(|r| (r.len().min(want), want))
+}
+
 pub fn take_acquisition_audio(min_samples: usize) -> Option<Vec<i16>> {
     let mut r = ACQUIRE_RING.lock().ok()?;
     if r.len() < min_samples {
@@ -974,16 +985,24 @@ impl AudioSink for Ft8ChunkSink {
                         }
                     }
 
-                    // The slot just started now has its final length —
-                    // nominal, or shifted by one of the two branches
-                    // above. Publish it beside the boundary so the
-                    // decode task can tell how much of its slot is
-                    // left (`decode_pipeline::slot_end_hint`); a slot
-                    // lengthened by acquisition carries seconds of
-                    // extra decode time that the nominal length would
-                    // hide.
+                    // **How much of this slot is still to come**, from
+                    // the boundary published just above — not the
+                    // slot's nominal length.
+                    //
+                    // The two branches above can both move the grid:
+                    // the UTC coarse anchor and the drift re-anchor set
+                    // `slot_samples` (this slot starts part-way in), and
+                    // acquisition / air-sync set `slot_target` (it runs
+                    // long or short). Publishing `slot_target` alone was
+                    // right only when neither had fired, and wrong by
+                    // exactly the jump when one had — which is the
+                    // moment the decode task most needs the number,
+                    // since the floor is about to judge the next bundle
+                    // by it. Seen on a radio as `hint_err` near −1 s
+                    // right after each re-anchor (2026-09-19).
+                    let remaining = self.slot_target.saturating_sub(self.slot_samples);
                     mfsk_app_shared::time_sync::publish_capture_slot_len_us(
-                        self.slot_target as i64 * (SLOT_SECS as i64 * 1_000_000)
+                        remaining as i64 * (SLOT_SECS as i64 * 1_000_000)
                             / SLOT_SAMPLES_12K as i64,
                     );
                 }
@@ -1216,6 +1235,23 @@ fn handle_rx_connected(addr: u8, iface_num: u8) -> Result<()> {
         c"uac_reader",
         READER_TASK_STACK,
         Some(AUDIO_TASK_PRIORITY),
+        // **PRO_CPU, with the rest of the capture path.**
+        //
+        // Left unpinned it shares whichever core has room, and at
+        // priority 6 that means it can land on APP_CPU beside
+        // `stage1_inc` — also 6, and the task whose lateness the whole
+        // slot grid rides on. Equal priority there is round-robin, so
+        // the reader's resampling takes half of stage1_inc's core
+        // whenever they coincide.
+        //
+        // Measured on a radio (2026-09-19, `logs/udp_monitor`): with
+        // the reader unpinned, `hint_err` ran −0.6..−1.1 s and every
+        // other slot's SpecBundle arrived 69-90 ms before key-up, where
+        // the 500 ms floor dropped it — a real band decoding 8-13
+        // stations a slot, and half the slots never tried. The SIM
+        // feeder is pinned to core 0, which is why nothing on the bench
+        // showed it.
+        Some(esp_idf_svc::hal::cpu::Core::Core0),
         move || reader_thread(handle_wrapped, addr, iface_num),
     ) {
         let stop_err = unsafe { sys::uac::uac_host_device_stop(handle) };
@@ -1734,7 +1770,7 @@ pub fn start_host() -> Result<()> {
     EVENT_SENDER
         .set(tx)
         .map_err(|_| anyhow!("uac: EVENT_SENDER double init — start_host called twice?"))?;
-    spawn_psram_thread(c"uac_app", APP_TASK_STACK, None, move || app_task(rx))
+    spawn_psram_thread(c"uac_app", APP_TASK_STACK, None, None, move || app_task(rx))
         .map_err(|e| anyhow!("uac_app spawn failed: {e}"))?;
     log::info!("uac: app_task spawned (stack={APP_TASK_STACK} B)");
 
@@ -1756,7 +1792,9 @@ pub fn start_host() -> Result<()> {
         return Err(anyhow!("usb_host_install failed (err={err:#x})"));
     }
 
-    if let Err(e) = spawn_psram_thread(c"usb_events", USB_EVENTS_TASK_STACK, None, usb_events_task) {
+    if let Err(e) =
+        spawn_psram_thread(c"usb_events", USB_EVENTS_TASK_STACK, None, None, usb_events_task)
+    {
         let uninstall_err = unsafe { sys::usb_host_uninstall() };
         if uninstall_err != sys::ESP_OK as sys::esp_err_t {
             log::error!(
@@ -1962,7 +2000,23 @@ pub fn link_info() -> mfsk_app_shared::ui::link_bar::LinkInfo {
 /// a receiver with no WiFi still has to start.
 /// How long to wait for the UDP log sink before installing the host
 /// anyway. A receiver with no WiFi still has to start.
-const LOG_SINK_WAIT_MS: u32 = 45_000;
+///
+/// **8 s, not 45.** The radio is not recognised until the host stack is
+/// installed, so this wait is time the operator spends looking at a
+/// board that has not noticed the IC-705 — reported from the bench as
+/// exactly that. Measured on this network (2026-09-19): the sink comes
+/// up 4.75-5.25 s after boot normally, and 24.5 s when the association
+/// is cold, so 8 s keeps the usual case unchanged (WiFi still wins the
+/// race, and its DMA buffers are still allocated before the host
+/// stack's) while a slow association no longer costs the radio twenty
+/// seconds.
+///
+/// What the wait was protecting is smaller than it looks: the one line
+/// that matters, what `start_host` concluded, is kept in
+/// [`HOST_RESULT`] and re-emitted by the panel once a sink exists,
+/// whenever that is. The rest is the IDF's own enumeration chatter at
+/// debug level.
+const LOG_SINK_WAIT_MS: u32 = 8_000;
 
 pub fn start_host_when_ready() {
     log::info!("uac: installing USB host — the serial console goes away when it returns");

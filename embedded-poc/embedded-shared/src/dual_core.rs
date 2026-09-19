@@ -733,9 +733,10 @@ pub fn continue_leftovers(
     failed_coarse: Vec<SyncCandidate>,
     cfg: &DecodeConfig,
     already: &[DecodeResult],
+    deadline_us: i64,
 ) -> Vec<DecodeResult> {
     let stop = || Stage3Stop {
-        deadline_us: i64::MAX,
+        deadline_us,
         slot_q: spec_q,
         yield_on_slot: true,
         key_up_guard_us: 0,
@@ -759,13 +760,25 @@ pub fn continue_leftovers(
     // Then the refinement the pre-key-up path skipped, for the
     // candidates it tried and failed — on the whole slot now, not the
     // prefix, so the late symbols count too.
-    if cfg.fine_sync && cfg.fine_sync_late && !failed_coarse.is_empty() && !stop().reached() {
-        let refined = fine_sync_split(audio, &failed_coarse);
-        let n = refined.len();
-        let p2 = pass2_split(audio, refined, n);
-        results.extend(
-            stage3_split(audio, p2, cfg.depth, cfg.q_thresh, cfg.bp_max_iter, stop()).results,
-        );
+    if cfg.fine_sync && cfg.fine_sync_late && !failed_coarse.is_empty() {
+        // **A few candidates at a time.** `fine_sync_split` itself has
+        // no stop condition, so one call over every failure is a block
+        // of work nothing can interrupt — and this runs in the window
+        // that has to be given back before the next SpecBundle lands.
+        // Four is ~40-50 ms on this board, small against the 500 ms
+        // floor the next slot is judged by.
+        const CHUNK: usize = 4;
+        for batch in failed_coarse.chunks(CHUNK) {
+            if stop().reached() {
+                break;
+            }
+            let refined = fine_sync_split(audio, batch);
+            let n = refined.len();
+            let p2 = pass2_split(audio, refined, n);
+            results.extend(
+                stage3_split(audio, p2, cfg.depth, cfg.q_thresh, cfg.bp_max_iter, stop()).results,
+            );
+        }
     }
     results.retain(|r| !already.iter().any(|a| a.message77() == r.message77()));
     dedup_by_message(&mut results);

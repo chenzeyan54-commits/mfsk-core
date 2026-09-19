@@ -10,6 +10,8 @@ extern crate alloc;
 
 use mfsk_core::ft8::decode::DecodeDepth;
 use mfsk_core::ft8::decode_block::{DEFAULT_Q_THRESH, NFFT_SPEC};
+use core::fmt::Write as _;
+
 use mfsk_core::msg::wsjt77::unpack77;
 
 use embedded_shared::{dual_core, esp_dsp_fft, pipeline, stage1_inc, wav_sim};
@@ -481,13 +483,24 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             Some(h) => format!("{:+}ms", (h - slotend) / 1_000),
             None => "na".to_string(),
         };
+        // **Two lines, because the UDP sink clips at
+        // `log_sink::LINE_MAX` (160).** In UAC mode that sink is the
+        // only channel off the board, and this line had grown to ~250
+        // characters: on a radio it arrived as
+        // `... coarse=98307us fine=114~`, with every timing after
+        // `fine` gone — which is most of what the line is for. Asking
+        // for a longer buffer would cost internal DRAM in 44 staged
+        // copies; two lines cost nothing.
         log::info!(
             "SLOT[{wav_idx}] src={source} grid={} p1={n_pass1} ready={n_ready} defer={n_deferred} \
-             cut={n_cut} fb={n_fallback} dec={} budget={FT8_BUDGET_MS}ms \
-             tail_win={}us q_wait={}us hint_err={hint_err} coarse={}us fine={}us early={}us \
-             tail_use={}us post_slotend={}us slot_wait={}us late={}us",
+             cut={n_cut} fb={n_fallback} dec={}",
             mfsk_app_shared::time_sync::grid_lock().label(),
             results.len(),
+        );
+        log::info!(
+            "SLOT[{wav_idx}] t: budget={FT8_BUDGET_MS}ms \
+             tail_win={}us q_wait={}us hint_err={hint_err} coarse={}us fine={}us early={}us \
+             tail_use={}us post_slotend={}us slot_wait={}us late={}us",
             tail_window,
             // How long this bundle sat in `spec_q` — a busy decode
             // task. Small while `tail_win` is also small means the
@@ -668,6 +681,25 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             mfsk_app_shared::time_sync::set_bootstrap_slot_shift_12k(0);
 
             if grid.is_acquiring() {
+                // **Say so on the panel.** Nothing decodes for the 25 s
+                // capture and the arithmetic after it, and the only
+                // grid indicator on screen is one character saying what
+                // the grid *is* — so a receiver working on a lock and a
+                // receiver that has stopped looked identical.
+                if let Some((have, want)) =
+                    crate::uac::acquisition_fill(mfsk_core::ft8::acquire::REQUIRED_SAMPLES)
+                {
+                    let mut line: heapless::String<32> = heapless::String::new();
+                    let _ = write!(
+                        &mut line,
+                        "SYNC: capturing {}/{} s",
+                        have / 12_000,
+                        want / 12_000
+                    );
+                    if let Ok(mut ui) = UI.lock() {
+                        ui.set_acq_line(line.as_str());
+                    }
+                }
                 if let Some(audio) = crate::uac::take_acquisition_audio(
                     mfsk_core::ft8::acquire::REQUIRED_SAMPLES,
                 ) {
@@ -752,6 +784,18 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                         .map_or(0.0, |n| n as f32 / 12_000.0);
                     for (trial, &(centre, _)) in phases.iter().enumerate() {
                         unsafe { esp_idf_svc::sys::vTaskDelay(1) };
+                        {
+                            let mut line: heapless::String<32> = heapless::String::new();
+                            let _ = write!(
+                                &mut line,
+                                "SYNC: trying {}/{}",
+                                trial + 1,
+                                phases.len()
+                            );
+                            if let Ok(mut ui) = UI.lock() {
+                                ui.set_acq_line(line.as_str());
+                            }
+                        }
                         let off = ((centre * 12_000.0).round() as i64)
                             .rem_euclid(SLOT_TRIAL_SAMPLES as i64)
                             as usize;
@@ -873,6 +917,11 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                     // decoded leaves it standing, so the retry is
                     // immediate.
                     grid.acquisition_done(applied.is_some());
+                    // Back to the QSO line; the link bar's `a` now says
+                    // what the grid is.
+                    if let Ok(mut ui) = UI.lock() {
+                        ui.set_acq_line("");
+                    }
                     match applied {
                         Some((dt, trial, n)) => {
                             let shift = (dt * 12_000.0).round() as i32;
@@ -1007,7 +1056,47 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         // policy question, not a side effect of where the decode
         // finished.
         let mut late_response = false;
-        if !leftover.is_empty() || !failed_coarse.is_empty() {
+        // **The carry-over runs on slack, and only on slack.**
+        //
+        // It is stage-3 work, so it goes through `dsp_worker` on
+        // APP_CPU — the core `stage1_inc` lives on. Priority 6 lets
+        // stage1_inc preempt it, but the two share the PSRAM bandwidth
+        // and the FFT, and a spectrogram that has to fight for those
+        // finishes late. "Until the next SpecBundle arrives" therefore
+        // meant eleven seconds of every fifteen with that contention
+        // standing.
+        //
+        // Measured on a radio, 2026-09-19: `tail_win` 1.3-2.1 s against
+        // a geometric 0.93, `hint_err` −0.6..−1.2 s — stage1_inc a
+        // second behind the audio sink — and the next bundle then
+        // arriving inside the 500 ms floor, which dropped the slot.
+        // Every other slot on a band running 8-13 stations.
+        //
+        // Three gates, all of them "is there slack":
+        //
+        // * this slot did not already run past key-up,
+        // * stage1_inc is keeping up (`hint_err` inside
+        //   `CARRY_OVER_MAX_LAG_US` — it is the measurement that says
+        //   whether the last slot's work hurt), and
+        // * a hard cap on the slice, so even a healthy pipeline gets
+        //   the core back long before the next bundle is due.
+        const CARRY_OVER_MAX_MS: i64 = 2_000;
+        const CARRY_OVER_MAX_LAG_US: i64 = 300_000;
+        let pipeline_lag = slot_end_hint_us.map_or(0, |h| (slotend - h).abs());
+        let now_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+        let carry_deadline = (now_us + CARRY_OVER_MAX_MS * 1_000)
+            .min(slotend + 15_000_000 - 1_500_000);
+        let carry_ok = post_slotend <= dual_core::FT8_KEY_UP_AFTER_SLOT_END_US
+            && pipeline_lag <= CARRY_OVER_MAX_LAG_US
+            && now_us < carry_deadline;
+        if !carry_ok && (!leftover.is_empty() || !failed_coarse.is_empty()) {
+            log::info!(
+                "SLOT[{wav_idx}] carry-over skipped — {} candidates held back                  (post_slotend={post_slotend}us, pipeline lag={}us)",
+                leftover.len() + failed_coarse.len(),
+                pipeline_lag,
+            );
+        }
+        if carry_ok && (!leftover.is_empty() || !failed_coarse.is_empty()) {
             let n_left = leftover.len() + failed_coarse.len();
             let late = dual_core::continue_leftovers(
                 spec_q,
@@ -1016,6 +1105,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                 failed_coarse,
                 &cfg,
                 &results,
+                carry_deadline,
             );
             if !late.is_empty() {
                 log::info!(

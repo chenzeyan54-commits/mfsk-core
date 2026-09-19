@@ -607,6 +607,8 @@ pub fn run_log_panel(
         let wf_seq;
         let tx_seq;
         let tx_line_snapshot: heapless::String<48>;
+        // What the strip shows: the acquisition, while one is running.
+        let acq_line_snapshot: heapless::String<32>;
         {
             let Ok(mut ui) = UI.lock() else {
                 log::warn!("UI mutex poisoned — skipping render frame");
@@ -652,6 +654,13 @@ pub fn run_log_panel(
                 }
             }
             tx_line_snapshot = buf;
+            let mut abuf: heapless::String<32> = heapless::String::new();
+            for ch in ui.acq_line().chars() {
+                if abuf.push(ch).is_err() {
+                    break;
+                }
+            }
+            acq_line_snapshot = abuf;
             let max_seq = decoded_snapshot
                 .iter()
                 .map(|r| r.slot_seq)
@@ -730,7 +739,9 @@ pub fn run_log_panel(
             .into_styled(PrimitiveStyle::with_fill(tx_bg))
             .draw(&mut display)
             .ok();
-            let text = if tx_line_snapshot.is_empty() {
+            let text = if !acq_line_snapshot.is_empty() {
+                acq_line_snapshot.as_str()
+            } else if tx_line_snapshot.is_empty() {
                 "IDLE: ---"
             } else {
                 tx_line_snapshot.as_str()
