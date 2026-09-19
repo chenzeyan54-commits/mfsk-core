@@ -333,34 +333,84 @@ fn main() -> ! {
                     // starting NTP anyway would spend the timeout and
                     // then discipline a clock `suppress_clock` makes
                     // invisible, which is cost without effect.
-                    let _sntp = if grid_src == mfsk_app_shared::grid_src::GridSource::AirDt {
-                        log::info!("NTP not started — grid source is the air (CONFIG page)");
-                        None
-                    } else {
-                        match mfsk_app_shared::ntp::start(NTP_SERVER) {
-                        Ok(sntp) => {
-                            if mfsk_app_shared::ntp::wait_synced(&sntp, NTP_SYNC_TIMEOUT_MS) {
-                                log::info!("NTP synced — FT8 slot grid can anchor to UTC");
-                            } else {
-                                log::warn!(
-                                    "NTP never synced in {NTP_SYNC_TIMEOUT_MS} ms — the slot \
-                                         grid stays free-running and decodes are unlikely"
-                                );
+                    let (_sntp, ntp_synced) =
+                        if grid_src == mfsk_app_shared::grid_src::GridSource::AirDt {
+                            log::info!("NTP not started — grid source is the air (CONFIG page)");
+                            (None, false)
+                        } else {
+                            match mfsk_app_shared::ntp::start(NTP_SERVER) {
+                                Ok(sntp) => {
+                                    let ok = mfsk_app_shared::ntp::wait_synced(
+                                        &sntp,
+                                        NTP_SYNC_TIMEOUT_MS,
+                                    );
+                                    if ok {
+                                        log::info!("NTP synced — FT8 slot grid can anchor to UTC");
+                                    } else {
+                                        log::warn!(
+                                            "NTP never synced in {NTP_SYNC_TIMEOUT_MS} ms — the \
+                                             slot grid stays free-running and decodes are unlikely"
+                                        );
+                                    }
+                                    (Some(sntp), ok)
+                                }
+                                Err(e) => {
+                                    log::warn!("NTP start failed: {e:#} — slot grid free-running");
+                                    (None, false)
+                                }
                             }
-                            Some(sntp)
-                        }
-                        Err(e) => {
-                            log::warn!("NTP start failed: {e:#} — slot grid free-running");
-                            None
-                        }
-                        }
-                    };
+                        };
+
+                    // **The 20 s window ends a wait, not the sync.**
+                    //
+                    // `wait_synced` counts its own delays, so a timeout
+                    // means the exchange had not arrived yet, not that
+                    // the poll was starved — and the handle above keeps
+                    // retrying underneath either way. Reading it once
+                    // and never again decided the clock source for the
+                    // whole session: measured on a radio 2026-09-19,
+                    // two consecutive host-mode boots timed out here
+                    // and ran the rest of the session as `grid=rtc`,
+                    // which turns off the sink's UTC phase tracking
+                    // entirely, from a board whose RTC had been set
+                    // from NTP minutes earlier and which then synced in
+                    // 2.4 s and 4.2 s on the boots either side.
+                    //
+                    // (`net.rs` carries the same watch for the FT4 /
+                    // WSPR / FST4 receivers. It was fixed there first,
+                    // in c66af4c9, on the mistaken reading that the
+                    // failure had come from that module — the log line
+                    // above is this one's. Both paths need it.)
+                    //
+                    // In `AirDt` there is no handle and no watch, which
+                    // is the point: the operator said the phase comes
+                    // from the band, and a late sync must not take it
+                    // back.
+                    let mut watching_ntp = !ntp_synced && _sntp.is_some();
+                    if watching_ntp {
+                        log::info!("NTP still retrying underneath — watching for it");
+                    }
 
                     // `handle`'s `Drop` tears the association down
                     // and `_sntp`'s stops the periodic re-sync, so
                     // this thread has to hold both forever.
                     loop {
-                        std::thread::sleep(std::time::Duration::from_secs(60));
+                        std::thread::sleep(std::time::Duration::from_secs(
+                            if watching_ntp { 5 } else { 60 },
+                        ));
+                        if !watching_ntp {
+                            continue;
+                        }
+                        match _sntp.as_ref() {
+                            Some(sntp) if mfsk_app_shared::ntp::note_sync_completed(sntp) => {
+                                watching_ntp = false;
+                                log::info!(
+                                    "NTP synced on a later attempt — UTC now owns the slot phase"
+                                );
+                            }
+                            Some(_) => {}
+                            None => watching_ntp = false,
+                        }
                     }
                 }
                 Err(e) => log::warn!("WiFi STA failed: {e:#} — UDP log disabled"),

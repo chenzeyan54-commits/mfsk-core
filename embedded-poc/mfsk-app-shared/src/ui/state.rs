@@ -21,6 +21,20 @@ pub struct DecodedRow {
     /// Hard-error count from BP — useful for marking borderline
     /// decodes (`!` if ≥ 24).
     pub hard_errors: u8,
+    /// This decode's DT, in tenths of a second, clamped.
+    ///
+    /// **Per station, because the median cannot answer the question it
+    /// is asked.** A grid that is half a second out puts every station
+    /// at the same offset; stations whose own clocks are loose scatter
+    /// around the grid. One number in the middle looks identical in
+    /// both cases, and the difference decides whether to move the grid
+    /// at all (the per-slot DT servo this project removed on
+    /// 2026-09-05 was feeding on exactly that ambiguity).
+    ///
+    /// Tenths rather than a float: the row is a UI value, ±2.5 s fits
+    /// an `i8`, and the decoder's own resolution here is coarser than
+    /// 0.1 s anyway.
+    pub dt_ds: i8,
     /// Decoded text. WSJT-X 77-bit packed messages fit in 22 chars.
     pub msg: String<22>,
     /// Latest slot in which this message decoded (refreshed on every
@@ -68,6 +82,11 @@ pub struct UiState {
     /// search-and-remove existing entries in place to dedupe by msg.
     decoded: heapless::Vec<DecodedRow, 16>,
     waterfall: heapless::Deque<WfLine, WF_DEPTH>,
+    /// One flag per retained waterfall row: was it the first pair of a
+    /// slot? 100 bytes, kept beside the rows rather than inside them
+    /// because `WfLine` is a plain `[u8; WF_COLS]` the renderer reads
+    /// as palette indices.
+    wf_slot_start: heapless::Deque<bool, WF_DEPTH>,
     pub status: StatusInfo,
     /// What the cold grid acquisition is doing, or empty.
     ///
@@ -152,6 +171,7 @@ impl UiState {
         Self {
             decoded: heapless::Vec::new(),
             waterfall: heapless::Deque::new(),
+            wf_slot_start: heapless::Deque::new(),
             status: StatusInfo {
                 rig_freq_hz: None,
                 rig_mode: None,
@@ -266,12 +286,35 @@ impl UiState {
     /// `wf_push_seq` so the display loop's fingerprint check fires
     /// even after the ring saturates at `WF_DEPTH`.
     pub fn push_waterfall(&mut self, row: WfLine) {
+        self.push_waterfall_at(row, u8::MAX);
+    }
+
+    /// [`Self::push_waterfall`] with the row's position in its slot.
+    ///
+    /// **`pair_idx` is `stage1_inc`'s `j_b`** — the *odd* row of the
+    /// pair it just computed (`j_b = 2j + 1`), not the pair number. So
+    /// the first tick of a slot carries 1 and **0 never appears**; a
+    /// `== 0` test here drew no rule at all, which is how this shipped
+    /// once. `u8::MAX` means "not stated", which is what the plain
+    /// `push_waterfall` passes.
+    ///
+    /// The renderer rules the marked row, so the operator can see the
+    /// grid the decoder is actually using against the transmissions on
+    /// the band.
+    pub fn push_waterfall_at(&mut self, row: WfLine, pair_idx: u8) {
         if self.waterfall.is_full() {
             let _ = self.waterfall.pop_front();
+            let _ = self.wf_slot_start.pop_front();
         }
         let _ = self.waterfall.push_back(row);
+        let _ = self.wf_slot_start.push_back(pair_idx <= 1);
         self.wf_push_seq.fetch_add(1, Ordering::AcqRel);
         self.bump();
+    }
+
+    /// Slot-start flags, parallel to [`Self::waterfall_iter`].
+    pub fn waterfall_marks_iter(&self) -> impl Iterator<Item = &bool> {
+        self.wf_slot_start.iter()
     }
 
     /// Monotonic count of `push_waterfall` calls. Display loop uses

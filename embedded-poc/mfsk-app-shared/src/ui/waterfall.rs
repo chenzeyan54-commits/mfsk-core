@@ -66,9 +66,45 @@ pub fn render<D>(display: &mut D, lines: &[&WfLine], width: u32) -> Result<(), D
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    render_marked(display, lines, &[], width)
+}
+
+/// Colour of the slot-boundary rule.
+const SLOT_MARK: Rgb565 = Rgb565::new(31, 0, 0);
+/// Dash period of that rule, in pixels. Dashed rather than solid so
+/// the row it lands on is still readable — the point is to see whether
+/// the signal starts *at* the line, which a solid bar would cover.
+const SLOT_MARK_DASH: usize = 6;
+
+/// [`render`] plus a rule across every row the caller marks.
+///
+/// `marks` is parallel to `lines`; a `true` draws the slot-boundary
+/// rule over that row. **This is the grid the decoder decided on**,
+/// not a nominal 15 s tick: `stage1_inc` stamps each `WfTick` with its
+/// `pair_idx` (its `j_b`, so the slot's first tick reads 1) and that
+/// row is wherever the audio sink last put the slot start. Seeing the band's transmissions begin somewhere else is the
+/// difference between "the grid is off" and "nobody is transmitting",
+/// which is otherwise only visible in a log this board cannot print
+/// while the USB host driver owns the console.
+pub fn render_marked<D>(
+    display: &mut D,
+    lines: &[&WfLine],
+    marks: &[bool],
+    width: u32,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
     let n = lines.len().min(WF_DEPTH);
     let blank_rows = WF_DEPTH - n;
     let take = &lines[lines.len() - n..];
+    // Same trailing window as `take`, and empty when the caller passed
+    // none — a length mismatch marks nothing rather than panicking.
+    let take_marks: &[bool] = if marks.len() == lines.len() {
+        &marks[lines.len() - n..]
+    } else {
+        &[]
+    };
 
     // Stream pixels top-to-bottom, left-to-right. The first
     // `blank_rows × width` pixels are palette[0]; the rest are
@@ -86,7 +122,15 @@ where
         // For a blank row return a zero stream; otherwise
         // map each palette index to its RGB565 colour.
         let blank = row < blank_rows;
+        let marked = !blank
+            && take_marks
+                .get(row - blank_rows)
+                .copied()
+                .unwrap_or(false);
         (0..width as usize).map(move |col| {
+            if marked && col % SLOT_MARK_DASH < SLOT_MARK_DASH / 2 {
+                return SLOT_MARK;
+            }
             let idx = if blank { 0 } else { row_pixels[col] & 0x0F };
             PALETTE[idx as usize]
         })

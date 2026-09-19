@@ -522,6 +522,7 @@ fn slot_loop() -> ! {
                     df_hz: d.freq_hz.round().clamp(0.0, 65_535.0) as u16,
                     snr_db: d.snr_db.round().clamp(-128.0, 127.0) as i8,
                     hard_errors: d.hard_errors.min(255) as u8,
+                    dt_ds: (d.dt_sec * 10.0).round().clamp(-99.0, 99.0) as i8,
                     msg,
                     slot_seq: seq,
                     first_seq: seq,

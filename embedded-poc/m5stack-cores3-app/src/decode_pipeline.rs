@@ -8,9 +8,9 @@
 
 extern crate alloc;
 
+use core::fmt::Write as _;
 use mfsk_core::ft8::decode::DecodeDepth;
 use mfsk_core::ft8::decode_block::{DEFAULT_Q_THRESH, NFFT_SPEC};
-use core::fmt::Write as _;
 
 use mfsk_core::msg::wsjt77::unpack77;
 
@@ -85,7 +85,6 @@ const FT8_BUDGET_MS: i64 = match option_env!("MFSK_FT8_BUDGET_MS") {
     None => 13_000,
 };
 
-
 /// `dual_core::DecodeConfig::slot_end_hint` — when the slot now being
 /// decoded ends, on `esp_timer_get_time()`'s clock.
 ///
@@ -107,6 +106,20 @@ fn slot_end_hint() -> Option<i64> {
         len.unwrap_or(SLOT_US),
     ))
 }
+
+/// Coarse score above which a slot that decoded nothing is reporting a
+/// *signal* rather than the noise floor.
+///
+/// `sync_min` is 1.0 because that is about where the floor sits, and a
+/// real station runs tens to low hundreds — the slots measured on a
+/// radio 2026-09-19 that decoded nothing while the grid was a second
+/// out read 14 to 220. Five is well clear of the floor and well under
+/// anything a station makes.
+///
+/// It decides two things: what the panel says about an empty slot, and
+/// whether that slot counts toward a cold acquisition at all
+/// (`grid_state::observe_slot`).
+const COARSE_SIGNAL_SCORE: f32 = 5.0;
 
 /// Per-candidate fine sync (WSJT-X `ft8b.f90` Stages A/B/C) plus a
 /// coarse-position retry — `dual_core::DecodeConfig::fine_sync`, whose
@@ -251,7 +264,22 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
     // that starts from one spends minutes finding out it was wrong —
     // which is what the 2026-09-19 session watched happen twice. The
     // capture costs 25 s and answers the question.
-    let unplaced = crate::grid_source() == mfsk_app_shared::grid_src::GridSource::AirDt;
+    // **Unplaced means the clock could not place it**, not merely that
+    // the operator chose the air.
+    //
+    // This read `== AirDt` alone, from when `AIR DT` skipped the sink's
+    // RTC anchor and the grid genuinely started nowhere. It takes the
+    // anchor now, so a board with a plausible clock starts on a phase
+    // worth one slot's trial — measured on a radio 2026-09-19, that
+    // phase decoded 3 stations on the second slot where the pre-charged
+    // path spent 2 min 9 s and two captures. Without a clock there is
+    // still nothing to try, and the capture starts from the first slot
+    // exactly as before.
+    // Whether this placement has already spent its one trim. Cleared
+    // wherever the grid is placed afresh.
+    let mut trim_used = false;
+    let unplaced = crate::grid_source() == mfsk_app_shared::grid_src::GridSource::AirDt
+        && mfsk_app_shared::time_sync::utc_now_ms().is_none();
     let mut grid = if unplaced {
         log::warn!("air-sync: AIR DT — cold start, capturing from this slot");
         crate::uac::arm_acquisition();
@@ -504,7 +532,10 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         log::info!(
             "SLOT[{wav_idx}] src={source} grid={} p1={n_pass1} ready={n_ready} defer={n_deferred} \
              cut={n_cut} fb={n_fallback} dec={}",
-            mfsk_app_shared::time_sync::grid_lock().label(),
+            mfsk_app_shared::grid_src::grid_label(
+                crate::grid_source(),
+                mfsk_app_shared::time_sync::grid_lock(),
+            ),
             results.len(),
         );
         // **In ms, and still two lines.** Even split, the µs form
@@ -545,6 +576,12 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         // because that is about where the noise floor sits, so the top
         // score separates "an empty band or an audio problem" from "a
         // station this decoder could not read".
+        // **Was there anything to decode?** Coarse sync's own top score,
+        // which the panel shows and the acquisition trigger counts.
+        let had_signal = !results.is_empty()
+            || top3
+                .first()
+                .is_some_and(|&(sc, _, _)| sc >= COARSE_SIGNAL_SCORE);
         if results.is_empty() && !skipped {
             let n = n_pass1.min(3);
             let mut line: heapless::String<96> = heapless::String::new();
@@ -552,6 +589,36 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                 let _ = write!(&mut line, " [{s:.2} @ {dt:+.2}s {f:.0}Hz]");
             }
             log::info!("SLOT[{wav_idx}] nothing decoded — top {n} coarse:{line}");
+            // **And put it on the panel.**
+            //
+            // "Is the grid off, or is the band empty?" is the question
+            // an operator asks at exactly this moment, and the answer
+            // was computed here and then only logged — on a board whose
+            // console the USB host driver has taken. A strong candidate
+            // at a large |dt| is a signal the grid is missing; a top
+            // score at the noise floor (`sync_min` is 1.0, which is
+            // about where the floor sits) is an empty band or a dead
+            // input, and those want opposite actions.
+            //
+            // The strip is the TX line's, shown only while this is
+            // non-empty, so it costs no screen space — the panel is
+            // already narrow enough that a second row was declined.
+            if let Some(&(sc, dt, _)) = top3.first() {
+                let mut l: heapless::String<32> = heapless::String::new();
+                if sc >= COARSE_SIGNAL_SCORE {
+                    let _ = write!(&mut l, "SIG {sc:.0} @ {dt:+.2}s — grid off?");
+                } else {
+                    let _ = write!(&mut l, "SIG {sc:.1} — band quiet");
+                }
+                if let Ok(mut ui) = UI.lock() {
+                    ui.set_acq_line(l.as_str());
+                }
+            }
+        } else if !results.is_empty() {
+            // Decodes are their own answer; give the strip back.
+            if let Ok(mut ui) = UI.lock() {
+                ui.set_acq_line("");
+            }
         }
 
         for r in results.iter() {
@@ -665,12 +732,170 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             // not lock, and reached steady decoding four slots sooner.
             // The partial slot's decodes are still shown; it just
             // neither locks nor counts as under par.
+            // **The acquiring flag is read before the observation,
+            // because the observation sets it.**
+            //
+            // `observe_slot` flips `acquiring` inside the same call
+            // that returns `Acquire`, so a trim gated on
+            // `!grid.is_acquiring()` after it is gated on a decision
+            // that has already been taken — which is how the first cut
+            // of this reordering (2026-09-19) moved `arm_acquisition`
+            // below the trim and changed nothing at all: `trimmed`
+            // could never be true on the one path it was written for.
+            let was_acquiring = grid.is_acquiring();
+            // **The cheap correction is decided first.**
+            //
+            // `arm_acquisition` used to run in the `Acquire` arm below
+            // and this block was gated on `!grid.is_acquiring()`, so
+            // the trim could only fire on a grid that was already good
+            // enough not to want it — and never on the one case it
+            // exists for. Measured on a radio 2026-09-19: a slot
+            // decoded 3 stations at a median DT of −0.997 s, one
+            // millisecond inside the coarse search's own edge, and the
+            // receiver armed a 25 s capture instead of moving 1.0 s
+            // from the three decodes already in hand. Two captures
+            // followed, both decoding nothing, and the slots between
+            // them were spent.
+            // **Trim the grid from the air, once, when the pool agrees.**
+            //
+            // This is what `TIME: AIR DT` is for and what it was not
+            // doing: with no NTP the phase comes from the RTC, whose
+            // battery life on this board is unknown and whose read is
+            // whole seconds, and nothing corrected the remainder. The
+            // DT median was measured, logged, and thrown away.
+            //
+            // Not the per-slot servo that was removed on 2026-09-05 —
+            // that fed every slot's median, including slots with one or
+            // two decodes, and oscillated the grid to ±0.6 s with `dec`
+            // falling 8 → 4. This waits for `DT_TRIM_MIN_OBS`
+            // observations pooled across slots, moves once, and clears
+            // the pool so the next move needs fresh evidence. A station's
+            // own clock error averages out over that many; a grid error
+            // does not.
+            //
+            // Saturated at `DT_TRIM_MAX_S`: more than that is not a trim
+            // and belongs to cold acquisition, which searches the whole
+            // period.
+            const DT_TRIM_MIN_OBS: usize = 8;
+            const DT_TRIM_MIN_S: f32 = 0.15;
+            /// The same floor for a grid running *early*, where the
+            /// correction costs a slot outright.
+            ///
+            /// 0.85 s, just inside the ±1.0 s search. An early grid is
+            /// absorbed by that search rather than lost to it — the
+            /// slots measured at +0.65 s on a radio 2026-09-19 decoded
+            /// four and eight stations — so the error has to be about
+            /// to leave the window before a whole slot is worth
+            /// spending on it. At 0.6 s the same log shows the cost:
+            /// +0.645 and +0.606 each bought a 0.6 s stub slot that
+            /// decoded nothing, and the stubs came fast enough to keep
+            /// the loop in them.
+            const DT_TRIM_MIN_EARLY_S: f32 = 0.85;
+            const DT_TRIM_MAX_S: f32 = 1.0;
+            /// A DT no station's own clock explains.
+            ///
+            /// The pooled bar exists because a decode's DT is that
+            /// station's timing as much as the grid's, and only a
+            /// sample across transmitters averages the first away. But
+            /// operators run WSJT-X against NTP: half a second is far
+            /// outside that population, so a single slot agreeing on
+            /// more than this is already saying something only the grid
+            /// can explain.
+            ///
+            /// The bar was briefly dropped to `LOCK_MIN_DECODES` for
+            /// *any* error, which is the 2026-09-05 per-slot servo
+            /// again under another name — and it behaved the same way,
+            /// walking −0.844, −1.004, −0.764, −0.202, +0.671 on five
+            /// consecutive slots.
+            const DT_TRIM_BIG_S: f32 = 0.5;
+            let slot_sample = match (slot_median, n_dec) {
+                (Some(m), n)
+                    if n >= mfsk_app_shared::grid_state::LOCK_MIN_DECODES
+                        && m.abs() >= DT_TRIM_BIG_S =>
+                {
+                    Some(m)
+                }
+                _ => None,
+            };
+            let pooled_sample = if mfsk_app_shared::time_sync::dt_pool_len() >= DT_TRIM_MIN_OBS {
+                mfsk_app_shared::time_sync::pooled_dt_median()
+            } else {
+                None
+            };
+            let mut trimmed = false;
+            // **One trim per placement, and then never again.**
+            //
+            // A cooldown was tried first — wait two slots, measure,
+            // correct again — and it is the wrong shape for this
+            // problem. With the audio rate fixed (−5.8 ms a slot,
+            // measured over 30 minutes) a grid that is placed *stays*
+            // placed: there is nothing to track, so a controller that
+            // keeps correcting is only ever reacting to the noise in
+            // its own measurement. That is the 2026-09-05 finding
+            // restated, and the cooldown version walked the grid the
+            // same way, just more slowly.
+            //
+            // So the trim is a one-shot belonging to a placement, not a
+            // rate. `trim_used` is cleared where the grid is placed —
+            // the sink's anchor and an applied acquisition — and set
+            // here. A placement that ends up wrong is not this
+            // mechanism's problem: it is `REACQUIRE_TRIGGER_SLOTS`'s,
+            // which re-places and re-arms this.
+            //
+            // **Full slots only.** A short slot — a correction's own
+            // stub, or the first after a re-anchor — has a DT measured
+            // against audio that is not a slot.
+            if !full_slot || trim_used {
+                // nothing to measure, or nothing left to spend
+            } else if !mfsk_app_shared::time_sync::clock_is_disciplined() && !was_acquiring {
+                if let Some(m) = slot_sample.or(pooled_sample) {
+                    // **Asymmetric, because the two directions do not
+                    // cost the same.** A grid running late is corrected
+                    // by shortening one slot, which still reaches
+                    // `SPEC_EMIT_PAIR` and still decodes. A grid
+                    // running early cannot be corrected by lengthening
+                    // — `stage1_inc::NMAX` is 180 000 and is the
+                    // spectrogram's geometry — so the only exact move
+                    // is a stub slot of `15 s − error`, and that slot
+                    // decodes nothing (`p1=0`, measured). Inside the
+                    // ±1.0 s search an uncorrected early grid still
+                    // works, just off-centre, so it has to be worth a
+                    // whole slot before it is worth correcting.
+                    let floor = if m > 0.0 {
+                        DT_TRIM_MIN_EARLY_S
+                    } else {
+                        DT_TRIM_MIN_S
+                    };
+                    if m.abs() >= floor {
+                        let applied = m.clamp(-DT_TRIM_MAX_S, DT_TRIM_MAX_S);
+                        // Same channel and the same sign as cold
+                        // acquisition's one-shot: DT > 0 means the slot
+                        // opened early, so lengthen the next one.
+                        mfsk_app_shared::time_sync::set_acquisition_shift_12k(
+                            (applied * 12_000.0).round() as i32,
+                        );
+                        log::warn!(
+                            "  air-sync: trimming the grid {applied:+.3} s from {} (median {m:+.3} s) — one shot",
+                            if slot_sample.is_some() {
+                                "this slot's decodes"
+                            } else {
+                                "the pooled decodes"
+                            },
+                        );
+                        trimmed = true;
+                        trim_used = true;
+                        mfsk_app_shared::time_sync::reset_dt_pool();
+                        mfsk_app_shared::time_sync::reset_slot_phase();
+                    }
+                }
+            }
+
             let action = if full_slot {
                 // The slot's own DT median is the phase error, and the
                 // lock decision needs it: a count alone cannot tell a
                 // centred grid from one 0.7 s out that still catches
                 // the loud half of the band.
-                grid.observe_with_phase(n_dec, slot_median)
+                grid.observe_slot(n_dec, slot_median, had_signal)
             } else {
                 log::info!(
                     "  air-sync: partial slot ({} samples, {n_dec} decoded) — not counted \
@@ -687,6 +912,25 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                     );
                     mfsk_app_shared::time_sync::note_grid_lock(
                         mfsk_app_shared::time_sync::GridLock::Air,
+                    );
+                }
+                mfsk_app_shared::grid_state::GridAction::Acquire { slots, relock } if trimmed => {
+                    // `observe_slot` already set `acquiring`; hand it
+                    // back, or nothing fills the ring, the acquisition
+                    // never completes, and the trim stays gated off for
+                    // the rest of the session. `true` because a phase
+                    // *was* applied — the trim's — so the under-par run
+                    // restarts on the same terms a capture would give
+                    // it.
+                    grid.acquisition_done(true);
+                    // **The trim just moved the grid**, so the slots
+                    // that led here were measured at the old phase and
+                    // say nothing about the new one. Acquisition is for
+                    // a grid that decodes *nothing* — the one case a
+                    // trim cannot reach, because it has no DT to use.
+                    let _ = (slots, relock);
+                    log::info!(
+                        "  air-sync: acquisition deferred — the trim moved the grid this slot"
                     );
                 }
                 mfsk_app_shared::grid_state::GridAction::Acquire { slots, relock } => {
@@ -720,78 +964,6 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             // through its own uncapped one-shot channel.
             mfsk_app_shared::time_sync::set_bootstrap_slot_shift_12k(0);
 
-            // **Trim the grid from the air, once, when the pool agrees.**
-            //
-            // This is what `TIME: AIR DT` is for and what it was not
-            // doing: with no NTP the phase comes from the RTC, whose
-            // battery life on this board is unknown and whose read is
-            // whole seconds, and nothing corrected the remainder. The
-            // DT median was measured, logged, and thrown away.
-            //
-            // Not the per-slot servo that was removed on 2026-09-05 —
-            // that fed every slot's median, including slots with one or
-            // two decodes, and oscillated the grid to ±0.6 s with `dec`
-            // falling 8 → 4. This waits for `DT_TRIM_MIN_OBS`
-            // observations pooled across slots, moves once, and clears
-            // the pool so the next move needs fresh evidence. A station's
-            // own clock error averages out over that many; a grid error
-            // does not.
-            //
-            // Saturated at `DT_TRIM_MAX_S`: more than that is not a trim
-            // and belongs to cold acquisition, which searches the whole
-            // period.
-            const DT_TRIM_MIN_OBS: usize = 8;
-            const DT_TRIM_MIN_S: f32 = 0.15;
-            const DT_TRIM_MAX_S: f32 = 1.0;
-            // **One slot with three stations in it is already a sample.**
-            //
-            // Requiring eight pooled observations had the condition
-            // upside down: the further out the grid is, the fewer slots
-            // decode at all, so the error that most needs correcting is
-            // the one that cannot raise the evidence for it. Measured on
-            // a radio (2026-09-19): one slot decoded 7 stations at a
-            // median of −0.988 s and every slot after it decoded 0 — the
-            // pool stopped one short of eight, no trim fired, and the
-            // receiver spent 100 s reaching a cold acquisition instead
-            // of moving 0.99 s on the next slot.
-            //
-            // A slot's own median over `LOCK_MIN_DECODES` stations is
-            // three different transmitters agreeing, which is what the
-            // pooled bar was reaching for. The pooled path stays for
-            // bands that decode one or two at a time.
-            let slot_sample = match (slot_median, n_dec) {
-                (Some(m), n) if n >= mfsk_app_shared::grid_state::LOCK_MIN_DECODES => Some(m),
-                _ => None,
-            };
-            let pooled_sample = if mfsk_app_shared::time_sync::dt_pool_len() >= DT_TRIM_MIN_OBS {
-                mfsk_app_shared::time_sync::pooled_dt_median()
-            } else {
-                None
-            };
-            if !mfsk_app_shared::time_sync::clock_is_disciplined() && !grid.is_acquiring() {
-                if let Some(m) = slot_sample.or(pooled_sample) {
-                    if m.abs() >= DT_TRIM_MIN_S {
-                        let applied = m.clamp(-DT_TRIM_MAX_S, DT_TRIM_MAX_S);
-                        // Same channel and the same sign as cold
-                        // acquisition's one-shot: DT > 0 means the slot
-                        // opened early, so lengthen the next one.
-                        mfsk_app_shared::time_sync::set_acquisition_shift_12k(
-                            (applied * 12_000.0).round() as i32,
-                        );
-                        log::warn!(
-                            "  air-sync: trimming the grid {applied:+.3} s from {} (median {m:+.3} s) — one shot",
-                            if slot_sample.is_some() {
-                                "this slot's decodes"
-                            } else {
-                                "the pooled decodes"
-                            },
-                        );
-                        mfsk_app_shared::time_sync::reset_dt_pool();
-                        mfsk_app_shared::time_sync::reset_slot_phase();
-                    }
-                }
-            }
-
             if grid.is_acquiring() {
                 // **Say so on the panel.** Nothing decodes for the 25 s
                 // capture and the arithmetic after it, and the only
@@ -812,9 +984,9 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                         ui.set_acq_line(line.as_str());
                     }
                 }
-                if let Some(audio) = crate::uac::take_acquisition_audio(
-                    mfsk_core::ft8::acquire::REQUIRED_SAMPLES,
-                ) {
+                if let Some(audio) =
+                    crate::uac::take_acquisition_audio(mfsk_core::ft8::acquire::REQUIRED_SAMPLES)
+                {
                     // **Try the clusters; the decoder decides.**
                     //
                     // Acquisition used to reduce the candidates to one
@@ -898,12 +1070,8 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                         unsafe { esp_idf_svc::sys::vTaskDelay(1) };
                         {
                             let mut line: heapless::String<32> = heapless::String::new();
-                            let _ = write!(
-                                &mut line,
-                                "SYNC: trying {}/{}",
-                                trial + 1,
-                                phases.len()
-                            );
+                            let _ =
+                                write!(&mut line, "SYNC: trying {}/{}", trial + 1, phases.len());
                             if let Ok(mut ui) = UI.lock() {
                                 ui.set_acq_line(line.as_str());
                             }
@@ -935,9 +1103,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                         for r in got.iter() {
                             let _ = dts.push(r.dt_sec);
                         }
-                        dts.sort_by(|a, b| {
-                            a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal)
-                        });
+                        dts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
                         let med = dts[dts.len() / 2];
                         let mut dt = centre + med + start_s;
                         while dt > 7.5 {
@@ -1038,6 +1204,13 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                         Some((dt, trial, n)) => {
                             let shift = (dt * 12_000.0).round() as i32;
                             mfsk_app_shared::time_sync::set_acquisition_shift_12k(shift);
+                            // A fresh placement gets a fresh trim: the
+                            // capture puts the grid within a cluster's
+                            // width, and one pooled correction after it
+                            // is what centres it. The sink's boot
+                            // anchor is the other placement, and
+                            // `trim_used` starts false for it.
+                            trim_used = false;
                             mfsk_app_shared::time_sync::note_grid_lock(
                                 mfsk_app_shared::time_sync::GridLock::Air,
                             );
@@ -1123,16 +1296,24 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                         df_hz: r.freq_hz.round().clamp(0.0, 65_535.0) as u16,
                         snr_db: snr_i8,
                         hard_errors: r.hard_errors.min(255) as u8,
+                        dt_ds: (r.dt_sec * 10.0).round().clamp(-99.0, 99.0) as i8,
                         msg,
                         slot_seq,
                         first_seq: slot_seq,
                     };
                     ui.push_decode(row);
                     log::info!(
-                        "{:4.0}Hz {:+5.1}dB (raw={:+5.1}) {}",
-                        r.freq_hz,
+                        // WSJT-X's order — dB, DT, Freq, message — so
+                        // a log read beside its Band Activity window
+                        // lines up. **Per-station DT is the point**:
+                        // the slot median below cannot separate a grid
+                        // that is off from a band whose clocks are
+                        // loose, and those want opposite responses.
+                        "{:+5.1}dB (raw={:+5.1}) {:+5.2}s {:4.0}Hz {}",
                         calibrated_snr,
                         r.snr_db,
+                        r.dt_sec,
+                        r.freq_hz,
                         text
                     );
                     qso.set_rx_snr(snr_i8);
@@ -1183,7 +1364,7 @@ fn wf_drain(wf_q: esp_idf_svc::sys::QueueHandle_t) -> ! {
     loop {
         let tick = pipeline::recv_box::<pipeline::WfTick>(wf_q);
         if let Ok(mut ui) = UI.lock() {
-            ui.push_waterfall(tick.row);
+            ui.push_waterfall_at(tick.row, tick.pair_idx);
         }
         let _ = n;
     }

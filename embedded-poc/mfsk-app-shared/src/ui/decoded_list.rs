@@ -181,7 +181,15 @@ where
 
         let mut s: String<32> = String::new();
         let snr = row.snr_db.clamp(-30, 30);
-        let _ = write!(&mut s, "{snr:>+3} {:>4} ", row.df_hz);
+        // **WSJT-X's column order**: dB, DT, Freq, Message. The one it
+        // puts first, UTC, is left out — six characters plus a space
+        // does not fit beside a 22-character message in `ROW_CHARS`
+        // (40), and the status bar already carries the clock.
+        //
+        // `ROW_CHARS` otherwise has the room: 3 + 4 + 4 + three spaces
+        // is 14, so a full-length message still lands with slack.
+        let dt = row.dt_ds.clamp(-99, 99) as f32 / 10.0;
+        let _ = write!(&mut s, "{snr:>+3} {dt:>+4.1} {:>4} ", row.df_hz);
         let msg_room = ROW_CHARS.saturating_sub(s.len());
         let msg = row.msg.as_str();
         let msg_take = msg.len().min(msg_room.saturating_sub(1));

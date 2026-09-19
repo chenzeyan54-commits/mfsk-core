@@ -178,6 +178,7 @@ pub fn run() -> ! {
                         df_hz: r.freq_hz.round().clamp(0.0, 65_535.0) as u16,
                         snr_db: snr_i8,
                         hard_errors: r.hard_errors.min(255) as u8,
+                        dt_ds: (r.dt_sec * 10.0).round().clamp(-99.0, 99.0) as i8,
                         msg,
                         slot_seq,
                         first_seq: slot_seq,

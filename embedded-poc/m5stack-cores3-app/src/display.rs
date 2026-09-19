@@ -445,6 +445,11 @@ pub fn run_log_panel(
     let mut wf_snapshot: Box<
         heapless::Vec<mfsk_app_shared::ui::state::WfLine, { mfsk_app_shared::ui::state::WF_DEPTH }>,
     > = Box::new(heapless::Vec::new());
+    // Slot-start flags for the waterfall, parallel to `wf_snapshot`.
+    // 100 bytes on this task's stack rather than a `Box`: the rows
+    // beside them are 24 KB and boxed for that reason, this is not.
+    let mut wf_marks: heapless::Vec<bool, { mfsk_app_shared::ui::state::WF_DEPTH }> =
+        heapless::Vec::new();
     let mut decoded_snapshot: Box<heapless::Vec<mfsk_app_shared::ui::state::DecodedRow, 16>> =
         Box::new(heapless::Vec::new());
 
@@ -646,6 +651,12 @@ pub fn run_log_panel(
                         break;
                     }
                 }
+                wf_marks.clear();
+                for m in ui.waterfall_marks_iter() {
+                    if wf_marks.push(*m).is_err() {
+                        break;
+                    }
+                }
             }
             tx_seq = ui.tx_seq();
             let mut buf: heapless::String<48> = heapless::String::new();
@@ -714,7 +725,7 @@ pub fn run_log_panel(
                 &mfsk_app_shared::ui::state::WfLine,
                 { mfsk_app_shared::ui::state::WF_DEPTH },
             > = wf_snapshot.iter().collect();
-            waterfall::render(&mut display, &wf_refs, SHARED_UI_WIDTH).ok();
+            waterfall::render_marked(&mut display, &wf_refs, &wf_marks, SHARED_UI_WIDTH).ok();
             last_wf_seq = wf_seq;
         }
 
