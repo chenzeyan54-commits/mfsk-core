@@ -913,18 +913,31 @@ impl AudioSink for Ft8ChunkSink {
         // get inside the ±1 s coarse search so the air-sync refinement
         // (#356) has a DT to work with. Only NTP hands the phase to the
         // UTC drift check below.
-        // **`AIR DT` does not take the clock's phase at all.**
+        // **`AIR DT` takes the anchor too.** It used not to, on the
+        // reading that an RTC-guessed phase only got in the air's way:
+        // "measured 0.68 s and 1.65 s out on 2026-09-19, each time
+        // costing minutes before the capture put it right".
         //
-        // The anchor exists to get a clock-having receiver inside the
-        // ±1 s search so air-sync has something to refine. With the air
-        // as the chosen source the refinement *is* the placement, and an
-        // anchor beforehand only moves the grid to a phase the RTC
-        // guessed — measured 0.68 s and 1.65 s out on 2026-09-19, each
-        // time costing minutes before the capture put it right. So in
-        // that mode the grid stays free-running until the acquisition
-        // places it, which it does from the first slot.
-        let air_only = crate::grid_source() == mfsk_app_shared::grid_src::GridSource::AirDt;
-        if !self.coarse_anchored && !air_only {
+        // Those measurements were taken while the audio path was losing
+        // 6.5 % of its samples (the isochronous URB budget, aa10bf2e).
+        // The RTC was not 1.65 s wrong; the grid was *drifting* that far
+        // after the anchor placed it correctly, at +1035 ms a slot. With
+        // the loss gone the same anchor holds to −5.8 ms a slot, and
+        // skipping it costs exactly what it was supposed to save:
+        // measured on a radio 2026-09-19, an `AIR DT` start with a
+        // good RTC spent **2 min 9 s** and two 25 s captures — the
+        // first of which decoded nothing at all — rediscovering a phase
+        // the clock already had.
+        //
+        // The air still owns the phase: this is a one-shot placement,
+        // `clock_is_disciplined()` stays false without NTP, and the
+        // acquisition path is untouched. If the RTC really is seconds
+        // out — the hilltop case this mode exists for — the anchor
+        // places the grid wrongly, nothing decodes, and the under-par
+        // run reaches acquisition exactly as before. There is no case
+        // where starting from the clock is worse than starting from
+        // nothing.
+        if !self.coarse_anchored {
             if let Some(remain) = mfsk_app_shared::time_sync::samples_to_next_slot_12k(SLOT_SECS) {
                 // The clock puts the boundary within a second; a
                 // persisted air fix puts it within milliseconds. Same
@@ -1008,6 +1021,41 @@ impl AudioSink for Ft8ChunkSink {
                     let now_us = unsafe { sys::esp_timer_get_time() };
                     mfsk_app_shared::time_sync::publish_capture_slot(self.wav_idx as u32, now_us);
 
+                    // **Where this boundary fell against UTC**, in ms
+                    // into the 15 s grid, signed to the nearer tick.
+                    //
+                    // The one measurement that separates the two
+                    // explanations for a slot grid that reads ~0.75 s
+                    // out after the anchor and 0.04 s out once the
+                    // per-slot tracker has had a turn (measured on a
+                    // radio 2026-09-19, the same 0.7 s in both NTP and
+                    // `AIR DT` on the first full slot):
+                    //
+                    //   ≈0    — the boundary is declared at the right
+                    //           *time*, so the offset is in the audio
+                    //           this sink is holding, not in the
+                    //           arithmetic;
+                    //   ≈±750 — the declaration itself is late or
+                    //           early, and the bug is in `slot_target`
+                    //           / `slot_samples` or in the anchor.
+                    //
+                    // Guessing between them was tried and the sign did
+                    // not work out either way, which is why this is a
+                    // measurement rather than a fix.
+                    if let Some(ms) = mfsk_app_shared::time_sync::utc_now_ms() {
+                        let into = (ms % (SLOT_SECS as u64 * 1000)) as i64;
+                        let err = if into > SLOT_SECS as i64 * 500 {
+                            into - SLOT_SECS as i64 * 1000
+                        } else {
+                            into
+                        };
+                        log::info!(
+                            "uac: slot {} boundary {err:+} ms off the UTC grid (target {} samples)",
+                            self.wav_idx,
+                            self.slot_target,
+                        );
+                    }
+
                     // One phase authority per boundary, never both.
                     // Once NTP has disciplined the clock it is trusted
                     // absolutely; before then — or forever, off-grid —
@@ -1088,11 +1136,37 @@ impl AudioSink for Ft8ChunkSink {
                             // Cold-acquisition one-shot (#356b): the grid
                             // was lost past ±1 s and `decode_pipeline`
                             // recovered the phase from a 25 s FT8
-                            // capture. Uncapped — lengthen this one slot
-                            // by up to a whole period, then straight back
-                            // to nominal and hand to the narrow tracking.
-                            self.slot_target =
-                                (SLOT_SAMPLES_12K as i32 + acq).clamp(30_000, 300_000) as usize;
+                            // capture, or the DT trim wants a smaller
+                            // move through the same channel.
+                            //
+                            // **A slot can only be shortened.** This
+                            // used to be `(SLOT + acq).clamp(30_000,
+                            // 300_000)`, and `acq` reaches +90 000 (dt
+                            // is normalised to ±7.5 s), so a positive
+                            // shift asked for a slot of up to 270 000
+                            // samples. `stage1_inc::NMAX` is 180 000 and
+                            // is the spectrogram's geometry, not a
+                            // buffer — the excess is dropped with a
+                            // warning, and the sink then reports a total
+                            // the builder never held. That is the same
+                            // `audio_fill != reported total` split the
+                            // grid anchor had this morning.
+                            //
+                            // A shift of `+acq` and one of `acq - SLOT`
+                            // land the boundary in the same place, so
+                            // the positive case is taken by *shortening*
+                            // to `acq`. Never fired on hardware — both
+                            // acquisitions measured 2026-09-19 were
+                            // negative — which is the whole reason to
+                            // fix it now rather than after it does.
+                            let acq_abs = acq.unsigned_abs() as usize;
+                            self.slot_target = if acq_abs <= DEAD_ZONE_SAMPLES {
+                                SLOT_SAMPLES_12K
+                            } else if acq > 0 {
+                                acq as usize
+                            } else {
+                                (SLOT_SAMPLES_12K as i32 + acq).max(MIN_ACQ_SLOT_SAMPLES) as usize
+                            };
                             self.coarse_anchored = true;
                             mfsk_app_shared::time_sync::note_grid_lock(
                                 mfsk_app_shared::time_sync::GridLock::Air,
@@ -1222,6 +1296,11 @@ const SLOT_DRIFT_REANCHOR_MS: u32 = 250;
 /// that costs a slot must not trigger on that. 200 ms, a fifth of the
 /// ±1.0 s the coarse search covers.
 const DEAD_ZONE_SAMPLES: usize = 2_400;
+
+/// Floor for a cold-acquisition slot, in samples. `acq` is bounded by
+/// ±90 000, so the shortening branch cannot go below 90 000 on its own;
+/// this is the guard for a future wider bound rather than a live one.
+const MIN_ACQ_SLOT_SAMPLES: i32 = 30_000;
 
 /// Driver event callback. Invoked by the UAC class-driver background
 /// task on every `RX_CONNECTED` / `TX_CONNECTED` notification (i.e.
@@ -2153,6 +2232,7 @@ pub fn link_info() -> mfsk_app_shared::ui::link_bar::LinkInfo {
         vbus_mv: crate::pmic::vbus_mv_cached(),
         clock_set: mfsk_app_shared::time_sync::utc_now_ms().is_some(),
         grid: mfsk_app_shared::time_sync::grid_lock(),
+        grid_src: crate::grid_source(),
         vbus: tried.then(|| {
             (
                 p1 & crate::board::AW9523_P1_BOOST_EN != 0,

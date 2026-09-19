@@ -111,6 +111,11 @@ impl UsbLink {
 #[derive(Clone, Copy, Debug)]
 pub struct LinkInfo {
     pub usb: UsbLink,
+    /// Which time source the operator chose on the CONFIG page. Shown
+    /// beside [`Self::grid`] rather than instead of it: one says what
+    /// was asked for, the other what the grid is actually running on,
+    /// and the interesting state is when they differ.
+    pub grid_src: crate::grid_src::GridSource,
     /// Devices the host stack currently has open. Zero with
     /// [`UsbLink::Waiting`] is the "radio not seen" case.
     pub devices: u8,
@@ -262,17 +267,25 @@ where
             let _ = rest.push_str("down");
         }
     }
-    // One character, because there is room for one: what the slot grid
-    // is anchored to. `T` = NTP, `a` = off-air FT8 lock (#356), `r` =
-    // an RTC value (plausible, not disciplined), `-` = free-running.
-    // The receivers' headers carry the time itself; this says what that
-    // time — and the decode — can be trusted against.
+    // One character, because there is room for one, and **case says
+    // whether the chosen source is the one actually holding the
+    // phase**: `T`/`t` = NTP selected, disciplined / still on the
+    // clock's guess; `A`/`a` = AIR DT selected, placed off-air (#356) /
+    // still on the clock's guess; `-` = free-running.
+    //
+    // It used to report the lock alone, so `AIR DT` with the grid on
+    // its one-shot RTC anchor read plain `r` — the same glyph an NTP
+    // build shows before it syncs, and no way to tell from the panel
+    // which mode the operator had selected. Reported from the bench as
+    // "AIR DT なのに rtc と出る".
+    use crate::grid_src::GridSource;
     use crate::time_sync::GridLock;
-    let _ = rest.push_str(match info.grid {
-        GridLock::Ntp => " T",
-        GridLock::Air => " a",
-        GridLock::Rtc => " r",
-        GridLock::FreeRun => " -",
+    let _ = rest.push_str(match (info.grid_src, info.grid) {
+        (_, GridLock::FreeRun) => " -",
+        (GridSource::Ntp, GridLock::Ntp) => " T",
+        (GridSource::Ntp, _) => " t",
+        (GridSource::AirDt, GridLock::Air) => " A",
+        (GridSource::AirDt, _) => " a",
     });
     let wifi_fg = if info.wifi_rssi.is_some() {
         Rgb565::WHITE
