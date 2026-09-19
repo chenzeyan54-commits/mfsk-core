@@ -37,7 +37,7 @@ use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use esp_idf_svc::sys::MALLOC_CAP_SPIRAM;
 use mipidsi::{
     models::ILI9342CRgb565,
-    options::{ColorInversion, Orientation},
+    options::{ColorInversion, ColorOrder, Orientation},
     Builder,
 };
 
@@ -346,6 +346,7 @@ pub fn run<P: SpotPanel>(ctx: DisplayCtx) -> ! {
                 .display_size(crate::board::NATIVE_W, crate::board::NATIVE_H)
                 .orientation(Orientation::new().rotate(crate::board::ROTATION))
                 .invert_colors(ColorInversion::Inverted)
+                .color_order(ColorOrder::Bgr)
                 .init(&mut delay)
             {
                 Ok(d) => d,

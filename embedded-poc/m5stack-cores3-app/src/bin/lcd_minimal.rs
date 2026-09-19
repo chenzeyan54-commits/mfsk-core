@@ -43,7 +43,7 @@ use esp_idf_hal::units::FromValueType;
 use display_interface_spi::SPIInterface;
 use mipidsi::{
     models::ILI9342CRgb565,
-    options::{ColorInversion, Orientation, Rotation},
+    options::{ColorInversion, ColorOrder, Orientation, Rotation},
     Builder,
 };
 
@@ -154,6 +154,8 @@ fn main() -> ! {
             match Builder::new(ILI9342CRgb565, di)
                 .display_size(320, 240)
                 .invert_colors(ColorInversion::Inverted)
+                // Same panel as the app: wired BGR (see `display.rs`).
+                .color_order(ColorOrder::Bgr)
                 .init(&mut delay)
             {
                 Ok(d) => {

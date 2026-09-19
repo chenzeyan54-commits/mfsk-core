@@ -31,7 +31,7 @@ use esp_idf_hal::{
 };
 use mipidsi::{
     models::ILI9342CRgb565,
-    options::{ColorInversion, Orientation},
+    options::{ColorInversion, ColorOrder, Orientation},
     Builder,
 };
 
@@ -302,6 +302,18 @@ pub fn run_log_panel(
         // receivers present the same 240x320 canvas.
         .orientation(Orientation::new().rotate(crate::board::ROTATION))
         .invert_colors(ColorInversion::Inverted) // M5GFX CoreS3: cfg.invert = true
+        // **BGR, not RGB.** The CoreS3's ILI9342C is wired
+        // blue-green-red, and mipidsi defaults to RGB, so every colour
+        // this UI draws came out with its red and blue exchanged:
+        // `CSS_ORANGE` (255, 165, 0) reached the panel as (0, 165, 255)
+        // and read as sky blue, which is how the menu's amber hold
+        // indicator was reported as "blue". Green, white, grey and
+        // black are unaffected, which is why it went unnoticed — those
+        // are most of this UI. The waterfall's palette is the other
+        // casualty and is corrected by the same line: it is written
+        // black → blue → cyan → green → lime → red, and was being
+        // displayed with the blue and red ends swapped.
+        .color_order(ColorOrder::Bgr)
         .init(&mut delay)
     {
         Ok(d) => d,

@@ -103,7 +103,11 @@ use esp_idf_hal::gpio::AnyIOPin;
 use esp_idf_hal::spi::{config::Config as SpiConfig, SpiDeviceDriver, SpiDriver, SpiDriverConfig};
 use esp_idf_hal::units::FromValueType;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
-use mipidsi::{models::ILI9342CRgb565, options::ColorInversion, Builder};
+use mipidsi::{
+    models::ILI9342CRgb565,
+    options::{ColorInversion, ColorOrder},
+    Builder,
+};
 
 /// Seconds per burst. Five minutes at one edge per second is N = 300.
 const BURST_S: u64 = match option_env!("MFSK_RTC_BURST_S") {
@@ -416,6 +420,8 @@ fn main() -> ! {
         let display = Builder::new(ILI9342CRgb565, di)
             .display_size(320, 240)
             .invert_colors(ColorInversion::Inverted)
+            // Same panel as the app: wired BGR (see `display.rs`).
+            .color_order(ColorOrder::Bgr)
             .init(&mut delay)
             .expect("mipidsi init");
         Screen { display }

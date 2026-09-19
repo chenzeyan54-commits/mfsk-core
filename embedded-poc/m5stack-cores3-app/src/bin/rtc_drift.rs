@@ -90,7 +90,11 @@ use esp_idf_hal::delay::Ets;
 use esp_idf_hal::gpio::AnyIOPin;
 use esp_idf_hal::spi::{config::Config as SpiConfig, SpiDeviceDriver, SpiDriver, SpiDriverConfig};
 use esp_idf_hal::units::FromValueType;
-use mipidsi::{models::ILI9342CRgb565, options::ColorInversion, Builder};
+use mipidsi::{
+    models::ILI9342CRgb565,
+    options::{ColorInversion, ColorOrder},
+    Builder,
+};
 
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -445,6 +449,8 @@ fn main() -> ! {
         let display = Builder::new(ILI9342CRgb565, di)
             .display_size(320, 240)
             .invert_colors(ColorInversion::Inverted)
+            // Same panel as the app: wired BGR (see `display.rs`).
+            .color_order(ColorOrder::Bgr)
             .init(&mut delay)
             .expect("mipidsi init");
         Screen { display }
