@@ -40,14 +40,18 @@ pub const LOCK_MAX_PHASE_S: f32 = 0.3;
 /// Under-par slots **that carried a signal** before a cold
 /// acquisition, from a standing start (nothing has ever locked).
 ///
-/// One. The count used to be three, standing in for "is the band quiet
-/// or is the grid lost?"; [`GridState::observe_slot`] now measures
-/// that directly and a signal-less slot no longer counts, so the run
-/// no longer has to be long to mean anything. A single slot with a
-/// station in it that would not decode is the whole of the evidence,
-/// and on a mode the operator selected by hand it is evidence they
-/// have already accepted.
-pub const ACQUIRE_TRIGGER_SLOTS: u32 = 1;
+/// Three. It was briefly one, on the reasoning that an operator who
+/// chose `TIME: AIR DT` has already said the phase is suspect and
+/// should not wait for the receiver to re-derive that. What made the
+/// wait look expensive was a grid that really was a second out on
+/// every boot — the RTC write was releasing its counters one second
+/// late, so `AIR DT` inherited a whole second and needed the capture
+/// (2026-09-19; fixed in `rtc::write_from_system_clock`). With the
+/// clock right the grid starts where it belongs and a capture should
+/// be rare, so the count goes back to what keeps a transient from
+/// spending 25 s: three slots that carried signal and would not
+/// decode.
+pub const ACQUIRE_TRIGGER_SLOTS: u32 = 3;
 
 /// The same count once a lock has produced decodes. Higher, and still
 /// higher for a reason the signal test does not cover: after a lock,
@@ -267,9 +271,12 @@ mod tests {
     fn a_grid_that_decodes_but_is_off_centre_neither_locks_nor_holds() {
         // The 2026-09-19 case: six stations through a grid 0.68 s out.
         let mut g = GridState::new();
-        assert!(!g.is_locked(), "an off-centre grid must not lock");
-        // Under par even though the slot decoded, so the air gets its
-        // chance — and with the trigger at one, on that slot.
+        for _ in 1..ACQUIRE_TRIGGER_SLOTS {
+            assert_eq!(g.observe_with_phase(6, Some(-0.68)), GridAction::Hold);
+            assert!(!g.is_locked(), "an off-centre grid must not lock");
+        }
+        // The under-par run accumulates even though slots are decoding,
+        // so the air gets its chance.
         assert!(matches!(
             g.observe_with_phase(6, Some(-0.68)),
             GridAction::Acquire { .. }
@@ -289,9 +296,10 @@ mod tests {
     #[test]
     fn one_decode_a_slot_is_not_a_lock_and_still_reaches_acquisition() {
         let mut g = GridState::new();
+        for _ in 1..ACQUIRE_TRIGGER_SLOTS {
+            assert_eq!(g.observe(1), GridAction::Hold);
+        }
         assert!(!g.is_locked(), "one decode a slot must not lock the grid");
-        // One under-par slot is now the trigger from a standing start —
-        // a slot that decoded at all carried a signal by definition.
         assert_eq!(
             g.observe(1),
             GridAction::Acquire {
@@ -411,6 +419,9 @@ mod tests {
         }
         g.acquisition_done(true);
         assert_eq!(g.lost_slots(), 0);
+        for _ in 1..ACQUIRE_TRIGGER_SLOTS {
+            assert_eq!(g.observe(0), GridAction::Hold);
+        }
         assert!(matches!(g.observe(0), GridAction::Acquire { .. }));
     }
 
@@ -426,7 +437,10 @@ mod tests {
             );
         }
         assert_eq!(g.lost_slots(), 0);
-        // One slot with a station in it that would not decode is.
+        // Slots with a station in them that would not decode are.
+        for _ in 1..ACQUIRE_TRIGGER_SLOTS {
+            assert_eq!(g.observe_slot(0, None, true), GridAction::Hold);
+        }
         assert!(matches!(
             g.observe_slot(0, None, true),
             GridAction::Acquire { .. }
@@ -439,8 +453,14 @@ mod tests {
     #[test]
     fn the_hardware_recovery_sequence() {
         let mut g = GridState::new();
+        for _ in 1..ACQUIRE_TRIGGER_SLOTS {
+            assert_eq!(g.observe(1), GridAction::Hold);
+        }
         assert!(matches!(g.observe(1), GridAction::Acquire { .. }));
         g.acquisition_done(true); // -5.75 s, applied, and wrong
+        for _ in 1..ACQUIRE_TRIGGER_SLOTS {
+            assert_eq!(g.observe(0), GridAction::Hold);
+        }
         assert!(matches!(g.observe(0), GridAction::Acquire { .. }));
         g.acquisition_done(true); // +6.60 s, applied, close enough
         assert_eq!(g.observe(5), GridAction::Lock { n_dec: 5 });

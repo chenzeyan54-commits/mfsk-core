@@ -576,6 +576,15 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         // because that is about where the noise floor sits, so the top
         // score separates "an empty band or an audio problem" from "a
         // station this decoder could not read".
+        // **The status strip, decided in one place further down.**
+        //
+        // It shares the TX line's row, so only one thing can be on it
+        // and the precedence has to be explicit: an acquisition in
+        // flight, then a grid the operator asked the air for and the
+        // air has not confirmed, then what a slot that decoded nothing
+        // actually heard. Empty hands the row back to the TX line.
+        let mut strip: heapless::String<32> = heapless::String::new();
+
         // **Was there anything to decode?** Coarse sync's own top score,
         // which the panel shows and the acquisition trigger counts.
         let had_signal = !results.is_empty()
@@ -604,20 +613,11 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             // non-empty, so it costs no screen space — the panel is
             // already narrow enough that a second row was declined.
             if let Some(&(sc, dt, _)) = top3.first() {
-                let mut l: heapless::String<32> = heapless::String::new();
                 if sc >= COARSE_SIGNAL_SCORE {
-                    let _ = write!(&mut l, "SIG {sc:.0} @ {dt:+.2}s — grid off?");
+                    let _ = write!(&mut strip, "SIG {sc:.0} @ {dt:+.2}s — grid off?");
                 } else {
-                    let _ = write!(&mut l, "SIG {sc:.1} — band quiet");
+                    let _ = write!(&mut strip, "SIG {sc:.1} — band quiet");
                 }
-                if let Ok(mut ui) = UI.lock() {
-                    ui.set_acq_line(l.as_str());
-                }
-            }
-        } else if !results.is_empty() {
-            // Decodes are their own answer; give the strip back.
-            if let Ok(mut ui) = UI.lock() {
-                ui.set_acq_line("");
             }
         }
 
@@ -792,31 +792,26 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             /// the loop in them.
             const DT_TRIM_MIN_EARLY_S: f32 = 0.85;
             const DT_TRIM_MAX_S: f32 = 1.0;
-            /// A DT no station's own clock explains.
-            ///
-            /// The pooled bar exists because a decode's DT is that
-            /// station's timing as much as the grid's, and only a
-            /// sample across transmitters averages the first away. But
-            /// operators run WSJT-X against NTP: half a second is far
-            /// outside that population, so a single slot agreeing on
-            /// more than this is already saying something only the grid
-            /// can explain.
-            ///
-            /// The bar was briefly dropped to `LOCK_MIN_DECODES` for
-            /// *any* error, which is the 2026-09-05 per-slot servo
-            /// again under another name — and it behaved the same way,
-            /// walking −0.844, −1.004, −0.764, −0.202, +0.671 on five
-            /// consecutive slots.
-            const DT_TRIM_BIG_S: f32 = 0.5;
-            let slot_sample = match (slot_median, n_dec) {
-                (Some(m), n)
-                    if n >= mfsk_app_shared::grid_state::LOCK_MIN_DECODES
-                        && m.abs() >= DT_TRIM_BIG_S =>
-                {
-                    Some(m)
-                }
-                _ => None,
-            };
+            // **Pooled evidence only.**
+            //
+            // A single slot's median was admitted for a while — first
+            // for any error over `LOCK_MIN_DECODES` decodes, which is
+            // the 2026-09-05 per-slot servo under another name and
+            // walked the grid −0.844, −1.004, −0.764, −0.202, +0.671 on
+            // five consecutive slots; then only past 0.5 s, on the
+            // argument that no station's own clock explains that much.
+            //
+            // Both were reaching for a correction the receiver needed
+            // *often*, and it needed one often because the RTC write
+            // was releasing a second late and every `AIR DT` boot
+            // started a second out (fixed in
+            // `rtc::write_from_system_clock`, 2026-09-19 — the same
+            // band then read `dt +0.04` with no trim at all). With the
+            // clock right this is back to what it was designed as: a
+            // correction that waits for a sample across transmitters,
+            // because that is the only kind that tells a grid error
+            // from one loose station.
+
             let pooled_sample = if mfsk_app_shared::time_sync::dt_pool_len() >= DT_TRIM_MIN_OBS {
                 mfsk_app_shared::time_sync::pooled_dt_median()
             } else {
@@ -848,7 +843,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             if !full_slot || trim_used {
                 // nothing to measure, or nothing left to spend
             } else if !mfsk_app_shared::time_sync::clock_is_disciplined() && !was_acquiring {
-                if let Some(m) = slot_sample.or(pooled_sample) {
+                if let Some(m) = pooled_sample {
                     // **Asymmetric, because the two directions do not
                     // cost the same.** A grid running late is corrected
                     // by shortening one slot, which still reaches
@@ -875,12 +870,8 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                             (applied * 12_000.0).round() as i32,
                         );
                         log::warn!(
-                            "  air-sync: trimming the grid {applied:+.3} s from {} (median {m:+.3} s) — one shot",
-                            if slot_sample.is_some() {
-                                "this slot's decodes"
-                            } else {
-                                "the pooled decodes"
-                            },
+                            "  air-sync: trimming the grid {applied:+.3} s from the pooled \
+                             decodes (median {m:+.3} s) — one shot"
                         );
                         trimmed = true;
                         trim_used = true;
@@ -1334,6 +1325,31 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         if qso.state == QsoState::Idle {
             qso.call_cq(None);
         }
+        // **One writer for the status strip.**
+        //
+        // An acquisition in flight has already put its own progress
+        // there and cleared it on the way out, so this only speaks when
+        // one is not running. The `AIR DT` line is the case that had no
+        // display at all: the operator chose the air, the grid is
+        // running on the clock's one-shot anchor, and nothing has
+        // confirmed it yet — which since the RTC write was fixed is the
+        // *normal* state and looks exactly like an ordinary receive.
+        // Reported from the bench twice.
+        if !grid.is_acquiring() {
+            if source == "uac"
+                && crate::grid_source() == mfsk_app_shared::grid_src::GridSource::AirDt
+                && !grid.is_locked()
+            {
+                let mut l: heapless::String<32> = heapless::String::new();
+                let _ = l.push_str("AIR DT: clock phase, unproven");
+                if let Ok(mut ui) = UI.lock() {
+                    ui.set_acq_line(l.as_str());
+                }
+            } else if let Ok(mut ui) = UI.lock() {
+                ui.set_acq_line(strip.as_str());
+            }
+        }
+
         let intent = qso.next_tx();
         push_tx_line(&qso, intent.as_ref());
 
