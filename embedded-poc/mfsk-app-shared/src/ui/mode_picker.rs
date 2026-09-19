@@ -38,9 +38,10 @@
 //! tap a row to arm, press the bar to commit, tap outside to dismiss.
 //! Nothing is reserved when it is closed.
 //!
-//! The hold shows its progress ([`HOLD_BAR_H`]) — without that, a press
-//! that fell short of the threshold looked exactly like a panel that
-//! had not noticed the finger at all.
+//! The hold is acknowledged the instant it starts, with a border round
+//! the panel ([`HOLD_BORDER_W`]) — without that, a press that fell
+//! short of the threshold looked exactly like a panel that had not
+//! noticed the finger at all.
 //!
 //! ## Two levels, because there are two kinds of setting
 //!
@@ -138,20 +139,24 @@ pub const ARM_MS: u64 = 8_000;
 
 /// How long a finger must stay down to summon the picker. Long enough
 /// not to fire while someone is using the screen for something else.
-pub const OPEN_MS: u64 = 500;
+pub const OPEN_MS: u64 = 300;
 
-/// Height of the hold indicator, in pixels.
+/// Width of the hold indicator's border, in pixels.
 ///
 /// **A hold with no feedback is indistinguishable from a dead panel.**
 /// Opening the menu is a press-and-hold because neither the WSPR nor
 /// the FST4 screen has a pixel to spare for a permanent button — but
 /// nothing on screen said so, or said that the hold was registering, so
-/// a press that was a hundred milliseconds short looked exactly like a
-/// press that was never seen. This draws a bar along the top edge of
-/// where the menu is about to appear, growing from the centre as the
-/// hold completes: it says the touch landed, it says something is
-/// coming, and it says where.
-pub const HOLD_BAR_H: u32 = 6;
+/// a press that fell short looked exactly like a press that was never
+/// seen.
+///
+/// So the whole screen takes a two-pixel border the moment a finger is
+/// seen: one draw, no animation, gone on release. A progress bar was
+/// tried first and is the wrong instrument — it draws the eye to one
+/// place, animates a wait nobody asked to watch, and at 300 ms is over
+/// before it reads. What the operator needs to know is binary: the
+/// panel felt that.
+pub const HOLD_BORDER_W: u32 = 2;
 
 /// Height of the commit bar under the list.
 pub const COMMIT_H: u32 = 40;
@@ -236,6 +241,9 @@ fn hit(origin: Point, x: u16, y: u16, rows: usize) -> Option<Target> {
 /// between the three receivers.
 pub struct ModePicker {
     origin: Point,
+    /// The panel, for the hold border. The widget draws nothing else
+    /// outside its own footprint.
+    screen: Size,
     page: Page,
     open: bool,
     just_closed: bool,
@@ -254,6 +262,9 @@ pub struct ModePicker {
     /// The hold indicator is on screen, so leaving it needs an erase
     /// and a repaint of what it covered.
     hold_drawn: bool,
+    /// The overlay opened while the border was up: the next render
+    /// clears it, since the overlay's own footprint does not.
+    erase_hold: bool,
     /// Set once the commit fires. The caller is on its way to a reboot;
     /// until it arrives, the bar says so rather than sitting there
     /// looking unpressed.
@@ -263,9 +274,10 @@ pub struct ModePicker {
 }
 
 impl ModePicker {
-    pub fn new(origin: Point) -> Self {
+    pub fn new(origin: Point, screen: Size) -> Self {
         Self {
             origin,
+            screen,
             page: Page::Root,
             open: false,
             just_closed: false,
@@ -273,6 +285,7 @@ impl ModePicker {
             armed: None,
             pressed: None,
             hold_drawn: false,
+            erase_hold: false,
             committing: false,
             drawn: None,
             needs_draw: false,
@@ -399,8 +412,11 @@ impl ModePicker {
                     self.open = true;
                     self.armed = None;
                     self.needs_draw = true;
-                    // The overlay covers the bar; no erase needed, and
-                    // no repaint request either.
+                    // The border is at the panel's edges, which the
+                    // overlay does not cover — `render_hold` is not
+                    // called once `open` is set, so erase it here.
+                    // `close()` repaints the screen anyway.
+                    self.erase_hold = self.hold_drawn;
                     self.hold_drawn = false;
                 }
             }
@@ -446,6 +462,20 @@ impl ModePicker {
     {
         if !self.open {
             return self.render_hold(display);
+        }
+        if core::mem::take(&mut self.erase_hold) {
+            let (w, h) = (self.screen.width, self.screen.height);
+            let b = HOLD_BORDER_W;
+            for (p, size) in [
+                (Point::new(0, 0), Size::new(w, b)),
+                (Point::new(0, (h - b) as i32), Size::new(w, b)),
+                (Point::new(0, 0), Size::new(b, h)),
+                (Point::new((w - b) as i32, 0), Size::new(b, h)),
+            ] {
+                Rectangle::new(p, size)
+                    .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+                    .draw(display)?;
+            }
         }
         let armed_idx = self.armed.map(|(i, _)| i);
         // `needs_draw` is what carries a pressed/released edge here —
@@ -572,45 +602,47 @@ impl ModePicker {
         Ok(())
     }
 
-    /// The hold indicator, drawn while the overlay is still closed.
+    /// The hold indicator, drawn while the overlay is still closed: a
+    /// border round the whole panel for as long as a finger is down.
     ///
-    /// Grows from the centre of the widget's top edge to its full
-    /// width as the press approaches [`OPEN_MS`]. On release before
-    /// then it is erased and [`Self::take_just_closed`] fires, so the
-    /// caller repaints the few pixels it covered — the same path the
-    /// overlay itself uses.
+    /// Drawn once when the press begins and erased once when it ends —
+    /// the intermediate frames have nothing to say. On release the
+    /// erase requests a repaint through [`Self::take_just_closed`], the
+    /// same path the overlay itself uses, because the border sat on
+    /// whatever the screen was showing.
     fn render_hold<D>(&mut self, display: &mut D) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = Rgb565>,
     {
-        let held_ms = self
-            .press_since
-            .map(|since| since.elapsed().as_millis() as u64);
-        match held_ms {
-            Some(ms) => {
-                let frac = (ms as f32 / OPEN_MS as f32).clamp(0.0, 1.0);
-                let w = (WIDTH as f32 * frac) as u32;
-                if w == 0 {
-                    return Ok(());
-                }
-                let x = self.origin.x + (WIDTH as i32 - w as i32) / 2;
-                Rectangle::new(Point::new(x, self.origin.y), Size::new(w, HOLD_BAR_H))
-                    .into_styled(PrimitiveStyle::with_fill(Rgb565::CSS_ORANGE))
-                    .draw(display)?;
-                self.hold_drawn = true;
-                Ok(())
-            }
-            None => {
-                if self.hold_drawn {
-                    Rectangle::new(self.origin, Size::new(WIDTH, HOLD_BAR_H))
-                        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
-                        .draw(display)?;
-                    self.hold_drawn = false;
-                    // Whatever the bar sat on has to come back.
-                    self.just_closed = true;
-                }
-                Ok(())
-            }
+        let pressed = self.press_since.is_some();
+        if pressed == self.hold_drawn {
+            return Ok(());
         }
+        let colour = if pressed {
+            Rgb565::CSS_ORANGE
+        } else {
+            Rgb565::BLACK
+        };
+        let (w, h) = (self.screen.width, self.screen.height);
+        let b = HOLD_BORDER_W;
+        // Four bars rather than a stroked rectangle: the stroke would
+        // be centred on the edge and half of it would fall off the
+        // panel, which on this driver is a clipped write per frame.
+        for (p, size) in [
+            (Point::new(0, 0), Size::new(w, b)),
+            (Point::new(0, (h - b) as i32), Size::new(w, b)),
+            (Point::new(0, 0), Size::new(b, h)),
+            (Point::new((w - b) as i32, 0), Size::new(b, h)),
+        ] {
+            Rectangle::new(p, size)
+                .into_styled(PrimitiveStyle::with_fill(colour))
+                .draw(display)?;
+        }
+        self.hold_drawn = pressed;
+        if !pressed {
+            // Whatever the border sat on has to come back.
+            self.just_closed = true;
+        }
+        Ok(())
     }
 }

@@ -211,10 +211,10 @@ image, off every flash.
 
 ## 5. The menu — mode and settings
 
-Hold a finger anywhere on the screen for about **0.5 s**. While you
-hold, an amber bar grows from the centre of the top edge of where the
-menu will appear — it says the touch landed, that something is coming,
-and where. No bar means the touch is not reaching the panel.
+Hold a finger anywhere on the screen for about **0.3 s**. The moment a
+finger lands, a 2 px border is drawn round the whole screen — no
+animation. Border means the panel felt it; no border means the touch is
+not reaching it. That is all it is there to say.
 
 The overlay opens on a three-row **root**:
 

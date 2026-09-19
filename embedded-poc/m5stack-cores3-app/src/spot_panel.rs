@@ -393,10 +393,13 @@ pub fn run<P: SpotPanel>(ctx: DisplayCtx) -> ! {
     let mut boot_summary_sent = false;
     let mut rtc_stored = false;
     let mut last_contact = crate::touch::Contact::default();
-    let mut picker = mode_picker::ModePicker::new(embedded_graphics::prelude::Point::new(
-        (crate::board::CANVAS_W as i32 - mode_picker::WIDTH as i32) / 2,
-        (crate::board::CANVAS_H as i32 - mode_picker::height() as i32) / 2,
-    ));
+    let mut picker = mode_picker::ModePicker::new(
+        embedded_graphics::prelude::Point::new(
+            (crate::board::CANVAS_W as i32 - mode_picker::WIDTH as i32) / 2,
+            (crate::board::CANVAS_H as i32 - mode_picker::height() as i32) / 2,
+        ),
+        embedded_graphics::prelude::Size::new(crate::board::CANVAS_W as u32, crate::board::CANVAS_H as u32),
+    );
 
     let mut last_dirty = u32::MAX;
     let mut tick: u32 = 0;

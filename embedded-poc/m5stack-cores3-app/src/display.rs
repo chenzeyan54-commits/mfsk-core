@@ -458,10 +458,13 @@ pub fn run_log_panel(
     // Centred, like the other two receivers. The origin used to be
     // (140, 134), from when this panel ran unrotated at 320x240 — at
     // 240 wide that put a 208 px widget 108 px off the right edge.
-    let mut picker = mode_picker::ModePicker::new(Point::new(
-        (crate::board::CANVAS_W as i32 - mode_picker::WIDTH as i32) / 2,
-        (crate::board::CANVAS_H as i32 - mode_picker::height() as i32) / 2,
-    ));
+    let mut picker = mode_picker::ModePicker::new(
+        Point::new(
+            (crate::board::CANVAS_W as i32 - mode_picker::WIDTH as i32) / 2,
+            (crate::board::CANVAS_H as i32 - mode_picker::height() as i32) / 2,
+        ),
+        Size::new(crate::board::CANVAS_W as u32, crate::board::CANVAS_H as u32),
+    );
     let mut touch_read_failed = false;
     let mut last_wf_seq: u32 = u32::MAX;
     let mut last_decoded_fp: (usize, u32) = (usize::MAX, u32::MAX);
