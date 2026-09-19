@@ -182,7 +182,16 @@ const USB_EVENTS_TASK_STACK: usize = 4096;
 /// `tskNO_AFFINITY` but pinning to core 0 (PRO_CPU) matches the upstream
 /// audio_player example and keeps the decoder's core 1 (APP_CPU) free.
 const UAC_DRIVER_TASK_STACK: usize = 4096;
-const UAC_DRIVER_TASK_PRIORITY: usize = 5;
+/// **6, the same as [`AUDIO_TASK_PRIORITY`] and for the same reason.**
+///
+/// This was 5 while the reader was raised to 6 on 2026-09-19, which
+/// raised one half of the audio path and left the half feeding it
+/// sharing core 0 with the decode thread at equal priority — 100 Hz
+/// round-robin, so the class driver got about half a core for as long
+/// as a decode ran. That is visible in the honest priority argument the
+/// reader's constant already makes: a 16 KB ring is 85 ms of audio, and
+/// nothing in the path may stall longer than that.
+const UAC_DRIVER_TASK_PRIORITY: usize = 6;
 const UAC_DRIVER_TASK_CORE: sys::BaseType_t = 0;
 
 /// `uac_app` task stack. Just runs `recv()` → device_open/start →
@@ -527,11 +536,26 @@ pub fn acquisition_start_in_slot() -> Option<usize> {
 
 /// Start filling the acquisition ring from scratch.
 pub fn arm_acquisition() {
+    // **Already armed is left alone.** The capture is 25 s of audio; a
+    // second arm that clears the ring throws away what has been
+    // gathered and starts the wait again. That matters now that the
+    // pipeline arms at boot — the `Acquire` action a slot later must
+    // not undo it.
+    if ACQUIRE_ARMED.load(Ordering::Acquire) {
+        return;
+    }
     if let Ok(mut r) = ACQUIRE_RING.lock() {
         r.clear();
         r.reserve(ACQUIRE_RING_CAP);
     }
     ACQUIRE_ARMED.store(true, Ordering::Release);
+}
+
+/// Whether a persisted grid fix was handed over by
+/// [`seed_grid_fix_us`] — i.e. whether this boot has a phase from
+/// anywhere other than the air.
+pub fn grid_fix_seeded() -> bool {
+    PENDING_GRID_FIX_US.load(Ordering::Acquire) != i32::MIN
 }
 
 /// Stop filling and drop the buffer.
@@ -793,6 +817,51 @@ struct Ft8ChunkSink {
 // SAFETY: `QueueHandle_t` is a raw pointer into IDF-owned state; the
 // IDF queue API is thread-safe by design (that's the whole point of a
 // FreeRTOS queue), and `Ft8ChunkSink` never dereferences the pointer
+/// **How long the reader spent blocked handing chunks on.** Max and
+/// total per 1 Hz tick, in µs, reset by the tick that prints them.
+///
+/// The question these answer cannot be answered from the outside: a
+/// second with fewer bytes in it says audio was lost, not where. The
+/// reader drains a 16 KB ring (85 ms, [`STREAM_BUFFER_BYTES`]) and
+/// blocks on a four-chunk queue (400 ms), so "the reader was held
+/// longer than the ring" and "the driver was not scheduled" produce
+/// the same missing bytes and want opposite fixes.
+///
+/// Two relaxed atomics per chunk, no allocation, no lock, nothing on
+/// the stack — the constraints `embedded-poc/CLAUDE.md` sets for a
+/// probe on this board.
+static SINK_BLOCK_MAX_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SINK_BLOCK_SUM_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// **Longest gap between two reads, per tick, in µs.** The question
+/// [`SINK_BLOCK_MAX_US`] cannot answer.
+///
+/// A deficit second is never followed by a surplus one — measured on a
+/// radio 2026-09-19, 34-38 reads of 4 096 B where every other second
+/// does exactly 47 — so the samples are discarded rather than queued,
+/// and the ring is only [`STREAM_BUFFER_BYTES`] = 85 ms deep. Anything
+/// in the path that stops for longer than that loses audio outright,
+/// and "the reader was not scheduled" and "the class driver did not
+/// resubmit transfers" look identical from the byte count while
+/// wanting opposite fixes. A read normally completes every 21.3 ms
+/// (4 096 B at 192 000 B/s), so this separates them on its own: a
+/// figure near 21 ms exonerates this thread.
+static READ_GAP_MAX_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Reads that came back `ESP_ERR_TIMEOUT` — the ring stayed empty for
+/// the whole [`READER_READ_TIMEOUT_MS`]. Counted because the loop
+/// otherwise `continue`s past it in silence, and it is the driver side
+/// of the same question.
+static READ_TIMEOUTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Hand a chunk on, timing how long that took.
+fn send_chunk_timed(q: sys::QueueHandle_t, msg: Box<ChunkMsg>) {
+    let t0 = unsafe { sys::esp_timer_get_time() };
+    send_box(q, msg);
+    let dt = (unsafe { sys::esp_timer_get_time() } - t0).clamp(0, u32::MAX as i64) as u32;
+    SINK_BLOCK_SUM_US.fetch_add(dt, Ordering::Relaxed);
+    SINK_BLOCK_MAX_US.fetch_max(dt, Ordering::Relaxed);
+}
+
 // itself — every use goes through `pipeline::send_box`, which wraps
 // the IDF `xQueueGenericSend`. Matches `DeviceHandle`'s own identical
 // `Send` rationale above.
@@ -844,7 +913,18 @@ impl AudioSink for Ft8ChunkSink {
         // get inside the ±1 s coarse search so the air-sync refinement
         // (#356) has a DT to work with. Only NTP hands the phase to the
         // UTC drift check below.
-        if !self.coarse_anchored {
+        // **`AIR DT` does not take the clock's phase at all.**
+        //
+        // The anchor exists to get a clock-having receiver inside the
+        // ±1 s search so air-sync has something to refine. With the air
+        // as the chosen source the refinement *is* the placement, and an
+        // anchor beforehand only moves the grid to a phase the RTC
+        // guessed — measured 0.68 s and 1.65 s out on 2026-09-19, each
+        // time costing minutes before the capture put it right. So in
+        // that mode the grid stays free-running until the acquisition
+        // places it, which it does from the first slot.
+        let air_only = crate::grid_source() == mfsk_app_shared::grid_src::GridSource::AirDt;
+        if !self.coarse_anchored && !air_only {
             if let Some(remain) = mfsk_app_shared::time_sync::samples_to_next_slot_12k(SLOT_SECS) {
                 // The clock puts the boundary within a second; a
                 // persisted air fix puts it within milliseconds. Same
@@ -864,7 +944,22 @@ impl AudioSink for Ft8ChunkSink {
                     );
                     r
                 };
-                self.slot_samples = SLOT_SAMPLES_12K.saturating_sub(remain);
+                // **Shorten this slot; do not pre-load its counter.**
+                //
+                // Both ways move the boundary to `remain` samples from
+                // now. Only one of them tells the truth downstream:
+                // `slot_samples` is "how much of this slot has been
+                // pushed", and stage1_inc fills its buffer from what it
+                // actually receives, so a pre-loaded counter makes
+                // `SlotEnd` report a full slot while the buffer holds
+                // `remain` samples. `finalize_slot` then hands the
+                // decoder a truncated slot labelled as a whole one —
+                // the last second missing, every station at positive DT
+                // losing its tail. Seen on the radio as
+                // `audio_fill=168000 != reported total 180756` and, in
+                // NTP mode where the drift re-anchor fires often, as
+                // every other slot decoding nothing (2026-09-19).
+                self.slot_target = remain;
                 self.coarse_anchored = true;
                 // Grid lock state (#356b): a plausible clock, disciplined
                 // or not. `decode_pipeline`'s air-sync raises this to
@@ -877,8 +972,11 @@ impl AudioSink for Ft8ChunkSink {
                     },
                 );
                 log::info!(
-                    "uac: slot grid coarse-anchored to the system clock — {} ms to the next boundary",
+                    "uac: slot grid coarse-anchored to the system clock — {} ms to the next \
+                     boundary (clock sub-second {} ms, slot_samples now {})",
                     remain / 12,
+                    mfsk_app_shared::time_sync::utc_now_ms().map_or(-1, |ms| (ms % 1000) as i64),
+                    self.slot_samples,
                 );
             }
         }
@@ -886,10 +984,10 @@ impl AudioSink for Ft8ChunkSink {
             self.chunk.push(s);
             if self.chunk.len() >= CHUNK_LEN {
                 let to_send = core::mem::replace(&mut self.chunk, Vec::with_capacity(CHUNK_LEN));
-                send_box(self.chunk_q, Box::new(ChunkMsg::Samples(to_send)));
+                send_chunk_timed(self.chunk_q, Box::new(ChunkMsg::Samples(to_send)));
                 self.slot_samples += CHUNK_LEN;
                 if self.slot_samples >= self.slot_target {
-                    send_box(
+                    send_chunk_timed(
                         self.chunk_q,
                         Box::new(ChunkMsg::SlotEnd {
                             wav_idx: self.wav_idx,
@@ -939,10 +1037,38 @@ impl AudioSink for Ft8ChunkSink {
                             } else {
                                 (remain / 12) as i32
                             };
+                            // **Track every slot; clamp so no slot is
+                            // shorter than the emit point.**
+                            //
+                            // This used to fire only past
+                            // `SLOT_DRIFT_REANCHOR_MS`, and then took
+                            // the whole error out of one slot. That is
+                            // the worse half of the trade twice over:
+                            // the audio arrives at 12 032 sa/s against
+                            // a nominal 12 000 (measured on an IC-705,
+                            // 2026-09-19), so the error refills and the
+                            // correction is not rare; and a slot cut
+                            // more than 12 000 samples short never
+                            // reaches `stage1_inc::SPEC_EMIT_PAIR` at
+                            // 168 000, so it emits a partial SpecBundle
+                            // and the decoder gets no tail window at
+                            // all. Measured: alternating slots at
+                            // `pair_done=85/92`, `tail_win=0`, `dec` 0-2
+                            // against 7 on the slots between them.
+                            //
+                            // Following it every slot keeps the phase
+                            // inside one chunk of UTC, and the clamp
+                            // spreads a genuine step (an NTP jump) over
+                            // a few slots that all still decode instead
+                            // of one that cannot.
+                            let target = remain.clamp(EMIT_SAFE_MIN_SAMPLES, SLOT_TRACK_MAX_SAMPLES);
                             if err_ms.unsigned_abs() > SLOT_DRIFT_REANCHOR_MS {
-                                log::warn!("uac: slot phase {err_ms:+} ms off UTC — re-anchoring");
-                                self.slot_samples = SLOT_SAMPLES_12K.saturating_sub(remain);
+                                log::warn!(
+                                    "uac: slot phase {err_ms:+} ms off UTC — tracking to {target} \
+                                     samples"
+                                );
                             }
+                            self.slot_target = target;
                         }
                     } else {
                         let acq = mfsk_app_shared::time_sync::take_acquisition_shift_12k();
@@ -1052,10 +1178,23 @@ pub fn seed_grid_fix_us(offset_us: i32) {
 const SLOT_SAMPLES_12K: usize = 180_000;
 /// The same slot, in seconds — what the UTC grid is computed from.
 const SLOT_SECS: u64 = 15;
-/// Phase error that triggers a re-anchor rather than a note. 250 ms is
-/// a tenth of the ±2.5 s FT8 searches, so this corrects long-term
-/// drift (and the NTP step) without chasing jitter.
+/// Phase error that is worth a log line. The correction itself runs
+/// every slot (see the tracking block); this is only the threshold for
+/// saying so, so it stays at a tenth of the ±2.5 s FT8 searches.
 const SLOT_DRIFT_REANCHOR_MS: u32 = 250;
+
+/// Shortest slot the phase tracker may ask for.
+///
+/// `stage1_inc` emits its SpecBundle once it holds 168 000 samples
+/// (`SPEC_EMIT_PAIR`), which is what gives the decoder a tail window
+/// before the boundary. A slot shorter than that emits *partial* and
+/// the window is zero, so a correction is never allowed to cost the
+/// slot it corrects: 174 000 samples (14.5 s) leaves 0.5 s of it.
+const EMIT_SAFE_MIN_SAMPLES: usize = 174_000;
+/// Longest slot the tracker may ask for — the mirror of
+/// [`EMIT_SAFE_MIN_SAMPLES`], so one step moves the phase by at most
+/// half a second in either direction.
+const SLOT_TRACK_MAX_SAMPLES: usize = 186_000;
 
 /// Driver event callback. Invoked by the UAC class-driver background
 /// task on every `RX_CONNECTED` / `TX_CONNECTED` notification (i.e.
@@ -1411,6 +1550,8 @@ fn reader_thread(handle: DeviceHandle, addr: u8, iface_num: u8) {
     let mut last_log = std::time::Instant::now();
     // When audio last actually arrived — the stall watchdog's clock.
     let mut last_data = std::time::Instant::now();
+    /// Completion time of the previous read, for `READ_GAP_MAX_US`.
+    let mut last_read_done: i64 = 0;
     let mut last_bytes: u32 = 0;
     // Post-resample signal statistics for the 1 Hz tick — issue #163.
     //
@@ -1487,16 +1628,20 @@ fn reader_thread(handle: DeviceHandle, addr: u8, iface_num: u8) {
             let free_internal = unsafe {
                 sys::heap_caps_get_free_size(sys::MALLOC_CAP_INTERNAL | sys::MALLOC_CAP_8BIT)
             };
-            let largest_internal = unsafe {
-                sys::heap_caps_get_largest_free_block(
-                    sys::MALLOC_CAP_INTERNAL | sys::MALLOC_CAP_8BIT,
-                )
-            };
+            // `bps` is bytes in this interval, and the interval is
+            // only *at least* a second — so it is printed, or a slow
+            // tick reads as lost audio.
+            let int_ms = now.duration_since(last_log).as_millis();
+            let blk_max = SINK_BLOCK_MAX_US.swap(0, Ordering::Relaxed);
+            let blk_sum = SINK_BLOCK_SUM_US.swap(0, Ordering::Relaxed);
+            let gap_max = READ_GAP_MAX_US.swap(0, Ordering::Relaxed);
+            let to = READ_TIMEOUTS.swap(0, Ordering::Relaxed);
             log::info!(
-                "uac: rx tick: {bps} B/s (total {bytes} B / {packets} pkt / {errors} err) \
-                 | audio {out_samples} sa/s (want 12000), rms {dbfs:.1} dBFS, peak {peak}, \
-                 clipped {clipped} | internal={free_internal} largest={largest_internal}",
+                "uac: rx tick: {bps} B/{int_ms}ms ({packets} pkt / {errors} err) \
+                 | audio {out_samples} sa/s, rms {dbfs:.1} dBFS, peak {peak}, clip {clipped} \
+                 | blk {blk_max}/{blk_sum}us gap {gap_max}us to {to} | int={free_internal}",
             );
+            let _ = bytes;
             UAC_SA_PER_S.store(out_samples, Ordering::Release);
             UAC_RMS_MDB.store(
                 if out_samples > 0 {
@@ -1534,6 +1679,11 @@ fn reader_thread(handle: DeviceHandle, addr: u8, iface_num: u8) {
         }
 
         let mut bytes_read: u32 = 0;
+        let t_read_start = unsafe { sys::esp_timer_get_time() };
+        if last_read_done > 0 {
+            let gap = (t_read_start - last_read_done).clamp(0, u32::MAX as i64) as u32;
+            READ_GAP_MAX_US.fetch_max(gap, Ordering::Relaxed);
+        }
         let err = unsafe {
             sys::uac::uac_host_device_read(
                 handle.0,
@@ -1549,6 +1699,8 @@ fn reader_thread(handle: DeviceHandle, addr: u8, iface_num: u8) {
             // received a fresh iso IN frame). NOT a reason to exit
             // (Gemini PR #98 review). Just continue the loop.
             if err == sys::ESP_ERR_TIMEOUT as sys::esp_err_t {
+                READ_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                last_read_done = unsafe { sys::esp_timer_get_time() };
                 continue;
             }
             RX_ERRORS.fetch_add(1, Ordering::Relaxed);
@@ -1564,6 +1716,7 @@ fn reader_thread(handle: DeviceHandle, addr: u8, iface_num: u8) {
             gate.reopen = Some((addr, iface_num));
             break;
         }
+        last_read_done = unsafe { sys::esp_timer_get_time() };
         if bytes_read > 0 {
             last_data = std::time::Instant::now();
         }
@@ -1793,7 +1946,16 @@ pub fn start_host() -> Result<()> {
     }
 
     if let Err(e) =
-        spawn_psram_thread(c"usb_events", USB_EVENTS_TASK_STACK, None, None, usb_events_task)
+        spawn_psram_thread(
+            c"usb_events",
+            USB_EVENTS_TASK_STACK,
+            // Part of the audio path: it is what dispatches the host
+            // library's events, so it answers to
+            // `UAC_DRIVER_TASK_PRIORITY`'s argument, not to a default.
+            Some(AUDIO_TASK_PRIORITY),
+            None,
+            usb_events_task,
+        )
     {
         let uninstall_err = unsafe { sys::usb_host_uninstall() };
         if uninstall_err != sys::ESP_OK as sys::esp_err_t {
