@@ -12,8 +12,8 @@
 //! ε.4 of the `docs/CLEANUP_2026_05.md` `decode_block` split. The
 //! parent (`decode_block.rs`) re-exports `SymMask`,
 //! `symbol_spectra_direct`, and the `fill_symbol_spectra*` family so
-//! external callers (`super::decode::*` host path, `mfsk-ffi-ft8`
-//! embedded entry, `embedded-shared::stage1_inc`) keep the same
+//! external callers (`super::decode::*` host path,
+//! `embedded-shared::stage1_inc`) keep the same
 //! `mfsk_core::ft8::decode_block::*` paths as before. The legacy
 //! BASIS (Q15 sin/cos dot-product) fill path was removed in 0.8.0
 //! (issue #162) — `fill_symbol_spectra_goertzel` (Phase

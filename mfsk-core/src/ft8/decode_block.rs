@@ -67,8 +67,8 @@ mod spectrogram;
 mod types;
 
 // Re-export the items that were previously defined inline in this
-// file so external callers (`mfsk-ffi-ft8`, `embedded-shared`,
-// integration tests, sibling modules under `ft8/`) see the same
+// file so external callers (`embedded-shared`, integration tests,
+// sibling modules under `ft8/`) see the same
 // `mfsk_core::ft8::decode_block::*` paths.
 pub use coarse_sync::{
     coarse_allsum_len, coarse_sync, coarse_sync_with_allsum, coarse_sync_with_allsum_and_lag,

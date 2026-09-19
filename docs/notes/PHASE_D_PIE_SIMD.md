@@ -5,8 +5,8 @@ vector kernels on the production S3 decode path. Drafted 2026-05-22.
 
 Lives outside the `Phase B / Phase C` controller-line plan in
 `docs/notes/ROADMAP.md` because it is **pure decoder-side perf** and
-benefits every S3 consumer (`m5stack-s3`, `m5stack-s3-app`, the
-planned `m5stack-cores3-app`, and any `mfsk-ffi-ft8` user on S3).
+benefits every S3 consumer (`m5stack-s3`, `m5stack-s3-app`,
+`m5stack-cores3-app`, and any `mfsk-ffi` user on S3).
 
 ## Why now
 

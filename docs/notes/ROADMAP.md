@@ -1172,8 +1172,11 @@ boot-mode work) — removed below rather than left misleading.
   run against real hardware. `embedded-poc/m5stack-cores3-app/CLAUDE.md`
   has the full phase breakdown (T0-T3) this rolls up into.
 
-`mfsk-ffi-ft8/src/stream.rs::mfsk_ft8_stream_*` and `embedded-shared`
-resampler API are the seams shared between B-Stick and B-Core.
+`embedded-shared`'s streaming pipeline + resampler API are the seams
+shared between B-Stick and B-Core. (This used to name
+`mfsk-ffi-ft8/src/stream.rs::mfsk_ft8_stream_*` alongside them; that
+crate was retired in 0.11.0 and both boards call `mfsk-core` directly,
+so the C ABI is no longer on this path at all.)
 
 ## Phase C — Quality / infra
 

@@ -6,7 +6,7 @@
 //! ε.3 of the `docs/CLEANUP_2026_05.md` `decode_block` split. The
 //! parent (`decode_block.rs`) re-exports the public entries so
 //! external callers — host `decode.rs`, embedded `stage1_inc`,
-//! `mfsk-ffi-ft8`, integration tests — keep the same
+//! integration tests — keep the same
 //! `mfsk_core::ft8::decode_block::*` paths.
 
 use alloc::vec;
@@ -95,8 +95,8 @@ pub fn coarse_sync_with_lag(
 /// ([`coarse_allsum_len`]).
 ///
 /// Public as of v0.6 (#49 cat C): the embedded port (`m5stack-core2`,
-/// `m5stack-s3`, `m5stack-s3-app`) and `mfsk-ffi-ft8` both build the
-/// allsum incrementally during slot capture and pass it back here, so
+/// `m5stack-s3`, `m5stack-s3-app`) builds the
+/// allsum incrementally during slot capture and passes it back here, so
 /// this is a stable public surface — not a benchmark-only escape hatch.
 pub fn coarse_sync_with_allsum(
     spec: &Spectrogram,

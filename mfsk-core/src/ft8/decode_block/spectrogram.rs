@@ -4,8 +4,8 @@
 //!
 //! ε.2 of the `docs/CLEANUP_2026_05.md` `decode_block` split. The
 //! parent (`decode_block.rs`) re-exports `Spectrogram`, `SpecCell`,
-//! and `compute_spectrogram` so external callers (`mfsk-ffi-ft8`,
-//! `embedded-shared::pipeline::Stage1Output`, the m5stack apps,
+//! and `compute_spectrogram` so external callers
+//! (`embedded-shared::pipeline::Stage1Output`, the m5stack apps,
 //! integration tests) see the same `mfsk_core::ft8::decode_block::*`
 //! paths as before the split. The remaining ex-private items
 //! (`CoarseAcc`, `Spectrogram::power_acc`) are surfaced as

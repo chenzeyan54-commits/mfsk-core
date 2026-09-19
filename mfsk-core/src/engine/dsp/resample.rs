@@ -150,8 +150,11 @@ pub fn resample_i16_to_12k_f32(samples: &[i16], src_rate: u32) -> Vec<f32> {
 /// buffer — no per-call heap allocation. Pure scalar i64 arithmetic;
 /// runs on FPU-less MCUs.
 ///
-/// **Pairs with** `MfskFt8Stream` in `mfsk-ffi-ft8`, which holds one
-/// of these plus a 12 kHz ring buffer for the FT8 decode entry.
+/// **Paired with** `MfskFt8Stream` in `mfsk-ffi-ft8`, which held one
+/// of these plus a 12 kHz ring buffer for the FT8 decode entry. That
+/// crate was retired in 0.11.0; `mfsk-ffi`'s `mfsk_stream_*` is the
+/// generalised successor, and `embedded-shared`'s own pipeline is what
+/// drives this type on the boards.
 pub struct LinearResamplerI16To12k {
     src_rate: u32,
     /// Q32 source-sample step per output sample.

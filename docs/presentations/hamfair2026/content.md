@@ -474,7 +474,7 @@ Ryzen で 6 ミリ秒、ESP32-S3 で 1.19 秒 — 差は純粋な CPU 性能比�
 | **ブラウザ** | `wasm32-unknown-unknown` | rustfft の WASM SIMD | `+simd128` を明示するのを忘れずに（既定では付きません） |
 | **Android / iOS** | NDK arm64-v8a ほか | NEON | C ABI（`mfsk-ffi`）経由。Fortran ランタイム不要 |
 | **マイコン** | `no_std + alloc`<br>ESP32-S3 / RP2350 / Cortex-M | 呼び出し側が注入<br>（esp-dsp / CMSIS-DSP） | 実運用中。`fft-extern` + `fixed-point` |
-| **C / C++ から** | staticlib | — | `mfsk-ffi`（全モード）と `mfsk-ffi-ft8`（FT8 のみ・組み込み向け）。<br>ヘッダは cbindgen 生成、C++ 実ドライバを CI が毎回動かしています |
+| **C / C++ から** | staticlib | — | `mfsk-ffi`（全モード）。<br>ヘッダは cbindgen 生成、C++ 実ドライバを CI が毎回動かしています |
 
 ### F07-04 · 小見出し
 
@@ -904,7 +904,7 @@ mfsk-core（裏面）
 | **ブラウザ** | `wasm32-unknown-unknown` | rustfft の WASM SIMD。`+simd128` の明示を忘れずに（既定では付きません） |
 | **Android / iOS** | NDK arm64-v8a ほか | NEON。C ABI 経由で、Fortran ランタイム不要 |
 | **マイコン** | `no_std + alloc` — ESP32-S3 / RP2350 / Cortex-M | 実運用中。`fft-extern` + `fixed-point`、FFT は呼び出し側が注入 |
-| **C / C++ から** | staticlib | `mfsk-ffi`（全モード）／`mfsk-ffi-ft8`（FT8 のみ）。ヘッダは cbindgen 生成 |
+| **C / C++ から** | staticlib | `mfsk-ffi`（全モード）。ヘッダは cbindgen 生成 |
 
 ### L02-05 · 注記
 

@@ -626,9 +626,13 @@ there is no serial device to find.
   (persistent dual-core worker for the WSPR candidate loop, Phase E)
   — an FT8-independent sibling of `dual_core.rs`, not a shared
   abstraction between the two protocols.
-- **`idf-component/`** — esp-idf component shim that wraps
-  `mfsk-ffi-ft8` so C-only ESP-IDF projects can pull the FT8
-  decoder in without writing Rust glue.
+- **`idf-component/`** — **documentation only** since 0.11.0. It used
+  to be a file skeleton around the `mfsk-ffi-ft8` crate; that crate was
+  retired and the skeleton was never carried forward, so its `README.md`
+  is the wiring written out instead. Note a C-only ESP-IDF project
+  cannot avoid Rust entirely: `extern "Rust"` FFT-planner symbols
+  returning `Box<dyn Trait>` are not C types, so every non-Rust
+  integration links at least one small Rust staticlib.
 - **`scripts/`** — `capture.sh` (the wrapper to reach for),
   `flash-monitor.sh` (the espflash flags), `lib-platform.sh`
   (WSL/macOS divergences, sourced by both), `udp-log-listen.sh`,
