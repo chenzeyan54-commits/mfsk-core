@@ -35,8 +35,12 @@
 //! WSPR's spot lists use 312 of 320 vertical pixels and FST4's screen
 //! is as full; there is no column to give a permanent widget. So it is
 //! an overlay: hold a finger anywhere for [`OPEN_MS`] and it appears,
-//! tap a mode to arm, tap it again to commit, tap outside to dismiss.
+//! tap a row to arm, press the bar to commit, tap outside to dismiss.
 //! Nothing is reserved when it is closed.
+//!
+//! The hold shows its progress ([`HOLD_BAR_H`]) — without that, a press
+//! that fell short of the threshold looked exactly like a panel that
+//! had not noticed the finger at all.
 //!
 //! ## Two levels, because there are two kinds of setting
 //!
@@ -71,10 +75,15 @@ enum Page {
     Root,
     Mode,
     Config,
+    Demo,
 }
 
-/// The root's two rows, in draw order.
-const ROOT: [(Page, &str); 2] = [(Page::Mode, "MODE"), (Page::Config, "CONFIG")];
+/// The root's rows, in draw order.
+const ROOT: [(Page, &str); 3] = [
+    (Page::Mode, "MODE"),
+    (Page::Config, "CONFIG"),
+    (Page::Demo, "DEMO"),
+];
 
 /// What [`ModePicker::update`] hands back when the commit bar fires.
 /// Both restart the board; the caller writes the one it is given.
@@ -88,16 +97,27 @@ pub enum Commit {
 pub const GRID_SOURCES: [GridSource; 2] = [GridSource::Ntp, GridSource::AirDt];
 
 /// The receivers this binary can boot into, in draw order.
+///
+/// Named by mode alone. They used to read "FT8 / UAC", which said
+/// nothing a reader could use: every one of these takes its audio from
+/// the radio over USB, so "UAC" is the board, not the choice.
+///
 /// Five rows is 5 x [`PITCH`] + [`COMMIT_H`] = 280 px, against a
 /// 240x320 panel — it fits, with the widget's top moving from y=44 to
 /// y=20 as it centres. A sixth would not.
-pub const MODES: [(BootMode, &str); 5] = [
-    (BootMode::Uac, "FT8 / UAC"),
+pub const MODES: [(BootMode, &str); 4] = [
+    (BootMode::Uac, "FT8"),
     (BootMode::Ft4, "FT4"),
     (BootMode::Wspr, "WSPR"),
     (BootMode::Fst4, "FST4"),
-    (BootMode::Decode, "DECODE (wav)"),
 ];
+
+/// Not a receiver — a fixed recording, decoded on a loop.
+///
+/// It lived among the modes as "DECODE (wav)", where the one thing it
+/// needed to say (that no radio is involved) was the part in brackets.
+/// On its own page the page says it.
+pub const DEMOS: [(BootMode, &str); 1] = [(BootMode::Decode, "WAV REPLAY")];
 
 pub const WIDTH: u32 = 208;
 /// Drawn height of one button.
@@ -118,19 +138,40 @@ pub const ARM_MS: u64 = 8_000;
 
 /// How long a finger must stay down to summon the picker. Long enough
 /// not to fire while someone is using the screen for something else.
-pub const OPEN_MS: u64 = 800;
+pub const OPEN_MS: u64 = 500;
+
+/// Height of the hold indicator, in pixels.
+///
+/// **A hold with no feedback is indistinguishable from a dead panel.**
+/// Opening the menu is a press-and-hold because neither the WSPR nor
+/// the FST4 screen has a pixel to spare for a permanent button — but
+/// nothing on screen said so, or said that the hold was registering, so
+/// a press that was a hundred milliseconds short looked exactly like a
+/// press that was never seen. This draws a bar along the top edge of
+/// where the menu is about to appear, growing from the centre as the
+/// hold completes: it says the touch landed, it says something is
+/// coming, and it says where.
+pub const HOLD_BAR_H: u32 = 6;
 
 /// Height of the commit bar under the list.
 pub const COMMIT_H: u32 = 40;
 
 /// Total height: the mode rows plus the commit bar.
+/// Rows the widget is sized for — the widest page. Compile-checked
+/// against the others so adding a row to any page cannot quietly leave
+/// it undrawable.
+pub const ROWS: usize = MODES.len();
+const _: () = assert!(ROWS >= ROOT.len(), "the root has more rows than the widget draws");
+const _: () = assert!(ROWS >= GRID_SOURCES.len(), "CONFIG has more rows than the widget draws");
+const _: () = assert!(ROWS >= DEMOS.len(), "DEMO has more rows than the widget draws");
+
 pub const fn height() -> u32 {
-    (MODES.len() as i32 * PITCH) as u32 + COMMIT_H
+    (ROWS as i32 * PITCH) as u32 + COMMIT_H
 }
 
 /// Top of the commit bar, relative to the widget origin.
 const fn commit_top() -> i32 {
-    MODES.len() as i32 * PITCH
+    ROWS as i32 * PITCH
 }
 
 /// What a touch landed on.
@@ -138,6 +179,15 @@ const fn commit_top() -> i32 {
 enum Target {
     Mode(usize),
     Commit,
+    /// A band inside the widget that this page does not use.
+    ///
+    /// The widget is sized for the longest page, so the root and
+    /// CONFIG leave blank rows under their last one. They look like
+    /// part of the widget because they are, and a press there used to
+    /// fall through to "outside" — which *dismisses*. So aiming at the
+    /// lower half of an open menu closed it, which is indistinguishable
+    /// from the panel ignoring the touch. Dead, not outside.
+    Dead,
 }
 
 /// Bands are contiguous — a press in the drawn gap between two rows
@@ -173,11 +223,12 @@ fn hit(origin: Point, x: u16, y: u16, rows: usize) -> Option<Target> {
     let idx = (dy / PITCH) as usize;
     // A page with fewer rows than the widget has bands: the empty ones
     // are painted out, and a press there is a press on nothing — not
-    // on the last row, which is how a mis-hit turns into a commit.
+    // on the last row (which is how a mis-hit turns into a commit), and
+    // not outside either (which would dismiss).
     if idx < rows {
         Some(Target::Mode(idx))
     } else {
-        None
+        Some(Target::Dead)
     }
 }
 
@@ -200,6 +251,9 @@ pub struct ModePicker {
     /// indistinguishable from a control that is not there, which is how
     /// this one was reported from the bench.
     pressed: Option<Target>,
+    /// The hold indicator is on screen, so leaving it needs an erase
+    /// and a repaint of what it covered.
+    hold_drawn: bool,
     /// Set once the commit fires. The caller is on its way to a reboot;
     /// until it arrives, the bar says so rather than sitting there
     /// looking unpressed.
@@ -218,6 +272,7 @@ impl ModePicker {
             press_since: None,
             armed: None,
             pressed: None,
+            hold_drawn: false,
             committing: false,
             drawn: None,
             needs_draw: false,
@@ -246,6 +301,7 @@ impl ModePicker {
             Page::Root => ROOT.len(),
             Page::Mode => MODES.len(),
             Page::Config => GRID_SOURCES.len(),
+            Page::Demo => DEMOS.len(),
         }
     }
 
@@ -255,6 +311,7 @@ impl ModePicker {
             Page::Root => ROOT[i].1,
             Page::Mode => MODES[i].1,
             Page::Config => GRID_SOURCES[i].label(),
+            Page::Demo => DEMOS[i].1,
         }
     }
 
@@ -317,6 +374,7 @@ impl ModePicker {
                             self.needs_draw = true;
                             return Some(match self.page {
                                 Page::Mode => Commit::Mode(MODES[idx].0),
+                                Page::Demo => Commit::Mode(DEMOS[idx].0),
                                 Page::Config => Commit::Grid(GRID_SOURCES[idx]),
                                 Page::Root => unreachable!("handled above"),
                             });
@@ -329,6 +387,9 @@ impl ModePicker {
                             log::info!("picker: commit pressed with no selection standing");
                         }
                     }
+                    Some(Target::Dead) => {
+                        log::info!("picker: press on an unused row — ignored");
+                    }
                     None => self.close(),
                 }
             }
@@ -338,6 +399,9 @@ impl ModePicker {
                     self.open = true;
                     self.armed = None;
                     self.needs_draw = true;
+                    // The overlay covers the bar; no erase needed, and
+                    // no repaint request either.
+                    self.hold_drawn = false;
                 }
             }
         }
@@ -381,7 +445,7 @@ impl ModePicker {
         D: DrawTarget<Color = Rgb565>,
     {
         if !self.open {
-            return Ok(());
+            return self.render_hold(display);
         }
         let armed_idx = self.armed.map(|(i, _)| i);
         // `needs_draw` is what carries a pressed/released edge here —
@@ -399,7 +463,9 @@ impl ModePicker {
                 .build()
         };
 
-        for i in 0..MODES.len() {
+        // Every page draws into the same bands; the widest is what the
+        // widget was sized for.
+        for i in 0..ROWS {
             let top = self.origin.y + i as i32 * PITCH;
             // Rows past this page's end are painted out, so a shorter
             // page does not leave the previous one's labels standing.
@@ -415,6 +481,7 @@ impl ModePicker {
             let is_current = match self.page {
                 Page::Root => false,
                 Page::Mode => MODES[i].0 == current,
+                Page::Demo => DEMOS[i].0 == current,
                 Page::Config => GRID_SOURCES[i] == current_grid,
             };
             let selected = armed_idx == Some(i);
@@ -485,7 +552,7 @@ impl ModePicker {
                 });
                 let _ = line.push_str(self.row_label(i));
             }
-            (Page::Mode, None) => {
+            (Page::Mode, None) | (Page::Demo, None) => {
                 let _ = line.push_str("pick a mode above");
             }
             (Page::Config, None) => {
@@ -503,5 +570,47 @@ impl ModePicker {
         self.drawn = Some((self.page, armed_idx));
         self.needs_draw = false;
         Ok(())
+    }
+
+    /// The hold indicator, drawn while the overlay is still closed.
+    ///
+    /// Grows from the centre of the widget's top edge to its full
+    /// width as the press approaches [`OPEN_MS`]. On release before
+    /// then it is erased and [`Self::take_just_closed`] fires, so the
+    /// caller repaints the few pixels it covered — the same path the
+    /// overlay itself uses.
+    fn render_hold<D>(&mut self, display: &mut D) -> Result<(), D::Error>
+    where
+        D: DrawTarget<Color = Rgb565>,
+    {
+        let held_ms = self
+            .press_since
+            .map(|since| since.elapsed().as_millis() as u64);
+        match held_ms {
+            Some(ms) => {
+                let frac = (ms as f32 / OPEN_MS as f32).clamp(0.0, 1.0);
+                let w = (WIDTH as f32 * frac) as u32;
+                if w == 0 {
+                    return Ok(());
+                }
+                let x = self.origin.x + (WIDTH as i32 - w as i32) / 2;
+                Rectangle::new(Point::new(x, self.origin.y), Size::new(w, HOLD_BAR_H))
+                    .into_styled(PrimitiveStyle::with_fill(Rgb565::CSS_ORANGE))
+                    .draw(display)?;
+                self.hold_drawn = true;
+                Ok(())
+            }
+            None => {
+                if self.hold_drawn {
+                    Rectangle::new(self.origin, Size::new(WIDTH, HOLD_BAR_H))
+                        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+                        .draw(display)?;
+                    self.hold_drawn = false;
+                    // Whatever the bar sat on has to come back.
+                    self.just_closed = true;
+                }
+                Ok(())
+            }
+        }
     }
 }

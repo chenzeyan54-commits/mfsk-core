@@ -211,13 +211,21 @@ image, off every flash.
 
 ## 5. The menu — mode and settings
 
-Hold a finger anywhere on the screen for about **0.8 s**. The overlay
-opens on a two-row **root**:
+Hold a finger anywhere on the screen for about **0.5 s**. While you
+hold, an amber bar grows from the centre of the top edge of where the
+menu will appear — it says the touch landed, that something is coming,
+and where. No bar means the touch is not reaching the panel.
+
+The overlay opens on a three-row **root**:
 
 | Row | What it holds |
 |---|---|
-| `MODE` | which receiver boots (FT8/UAC, FT4, WSPR, FST4, DECODE) |
-| `CONFIG` | where the slot phase comes from (NTP, or the air's DT) |
+| `MODE` | which receiver boots (FT8, FT4, WSPR, FST4) |
+| `CONFIG` | how the slot phase is kept (NTP, or the air's DT) |
+| `DEMO` | running without a radio (`WAV REPLAY` — a recording, decoded on a loop) |
+
+Pages have different numbers of rows. **Pressing an unused band does
+nothing** — it does not dismiss. Only a press outside the widget does.
 
 A root row only navigates — opening a page needs no confirmation. Inside
 a page it works as it always has: **select, then commit**.

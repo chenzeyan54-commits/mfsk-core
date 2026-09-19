@@ -527,80 +527,14 @@ pub fn run_log_panel(
                 }
             }
         }
-        if touch_int.is_low() {
-            if let Some(i2c) = pmic_i2c.as_mut() {
-                match crate::touch::read(i2c) {
-                    Some(c) => {
-                        let last_touch_points = last_touch.points;
-                        if c != last_touch {
-                            if c.points > 0 {
-                                log::info!("touch: {} pt at ({}, {})", c.points, c.x, c.y);
-                            } else {
-                                log::info!("touch: released");
-                            }
-                            last_touch = c;
-                        }
-                        let _ = last_touch_points;
-                        {
-                            match picker.update(c.points > 0, c.x, c.y) {
-                                Some(mode_picker::Commit::Mode(target)) => {
-                                    log::warn!(
-                                        "boot_mode -> {} (touch), restarting",
-                                        target.label()
-                                    );
-                                    if let Err(e) = boot_mode::write(&nvs, target) {
-                                        log::error!(
-                                            "boot_mode write failed: {e} — not restarting"
-                                        );
-                                    } else {
-                                        // Let the line reach the log sink;
-                                        // in UAC mode that is the only
-                                        // channel.
-                                        std::thread::sleep(std::time::Duration::from_millis(400));
-                                        // SAFETY: no arguments, does not return.
-                                        unsafe { esp_idf_svc::sys::esp_restart() };
-                                    }
-                                }
-                                Some(mode_picker::Commit::Grid(src)) => {
-                                    log::warn!(
-                                        "grid source -> {} (touch), restarting",
-                                        src.label()
-                                    );
-                                    if let Err(e) =
-                                        mfsk_app_shared::grid_src::write(&nvs, src)
-                                    {
-                                        log::error!(
-                                            "grid source write failed: {e} — not restarting"
-                                        );
-                                    } else {
-                                        std::thread::sleep(std::time::Duration::from_millis(400));
-                                        // SAFETY: no arguments, does not return.
-                                        unsafe { esp_idf_svc::sys::esp_restart() };
-                                    }
-                                }
-                                None => {}
-                            }
-                        }
-                    }
-                    None => {
-                        if !touch_read_failed {
-                            log::warn!("touch: read failed — not repeating this");
-                            touch_read_failed = true;
-                        }
-                    }
-                }
-            }
-        } else if last_touch.points > 0 {
-            // The pin going high is the release; there is nothing to
-            // read for it.
-            log::info!("touch: released");
-            last_touch = crate::touch::Contact::default();
-        }
-
-        // With no finger down the picker still needs a frame to let an
-        // arming lapse and to notice a release.
-        if last_touch.points == 0 {
-            let _ = picker.update(false, 0, 0);
+        if let Some(commit) = poll_touch_once(
+            &touch_int,
+            pmic_i2c.as_mut(),
+            &mut last_touch,
+            &mut picker,
+            &mut touch_read_failed,
+        ) {
+            apply_commit(&nvs, commit);
         }
         picker.render(&mut display, mode, crate::grid_source()).ok();
         if picker.take_just_closed() {
@@ -717,7 +651,18 @@ pub fn run_log_panel(
         // vanished a moment after opening.
         if picker.is_open() {
             picker.render(&mut display, mode, crate::grid_source()).ok();
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // The overlay is the one screen that is nothing but input;
+            // spend its idle time sampling rather than sleeping.
+            if let Some(commit) = pump_touch(
+                50,
+                &touch_int,
+                pmic_i2c.as_mut(),
+                &mut last_touch,
+                &mut picker,
+                &mut touch_read_failed,
+            ) {
+                apply_commit(&nvs, commit);
+            }
             tick = tick.wrapping_add(1);
             continue;
         }
@@ -949,14 +894,135 @@ pub fn run_log_panel(
         }
 
         let _ = fanout;
-        // 50 ms, not 100.
+        // The frame's idle time, spent sampling touch.
         //
-        // With the INT pin gating the I2C read, this loop's period is
-        // what decides whether a tap is seen at all, and 100 ms was
-        // long enough to miss quick ones. The extra iterations cost a
-        // GPIO read each; the bus is only touched when a finger is
-        // actually down.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // It used to be `sleep(50)`, on the reasoning that the loop
+        // period decides whether a tap is seen — true, but the period
+        // is the render plus the sleep, and the render is the larger
+        // half. Polling inside the idle time instead puts three or four
+        // samples under a ~100 ms tap however long the frame took.
+        if let Some(commit) = pump_touch(
+            50,
+            &touch_int,
+            pmic_i2c.as_mut(),
+            &mut last_touch,
+            &mut picker,
+            &mut touch_read_failed,
+        ) {
+            apply_commit(&nvs, commit);
+        }
         tick = tick.wrapping_add(1);
     }
+}
+
+/// One touch poll, fed to the picker.
+///
+/// Split out of the render loop because the loop's period is not its
+/// sleep: a frame draws the waterfall, the decoded list and the status
+/// bar first, and touch was only sampled once per frame behind all of
+/// that. A tap is ~100 ms of contact; a frame that takes longer misses
+/// it outright, which is what "the panel is unresponsive" was.
+///
+/// The I2C bus is still only touched while the INT pin says a finger is
+/// down (#163's `i2c_cmd_link` churn is the reason), so idling costs a
+/// GPIO read per poll and nothing else.
+fn poll_touch_once(
+    touch_int: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    i2c: Option<&mut esp_idf_hal::i2c::I2cDriver<'static>>,
+    last_touch: &mut crate::touch::Contact,
+    picker: &mut mode_picker::ModePicker,
+    read_failed: &mut bool,
+) -> Option<mode_picker::Commit> {
+    if touch_int.is_low() {
+        let Some(i2c) = i2c else {
+            return None;
+        };
+        match crate::touch::read(i2c) {
+            Some(c) => {
+                if c != *last_touch {
+                    if c.points > 0 {
+                        log::info!("touch: {} pt at ({}, {})", c.points, c.x, c.y);
+                    } else {
+                        log::info!("touch: released");
+                    }
+                    *last_touch = c;
+                }
+                return picker.update(c.points > 0, c.x, c.y);
+            }
+            None => {
+                if !*read_failed {
+                    log::warn!("touch: read failed — not repeating this");
+                    *read_failed = true;
+                }
+            }
+        }
+    } else if last_touch.points > 0 {
+        // The pin going high is the release; there is nothing to read
+        // for it.
+        log::info!("touch: released");
+        *last_touch = crate::touch::Contact::default();
+    }
+    // With no finger down the picker still needs a call to let an
+    // arming lapse and to notice the release.
+    if last_touch.points == 0 {
+        return picker.update(false, 0, 0);
+    }
+    None
+}
+
+/// Idle for `ms`, sampling touch throughout instead of sleeping
+/// through it. Returns early on a commit.
+fn pump_touch(
+    ms: u64,
+    touch_int: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    mut i2c: Option<&mut esp_idf_hal::i2c::I2cDriver<'static>>,
+    last_touch: &mut crate::touch::Contact,
+    picker: &mut mode_picker::ModePicker,
+    read_failed: &mut bool,
+) -> Option<mode_picker::Commit> {
+    /// Fast enough that a short tap lands on at least three polls, slow
+    /// enough to stay out of the way — the panel's own report rate is
+    /// ~60 Hz and the controller holds the last contact between reads.
+    const STEP_MS: u64 = 12;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    loop {
+        if let Some(c) = poll_touch_once(
+            touch_int,
+            i2c.as_deref_mut(),
+            last_touch,
+            picker,
+            read_failed,
+        ) {
+            return Some(c);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(STEP_MS));
+    }
+}
+
+/// Persist what the picker committed and restart into it.
+fn apply_commit(nvs: &EspNvs<NvsDefault>, commit: mode_picker::Commit) {
+    match commit {
+        mode_picker::Commit::Mode(target) => {
+            log::warn!("boot_mode -> {} (touch), restarting", target.label());
+            if let Err(e) = boot_mode::write(nvs, target) {
+                log::error!("boot_mode write failed: {e} — not restarting");
+                return;
+            }
+        }
+        mode_picker::Commit::Grid(src) => {
+            log::warn!("grid source -> {} (touch), restarting", src.label());
+            if let Err(e) = mfsk_app_shared::grid_src::write(nvs, src) {
+                log::error!("grid source write failed: {e} — not restarting");
+                return;
+            }
+        }
+    }
+    // Let the line reach the log sink; in UAC mode that is the only
+    // channel off this board.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    // SAFETY: no arguments, does not return.
+    unsafe { esp_idf_svc::sys::esp_restart() };
 }
