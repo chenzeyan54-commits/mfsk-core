@@ -38,6 +38,12 @@ pub const RTC_I2C_ADDR: u8 = 0x51;
 /// question this feature exists to settle.
 pub static RTC_RESULT: crate::log_slot::LogSlot = crate::log_slot::LogSlot::new();
 
+/// Control/status 1. Bit 5 is `STOP`: it halts the counters **and
+/// clears the internal prescaler**, which is the only way to move the
+/// chip's tick phase — a seconds write alone leaves the next tick
+/// wherever it already fell inside the new second.
+const REG_CONTROL1: u8 = 0x00;
+const STOP_BIT: u8 = 0x20;
 const REG_SECONDS: u8 = 0x02;
 /// Seconds register bit 7: contents invalid since the last write.
 const VL_MASK: u8 = 0x80;
@@ -135,8 +141,55 @@ pub fn read_epoch(i2c: &mut I2cDriver<'_>) -> Option<i64> {
 }
 
 /// [`read_epoch`], then commit it to the system clock.
+///
+/// **Waits for the chip's seconds to tick over first**, and sets the
+/// clock at that instant.
+///
+/// The chip stores whole seconds, so one read says which second it is
+/// and nothing about where inside it — and `settimeofday` with
+/// `tv_usec: 0` then asserts "the second just started", which is wrong
+/// by a uniform 0..1 s. That is not a rounding detail here: the FT8
+/// slot grid is derived from this clock, the decoder searches ±1.0 s
+/// and decodes well over about ±0.4 s, so half of all boots start
+/// outside the useful window. Measured on 2026-09-19: a boot 0.68 s out
+/// decoded 6 stations on its first slot, locked on that, and then
+/// decoded 0-1 for as long as it was left alone.
+///
+/// Polling until the value changes costs up to one second of I2C reads
+/// at 10 ms — against a 25 s air acquisition, which is what the error
+/// otherwise forces. `write_from_system_clock` resets the prescaler on
+/// the UTC boundary, so the tick this waits for is a UTC second's, and
+/// what the two together buy is a network-free boot aligned to a few
+/// milliseconds instead of half a second.
 pub fn read_into_system_clock(i2c: &mut I2cDriver<'_>) -> Option<i64> {
-    let unix = read_epoch(i2c)?;
+    let first = read_epoch(i2c)?;
+    // Bounded: a second plus a margin. If the value never changes the
+    // chip is stopped or unreadable, and the un-aligned value is still
+    // better than no clock — that is what the fallback keeps.
+    let mut aligned = None;
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < std::time::Duration::from_millis(1_150) {
+        esp_idf_svc::hal::delay::FreeRtos::delay_ms(10);
+        match read_epoch(i2c) {
+            Some(e) if e != first => {
+                aligned = Some(e);
+                break;
+            }
+            Some(_) => {}
+            // A single bad read mid-poll is not a reason to abandon a
+            // clock we have already decoded once.
+            None => {}
+        }
+    }
+    let unix = match aligned {
+        Some(e) => e,
+        None => {
+            log::warn!(
+                "rtc: seconds did not tick within 1.15 s — using the unaligned read,                  so the slot grid starts up to 1 s out"
+            );
+            first
+        }
+    };
     // Say where the clock came from, so `write_from_system_clock`
     // can refuse to write it back. See `time_sync::ClockSource` for
     // the 186 s this cost (#354).
@@ -152,7 +205,14 @@ pub fn read_into_system_clock(i2c: &mut I2cDriver<'_>) -> Option<i64> {
         log::warn!("rtc: settimeofday failed (rc={rc})");
         return None;
     }
-    log::info!("rtc: system clock set from BM8563 — epoch {unix}");
+    log::info!(
+        "rtc: system clock set from BM8563 — epoch {unix}{}",
+        if aligned.is_some() {
+            " (on the chip's tick, sub-second known)"
+        } else {
+            " (unaligned)"
+        }
+    );
     {
         let mut msg: heapless::String<64> = heapless::String::new();
         use core::fmt::Write as _;
@@ -196,14 +256,26 @@ pub fn write_from_system_clock(i2c: &mut I2cDriver<'_>) -> Result<()> {
     // update lands *on* the boundary rather than after it: 8 bytes at
     // 100 kHz is ~0.8 ms including the address phase.
     //
-    // What this does **not** do is align the chip's own tick phase:
-    // the PCF8563's prescaler is not reset by a seconds write (only
-    // the STOP bit in control register 0x00 does that, which is a
-    // register this code does not touch today), so the next tick
-    // still falls at an arbitrary point inside the new second. The
-    // residual is bounded by 1 s and no longer accumulates, which is
-    // what the drift measurement needed. Driving STOP for sub-ms
-    // alignment is a further step, and wants a bench to verify.
+    // **And it aligns the chip's tick phase**, which is the step this
+    // comment used to describe as "a further step".
+    //
+    // Landing the *value* on the boundary is not enough: the
+    // prescaler keeps running, so the chip's next tick falls wherever
+    // it already fell inside the new second, and a reader has no way
+    // to know where. That residual — bounded by 1 s, uniform — is
+    // exactly the phase error a boot with no network starts with, and
+    // it cost 0.68 s of slot grid on 2026-09-19, which took the FT8
+    // decode from 6 stations to 0-1 on a live band.
+    //
+    // `STOP` (bit 5 of control register 0) halts the counters and
+    // clears the prescaler, so the sequence is: set STOP, write the
+    // registers at leisure, then clear STOP *on* the UTC second
+    // boundary. The chip's seconds then tick with UTC, and
+    // [`read_into_system_clock`]'s wait for the increment turns that
+    // into a known sub-second phase on the next boot.
+    //
+    // STOP is cleared on every exit path below, including the error
+    // ones: a chip left stopped keeps no time at all.
     const WRITE_LEAD_US: u64 = 800;
     let sub = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -257,8 +329,48 @@ pub fn write_from_system_clock(i2c: &mut I2cDriver<'_>) -> Result<()> {
         u8_to_bcd(mo as u8) | if y < 2000 { CENTURY_MASK } else { 0 },
         u8_to_bcd((y % 100) as u8),
     ];
-    i2c.write(RTC_I2C_ADDR, &buf, I2C_TIMEOUT_TICKS)
-        .map_err(|e| anyhow!("BM8563 write failed: {e}"))?;
-    log::info!("rtc: BM8563 set to {y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC");
+    // Counters held and prescaler cleared while the value goes in, so
+    // the tick phase is ours to place.
+    let stopped = i2c
+        .write(RTC_I2C_ADDR, &[REG_CONTROL1, STOP_BIT], I2C_TIMEOUT_TICKS)
+        .is_ok();
+    if !stopped {
+        log::warn!("rtc: could not set STOP — the write still lands on the boundary, but the chip's tick phase stays where it was");
+    }
+    let write_res = i2c
+        .write(RTC_I2C_ADDR, &buf, I2C_TIMEOUT_TICKS)
+        .map_err(|e| anyhow!("BM8563 write failed: {e}"));
+    if stopped {
+        // Release on the boundary of the second just written. Same
+        // lead as the value write: one register, ~0.3 ms at 100 kHz.
+        const RELEASE_LEAD_US: u64 = 300;
+        loop {
+            let sub = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_micros() as u64)
+                .unwrap_or(0);
+            if sub + RELEASE_LEAD_US >= 1_000_000 {
+                break;
+            }
+            // SAFETY: a ROM busy-wait with no preconditions.
+            unsafe { esp_idf_svc::sys::esp_rom_delay_us(100) };
+        }
+        if let Err(e) = i2c.write(RTC_I2C_ADDR, &[REG_CONTROL1, 0x00], I2C_TIMEOUT_TICKS) {
+            // Worse than a phase error: a stopped chip keeps no time.
+            log::error!("rtc: could not clear STOP ({e}) — retrying once");
+            if let Err(e) = i2c.write(RTC_I2C_ADDR, &[REG_CONTROL1, 0x00], I2C_TIMEOUT_TICKS) {
+                log::error!("rtc: STOP still set ({e}) — the chip is not counting");
+            }
+        }
+    }
+    write_res?;
+    log::info!(
+        "rtc: BM8563 set to {y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC{}",
+        if stopped {
+            " (prescaler reset — tick phase aligned to UTC)"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
