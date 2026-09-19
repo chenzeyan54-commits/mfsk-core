@@ -276,38 +276,31 @@ pub fn write_from_system_clock(i2c: &mut I2cDriver<'_>) -> Result<()> {
     //
     // STOP is cleared on every exit path below, including the error
     // ones: a chip left stopped keeps no time at all.
-    const WRITE_LEAD_US: u64 = 800;
-    let sub = std::time::SystemTime::now()
+    // **The value written is the second STOP will be released on.**
+    //
+    // It used to be the second about to start, chosen by spinning to
+    // just before a boundary and taking `as_secs() + 1`. The register
+    // write then took ~1 ms of I2C and crossed that very boundary, so
+    // the release loop — waiting for the *next* one — landed a second
+    // later and started the chip holding a value one second stale.
+    // **The RTC came out exactly 1 s slow**, which is invisible until
+    // something runs off it alone: `TIME: AIR DT` never starts NTP, so
+    // its slot grid inherited the whole second and the band's decodes
+    // read `dt ≈ −1.0` against a grid the board's own clock called
+    // correct (measured 2026-09-19; NTP mode showed the same −0.7..−0.8
+    // on its *first* slot and only looked healthy because the UTC
+    // tracker corrected it on the next one).
+    //
+    // Picking the release boundary first and writing its value leaves a
+    // whole second for the I2C transaction instead of 800 µs, and the
+    // two can no longer disagree.
+    const RELEASE_SEC_AHEAD: u64 = 2;
+    let release_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| anyhow!("system clock is before the epoch: {e}"))?
-        .subsec_micros() as u64;
-    let wait_us = 1_000_000u64
-        .saturating_sub(sub)
-        .saturating_sub(WRITE_LEAD_US);
-    if wait_us > 3_000 {
-        esp_idf_svc::hal::delay::FreeRtos::delay_ms(((wait_us - 3_000) / 1_000) as u32);
-    }
-    loop {
-        let sub = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| anyhow!("system clock is before the epoch: {e}"))?
-            .subsec_micros() as u64;
-        if sub + WRITE_LEAD_US >= 1_000_000 {
-            break;
-        }
-        // SAFETY: a ROM busy-wait with no preconditions. A tick sleep
-        // is useless here — `CONFIG_FREERTOS_HZ` is unset in this
-        // crate, so the ESP-IDF default of 100 Hz applies and the
-        // shortest sleep available is 10 ms.
-        unsafe { esp_idf_svc::sys::esp_rom_delay_us(100) };
-    }
-    // The second that is about to start, which is what the boundary
-    // this loop just reached belongs to.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| anyhow!("system clock is before the epoch: {e}"))?
-        .as_secs() as i64
-        + 1;
+        .as_secs()
+        + RELEASE_SEC_AHEAD;
+    let now = release_at as i64;
     if now < 1_600_000_000 {
         return Err(anyhow!(
             "system clock is not set ({now}) — nothing worth storing"
@@ -341,19 +334,28 @@ pub fn write_from_system_clock(i2c: &mut I2cDriver<'_>) -> Result<()> {
         .write(RTC_I2C_ADDR, &buf, I2C_TIMEOUT_TICKS)
         .map_err(|e| anyhow!("BM8563 write failed: {e}"));
     if stopped {
-        // Release on the boundary of the second just written. Same
-        // lead as the value write: one register, ~0.3 ms at 100 kHz.
+        // Release on the boundary of the second that was written —
+        // `release_at`, not "the next boundary from here". Waiting for
+        // a boundary rather than for *this* one is the bug above.
         const RELEASE_LEAD_US: u64 = 300;
         loop {
-            let sub = std::time::SystemTime::now()
+            let d = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_micros() as u64)
-                .unwrap_or(0);
-            if sub + RELEASE_LEAD_US >= 1_000_000 {
+                .unwrap_or_default();
+            let us_to_go = (release_at as i64 - d.as_secs() as i64) * 1_000_000
+                - d.subsec_micros() as i64;
+            if us_to_go <= RELEASE_LEAD_US as i64 {
                 break;
             }
-            // SAFETY: a ROM busy-wait with no preconditions.
-            unsafe { esp_idf_svc::sys::esp_rom_delay_us(100) };
+            // A tick sleep while there is more than a tick to wait;
+            // `CONFIG_FREERTOS_HZ` is the IDF default 100, so the
+            // shortest is 10 ms and the busy-wait covers the rest.
+            if us_to_go > 20_000 {
+                esp_idf_svc::hal::delay::FreeRtos::delay_ms(10);
+            } else {
+                // SAFETY: a ROM busy-wait with no preconditions.
+                unsafe { esp_idf_svc::sys::esp_rom_delay_us(100) };
+            }
         }
         if let Err(e) = i2c.write(RTC_I2C_ADDR, &[REG_CONTROL1, 0x00], I2C_TIMEOUT_TICKS) {
             // Worse than a phase error: a stopped chip keeps no time.
