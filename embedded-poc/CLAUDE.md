@@ -214,6 +214,63 @@ Also settled while chasing this, worth not re-deriving:
 - **`CONFIG_USB_HOST_HUBS_SUPPORTED=y`** is required too — the
   IC-705 puts its CDC and audio interfaces behind an internal hub.
 
+### The isochronous URB budget is 9 ms by default, and that is not enough
+
+`CONFIG_UAC_NUM_ISOC_URBS=3` x `CONFIG_UAC_NUM_PACKETS_PER_URB=3` is one
+packet per 1 ms frame, so the USB layer holds **9 ms** of audio. Each URB
+is resubmitted from inside `usb_host_uac`'s own transfer callback, i.e.
+in the class-driver task; when that task is late the controller has no
+descriptor queued and *skips* those frames. The samples never reach the
+ring, so nothing downstream can see that they are missing — a 10 ms
+FreeRTOS tick slice is already past the budget.
+
+Measured on a CoreS3 + IC-705, 2026-09-19, over ~220 s each:
+
+| URBs x packets | delivered | slot grid |
+|---|---|---|
+| 3 x 3 (9 ms) | 179 609 B/s = 11 225 sa/s | **+1035 ms per 15 s slot** |
+| 6 x 8 (48 ms) | 192 062 B/s = 12 003.9 sa/s | −4.8 ms per slot |
+
+A sink that counts 180 000 samples as 15 s and is handed 11 225 sa/s
+walks off the air at a second every two and a half slots, which on FT8
+is every decode gone inside a few minutes — from a board whose clock was
+correct the whole time. `sdkconfig.defaults` carries the values and the
+derivation.
+
+**What this looks like from every other vantage point**, all of which
+were checked first and all of which said "fine":
+
+- the reader is never blocked (`send_box` max 7 µs, back in
+  `uac_host_device_read` within 4 ms, zero read timeouts);
+- the ring never overflows, and cannot — a reader that returns as soon
+  as 4 096 B are present keeps it at 0-4 KB, so `RX Ringbuffer overflow`
+  (the driver's own `ESP_LOGD`) never fires;
+- **a deficit second is never followed by a surplus one.** That single
+  observation is what rules out every "something was slow" theory and
+  leaves only "the bytes do not exist", because anything merely delayed
+  comes back.
+
+The honest diagnostic order, if this recurs: compute the delivered rate
+from each tick's own *interval* (`bytes/interval`, summed), never from a
+first/last difference on the cumulative counter — a session restart
+resets it and the wrong method reported 187 kB/s where the truth was
+179.6.
+
+### Priorities: print the ones in effect, not the ones you passed
+
+`TaskStatus_t` carries `uxCurrentPriority`, `uxBasePriority` and (via
+`xTaskGetCoreID`) the affinity; `board::log_task_stacks` prints all
+three. Before it did, every priority argument in this tree was an
+argument about a value *passed* — `uac_host_install`'s `task_priority`,
+`ThreadSpawnConfiguration`, `xTaskCreatePinnedToCore`'s core — and one
+of them was wrong: the `decode` task runs at **base priority 6**, level
+with `uac_reader` and `USB UAC Host` on core 0, while comment after
+comment in this tree said "the decode thread's 5".
+`CONFIG_PTHREAD_TASK_PRIO_DEFAULT` is 5 and `spawn_named` does produce
+5, so `spawn_named_tuned`'s own default path is where 6 comes from. Note
+`uxCurrentPriority` alone cannot tell a configured 6 from an inherited
+one — read the base beside it.
+
 ### Debugging this at all
 
 The USB host driver takes the PHY, so the serial console dies at the

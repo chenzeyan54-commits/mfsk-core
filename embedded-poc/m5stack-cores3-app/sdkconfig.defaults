@@ -221,6 +221,32 @@ CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
 # Refs #163.
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=2048
 
+# How much audio the USB layer itself can hold: URBs x packets, one
+# packet per 1 ms frame.
+#
+# **The stock 3 x 3 is 9 ms, and 9 ms is why this receiver's grid
+# walked off the air.** `usb_host_uac` resubmits each URB from inside
+# its transfer callback, i.e. in the class-driver task; when that task
+# is late the controller has no descriptor queued and skips those
+# frames outright — the samples never reach the ring, so nothing
+# downstream can notice. Measured on an IC-705, 2026-09-19: 187 087 B/s
+# delivered against 192 000 nominal over 194 s, i.e. **2.6 % of the
+# audio gone**, in bursts inside every decode window. Read as 12 000
+# sa/s by a sink that was actually getting 11 693, that is a slot grid
+# slipping +394 ms per 15 s slot — 1 s every 2.5 slots, and decodes
+# down to one station within minutes of an NTP sync that was itself
+# perfectly good. The Kconfig help says "Fewer URBs could cause audio
+# dropouts"; this is what that sentence costs.
+#
+# 6 x 8 is 48 ms, which is past both the 10 ms scheduler tick and the
+# per-slot decode's share of core 0. The cost is DMA-capable internal
+# DRAM: 6 URBs x 8 packets x 192 B (48 kHz stereo 16-bit) = 9 216 B
+# against the stock 1 728 B, allocated once per streaming interface and
+# in 1 536 B pieces, which this board's largest free internal block
+# clears comfortably.
+CONFIG_UAC_NUM_ISOC_URBS=6
+CONFIG_UAC_NUM_PACKETS_PER_URB=8
+
 # Coredump to flash (#163).
 #
 # The panic handler's only output is the console, and in host mode the
