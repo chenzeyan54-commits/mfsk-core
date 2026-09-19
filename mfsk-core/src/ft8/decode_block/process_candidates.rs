@@ -11,8 +11,7 @@
 //! here too, since the file body owns the `decode_block_multipass`
 //! they wrap. The parent module (`decode_block.rs`) re-exports them
 //! at the same `mfsk_core::ft8::decode_block::*` paths external
-//! callers (`mfsk-ffi-ft8`, integration tests, `super::decode::*`)
-//! already use.
+//! callers (integration tests, `super::decode::*`) already use.
 //!
 //! ε.5 of the `docs/CLEANUP_2026_05.md` `decode_block` split.
 
@@ -990,7 +989,7 @@ pub(super) fn fine_refine_pass1<S: AudioSample>(
 /// Variant of [`decode_block`] used by embedded fixed-point callers.
 /// Same recall / depth / staircase as `decode_block`; kept as a
 /// distinct name for API stability with existing embedded callers
-/// (`mfsk-ffi-ft8`, `embedded-shared::dual_core`).
+/// (`embedded-shared::dual_core`).
 #[cfg(feature = "fixed-point")]
 pub fn decode_block_into<S: AudioSample>(
     audio: &[S],

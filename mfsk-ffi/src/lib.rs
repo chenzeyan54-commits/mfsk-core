@@ -18,8 +18,9 @@
 //! strategy.
 //!
 //! Status codes, the decode-depth/strictness/equalisation enums and
-//! the mode/row/params types are shared with `mfsk-ffi-ft8` via
-//! `mfsk-ffi-abi` (issue #205) — this crate used to define its own
+//! the mode/row/params types live in `mfsk-ffi-abi` (issue #205), which
+//! was shared with `mfsk-ffi-ft8` until that crate was retired in
+//! 0.11.0 — this crate used to define its own
 //! `MfskStatus` with colliding numeric codes and a
 //! heap-`CString`-per-message result shape.
 //!
