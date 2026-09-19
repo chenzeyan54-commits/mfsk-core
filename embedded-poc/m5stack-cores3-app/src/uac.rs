@@ -1037,8 +1037,9 @@ impl AudioSink for Ft8ChunkSink {
                             } else {
                                 (remain / 12) as i32
                             };
-                            // **Track every slot; clamp so no slot is
-                            // shorter than the emit point.**
+                            // **Correct late by shortening, leave
+                            // small early alone, and take one short
+                            // slot for a large early.**
                             //
                             // This used to fire only past
                             // `SLOT_DRIFT_REANCHOR_MS`, and then took
@@ -1061,10 +1062,21 @@ impl AudioSink for Ft8ChunkSink {
                             // spreads a genuine step (an NTP jump) over
                             // a few slots that all still decode instead
                             // of one that cannot.
-                            let target = remain.clamp(EMIT_SAFE_MIN_SAMPLES, SLOT_TRACK_MAX_SAMPLES);
+                            let target = if remain <= DEAD_ZONE_SAMPLES
+                                || remain >= SLOT_SAMPLES_12K - DEAD_ZONE_SAMPLES
+                            {
+                                // Already on the grid, either side of
+                                // it. Leave the slot alone.
+                                SLOT_SAMPLES_12K
+                            } else {
+                                // End this slot on the next UTC
+                                // boundary. Exact, and done in one
+                                // slot whichever way the error points.
+                                remain
+                            };
                             if err_ms.unsigned_abs() > SLOT_DRIFT_REANCHOR_MS {
                                 log::warn!(
-                                    "uac: slot phase {err_ms:+} ms off UTC — tracking to {target} \
+                                    "uac: slot phase {err_ms:+} ms off UTC — next slot {target} \
                                      samples"
                                 );
                             }
@@ -1183,18 +1195,33 @@ const SLOT_SECS: u64 = 15;
 /// saying so, so it stays at a tenth of the ±2.5 s FT8 searches.
 const SLOT_DRIFT_REANCHOR_MS: u32 = 250;
 
-/// Shortest slot the phase tracker may ask for.
+/// How far off the grid may sit before a correction is worth a slot.
 ///
-/// `stage1_inc` emits its SpecBundle once it holds 168 000 samples
-/// (`SPEC_EMIT_PAIR`), which is what gives the decoder a tail window
-/// before the boundary. A slot shorter than that emits *partial* and
-/// the window is zero, so a correction is never allowed to cost the
-/// slot it corrects: 174 000 samples (14.5 s) leaves 0.5 s of it.
-const EMIT_SAFE_MIN_SAMPLES: usize = 174_000;
-/// Longest slot the tracker may ask for — the mirror of
-/// [`EMIT_SAFE_MIN_SAMPLES`], so one step moves the phase by at most
-/// half a second in either direction.
-const SLOT_TRACK_MAX_SAMPLES: usize = 186_000;
+/// **Corrections are exact and cost at most one slot; they are never
+/// spread.** Ending the slot on the next UTC boundary puts the grid
+/// right in one step whichever way the error points, and when the
+/// error is large that slot is short enough to emit a partial
+/// SpecBundle and decode nothing. That is the whole price, and it is
+/// the right one: spreading a 3 s error over six 0.5 s steps gives six
+/// slots at a phase the band cannot be found at, where one short slot
+/// gives one.
+///
+/// A clamped, spread version shipped for one run and taught this the
+/// expensive way. `stage1_inc::NMAX` is 180 000 and it is the
+/// spectrogram's geometry (`N_TIME = NMAX / NSTEP - 3`), not a buffer
+/// that can be grown — so a grid running *early* cannot be pulled back
+/// by running one slot long, and clamping it to a 174 000 floor
+/// shortens where lengthening was wanted. The error then grew by
+/// exactly one clamp step per slot: on a radio it walked +503, +1027,
+/// +1494 … +7002 ms, and every one of those slots decoded nothing —
+/// 26 of 123 slots in a 30-minute run, 2026-09-19.
+///
+/// The dead zone is what keeps the exact correction from firing on
+/// jitter: once the audio rate error is gone (measured −5.8 ms per
+/// slot) the phase sits near zero and crosses it, and a correction
+/// that costs a slot must not trigger on that. 200 ms, a fifth of the
+/// ±1.0 s the coarse search covers.
+const DEAD_ZONE_SAMPLES: usize = 2_400;
 
 /// Driver event callback. Invoked by the UAC class-driver background
 /// task on every `RX_CONNECTED` / `TX_CONNECTED` notification (i.e.
@@ -1550,7 +1577,7 @@ fn reader_thread(handle: DeviceHandle, addr: u8, iface_num: u8) {
     let mut last_log = std::time::Instant::now();
     // When audio last actually arrived — the stall watchdog's clock.
     let mut last_data = std::time::Instant::now();
-    /// Completion time of the previous read, for `READ_GAP_MAX_US`.
+    // Completion time of the previous read, for `READ_GAP_MAX_US`.
     let mut last_read_done: i64 = 0;
     let mut last_bytes: u32 = 0;
     // Post-resample signal statistics for the 1 Hz tick — issue #163.
