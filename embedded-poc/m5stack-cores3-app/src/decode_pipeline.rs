@@ -107,6 +107,55 @@ fn slot_end_hint() -> Option<i64> {
     ))
 }
 
+/// Drops this task's priority for as long as it is held.
+///
+/// **Cold acquisition is background work and must stop holding a
+/// real-time priority for it.** It runs 10-15 s on the decode task —
+/// three tiled searches inside `acquire_slot_phases` plus up to
+/// `ACQUIRE_MAX_TRIALS` full-slot decodes — and that task is priority 6
+/// on core 0, where the display loop is the main task at priority 1. So
+/// the panel stopped repainting for the whole acquisition, including
+/// the `SYNC: capturing n/25 s` line that exists to say what is
+/// happening. Reported from the bench as "everything appears to stop".
+///
+/// Yielding more often was the other candidate and is not enough: the
+/// existing `vTaskDelay(1)` points are six in fifteen seconds, and the
+/// tiled searches between them are in `mfsk_core` with no yield at all,
+/// so the best it can do is a repaint every 2.5 s. Dropping to the
+/// display's own priority instead lets it run *when it needs to*, and
+/// costs the acquisition only the time the display actually uses —
+/// that loop sleeps between frames rather than spinning.
+///
+/// The audio path is untouched at priority 6 and keeps its core.
+struct LowPriorityWhile(u32);
+
+impl LowPriorityWhile {
+    /// Priority to drop to. The display's own, so the two share the
+    /// core by round-robin rather than one starving the other.
+    const ACQUIRE_PRIORITY: u32 = 1;
+
+    fn new() -> Self {
+        // SAFETY: both take a null handle, documented as "the calling
+        // task", and `INCLUDE_uxTaskPriorityGet` / `_vTaskPrioritySet`
+        // are enabled in this build.
+        let was = unsafe { esp_idf_svc::sys::uxTaskPriorityGet(core::ptr::null_mut()) };
+        unsafe {
+            esp_idf_svc::sys::vTaskPrioritySet(core::ptr::null_mut(), Self::ACQUIRE_PRIORITY)
+        };
+        Self(was)
+    }
+}
+
+impl Drop for LowPriorityWhile {
+    fn drop(&mut self) {
+        // Restored on every exit path, including the ones that `continue`
+        // out of the slot: a decode task left at priority 1 would miss
+        // its own deadline on every slot after.
+        // SAFETY: as above.
+        unsafe { esp_idf_svc::sys::vTaskPrioritySet(core::ptr::null_mut(), self.0) };
+    }
+}
+
 /// Coarse score above which a slot that decoded nothing is reporting a
 /// *signal* rather than the noise floor.
 ///
@@ -122,25 +171,56 @@ fn slot_end_hint() -> Option<i64> {
 const COARSE_SIGNAL_SCORE: f32 = 5.0;
 
 /// Per-candidate fine sync (WSJT-X `ft8b.f90` Stages A/B/C) plus a
-/// coarse-position retry — `dual_core::DecodeConfig::fine_sync`, whose
-/// doc carries the measurement. On unless `MFSK_FT8_FINE_SYNC=0`.
+/// coarse-position retry — `dual_core::DecodeConfig::fine_sync`.
+///
+/// **Off, and the flag now says so.** It read `true` while
+/// `FT8_FINE_SYNC_MIN_SLACK_MS` refused it on every slot a healthy
+/// receiver produces, so the configuration claimed a stage that was
+/// unreachable — and with `core2-app` and `m5stack-s3-app` both
+/// passing `fine_sync: false`, `fine_sync_12k` had no caller on any
+/// board at all.
+///
+/// Kept rather than deleted, because both halves of the trade are
+/// measured and the answer turns on a budget that is not fixed
+/// forever: it wins recall (4.21 → 4.66 mean decodes over 61 phases on
+/// the shipped numeric path) and costs ~292 ms off the front of the
+/// early path, which this slot cannot spare (`cut` 0 → 3-15 and three
+/// slots past key-up, on a radio, 2026-09-19). Change `MAX_CAND`,
+/// speed up stage 3, or move the emit point and it is worth measuring
+/// again — `MFSK_FT8_FINE_SYNC=1` turns it back on, and the host
+/// mirror's `MFSK_MIRROR_FINE_REFINE` measures the recall half without
+/// a board.
 const FT8_FINE_SYNC: bool = match option_env!("MFSK_FT8_FINE_SYNC") {
     Some(s) => parse_u32(s) != 0,
-    None => true,
+    None => false,
 };
 
 /// `dual_core::DecodeConfig::fine_sync_min_slack_ms` — how much of the
 /// period must still be ahead for fine sync to earn its ~292 ms.
 ///
-/// 2 s, against a steady-state slack of ~1.43 s — so in an aligned
-/// slot fine sync does **not** run, and that is the measurement's
-/// answer, not an accident. With the audio path no longer lending the
-/// decoder starved time, the honest per-slot budget is ~1.1 s, and
-/// fine sync inside it cost decodes rather than winning them (10 →
-/// 5.5, 2026-09-19). What is left is a capability that switches on
-/// when a slot genuinely has room — a short partial slot after a
-/// re-anchor has less, a slot whose boundary sits further out has
-/// more.
+/// 2 s, against a steady-state slack of ~1.43 s — so fine sync does
+/// **not** run on healthy real audio, and that is a measurement rather
+/// than an oversight.
+///
+/// It was lowered to 1.2 s for one flash, on an argument that was
+/// right in both halves and wrong in the join. The recall half holds:
+/// on the shipped numeric path
+/// (`ft8_embedded_pipeline_mirror::mirror_phase_response`,
+/// `--features fixed-point`, 61 phases with and without
+/// `MFSK_MIRROR_FINE_REFINE`) fine sync moves mean decodes 4.21 →
+/// 4.66 and slots at 6-7 decodes 24 → 32. The time half was the
+/// mistake: ~292 ms out of ~1 430 ms looked free because #357's
+/// deadline sweep found `dec` flat down to 800 ms — but that sweep ran
+/// `MFSK_CORES3_FORCE_MODE=decode`, the wav_sim path, which has **no
+/// early/late split**. In the real pipeline those 292 ms come off the
+/// front of the *early* path and buy nothing back; they simply reduce
+/// how many candidates are tried before the slot arrives.
+///
+/// On a radio the difference was immediate and unambiguous
+/// (2026-09-19): `cut` went from 0 on every healthy slot to 3, 15, 10,
+/// 11, 1, 3, and three slots finished past key-up. `dec` moved too,
+/// but it swings 4-11 on this band from slot to slot and was not the
+/// evidence.
 ///
 /// WSJT-X runs its decode to completion because a PC can afford to;
 /// this board cannot, and this is where that difference is spent.
@@ -881,18 +961,61 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                 }
             }
 
-            let action = if full_slot {
+            /// How late a decode has to finish before the slot stops
+            /// being evidence about the grid.
+            ///
+            /// **A cold acquisition wrecks the slots behind it.** It
+            /// holds the decode task for 25 s of capture plus 10-15 s
+            /// of compute, and a bundle that queues up meanwhile is
+            /// decoded after its own slot has gone: no tail window, the
+            /// early path with nothing to work on, candidates cut
+            /// wholesale. Measured on hardware — `tail_win=0`,
+            /// `cut=15`, `dec=0` on a full 180 000-sample slot with 30
+            /// coarse candidates, `post_slotend` 2 747 ms (2026-09-20,
+            /// SIM) and 27 798 / 13 982 ms (2026-09-19, radio).
+            ///
+            /// Counted as evidence, such a slot says "signal present,
+            /// nothing decoded" — exactly what the acquisition trigger
+            /// looks for, so **the acquisition's own wreckage asks for
+            /// another acquisition**, and a failed capture leaves the
+            /// run standing so the retry is immediate. That is the loop
+            /// that kept `AIR DT` acquiring.
+            ///
+            /// The test is the pair, not the queue wait. `q_wait` was
+            /// tried first at half a slot and missed the case above by
+            /// a factor of two: a *successful* acquisition holds the
+            /// pipeline ~3 s, a failed one ~40, and both ruin the slot
+            /// equally. `tail_win == 0` says the bundle arrived at or
+            /// after its own slot end, which never happens on a healthy
+            /// slot (measured 889-927 ms, every slot of a 102-slot
+            /// run); `post_slotend` past this separates it from a slot
+            /// that merely ran long (median 336 ms, p90 454 ms in the
+            /// same run).
+            const WRECKED_POST_SLOTEND_US: i64 = 1_000_000;
+            let backlogged = tail_window == 0 && post_slotend > WRECKED_POST_SLOTEND_US;
+            if backlogged {
+                log::warn!(
+                    "  air-sync: slot decoded {} ms after its own end with no tail window — \
+                     not counted toward the grid",
+                    post_slotend / 1_000
+                );
+            }
+            let action = if full_slot && !backlogged {
                 // The slot's own DT median is the phase error, and the
                 // lock decision needs it: a count alone cannot tell a
                 // centred grid from one 0.7 s out that still catches
                 // the loud half of the band.
                 grid.observe_slot(n_dec, slot_median, had_signal)
             } else {
-                log::info!(
-                    "  air-sync: partial slot ({} samples, {n_dec} decoded) — not counted \
-                     toward the grid",
-                    slot.audio().len()
-                );
+                if !full_slot {
+                    // The backlogged case has already said so above,
+                    // with the number that explains it.
+                    log::info!(
+                        "  air-sync: partial slot ({} samples, {n_dec} decoded) — not counted \
+                         toward the grid",
+                        slot.audio().len()
+                    );
+                }
                 mfsk_app_shared::grid_state::GridAction::Hold
             };
             match action {
@@ -978,6 +1101,10 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                 if let Some(audio) =
                     crate::uac::take_acquisition_audio(mfsk_core::ft8::acquire::REQUIRED_SAMPLES)
                 {
+                    // Everything from here to the end of this block is
+                    // the 10-15 s of compute; hand the core back to the
+                    // panel for the duration.
+                    let _low = LowPriorityWhile::new();
                     // **Try the clusters; the decoder decides.**
                     //
                     // Acquisition used to reduce the candidates to one
