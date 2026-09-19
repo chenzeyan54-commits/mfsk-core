@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.11.0 — a new C ABI for every mode (breaking), FT4/FST4 a-priori decoding fixed (−1.1 dB AWGN), the sniper becomes FT8-only (breaking), a caller-supplied decode budget, `mfsk-ffi-ft8` retired
+## 0.11.0 — a new C ABI for every mode (breaking), FT4/FST4 a-priori decoding fixed (−1.1 dB AWGN), the sniper becomes FT8-only (breaking), a caller-supplied decode budget, `mfsk-ffi-ft8` retired, the CoreS3 FT8 receiver holds its slot grid
 
 **Why a minor bump.** Two independent reasons, either of which would be
 enough by this crate's own convention — the precedent is `0.7.0` (the
@@ -45,7 +45,41 @@ Kotlin **and Swift** bindings; and Windows/Android cross-compilation
 checked on every PR. The Swift package is verified by running its own
 suite on a Mac rather than by CI, which still has Linux runners only.
 
+**The CoreS3 receiver is the other half of this release, and it does not
+touch the crates.io crate.** Every one of those changes is in
+`embedded-poc/` and the two operator manuals; a `mfsk-core` consumer sees
+none of it. What it amounts to is that the board now holds its slot grid
+against a radio for half an hour without intervention — 102 slots over
+29 minutes on 40 m, mean 8.2 decodes, no empty slot, no acquisition and
+no trim — where before it walked off the air within minutes of a good NTP
+sync. Three independent bugs were in the way, each of which presented as
+the decoder's fault: 6.5 % of the USB audio was never delivered, the RTC
+was a second slow on every write, and the phase correction clamped
+itself in the one direction it could not be right in. The instrument
+that should have caught the second read the board's own clock, so it
+reported the grid healthy while the band said otherwise.
+
 ### Documentation
+
+- **Fourteen sites still named `mfsk-ffi-ft8` in the present tense.** The
+  crate was retired earlier in this release and the reference manuals
+  were swept, but outside them four sites pointed a reader at files that
+  are not there (`mfsk-ffi-ft8/src/stream.rs`,
+  `mfsk-ffi-ft8/Cargo.toml`) and one at a type that no longer exists
+  (`MfskFt8Stream`). `embedded-poc/CLAUDE.md` was wrong twice over,
+  describing `idf-component/` as a shim "so C-only ESP-IDF projects can
+  pull the FT8 decoder in without writing Rust glue" — that directory has
+  been documentation-only since the crate went, and pure C cannot satisfy
+  the `extern "Rust"` FFT-planner symbol, which is why the crate was
+  retired in the first place. Also corrected: `engine/dsp/resample.rs`
+  and `mfsk-ffi`'s module docs, an orphaned `embedded-shared/Cargo.toml`
+  comment about a `wav_sim::spawn` signature that changed long ago, seven
+  `ft8/decode_block*` caller lists (only the dead name dropped — the
+  `pub` those lists justify is still reached by `embedded-shared` and the
+  integration tests), both platform tables in the ハムフェア2026 slides,
+  and `PHASE_D_PIE_SIMD.md`. `CHANGELOG.md`, `docs/historical/` and
+  `ROADMAP.md`'s release-history sections are deliberately untouched,
+  where the crate is a correct record of what a past release did.
 
 - **"AP is not part of it" read as "AP does not work here", and three
   source doc comments still described the pre-refactor world.** Raised by
@@ -159,6 +193,143 @@ suite on a Mac rather than by CI, which still has Linux runners only.
 
 ### Added
 
+- **CoreS3: the time source is a setting, behind a two-level menu.** The
+  overlay listed five receivers and nothing else, so the one thing a
+  portable station has to decide before it can decode — where the slot
+  phase comes from — was decided by the software, from whether WiFi
+  happened to associate. The root is now `MODE` (which receiver boots) /
+  `CONFIG` (`TIME: NTP` or `TIME: AIR DT`) / `DEMO`. A root row only
+  navigates; a page selects-then-commits, because both commits restart
+  the board. `grid_src::GridSource` persists beside `boot_mode` in the
+  same NVS namespace and is published through `grid_source()` so the
+  picker can mark what is running.
+
+  **What `TIME: AIR DT` ended up being took three corrections**, all
+  worth recording because each was a plausible reading of the mode:
+
+  - It first *suppressed the system clock*, which was wrong twice. The
+    clock is the log's — FT8 logging needs the minute right — so
+    suppressing it throws away the timestamps this board exists to
+    produce; and it disabled the RTC coarse anchor that the persisted
+    grid fix is designed to complete, so every boot re-acquired. What
+    drifts is the slot phase, not the minute: −3.3 ppm is 11.9 ms an
+    hour, so days off the network make seconds of it against a ±1.0 s
+    coarse search. `AIR DT` now simply does not start NTP
+    (`clock_is_disciplined()` is false without it, so air-sync owns the
+    phase by the existing rule).
+  - The **RTC coarse anchor was then skipped** in that mode, on
+    measurements of 0.68 s and 1.65 s of error — taken while the audio
+    path was losing 6.5 % of its samples. The RTC was not wrong; the
+    grid was drifting +1035 ms a slot after the anchor placed it.
+    Skipping it cost what it was meant to save: an `AIR DT` start with a
+    good RTC spent 2 min 9 s and two 25 s captures, the first decoding
+    nothing, rediscovering a phase the clock already had. With the
+    anchor it decoded 8 stations on the second slot.
+  - FT8 now **reads** the `grid_fix` record it has been writing since
+    #356b — sub-second phase, when it was taken, how confident — and
+    `uac::seed_grid_fix_us` folds it into the sink's first coarse anchor
+    the way `apps/ft4.rs` already did. Refused past 12 hours (≈0.14 s of
+    holdover against a ±0.4 s plateau) or below 0.55 confidence. The
+    stored phase is relative to the RTC's own grid, so a constant RTC
+    error cancels and only between-session drift counts, which is what
+    the age limit is for.
+
+  `rtc` also stops discarding the sub-second: the BM8563 counts whole
+  seconds, so a write landing mid-second used to cost up to a second of
+  phase for nothing. The prescaler is reset through the `STOP` bit as
+  the write goes in, and the read side waits for the seconds tick, so
+  `tv_usec: 0` is true rather than assumed. On this receiver that second
+  is the difference between a grid inside FT8's coarse search and one
+  outside it.
+
+- **CoreS3: the menu names choices rather than boards, and answers the
+  finger.** "FT8 / UAC" sat beside "FT4" and "WSPR", which take their
+  audio over USB from the same radio in the same way, so the suffix
+  distinguished nothing; they are FT8, FT4, WSPR and FST4 now.
+  "DECODE (wav)" was not a receiver but a recording on a loop and said
+  so only in brackets — it moves to `DEMO` as `WAV REPLAY`. The widget's
+  geometry comes from one `ROWS` constant with compile-time assertions
+  against every page, so adding a row cannot leave it undrawable.
+
+  Two touch bugs behind it. **Pressing the menu's own blank area
+  dismissed it**: the widget is sized for its longest page, so shorter
+  pages leave painted-out bands that look like part of the widget and
+  fell through to "outside", which closes — aiming at the lower half of
+  an open menu was indistinguishable from a panel ignoring touches.
+  Those bands are `Target::Dead` now. And **the FT8 screen sampled touch
+  once per frame, behind the render**; a tap is ~100 ms of contact, so a
+  longer frame missed it outright. `pump_touch` spends the frame's idle
+  50 ms polling at 12 ms instead of sleeping through it, so a tap lands
+  on three or four samples however long the frame took. The bus is still
+  only touched while the INT pin says a finger is down. (`spot_panel`
+  had already worked this out for WSPR and FST4.)
+
+  The press-and-hold acknowledgement is **a 2 px border on the whole
+  screen rather than a progress bar**, drawn the moment a finger is seen
+  and erased on release. A bar draws the eye to one place and animates a
+  wait nobody asked to watch; what the operator needs is one bit — the
+  panel felt that. Threshold 500 → 300 ms. Both operator manuals say
+  what the border means and what its absence means.
+
+- **CoreS3: each decode carries its own DT, and the waterfall shows
+  where the slot starts.** The panel and log now use WSJT-X's column
+  order — dB, DT, Freq, Message. The slot median was the only thing
+  reported and it cannot answer the question it is asked: a grid half a
+  second out puts every station at the same offset, while loose station
+  clocks scatter around a correct one, and one number in the middle
+  looks identical either way. Measured the same evening: `-1.02 -0.78
+  -0.70 +0.31` against a grid 0.75 s out, against `-0.04 +0.36 +0.12
+  -0.04 -0.04 +0.60` on one that is right. UTC is left out — it does not
+  fit beside a 22-character message and the status bar has it.
+
+  `stage1_inc` emits a `WfTick` per FFT pair, so the waterfall's
+  vertical axis is time within the slot and the grid the decoder is
+  using can be drawn on it (dashed, so the row stays readable) — which
+  is how an operator tells "the signals do not start at the line" from
+  "there are no signals".
+
+  The grid trim is **one per placement rather than one per N slots**: on
+  its first real run it walked the grid −0.844, −1.004, −0.764, −0.202,
+  +0.671 on five consecutive slots, each correction decided from a slot
+  captured before the previous one took effect.
+
+- **Embedded: the priorities actually in effect are printed, and one of
+  them was wrong.** `board::log_task_stacks` had `TaskStatus_t` in hand
+  and printed only the stack; with `uxCurrentPriority`, `uxBasePriority`
+  and `xTaskGetCoreID` beside it, every priority claim in this tree
+  stops being a claim about a value *passed*. The `decode` task runs at
+  **base priority 6**, level with `uac_reader` and `USB UAC Host` on
+  core 0, while comment after comment here said "the decode thread's 5":
+  `CONFIG_PTHREAD_TASK_PRIO_DEFAULT` is 5 and `spawn_named` does produce
+  5, so `spawn_named_tuned`'s own default path is where 6 comes from.
+  Left as it is for now — the audio loss it was suspected of was the
+  isochronous URB budget — but the inconsistency is real and now
+  visible. `uxCurrentPriority` alone cannot separate a configured 6 from
+  an inherited one, which is why the base is printed next to it.
+
+  `stage1_inc` reports the slot's gain the same way: the shift is locked
+  from the slot's first second and applied to all of it, so the peak it
+  was locked from belongs beside the peak the slot reached. A slot that
+  decoded nothing while showing coarse scores of 20-125 against a 1.0
+  noise floor is a saturated spectrogram, and that pair of numbers is
+  what distinguishes it from a quiet band.
+
+- **CoreS3: the acquisition trigger fires on measured signal, not on a
+  count of empty slots.** `ACQUIRE_TRIGGER_SLOTS` stood in for "is the
+  band quiet, or is the grid lost?" — worth asking, since a 25 s capture
+  on a quiet band cannot succeed and both attempts measured on a radio
+  returned "none of 5 candidate phases decoded". The direct measurement
+  was already in hand: coarse sync's top score, at the noise floor on a
+  quiet band and tens to low hundreds when a station is there the grid
+  is missing. `observe_slot` takes `had_signal`, and a slot with nothing
+  in it no longer counts toward the trigger at all.
+  `REACQUIRE_TRIGGER_SLOTS` stays at six for a reason the signal test
+  does not cover: after a lock, signal that will not decode is more
+  often fading than a grid gone bad. `grid_src::grid_label` also names
+  the state that had none — `TIME: AIR DT` holding the phase from the
+  sink's one-shot RTC anchor reported plain `rtc`, indistinguishable on
+  the panel from an NTP build that had not synced; it is `air:rtc` now.
+
 - **CoreS3 FT8: fine sync moved to after key-up, where there is time
   for it.** Per-candidate fine sync (`ft8b.f90` Stages A/B/C) costs
   ~292 ms of a ~1.1 s pre-key-up budget, and inside that budget it is
@@ -205,6 +376,189 @@ suite on a Mac rather than by CI, which still has Linux runners only.
   of where the decode happened to finish.
 
 ### Fixed
+
+- **CoreS3 FT8: the USB audio path was silently dropping 6.5 % of its
+  samples, and that was the grid bug.**
+  `CONFIG_UAC_NUM_ISOC_URBS=3` × `CONFIG_UAC_NUM_PACKETS_PER_URB=3` is
+  one packet per 1 ms frame, so the USB layer held **9 ms** of audio.
+  Each URB is resubmitted from inside `usb_host_uac`'s own transfer
+  callback, in the class-driver task; when that task is late the
+  controller has no descriptor queued and *skips* those frames. The
+  samples never reach the ring, so nothing downstream can see that they
+  are missing — and a single 10 ms FreeRTOS tick slice is already past
+  the budget. Now 6 × 8 = 48 ms.
+
+  Measured against an IC-705, ~220 s per configuration, each tick's own
+  byte count over its own interval:
+
+  | URBs × packets | delivered | slot grid |
+  |---|---|---|
+  | 3 × 3 (9 ms) | 179 609 B/s = 11 225 sa/s | **+1035 ms per 15 s slot** |
+  | 6 × 8 (48 ms) | 192 062 B/s = 12 003.9 sa/s | −4.8 ms per slot |
+
+  A sink that counts 180 000 samples as 15 s and is handed 11 225 sa/s
+  walks off the air at a second every two and a half slots. That is the
+  whole of "the grid drifts within minutes of an NTP sync that was
+  itself good, and decodes fall to one station". After: 15 consecutive
+  slots all decoding.
+
+  Every other vantage point said "fine" and was checked first — the
+  reader never blocks (`send_box` max 7 µs, back in
+  `uac_host_device_read` within 4 ms, zero read timeouts) and the ring
+  cannot overflow, since a reader that returns on 4 096 B keeps it at
+  0-4 KB. What ruled all of that out was the one observation that a
+  deficit second is never followed by a surplus one: anything merely
+  delayed comes back.
+
+- **CoreS3: the RTC was exactly one second slow on every write.**
+  `write_from_system_clock` spun to just before a UTC second, took
+  `as_secs() + 1`, held the chip with `STOP`, wrote eight registers over
+  I²C — about 1 ms, which crosses that very boundary — and then waited
+  for the *next* boundary to release. The chip resumed holding second
+  S+1 at true time S+2. It now picks the release boundary first and
+  writes the value belonging to it, which also gives the transaction a
+  whole second instead of 800 µs.
+
+  Invisible to anything that also runs NTP, since the system clock is
+  disciplined within seconds of boot. `TIME: AIR DT` does not start NTP
+  at all, so it inherited the whole second, and every measurement taken
+  of that mode beforehand was of this bug:
+
+  |  | `dt` | decodes | captures | trims |
+  |---|---|---|---|---|
+  | before | −0.7 .. −1.0 | 2-8 | 2 × 25 s | every slot |
+  | after | +0.04 ± 0.07 | 4-9 | 0 | 0 |
+
+  — grid locked on the second slot, 15 s from boot.
+
+  **An instrument that shares the suspect's reference cannot convict
+  it.** A probe added to decide whether the boundary was declared at the
+  wrong *time* or over offset audio read `utc_now_ms()`, so it measured
+  the grid against the board's own clock — the thing that was wrong —
+  and reported "boundary on UTC to ±32 ms" while the band read
+  `dt −1.0`. Hours went into treating that contradiction as a decoder
+  problem. Both halves are now in `m5stack-cores3-app/CLAUDE.md`'s
+  own list of what costs a session.
+
+  Two loosenings added the same evening to make the grid self-correct
+  faster are **reverted**, because with the clock right there is nothing
+  to correct in a hurry: `ACQUIRE_TRIGGER_SLOTS` goes back to three, and
+  the trim takes pooled cross-transmitter evidence only. The single-slot
+  median admitted briefly was the 2026-09-05 per-slot servo under
+  another name and behaved the same, walking the grid −0.844, −1.004,
+  −0.764, −0.202, +0.671 on five consecutive slots.
+
+- **CoreS3: the slot phase is corrected every slot, exactly, to the next
+  UTC boundary.** It used to fire only past a re-anchor threshold and
+  then take the whole error out of one slot. The error refills, so the
+  correction was never rare; and a slot cut more than 12 000 samples
+  short never reaches `SPEC_EMIT_PAIR` at 168 000, so it emits a partial
+  `SpecBundle` and the decoder gets no tail window — alternating slots
+  at `pair_done=85/92`, `tail_win=0`, `dec` 0-2 against 7 on the slots
+  between them.
+
+  A clamped correction was tried first and was wrong in the one
+  direction it cannot be: `remain` is the distance to the *next*
+  boundary, so a grid running early gives a small `remain`, and clamping
+  it to a 174 000-sample floor shortens the slot where lengthening was
+  wanted. The error then grew by exactly one clamp step per slot — on a
+  radio it walked +503, +1027, +1494 … +7002 ms, and 26 of 123 slots
+  over 30 minutes decoded nothing. Lengthening was never available
+  either: `stage1_inc::NMAX` is 180 000 and that is the spectrogram's
+  geometry (`N_TIME = NMAX / NSTEP - 3`), not a buffer that can grow.
+
+  Ending the slot on the next UTC boundary is exact in one step
+  whichever way the error points. A large error makes that one slot
+  short enough to decode nothing, and that is the whole price — the
+  right one, because spreading a 3 s error over six half-second steps
+  gives six slots at a phase the band cannot be found at. A 200 ms dead
+  zone keeps it from firing on jitter.
+
+- **CoreS3: SNTP is still watched after the 20 s window closes.**
+  `wait_synced`'s timeout ended a wait, not the sync, and the caller
+  treated it as the answer for the session. Two consecutive host-mode
+  boots timed out and ran as `grid=rtc` thereafter — which turns off the
+  sink's UTC phase tracking entirely — from a board whose RTC had been
+  set from NTP minutes earlier, and which synced in 2.4 s and 4.2 s on
+  the boots either side. The network task now polls every 5 s at
+  priority 2 until it lands, then promotes the clock source through the
+  same `note_clock_from_ntp` the initial wait would have called.
+  `wait_synced` counts its own delays rather than wall time, so this is
+  not a starved poll given more room: the exchange had not arrived.
+
+- **CoreS3: stage 3 is bounded by the slot boundary the audio sink
+  publishes, and the carry-over is gone.** A slot's leftovers no longer
+  travel into the next slot's decode; the deadline is computed per slot
+  from the published boundary plus the ~0.5 s the late path needs, and
+  `budget_ms` stays as a 13 s runaway cap and nothing else.
+
+  Both halves were learned the hard way. Raising the cap to 13 s *as the
+  only bound* let stage 3 run 1.0-2.0 s past slot end, and on a radio
+  that cost the next slot's audio: every slot decoded 0 while the grid
+  slipped a second at a time. And the hint needs a sanity check —
+  a deliberately abnormal slot (cold acquisition stretches one to 25 s)
+  published a boundary putting key-up 9.2 s in the past, and an already
+  expired deadline claims no candidates at all (`hint_err=-10775ms`,
+  `cut=15`, `dec=0`, on a slot whose audio was fine). More than half a
+  slot out is a hint wrong about which slot it names; one or two seconds
+  in the past is a backlogged pipeline, which is true and is meant to
+  bite. `fine_sync_min_slack_ms` measures slack to that same deadline,
+  so fine sync does not run in an aligned steady-state slot (~1.43 s
+  against a 2 s threshold) — the measurement's answer, not an accident:
+  at the honest ~1.1 s budget fine sync cost decodes rather than winning
+  them, 10 against 5.5.
+
+  An intermediate step bounded the carry-over by slack instead of
+  removing it (three gates: no key-up overrun, `stage1_inc` within
+  `CARRY_OVER_MAX_LAG_US` (300 ms) of the audio clock, 2 s slice cap). Recorded because it is
+  right on its own terms and was **not** the cause: with the gate
+  holding back 14-15 candidates a slot and the carry-over doing nothing,
+  `hint_err` stayed at −0.5..−0.75 s and slots kept being skipped.
+
+- **CoreS3: a wrecked slot is no longer evidence about the grid.** A
+  cold acquisition holds the decode task for 25 s of capture plus
+  10-15 s of compute, and a bundle queued meanwhile is decoded after its
+  own slot has gone — no tail window, candidates cut wholesale. Counted,
+  such a slot reads "signal present, nothing decoded", which is exactly
+  what the acquisition trigger looks for, so the acquisition was asking
+  for another acquisition on the strength of the slots it had just
+  ruined. The test is `tail_win == 0 && post_slotend > 1 s`, and the
+  pair matters: `q_wait > 7.5 s` was tried first and missed by a factor
+  of two, because a *failed* acquisition holds the pipeline ~40 s and a
+  *successful* one ~3 s. Against a 102-slot radio run `tail_win` was
+  889-927 ms on every healthy slot and `post_slotend` had median
+  336 ms / p90 454 ms, so neither half is close to normal.
+
+  The acquisition trial loop also **reports every trial**, not only the
+  ones that decoded. Two `continue`s sat above the log line, so "none of
+  5 candidate phases decoded" covered two outcomes wanting opposite
+  fixes — tried and failed, and never tried at all. The second is real:
+  a trial cuts a whole slot starting at the candidate phase, so an
+  offset past 10 s runs off the end of a 25 s capture and a third of the
+  phase space is unreachable. Capturing two slots would fix it and is
+  not available — `ACQUIRE_CAPTURE_SAMPLES = 2 * SLOT` takes the ring to
+  720 KB and needs ~1.44 MB transiently while `take_acquisition_audio`
+  hands one Vec out and `arm_acquisition` reserves the next; the board
+  died of `rust_oom` in `stage1_inc` and rebooted into a loop. The
+  reasoning is recorded beside the constant, so the next attempt starts
+  from it rather than from the buffer.
+
+  After all of it: 102 slots over 29 minutes on 40 m, mean 8.2 decodes,
+  no empty slot, `cut > 0` on 2 slots, no acquisition and no trim.
+
+- **CoreS3: the panel is BGR, and every colour has been swapped since
+  the first screen.** `CSS_ORANGE` (255, 165, 0) reached the panel as
+  (0, 165, 255) — sky blue. mipidsi defaults to RGB; the CoreS3's
+  ILI9342C is wired BGR. Green, white, grey and black are unaffected,
+  which is most of what these screens draw and is why it survived: the
+  menu's amber hold indicator was the first thing to name a colour the
+  swap could ruin. The waterfall is the other casualty, its
+  `black → blue → cyan → green → lime → red` palette displaying with the
+  two ends reversed. All five CoreS3 display inits are set.
+  `m5stack-core2-app` is deliberately untouched — same controller and
+  the same M5GFX-derived `invert`, so very likely the same wiring, but
+  that board's screen has not been looked at and a blind flip would be
+  the same mistake in the other direction.
 
 - **CoreS3: the audio task now outranks the decoder, and what that
   exposed.** Both were priority 5 — the decode pipeline and the
