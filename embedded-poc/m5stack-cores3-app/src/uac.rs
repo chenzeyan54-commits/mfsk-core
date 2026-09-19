@@ -511,7 +511,24 @@ static AUDIO_SINK: Mutex<Option<Box<dyn AudioSink>>> = Mutex::new(None);
 /// `ft8::acquire::REQUIRED_SAMPLES` (25 s) plus one chunk of slack, so
 /// the last `extend_from_slice` never undershoots. ~600 KB on PSRAM
 /// while armed, freed the moment `decode_pipeline` takes it.
-const ACQUIRE_RING_CAP: usize = mfsk_core::ft8::acquire::REQUIRED_SAMPLES + CHUNK_LEN;
+/// Audio a cold acquisition captures, in samples at 12 kHz.
+///
+/// **`REQUIRED_SAMPLES`, i.e. 25 s, and it cannot simply be grown.**
+/// The trials that follow `acquire_slot_phases` cut a whole slot
+/// starting at the candidate phase, so an offset past 10 s runs off
+/// the end and is skipped — a third of the phase space is unreachable
+/// (2026-09-20). Two slots would fix that and was tried: the ring goes
+/// to 720 KB, `take_acquisition_audio` hands that Vec out while
+/// `arm_acquisition` reserves another, and the board died of `rust_oom`
+/// in `stage1_inc` on the next slot's spectrogram.
+///
+/// So the fix has to come from somewhere other than the buffer — a
+/// trial that wraps within the capture, or phases ranked so the
+/// reachable ones come first. Left as it is until then, with the
+/// skipped case now *logged* rather than silent.
+pub const ACQUIRE_CAPTURE_SAMPLES: usize = mfsk_core::ft8::acquire::REQUIRED_SAMPLES;
+const ACQUIRE_RING_CAP: usize = ACQUIRE_CAPTURE_SAMPLES + CHUNK_LEN;
+
 
 static ACQUIRE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ACQUIRE_RING: Mutex<Vec<i16>> = Mutex::new(Vec::new());

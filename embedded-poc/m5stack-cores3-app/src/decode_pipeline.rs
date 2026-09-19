@@ -1085,7 +1085,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                 // the grid *is* — so a receiver working on a lock and a
                 // receiver that has stopped looked identical.
                 if let Some((have, want)) =
-                    crate::uac::acquisition_fill(mfsk_core::ft8::acquire::REQUIRED_SAMPLES)
+                    crate::uac::acquisition_fill(crate::uac::ACQUIRE_CAPTURE_SAMPLES)
                 {
                     let mut line: heapless::String<32> = heapless::String::new();
                     let _ = write!(
@@ -1099,7 +1099,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                     }
                 }
                 if let Some(audio) =
-                    crate::uac::take_acquisition_audio(mfsk_core::ft8::acquire::REQUIRED_SAMPLES)
+                    crate::uac::take_acquisition_audio(crate::uac::ACQUIRE_CAPTURE_SAMPLES)
                 {
                     // Everything from here to the end of this block is
                     // the 10-15 s of compute; hand the core back to the
@@ -1198,6 +1198,26 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                             .rem_euclid(SLOT_TRIAL_SAMPLES as i64)
                             as usize;
                         if audio.len() < off + SLOT_TRIAL_SAMPLES {
+                            // **Say so.** This used to `continue` in
+                            // silence, and so did the zero-decode case
+                            // below, so "none of 5 candidate phases
+                            // decoded" covered both "tried and failed"
+                            // and "never tried" — which want opposite
+                            // fixes. The second is real: a whole slot
+                            // cut at an offset past 10 s runs off the
+                            // end of a 25 s capture, so a third of the
+                            // phase space cannot be tried at all. See
+                            // `uac::ACQUIRE_CAPTURE_SAMPLES` for why
+                            // the obvious fix (capture two slots) is
+                            // not available.
+                            log::warn!(
+                                "    acq trial {}/{}: centre={centre:+.3} SKIPPED — needs \
+                                 {} samples, capture has {}",
+                                trial + 1,
+                                phases.len(),
+                                off + SLOT_TRIAL_SAMPLES,
+                                audio.len(),
+                            );
                             continue;
                         }
                         let got = mfsk_core::ft8::decode_block::decode_block_tuned(
@@ -1210,6 +1230,11 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                             mfsk_core::ft8::params::DEFAULT_BP_MAX_ITER,
                         );
                         if got.is_empty() {
+                            log::info!(
+                                "    acq trial {}/{}: centre={centre:+.3} decoded=0",
+                                trial + 1,
+                                phases.len(),
+                            );
                             continue;
                         }
                         // The trial's own decodes place the grid far
