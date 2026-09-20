@@ -428,6 +428,34 @@ cases the one-tile stage failed. Measured:
 | `qso1` | 28/40 | 34/40 | **9/12** | 27 s vs 44 s |
 | `qso2` | 20/40 | 32/40 | **14/20** | 34 s vs 46 s |
 
+**Corrected 2026-09-20, before anything was built on it: the table
+below scores "on the shortlist", and a stage cannot end on that.** A
+trial cuts a whole slot out of the capture, so a capture of `C`
+seconds can only cut at offsets `0 ..= C - 15`, and the clamp in
+`decode_pipeline` plus the trial's own ±2.5 s search covers
+`(max_off + 5) / 15` of the period — **a third of it at 15 s,
+whatever the search finds**. Scored on what a stage can actually
+*confirm* (`what_a_short_capture_can_actually_confirm`):
+
+| capture | reachable | on list | **confirmable** |
+|---:|---:|---:|---:|
+| 25.0 s | 100 % | 106/120 | **106/120 = 88 %** |
+| 20.0 s | 67 % | 80/120 | **63/120 = 53 %** |
+| 15.0 s | 33 % | 80/120 | **31/120 = 26 %** |
+
+Re-deriving expected outage from those:
+
+```text
+  stage 1 at 15 s:  (0.26 × 20 + 0.74 × 38) / 0.88 = 37.8 s   vs 42 s → 10 %
+  stage 1 at 20 s:  (0.53 × 25 + 0.47 × 38) / 0.88 = 35.4 s   vs 42 s → 16 %
+```
+
+**10-16 %, not the 26-39 % first written here.** The rescue figures
+below are real and the geometry behind them is real; what was wrong
+was scoring the first stage on detection when it ends on confirmation.
+
+The rescue itself, for the record:
+
 **70-100 % of the first stage's misses are rescued, and the reason is
 geometric rather than lucky.** One tile at ±6.24 s covers 12.48 s of
 the 15 s period, so 2.52 s — 17 %, about 6.7 of 40 phases — is outside
@@ -435,8 +463,13 @@ its reach by construction. `qso3_busy` misses exactly 8. The second
 stage's tiles at 5 s and 10 s are precisely what covers that hole, so
 the rescue is a property of the tiling and not of the recording.
 
-**Expected dark band falls 26-39 %** for the same total work, ordered
-so the common case exits early.
+**Expected dark band falls 10-16 %** for the same total work, ordered
+so the common case exits early — after the correction above. The
+binding constraint is not detection but **trial geometry**: at 20 s the
+search puts the phase on the shortlist 80 times in 120 and only 63 of
+those are inside a trial's reach. Splicing a wrapped slot out of the
+capture would close the gap and cannot: the two halves are different
+transmissions.
 
 Caveat on the absolute numbers: the stage times (20 s for one tile,
 38 s for the full sequence, 37 s shipped) are read off the code's own
@@ -444,6 +477,15 @@ measurements — "three tiled searches at 543-635 ms each and up to five
 full-slot decodes at ~1.1 s, 10-15 s in total" — and not measured for
 an implementation that does not exist yet. The **ratio** is what the
 table supports.
+
+### Whether it is worth it
+
+At 10-16 % of a 42 s expected outage — six seconds — against ring
+surgery next to a recorded `rust_oom`, on an event that happens once
+in 278 slots when the clock is disciplined. **Not first.** It stays on
+the list because the outage is much more frequent in the case the
+board exists for — a hilltop with no NTP, where `AIR DT` is the only
+grid source — but it is no longer the largest thing available.
 
 ### What it would take
 

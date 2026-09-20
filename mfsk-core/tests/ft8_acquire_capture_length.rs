@@ -325,3 +325,130 @@ fn a_second_stage_rescues_the_first_stages_misses() {
         "\n  \"3 | 1 missed\" is the number that decides it: a second stage that fails\n           on the same slots as the first buys nothing. E[outage] retries on failure."
     );
 }
+
+/// **On the list is not the same as confirmable.**
+///
+/// A trial cuts a whole slot out of the capture starting at the
+/// candidate phase, so a capture of `C` seconds can only cut at
+/// offsets `0 ..= C - 15`. `decode_pipeline`'s clamp
+/// (`d4c014b3`) maps a centre circularly onto that band and lets the
+/// trial's own ±2.5 s search plus its median-DT correction cover the
+/// difference — which works while the centre is within 2.5 s of the
+/// band, and not otherwise.
+///
+/// So the reachable share of the period is
+/// `(max_off + 5) / 15`, and a 15 s capture reaches a third of it
+/// however good the search is. "One tile at 15 s finds the grid
+/// two thirds of the time" is therefore not a statement about what a
+/// 15 s stage could *confirm*, and a progressive acquisition has to be
+/// designed against this table rather than that one.
+#[test]
+#[ignore = "diagnostic — what a capture can trial, not just find"]
+fn what_a_short_capture_can_actually_confirm() {
+    const N_PHASE: usize = 40;
+    let tol: f32 = std::env::var("MFSK_ACQ_TOL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0);
+    /// `decode_block`'s own coarse window, which is what a trial searches.
+    const TRIAL_LAG_S: f32 = 2.5;
+
+    let tilings = [
+        (
+            "3 x ±2.5 @5s (shipped)",
+            Tiling {
+                name: "",
+                n: 3,
+                spacing_s: 5.0,
+                lag_s: 2.5,
+            },
+        ),
+        (
+            "2 x ±5.0 @5s          ",
+            Tiling {
+                name: "",
+                n: 2,
+                spacing_s: 5.0,
+                lag_s: 5.0,
+            },
+        ),
+        (
+            "1 x ±6.24 @17.5s      ",
+            Tiling {
+                name: "",
+                n: 1,
+                spacing_s: 2.5,
+                lag_s: 6.24,
+            },
+        ),
+        (
+            "1 x ±6.24 @15s        ",
+            Tiling {
+                name: "",
+                n: 1,
+                spacing_s: 0.0,
+                lag_s: 6.24,
+            },
+        ),
+    ];
+
+    println!(
+        "\n  {:24} {:>8} {:>10} {:>10} {:>12}",
+        "tiling", "capture", "reachable", "on list", "confirmable"
+    );
+    println!("  {:-<68}", "");
+    for name in ["qso3_busy.wav", "qso1.wav", "qso2.wav"] {
+        let path = format!(
+            "{}/../embedded-poc/assets/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut slot = load_wav_i16(std::path::Path::new(&path));
+        slot.truncate(SLOT);
+        println!("  {name}");
+        for (label, t) in &tilings {
+            // `capture_s` is (n-1)*spacing + 15, so a one-tile entry
+            // with a spacing carries extra audio for the trial to cut
+            // into without adding a window.
+            let max_off = t.capture_s() - 15.0;
+            let reach = ((max_off + 2.0 * TRIAL_LAG_S) / 15.0).min(1.0);
+            let (mut on, mut conf) = (0usize, 0usize);
+            for i in 0..N_PHASE {
+                let off_s = i as f32 * (15.0 / N_PHASE as f32);
+                let truth = wrap(-off_s);
+                let need = (t.capture_s() * SR as f32) as usize;
+                let start = (off_s * SR as f32) as usize;
+                let mut long: Vec<i16> = Vec::with_capacity(need + SLOT);
+                while long.len() < need {
+                    let from = (start + long.len()) % SLOT;
+                    let take = (SLOT - from).min(need - long.len());
+                    long.extend_from_slice(&slot[from..from + take]);
+                }
+                let list = phases(&long, t);
+                let hit = list.iter().any(|(dt, _)| wrap(dt - truth).abs() <= tol);
+                if hit {
+                    on += 1;
+                    // Reachable: the true phase, folded into [0, 15),
+                    // is within a trial's search of some legal offset.
+                    let want = truth.rem_euclid(15.0);
+                    let nearest = want.min(max_off.max(0.0)).max(0.0);
+                    let d = (want - nearest).abs().min(15.0 - want);
+                    if d <= TRIAL_LAG_S {
+                        conf += 1;
+                    }
+                }
+            }
+            println!(
+                "  {label:24} {:7.1}s {:9.0}% {:7}/{} {:9}/{}",
+                t.capture_s(),
+                100.0 * reach,
+                on,
+                N_PHASE,
+                conf,
+                N_PHASE
+            );
+        }
+    }
+    println!(
+        "\n  \"reachable\" is geometry — (max_off + 5) / 15. \"confirmable\" is a phase that\n           is both on the shortlist and inside a trial's reach, which is what a stage can end on."
+    );
+}
