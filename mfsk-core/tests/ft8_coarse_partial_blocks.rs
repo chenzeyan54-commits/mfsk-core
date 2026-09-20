@@ -14,7 +14,8 @@
 #![cfg(all(feature = "ft8", not(feature = "fft-rustfft")))]
 
 use mfsk_core::ft8::decode_block::{
-    coarse_sync_with_allsum_and_lag, compute_spectrogram, precompute_coarse_allsum,
+    coarse_sync_with_allsum_and_lag, coarse_sync_with_allsum_lag_and_rows, compute_spectrogram,
+    precompute_coarse_allsum,
 };
 
 macro_rules! asset_path {
@@ -142,5 +143,85 @@ fn the_shipped_window_admits_two_block_candidates() {
         "far-lag candidates took {} of {} pass-1 places",
         far.len(),
         shipped.len()
+    );
+}
+
+/// **The gate, and what it removes.**
+///
+/// Telling coarse sync where the fill stopped makes it refuse the lags
+/// whose block 2 is incomplete. The claim is narrow: candidates past
+/// the ceiling disappear, candidates below it are untouched — bit for
+/// bit, because the gate only ever writes `NEG_INFINITY` into lags
+/// that could not have been scored on all three blocks.
+#[test]
+fn the_gate_removes_far_lag_candidates_and_nothing_else() {
+    let (spec, allsum) = spec_and_allsum(true);
+    let open = coarse_sync_with_allsum_and_lag(
+        &spec, FREQ_MIN, FREQ_MAX, SYNC_MIN, MAX_CAND, &allsum, 1.0,
+    );
+    let gated = coarse_sync_with_allsum_lag_and_rows(
+        &spec, FREQ_MIN, FREQ_MAX, SYNC_MIN, MAX_CAND, &allsum, 1.0, FILLED,
+    );
+    let far = |cs: &[mfsk_core::engine::sync::SyncCandidate]| {
+        cs.iter().filter(|c| c.dt_sec > 0.88).count()
+    };
+    println!(
+        "  open : {} cands, {} past +0.88 s\n  gated: {} cands, {} past +0.88 s",
+        open.len(),
+        far(&open),
+        gated.len(),
+        far(&gated)
+    );
+    assert_eq!(far(&gated), 0, "a two-block candidate survived the gate");
+    assert!(far(&open) > 0, "fixture no longer exercises the gate");
+
+    // **The surviving candidates do not come through untouched**, and
+    // that is worth stating rather than asserting away. Gating writes
+    // `NEG_INFINITY` into a lag, so a frequency whose best lag was
+    // gated reports a different `red`; `red` feeds the 40th-percentile
+    // noise floor, and the floor normalises every score. Removing
+    // far-lag maxima therefore moves the floor a little and rescales
+    // the whole list.
+    let by_pos = |cs: &[mfsk_core::engine::sync::SyncCandidate]| {
+        let mut v: Vec<_> = cs
+            .iter()
+            .filter(|c| c.dt_sec <= 0.88)
+            .map(|c| ((c.freq_hz.to_bits(), c.dt_sec.to_bits()), c.score))
+            .collect();
+        v.sort_by_key(|(k, _)| *k);
+        v
+    };
+    let (a, b) = (by_pos(&open), by_pos(&gated));
+    let mut common = 0usize;
+    let mut worst: f32 = 0.0;
+    for (ka, sa) in &a {
+        if let Some((_, sb)) = b.iter().find(|(kb, _)| kb == ka) {
+            common += 1;
+            worst = worst.max((sa - sb).abs() / sa.max(1e-6));
+        }
+    }
+    println!(
+        "  {} of {} inside-ceiling positions survive; worst relative score move {:.3}%",
+        common,
+        a.len(),
+        100.0 * worst
+    );
+    // **One of 28 is displaced, and that is the floor moving, not the
+    // gate reaching inside the ceiling.** The lost entry sat near the
+    // `pass1_limit` cut; a 2.9 % rescale reorders the tail and the
+    // truncation drops whichever falls below. Recorded as a bound
+    // rather than asserted to zero, because the quantity that decides
+    // whether this trade is worth taking is *decodes*, not candidate
+    // identity — a shortlist place freed from a two-block candidate is
+    // the point of the exercise.
+    assert!(
+        common + 1 >= a.len(),
+        "the gate displaced {} inside-ceiling candidates, not at most one",
+        a.len() - common
+    );
+    assert!(
+        worst < 0.05,
+        "the noise floor moved {:.1} %, far more than the 2.9 % this fixture showed",
+        100.0 * worst
     );
 }

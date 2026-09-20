@@ -41,7 +41,9 @@ pub fn coarse_sync(
     sync_min: f32,
     max_cand: usize,
 ) -> Vec<SyncCandidate> {
-    coarse_sync_inner(spec, freq_min, freq_max, sync_min, max_cand, None, None)
+    coarse_sync_inner(
+        spec, freq_min, freq_max, sync_min, max_cand, None, None, None,
+    )
 }
 
 /// [`coarse_sync`] with an explicit ±lag search window in seconds,
@@ -79,6 +81,7 @@ pub fn coarse_sync_with_lag(
         max_cand,
         None,
         Some(sync_lag_s),
+        None,
     )
 }
 
@@ -114,6 +117,7 @@ pub fn coarse_sync_with_allsum(
         max_cand,
         Some(allsum),
         None,
+        None,
     )
 }
 
@@ -140,6 +144,7 @@ pub fn coarse_sync_with_allsum_and_lag(
         max_cand,
         Some(allsum),
         Some(sync_lag_s),
+        None,
     )
 }
 
@@ -148,6 +153,46 @@ pub fn coarse_sync_with_allsum_and_lag(
 /// Returns 0 when the band has no candidates (then
 /// `coarse_sync_with_allsum` would return an empty vec immediately
 /// regardless of `allsum`).
+/// [`coarse_sync_with_allsum_and_lag`] for a spectrogram only part of
+/// which is filled, **scoring only the lags that still have all three
+/// Costas blocks**.
+///
+/// `valid_rows` is how many leading time rows hold a spectrum. A
+/// streaming producer emits its bundle before the slot ends and must
+/// still declare the full `n_time`, because that is what sets the
+/// allsum's stride ([`coarse_allsum_len`]) — so its tail rows are
+/// present and zero, and block 2's trailing symbols reach into them at
+/// large positive lag. Those rows add nothing to the score's sums, so
+/// the score is not wrong; it is computed over fewer symbols and is
+/// correspondingly noisier, and a noisy score competes on equal terms
+/// with a quiet one.
+///
+/// This refuses to score such a lag at all. See the gate in
+/// `coarse_sync_inner` for why that is a divergence from WSJT-X and
+/// why it is opt-in; whole-slot callers use
+/// [`coarse_sync_with_allsum_and_lag`] and are unaffected.
+pub fn coarse_sync_with_allsum_lag_and_rows(
+    spec: &Spectrogram,
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    max_cand: usize,
+    allsum: &[CoarseAcc],
+    sync_lag_s: f32,
+    valid_rows: usize,
+) -> Vec<SyncCandidate> {
+    coarse_sync_inner(
+        spec,
+        freq_min,
+        freq_max,
+        sync_min,
+        max_cand,
+        Some(allsum),
+        Some(sync_lag_s),
+        Some(valid_rows),
+    )
+}
+
 pub fn coarse_allsum_len(
     spec_n_freq: usize,
     spec_n_time: usize,
@@ -309,6 +354,7 @@ fn coarse_sync_inner(
     max_cand: usize,
     external_allsum: Option<&[CoarseAcc]>,
     sync_lag_override_s: Option<f32>,
+    valid_rows: Option<usize>,
 ) -> Vec<SyncCandidate> {
     let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
     let tstep = NSTEP as f32 / SAMPLE_RATE_HZ;
@@ -502,6 +548,42 @@ fn coarse_sync_inner(
             // Block 2: WSJT-X guards `m + nssy*72 <= NHSYM` because
             // positive lag can push its trailing symbols past the slot.
             let bk2_n_end = valid_trailing_symbol_count(m_base[2][0], lag, n_time);
+            // **A lag whose block 2 is incomplete is not scored at
+            // all** — when the caller has said how many rows are real.
+            //
+            // Both scores below contain block 2, so an incomplete one
+            // makes both of them a ratio over fewer Costas symbols.
+            // That does not *inflate* the score: numerator and
+            // denominator are sums over the same symbols and the ratio
+            // is self-normalising (`ft8_coarse_partial_blocks` measures
+            // it — a zeroed tail scores bit-identically to the same
+            // symbols skipped). What it does is raise the *variance*:
+            // a noise coincidence over 14 symbols reaches a given
+            // ratio far more often than over 21, which is why the
+            // ±1.75 s widen filled the shortlist with candidates at
+            // −1.64 / +1.72 / +1.08 that scored 20-30 and decoded
+            // nothing (radio, 2026-09-19).
+            //
+            // Negative lag moves block 2 *earlier*, so it is never the
+            // truncated one; the asymmetry the measurement asked for
+            // (0 % of real decodes past +0.88 s, 0.26-1.35 % below
+            // −0.88 s, on 1 382 on-air decodes) falls out without a
+            // special case.
+            //
+            // **A deliberate divergence from WSJT-X**, which scores
+            // the truncated block and takes the result (`sync8.f90`
+            // guards the read and skips). Opt-in through `valid_rows`
+            // for exactly that reason: the host passes `None` and is
+            // bit-identical, the streaming embedded pipeline passes
+            // its fill point and pays for the divergence. Upstream
+            // never needs it, because upstream's spectrogram ends
+            // where its slot ends.
+            if valid_rows.is_some_and(|v| {
+                valid_trailing_symbol_count(m_base[2][0], lag, v.min(n_time)) < COSTAS.len()
+            }) {
+                sync2d[idx(fi, lag)] = f32::NEG_INFINITY;
+                continue;
+            }
             for n in 0..bk2_n_end {
                 let m_u = (m_base[2][n] + lag) as usize;
                 let tbin_lo = tbin_lo_arr[n];
@@ -760,7 +842,7 @@ mod tests {
         let spec =
             Spectrogram::from_parts(n_freq, N_TIME, vec![Default::default(); n_freq * N_TIME]);
 
-        let candidates = coarse_sync_inner(&spec, 200.0, 300.0, 1.5, 10, None, Some(2.5));
+        let candidates = coarse_sync_inner(&spec, 200.0, 300.0, 1.5, 10, None, Some(2.5), None);
 
         assert!(candidates.is_empty());
     }
