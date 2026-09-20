@@ -496,3 +496,61 @@ extendable to 25 s if the first stage misses, and a trial loop that
 can run twice against a growing buffer. The `rust_oom` recorded beside
 `ACQUIRE_CAPTURE_SAMPLES` is the standing warning about what a second
 buffer costs.
+
+## 10. The transmit side does not fit, and the reason is structural
+
+`MFSK_CORES3_TX_SYNTH_BENCH=1`, measured on the board 2026-09-20. Pure
+compute — no PTT, no audio interface.
+
+```text
+  message_to_tones      666 us     LDPC encode + Costas
+  alloc 607 KB f32       55 ms     PSRAM, zeroed
+  tones_to_f32_into     390 ms     the synthesis proper
+  i16 round trip         82 ms     a *second* 607 KB temp, then convert
+                       -------
+  total                 472 ms     for 151 680 samples
+```
+
+Against the schedule §8 establishes — audio at `slotend + 0.5 s`, PTT
+at the boundary, ~100 ms of IC-705 settle:
+
+```text
+  decoder must finish by  0.5 − 0.1 − 0.472 = slotend − 72 ms
+```
+
+**Before the slot ends.** The late path cannot even have run. With the
+synthesis on the critical path there is no schedule that works, and
+the board's measured `post_slotend` — median 332 ms, p90 479 ms — is
+not the problem; it would have to be negative.
+
+### It is not a number to optimise, it is a place to move
+
+`tx::play` already streams the waveform to the DMA in 20 ms chunks.
+Synthesising per chunk instead of building all 12.64 s first takes the
+472 ms off the critical path entirely: spread across the playback it is
+a **3.7 % duty**, and the decoder's deadline goes back to being the
+boundary.
+
+It also removes the allocations. The current path holds ~1.2 MB of
+PSRAM temporaries at once — `dphi` at 622 KB inside `synth_f32_into`
+and `synth_i16_into`'s own 607 KB — which is uncomfortably close to
+the ~1.44 MB that produced the `rust_oom` recorded beside
+`uac::ACQUIRE_CAPTURE_SAMPLES`.
+
+### The optimisations are real but secondary
+
+Worth having once the structure is right, and worth noting that this
+path never got the treatment the decode side did: `embedded-shared`
+wires esp-dsp FFT and dotprod backends for receive, and the
+synthesiser is generic `mfsk-core` code with no ESP acceleration at
+all.
+
+- **82 ms, the i16 round trip, is pure waste** and the smallest fix:
+  `synth_i16_into` runs the whole f32 synthesis into a 607 KB temp and
+  then converts. Writing i16 in the sample loop removes the temp, its
+  allocation and the copy. ~17 % for a contained `mfsk-core` change.
+- **390 ms is the synthesis**, and what dominates it is *not* yet
+  measured: 151 680 `sinf` calls against ~455 k read-modify-writes
+  into a 622 KB PSRAM `dphi`. A sine table and a chunked buffer in
+  internal RAM attack different halves, so the split is worth having
+  before either is written.

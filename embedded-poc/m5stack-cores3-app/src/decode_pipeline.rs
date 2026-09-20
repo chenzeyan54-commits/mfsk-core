@@ -388,6 +388,37 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                         best = best.min(dt);
                     }
                 }
+                // **Where the time goes, rather than a guess at it.**
+                // The synthesiser is generic `mfsk-core` code — the
+                // decode side got esp-dsp backends through
+                // `embedded-shared` and this path never did — so the
+                // figure above is an unoptimised starting point and
+                // the split decides what to aim at:
+                //
+                //  * `message_to_tones` is LDPC encode + Costas, once
+                //    per message and nothing to do with sample rate.
+                //  * `tones_to_f32_into` is the whole cost except the
+                //    i16 round trip: `synth_i16_into` allocates a
+                //    second 607 KB f32 buffer and converts, on top of
+                //    the 622 KB `dphi` the f32 path allocates itself.
+                //    Both live in PSRAM.
+                //  * what is left of `tones_to_i16_into` after that is
+                //    exactly that round trip.
+                let t_a = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+                let tones = message_to_tones(&msg77);
+                let t_b = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+                let mut f32buf = alloc::vec![0f32; TX_SAMPLES_12K];
+                let t_c = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+                mfsk_core::ft8::wave_gen::tones_to_f32_into(&mut f32buf, &tones, 1_500.0, 1.0);
+                let t_d = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+                log::warn!(
+                    "tx-synth split: message_to_tones {} us | alloc 607 KB f32 {} ms | \
+                     tones_to_f32_into {} ms | i16 round trip {} ms",
+                    t_b - t_a,
+                    (t_c - t_b) / 1_000,
+                    (t_d - t_c) / 1_000,
+                    (best - (t_d - t_c)) / 1_000
+                );
                 log::warn!(
                     "tx-synth bench: pack77 {} us | synth first (with 303 KB alloc) {} ms | \
                      synth best (buffer reused) {} ms | {} samples",
