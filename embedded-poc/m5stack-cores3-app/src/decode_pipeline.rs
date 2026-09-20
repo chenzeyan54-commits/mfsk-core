@@ -308,9 +308,42 @@ const FT8_SLOT_FLOOR_MS: i64 = 0;
 /// window.
 const FT8_SEARCH_LAG_S: f32 = 0.88;
 
-/// `dual_core::DecodeConfig::share_cand_budget` — off pending a board
-/// measurement; the host mirror's gain is on `qso1`/`qso2`, which the
-/// SIM harness cannot play.
+/// `dual_core::DecodeConfig::share_cand_budget` — off, and **inert
+/// while [`FT8_SEARCH_LAG_S`] sits at the coverage ceiling**.
+///
+/// It divides the stage-3 budget between the early (prefix) half and
+/// the late half instead of letting the early half take all of it.
+/// With no deferred candidates there is no late half to give anything
+/// to, and both settings compute the same two numbers:
+///
+/// ```text
+///                     share_cand ON            share_cand OFF
+///   early_budget      ready in top max_cand    max_cand
+///   late_budget       max_cand - early         max_cand - n_early_refined
+/// ```
+///
+/// When `defer == 0` every one of the top `max_cand` is ready, so the
+/// first row is `max_cand` either way and the second is 0 either way.
+/// The two arms run identical code.
+///
+/// That is the state the board is in: narrowing the search window to
+/// 0.88 s took `defer` from 1.27 a slot to 0 (see
+/// [`FT8_SEARCH_LAG_S`]), and a run on 2026-09-20 had **48 of 48 slots
+/// at `defer = 0`**. The A/B numbers from that run — 10.00 against
+/// 10.29 over 24 slots each — are two arms hearing different stations,
+/// not an effect.
+///
+/// **This used to say "off pending a board measurement".** It was
+/// measured, twice, while the window was still ±1.04 s and deferred
+/// candidates existed: `-0.64` and `+0.24` decodes a slot over n = 14
+/// each. Opposite signs, and smaller than that sample can resolve.
+///
+/// So: do not read the host mirror's gain on `qso1`/`qso2` as
+/// something the board is leaving on the table. It is a gain in a
+/// configuration the board no longer runs. Re-measuring this means
+/// first arranging for candidates to be deferred at all —
+/// `MFSK_FT8_LAG_AB` or a wider window — and the A/B harness
+/// (`MFSK_FT8_SHARE_CAND_AB`) is there for when that happens.
 const FT8_SHARE_CAND: bool = match option_env!("MFSK_FT8_SHARE_CAND") {
     Some(s) => parse_u32(s) != 0,
     None => false,
