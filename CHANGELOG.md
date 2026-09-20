@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.11.1 — the message-policy docs catch up with the code
+
+- **The message-acceptance policy reaches `Ft4` and every FST4
+  sub-mode, and five places said `Ft8` alone (#383).** No code changed:
+  PR #386 gave `engine::pipeline` an `InfoAccept` seam and implemented
+  `SupportsMessageFilter` for both, 14 commits before v0.11.0 was
+  tagged. What did not change was the prose PR #385 had written while
+  FT8 really was the only implementor — the trait's own doc comment,
+  FT8's impl beside it, `LIBRARY.md`'s builder table and its `.ja.md`
+  twin (which also still typed the closures `Fn(&str)`, omitted
+  `.codec_filter()` and linked §2.6 as "§2.5"), and 0.11.0's own
+  CHANGELOG entry, corrected in place with a note that the copy
+  published to crates.io still carries the old text.
+
+  `FrameDecodable::MESSAGE_FILTER_DEFAULT` is unchanged and still
+  `true` for FT8 alone, so FT4 and FST4 decode bit-identically unless a
+  caller asks for a policy. Whether FT4 *should* default to the codec
+  verdict — it has FT8's CRC-14 and `SupportsSicRounds`, which is the
+  reason FT8 does — is a measurement nobody has run.
+
 ## 0.11.0 — a new C ABI for every mode (breaking), FT4/FST4 a-priori decoding fixed (−1.1 dB AWGN), the sniper becomes FT8-only (breaking), a caller-supplied decode budget, `mfsk-ffi-ft8` retired, the CoreS3 FT8 receiver holds its slot grid and stops starving its own internal DRAM
 
 **Why a minor bump.** Two independent reasons, either of which would be
