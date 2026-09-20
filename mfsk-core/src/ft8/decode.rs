@@ -1599,6 +1599,11 @@ fn decode_sniper_inner<Pol: MessagePolicy>(
 impl FrameDecodable for Ft8 {
     type DecodeResult = DecodeResult;
 
+    /// See [`FrameDecodable::MESSAGE_FILTER_DEFAULT`]: FT8 is the one
+    /// protocol whose subtraction strategies are measured, and the
+    /// measurement says the verdict is worth a real decode there.
+    const MESSAGE_FILTER_DEFAULT: bool = true;
+
     fn __single_pass<Pol: MessagePolicy>(
         req: &DecodeRequest<'_, Self, Pol>,
     ) -> DecodeOutcome<Self> {

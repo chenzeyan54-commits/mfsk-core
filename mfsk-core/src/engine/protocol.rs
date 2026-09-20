@@ -667,7 +667,7 @@ pub trait MessageCodec: Default + 'static {
         true
     }
 
-    /// Judge a message this codec already unpacked, as *text*.
+    /// Judge a decoded message's **payload bits**, `PAYLOAD_BITS` wide.
     ///
     /// The layer below this one is the CRC, and a CRC false positive is
     /// a codeword the decoder converged on that is not the transmitted
@@ -676,6 +676,13 @@ pub trait MessageCodec: Default + 'static {
     /// `false` here is how a codec refuses one on grounds the bits
     /// cannot express: a callsign whose prefix the ITU never allocated,
     /// an exchange field outside the range its contest defines.
+    ///
+    /// Bits rather than text because the message *type* lives in them,
+    /// and some types carry no redundancy to check — `Wsjt77Message`'s
+    /// free text and telemetry are 71 bits in which nearly every
+    /// pattern is a valid message. A text-only verdict cannot tell
+    /// those apart from a structured type's garbage, so it either
+    /// refuses them (losing the traffic) or admits everything.
     ///
     /// Default: accept unconditionally. Appropriate for codecs whose
     /// own field checks are the whole story, and for any codec whose
@@ -693,8 +700,8 @@ pub trait MessageCodec: Default + 'static {
     /// [`Self::verify_info`] has it: the verdict is a property of the
     /// codec, and a function item passes into the policy layer without
     /// an indirection.
-    fn is_plausible(text: &str) -> bool {
-        let _ = text;
+    fn is_plausible(payload: &[u8]) -> bool {
+        let _ = payload;
         true
     }
 }

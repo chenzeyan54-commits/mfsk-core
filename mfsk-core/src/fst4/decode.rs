@@ -164,6 +164,29 @@ macro_rules! impl_frame_decodable {
 
         impl crate::msg::decode_request::SupportsWideBandAp for $proto {}
 
+        /// Opt-in only: `MESSAGE_FILTER_DEFAULT` stays `false` for every
+        /// FST4 sub-mode, so a request that names no policy decodes
+        /// bit-identically. CRC-24 puts FST4's false-positive rate 512x
+        /// below FT8/FT4's, which is why the filter is not worth its
+        /// recall cost here — see `FrameDecodable::MESSAGE_FILTER_DEFAULT`.
+        impl crate::msg::decode_request::SupportsMessageFilter for $proto {
+            fn __strategy_for<Pol: MessagePolicy>(
+                tag: crate::msg::decode_request::StrategyTag,
+            ) -> fn(&DecodeRequest<'_, Self, Pol>) -> DecodeOutcome<Self> {
+                match tag {
+                    crate::msg::decode_request::StrategyTag::SinglePass => {
+                        Self::__single_pass::<Pol>
+                    }
+                    // Unreachable by construction: `.sic_rounds()` and
+                    // `.sic_early()` live on impls gated by traits no
+                    // FST4 sub-mode implements, so neither tag can be
+                    // set on an FST4 request. WSJT-X's own
+                    // `fst4_decode.f90` has no SIC path either.
+                    _ => unreachable!("FST4 has no SIC strategy"),
+                }
+            }
+        }
+
         impl FrameDecodable for $proto {
             type DecodeResult = DecodeResult;
 
@@ -212,7 +235,9 @@ macro_rules! impl_frame_decodable {
                     .iter()
                     .map(|(m, v, pid)| (m.as_slice(), v.as_slice(), *pid))
                     .collect();
-                let (raw, fft_cache, budget) = pipeline::decode_frame_budgeted::<$proto>(
+                let accept =
+                    crate::msg::decode_request::PolicyAccept::<$proto, Pol>::new(&req.policy);
+                let (raw, fft_cache, budget) = pipeline::decode_frame_budgeted::<$proto, _>(
                     req.audio,
                     &$cfg,
                     req.freq_min,
@@ -228,6 +253,7 @@ macro_rules! impl_frame_decodable {
                     on_result,
                     req.budget,
                     &ap,
+                    &accept,
                 );
                 DecodeOutcome {
                     results: pipeline::dedup_known(raw, req.known),

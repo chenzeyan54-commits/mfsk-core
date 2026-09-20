@@ -282,6 +282,46 @@ impl DecodeDepth {
 /// (9/14 either way), no float ops on a path embedded/no_std builds also
 /// compile.
 ///
+/// A caller-supplied predicate over a candidate's FEC-decoded,
+/// **descrambled** information bits — the last acceptance test in the
+/// per-candidate ladder.
+///
+/// `engine` never depends on `msg` (the dependency direction is
+/// established crate-wide), so this module cannot unpack a codeword to
+/// text and cannot hold an opinion about the message it carries. This
+/// trait is the seam: `msg` supplies a predicate that does the
+/// unpacking, and the pipeline calls it at each rung's acceptance
+/// point.
+///
+/// **Why here and not over the returned `Vec`.** Rejecting a codeword
+/// here lets the ladder try its next rung — the next LLR variant, OSD,
+/// an a-priori hypothesis — exactly as a hard-error rejection does.
+/// Filtering the results afterwards cannot do that, and would also fire
+/// `on_result` for rows it then discards.
+///
+/// The default implementor [`AcceptAll`] is zero-sized, so a build
+/// where nobody supplies a predicate compiles to the code that was
+/// here before the seam existed.
+pub trait InfoAccept: Sync {
+    /// `info` is `<P::Fec as FecCodec>::K` bits wide with the CRC
+    /// retained, descrambled — the same shape
+    /// [`DecodeResult::info`] carries, so `info[..77]` is the message.
+    fn accept(&self, info: &[u8]) -> bool;
+}
+
+/// No opinion: every codeword the FEC and CRC layers verified is
+/// accepted. Zero-sized, and what every entry point that does not take
+/// a predicate passes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AcceptAll;
+
+impl InfoAccept for AcceptAll {
+    #[inline]
+    fn accept(&self, _info: &[u8]) -> bool {
+        true
+    }
+}
+
 /// Exposed as `pub` (alongside [`process_candidate_basic`]) so
 /// diagnostics/benchmarks that re-implement the staircase outside this
 /// module (e.g. `tests/fst4_sweep.rs`) read the real gate instead of
@@ -694,7 +734,7 @@ pub fn process_candidate_basic<P: GenericPipelineProtocol>(
 where
     P::Fec: BpPooledFec,
 {
-    process_candidate_basic_impl::<P>(
+    process_candidate_basic_impl::<P, AcceptAll>(
         cand,
         fft_cache,
         cfg,
@@ -707,6 +747,7 @@ where
         None,
         false,
         false,
+        &AcceptAll,
     )
 }
 
@@ -728,7 +769,7 @@ pub(crate) fn process_candidate_basic<P: GenericPipelineProtocol>(
 where
     P::Fec: BpPooledFec,
 {
-    process_candidate_basic_impl::<P>(
+    process_candidate_basic_impl::<P, AcceptAll>(
         cand,
         fft_cache,
         cfg,
@@ -741,6 +782,7 @@ where
         None,
         false,
         false,
+        &AcceptAll,
     )
 }
 
@@ -805,7 +847,7 @@ pub fn process_candidate_precomputed<P: GenericPipelineProtocol>(
 where
     P::Fec: BpPooledFec,
 {
-    process_candidate_basic_impl::<P>(
+    process_candidate_basic_impl::<P, AcceptAll>(
         cand,
         fft_cache,
         cfg,
@@ -818,6 +860,7 @@ where
         Some(precomputed_refine),
         skip_snr,
         skip_llr_nsym_max,
+        &AcceptAll,
     )
 }
 
@@ -880,7 +923,7 @@ pub(crate) fn ft4_snr_db(cand_score: f32) -> f32 {
 /// moving its signature to serve one new caller is not worth it.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
-pub(crate) fn process_candidate_basic_ap<P: GenericPipelineProtocol>(
+pub(crate) fn process_candidate_basic_ap<P: GenericPipelineProtocol, A: InfoAccept>(
     cand: &SyncCandidate,
     fft_cache: &[Complex<f32>],
     cfg: &DownsampleCfg,
@@ -890,16 +933,18 @@ pub(crate) fn process_candidate_basic_ap<P: GenericPipelineProtocol>(
     eq_mode: EqMode,
     sync_q_min: u32,
     ap: &[(&[u8], &[u8], u8)],
+    accept: &A,
 ) -> Option<DecodeResult>
 where
     P::Fec: BpPooledFec,
 {
-    process_candidate_basic_impl::<P>(
-        cand, fft_cache, cfg, depth, strictness, known, eq_mode, sync_q_min, ap, None, false, false,
+    process_candidate_basic_impl::<P, A>(
+        cand, fft_cache, cfg, depth, strictness, known, eq_mode, sync_q_min, ap, None, false,
+        false, accept,
     )
 }
 
-fn process_candidate_basic_impl<P: GenericPipelineProtocol>(
+fn process_candidate_basic_impl<P: GenericPipelineProtocol, A: InfoAccept>(
     cand: &SyncCandidate,
     fft_cache: &[Complex<f32>],
     cfg: &DownsampleCfg,
@@ -957,6 +1002,7 @@ fn process_candidate_basic_impl<P: GenericPipelineProtocol>(
     // comment for why (issue #306 recall-trade-off follow-up). `false`
     // for every existing caller (behaves exactly as before).
     skip_llr_nsym_max: bool,
+    accept: &A,
 ) -> Option<DecodeResult>
 where
     P::Fec: BpPooledFec,
@@ -1105,6 +1151,12 @@ where
                 // FT4 pre-LDPC scramble (WSJT-X `genft4.f90:64`): undo
                 // the rvec XOR before presenting the 77-bit payload.
                 descramble_info::<P>(&mut r.info);
+                // The message-text gate — rejecting here lets the ladder
+                // try its next rung, exactly as the hard-error gates above
+                // do. `AcceptAll` folds it away; see `InfoAccept`.
+                if !accept.accept(&r.info) {
+                    return None;
+                }
                 Some(DecodeResult {
                     info: r.info.into_boxed_slice(),
                     freq_hz: refined.freq_hz,
@@ -1270,6 +1322,12 @@ where
                                 i_start: i0,
                             });
                             descramble_info::<P>(&mut r.info);
+                            // The message-text gate — rejecting here lets the ladder
+                            // try its next rung, exactly as the hard-error gates above
+                            // do. `AcceptAll` folds it away; see `InfoAccept`.
+                            if !accept.accept(&r.info) {
+                                continue;
+                            }
                             return Some(DecodeResult {
                                 info: r.info.into_boxed_slice(),
                                 freq_hz: refined.freq_hz,
@@ -1312,6 +1370,12 @@ where
                                     i_start: i0,
                                 });
                                 descramble_info::<P>(&mut r.info);
+                                // The message-text gate — rejecting here lets the ladder
+                                // try its next rung, exactly as the hard-error gates above
+                                // do. `AcceptAll` folds it away; see `InfoAccept`.
+                                if !accept.accept(&r.info) {
+                                    continue;
+                                }
                                 return Some(DecodeResult {
                                     info: r.info.into_boxed_slice(),
                                     freq_hz: refined.freq_hz,
@@ -1390,6 +1454,12 @@ where
                             i_start: i0,
                         });
                         descramble_info::<P>(&mut r.info);
+                        // The message-text gate — rejecting here lets the ladder
+                        // try its next rung, exactly as the hard-error gates above
+                        // do. `AcceptAll` folds it away; see `InfoAccept`.
+                        if !accept.accept(&r.info) {
+                            continue;
+                        }
                         return Some(DecodeResult {
                             info: r.info.into_boxed_slice(),
                             freq_hz: refined.freq_hz,
@@ -1718,7 +1788,7 @@ pub fn decode_frame<P: GenericPipelineProtocol>(
 where
     P::Fec: BpPooledFec,
 {
-    let (results, fft_cache, _) = decode_frame_impl::<P>(
+    let (results, fft_cache, _) = decode_frame_impl::<P, AcceptAll>(
         audio,
         cfg,
         freq_min,
@@ -1734,6 +1804,7 @@ where
         on_result,
         None,
         &[],
+        &AcceptAll,
     );
     (results, fft_cache)
 }
@@ -1747,7 +1818,7 @@ where
 /// binaries call it — none of which has an opinion about a budget.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn decode_frame_budgeted<P: GenericPipelineProtocol>(
+pub(crate) fn decode_frame_budgeted<P: GenericPipelineProtocol, A: InfoAccept>(
     audio: &[i16],
     cfg: &DownsampleCfg,
     freq_min: f32,
@@ -1763,11 +1834,12 @@ pub(crate) fn decode_frame_budgeted<P: GenericPipelineProtocol>(
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
     budget: Option<BudgetCheck<'_>>,
     ap: &[(&[u8], &[u8], u8)],
+    accept: &A,
 ) -> (Vec<DecodeResult>, FftCache, BudgetReport)
 where
     P::Fec: BpPooledFec,
 {
-    decode_frame_impl::<P>(
+    decode_frame_impl::<P, A>(
         audio,
         cfg,
         freq_min,
@@ -1783,6 +1855,7 @@ where
         on_result,
         budget,
         ap,
+        accept,
     )
 }
 
@@ -1809,7 +1882,7 @@ pub(crate) fn decode_frame<P: GenericPipelineProtocol>(
 where
     P::Fec: BpPooledFec,
 {
-    let (results, fft_cache, _) = decode_frame_impl::<P>(
+    let (results, fft_cache, _) = decode_frame_impl::<P, AcceptAll>(
         audio,
         cfg,
         freq_min,
@@ -1825,6 +1898,7 @@ where
         on_result,
         None,
         &[],
+        &AcceptAll,
     );
     (results, fft_cache)
 }
@@ -1990,7 +2064,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_frame_impl<P: GenericPipelineProtocol>(
+fn decode_frame_impl<P: GenericPipelineProtocol, A: InfoAccept>(
     audio: &[i16],
     cfg: &DownsampleCfg,
     freq_min: f32,
@@ -2025,6 +2099,7 @@ fn decode_frame_impl<P: GenericPipelineProtocol>(
     // A-priori bit locking, applied as the final rung of each
     // candidate's ladder. See `process_candidate_basic_impl`.
     ap: &[(&[u8], &[u8], u8)],
+    accept: &A,
 ) -> (Vec<DecodeResult>, FftCache, BudgetReport)
 where
     P::Fec: BpPooledFec,
@@ -2111,7 +2186,7 @@ where
                     break;
                 }
                 budget_report.stages_run += 1;
-                if let Some(r) = process_candidate_basic_ap::<P>(
+                if let Some(r) = process_candidate_basic_ap::<P, A>(
                     cand,
                     fft_cache.as_slice(),
                     cfg,
@@ -2121,6 +2196,7 @@ where
                     eq_mode,
                     sync_q_min,
                     ap,
+                    accept,
                 ) {
                     if let Some(cb) = on_result {
                         cb(&r);
@@ -2145,7 +2221,7 @@ where
             let raw: Vec<DecodeResult> = candidates
                 .par_iter()
                 .filter_map(|cand| {
-                    let r = process_candidate_basic_ap::<P>(
+                    let r = process_candidate_basic_ap::<P, A>(
                         cand,
                         fft_cache.as_slice(),
                         cfg,
@@ -2155,6 +2231,7 @@ where
                         eq_mode,
                         sync_q_min,
                         ap,
+                        accept,
                     )?;
                     if let Some(cb) = on_result {
                         cb(&r);
@@ -2166,7 +2243,7 @@ where
             let raw: Vec<DecodeResult> = candidates
                 .iter()
                 .filter_map(|cand| {
-                    let r = process_candidate_basic_ap::<P>(
+                    let r = process_candidate_basic_ap::<P, A>(
                         cand,
                         fft_cache.as_slice(),
                         cfg,
@@ -2176,6 +2253,7 @@ where
                         eq_mode,
                         sync_q_min,
                         ap,
+                        accept,
                     )?;
                     if let Some(cb) = on_result {
                         cb(&r);
@@ -2244,7 +2322,7 @@ where
                     break;
                 }
                 budget_report.stages_run += 1;
-                if let Some(r) = process_candidate_basic_impl::<P>(
+                if let Some(r) = process_candidate_basic_impl::<P, A>(
                     &cand,
                     fft_cache.as_slice(),
                     cfg,
@@ -2257,6 +2335,7 @@ where
                     Some((cd0, freq_hz, i0, score)),
                     false,
                     false,
+                    accept,
                 ) {
                     if let Some(cb) = on_result {
                         cb(&r);
@@ -2281,7 +2360,7 @@ where
         let raw: Vec<DecodeResult> = deduped
             .into_par_iter()
             .filter_map(|(cand, cd0, freq_hz, i0, score)| {
-                let r = process_candidate_basic_impl::<P>(
+                let r = process_candidate_basic_impl::<P, A>(
                     &cand,
                     fft_cache.as_slice(),
                     cfg,
@@ -2294,6 +2373,7 @@ where
                     Some((cd0, freq_hz, i0, score)),
                     false,
                     false,
+                    accept,
                 )?;
                 if let Some(cb) = on_result {
                     cb(&r);
@@ -2305,7 +2385,7 @@ where
         let raw: Vec<DecodeResult> = deduped
             .into_iter()
             .filter_map(|(cand, cd0, freq_hz, i0, score)| {
-                let r = process_candidate_basic_impl::<P>(
+                let r = process_candidate_basic_impl::<P, A>(
                     &cand,
                     fft_cache.as_slice(),
                     cfg,
@@ -2318,6 +2398,7 @@ where
                     Some((cd0, freq_hz, i0, score)),
                     false,
                     false,
+                    accept,
                 )?;
                 if let Some(cb) = on_result {
                     cb(&r);
@@ -2382,7 +2463,7 @@ fn finish_frame(
 // `jt9`/`jt65`/`q65`/`uvpacket`, `ft8`+`alloc`/`fft-extern` embedded
 // presets, etc).
 #[allow(dead_code)]
-pub(crate) fn decode_frame_subtract<P: GenericPipelineProtocol>(
+pub(crate) fn decode_frame_subtract<P: GenericPipelineProtocol, A: InfoAccept>(
     audio: &[i16],
     ds_cfg: &DownsampleCfg,
     sub_cfg: &SubtractCfg,
@@ -2440,6 +2521,7 @@ pub(crate) fn decode_frame_subtract<P: GenericPipelineProtocol>(
     // Declining to start a round is therefore the granularity this
     // engine actually offers.
     budget: Option<BudgetCheck<'_>>,
+    accept: &A,
 ) -> (Vec<DecodeResult>, BudgetReport)
 where
     P::Fec: BpPooledFec,
@@ -2516,7 +2598,12 @@ where
         let new: Vec<DecodeResult> = candidates
             .par_iter()
             .filter_map(|cand| {
-                process_candidate_basic::<P>(
+                // `process_candidate_basic_impl`, not the `AcceptAll`
+                // wrapper: the SIC path has to carry the caller's
+                // message policy too, or `.sic_rounds()` would silently
+                // ignore it. Caught by `-D warnings` noticing `accept`
+                // unused in this function.
+                process_candidate_basic_impl::<P, A>(
                     cand,
                     &fft_cache,
                     ds_cfg,
@@ -2525,6 +2612,11 @@ where
                     &all_results,
                     eq_mode,
                     sync_q_min,
+                    &[],
+                    None,
+                    false,
+                    false,
+                    accept,
                 )
             })
             .collect();
@@ -2532,7 +2624,12 @@ where
         let new: Vec<DecodeResult> = candidates
             .iter()
             .filter_map(|cand| {
-                process_candidate_basic::<P>(
+                // `process_candidate_basic_impl`, not the `AcceptAll`
+                // wrapper: the SIC path has to carry the caller's
+                // message policy too, or `.sic_rounds()` would silently
+                // ignore it. Caught by `-D warnings` noticing `accept`
+                // unused in this function.
+                process_candidate_basic_impl::<P, A>(
                     cand,
                     &fft_cache,
                     ds_cfg,
@@ -2541,6 +2638,11 @@ where
                     &all_results,
                     eq_mode,
                     sync_q_min,
+                    &[],
+                    None,
+                    false,
+                    false,
+                    accept,
                 )
             })
             .collect();

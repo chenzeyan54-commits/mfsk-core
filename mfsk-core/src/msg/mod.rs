@@ -139,11 +139,13 @@ impl MessageCodec for Wsjt77Message {
         }
     }
 
-    /// [`wsjt77::is_plausible_message`] — the ITU-prefix callsign
-    /// allowlist plus the structural checks for the message types whose
-    /// exchange fields are not callsigns (ARRL Field Day, EU VHF
-    /// contest). See its own doc comment for what each part costs.
-    fn is_plausible(text: &str) -> bool {
-        wsjt77::is_plausible_message(text)
+    /// [`wsjt77::is_plausible_payload`] — dispatches on the message
+    /// type in bits 71..77, exempting the two types that carry no
+    /// redundancy (free text, telemetry) and judging the rest on their
+    /// rendered text: the ITU-prefix callsign allowlist plus structural
+    /// checks for the types whose exchange fields are not callsigns
+    /// (ARRL Field Day, RTTY Roundup, EU VHF contest).
+    fn is_plausible(payload: &[u8]) -> bool {
+        wsjt77::is_plausible_payload(payload)
     }
 }

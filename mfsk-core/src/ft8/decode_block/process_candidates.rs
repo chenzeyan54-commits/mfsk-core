@@ -1826,13 +1826,20 @@ where
 #[cfg(feature = "fft-rustfft")]
 const BLIND_CQ_MIN_NSYNC: u32 = 12;
 
+/// FT8 applies its codec verdict by default — see
+/// `FrameDecodable::MESSAGE_FILTER_DEFAULT` for the measurement that
+/// says so. Named rather than repeated as a literal at both sites.
+const FT8_FILTERS: bool =
+    <crate::ft8::Ft8 as crate::msg::decode_request::FrameDecodable>::MESSAGE_FILTER_DEFAULT;
+
 /// FT8's message codec verdict, as a function item so the policy layer
 /// can inline it. `<Ft8 as Protocol>::Msg` is `Wsjt77Message`, whose
-/// `is_plausible` is `msg::wsjt77::is_plausible_message` — named through
+/// `is_plausible` is `msg::wsjt77::is_plausible_payload` — named through
 /// the trait rather than directly so that a protocol swapping its codec
 /// cannot leave this pointing at the old one.
-fn codec_is_plausible(text: &str) -> bool {
-    <<crate::ft8::Ft8 as crate::engine::protocol::Protocol>::Msg as crate::engine::protocol::MessageCodec>::is_plausible(text)
+fn codec_is_plausible(payload: &[u8]) -> bool {
+    use crate::engine::protocol::{MessageCodec, Protocol};
+    <<crate::ft8::Ft8 as Protocol>::Msg as MessageCodec>::is_plausible(payload)
 }
 
 /// Per-candidate decode core — runs the LLR-staircase, OSD fallback,
@@ -2186,7 +2193,11 @@ pub(in crate::ft8) fn process_one_candidate_inner<Pol: MessagePolicy>(
                     let Some(text) = unpack77(&msg77) else {
                         return false;
                     };
-                    if !policy.accepts(codec_is_plausible, true, &text) {
+                    // `Pol::CAN_REJECT` first: arguments evaluate
+                    // eagerly, and `codec_is_plausible` unpacks. For a
+                    // request that named no policy this whole test is a
+                    // compile-time `false` and costs nothing.
+                    if !policy.accepts(codec_is_plausible(&msg77), FT8_FILTERS, &text) {
                         return false;
                     }
                     let upper = text.to_uppercase();
@@ -2245,7 +2256,8 @@ pub(in crate::ft8) fn process_one_candidate_inner<Pol: MessagePolicy>(
     // CRC-14's 1/16384 false-positive rate produces ~1-2 random
     // strings per slot. Same filter the host wide-band path
     // uses (`decode_frame::process_candidate`).
-    if !policy.accepts(codec_is_plausible, true, &text) {
+    // See the AP validator above for why `CAN_REJECT` is tested first.
+    if !policy.accepts(codec_is_plausible(&bp.message77), FT8_FILTERS, &text) {
         return None;
     }
     if known.iter().any(|r| r.message77() == bp.message77) {
