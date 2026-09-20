@@ -424,6 +424,20 @@ pub struct DecodeConfig {
     /// more lag bins — 27 of them at ±1.0 s against 63 at the ceiling.
     /// Run after the early path, since a grid correction applies to
     /// the *next* slot and must not be charged to this one's budget.
+    ///
+    /// **It runs on every slot while this is set, deliberately, and
+    /// the eventual design does not.** Calibration needs to know what
+    /// the probe says when the grid is *healthy* before anything can
+    /// read it when the grid is lost, and the per-slot cost is itself
+    /// one of the numbers being measured. Narrowing it to "only when
+    /// the grid is unproven" is a decision for the increment that acts
+    /// on the answer, not this one.
+    ///
+    /// Expect `post_slotend` to grow by the probe's cost and the
+    /// `PAST KEY-UP` line to appear with it. That bound stops stage 3
+    /// *claiming candidates*; the probe is outside it and reaches no
+    /// decode, no deadline and no acquisition trigger (whose test is
+    /// `post_slotend > 1 s`). The growth is the measurement.
     pub wide_probe_lag_s: f32,
 }
 
