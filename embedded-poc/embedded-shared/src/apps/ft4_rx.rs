@@ -384,6 +384,29 @@ pub struct Ft4Decode {
 /// search, which pushes the capture window out by 0.52 s. Both are
 /// deliberate. A QSO-capable build had 500 ms under the old
 /// anchoring — the budget did not shrink, it was measured.
+///
+/// **Unresolved: upstream puts FT4's transmit audio at 0.3 s, not
+/// 0.5 s.** `Modulator::start` pads silence to `delay_ms`, and that
+/// constant is **300 for FT4** where it is 500 for FT8 and 1000
+/// otherwise (`Modulator/Modulator.cpp:71-74`). The FT4 *decoder*
+/// nevertheless references 0.5 s — `xdt = ibest/666.67 - 0.5`
+/// (`lib/ft4_decode.f90:462`), searching `ibmin=-344 .. ibmax=1012`
+/// = ±1.0 s about it (`ft4_decode.f90:244-256`). The two disagree by
+/// 0.2 s in upstream itself.
+///
+/// The timeline above takes 0.5 s for both, so if the modulator's
+/// constant is the one that governs when *this* station must be
+/// transmitting, this budget is **200 ms optimistic**:
+/// `7.80 - 6.775` = 1 025 ms rather than 1 225 ms.
+///
+/// Left as it is, deliberately. The evidence available does not
+/// settle it: the WSJT-X FT4 sample's own six decodes run dt −0.4 to
+/// +0.3 (mean ≈ −0.1), which is real stations with real clock error
+/// and cannot separate a systematic 0.2 s from the spread. Changing a
+/// shipped budget on a reading of one constant is what the key-up
+/// re-anchoring already had to undo once. What would settle it: a
+/// WSJT-X FT4 transmission recorded against a disciplined clock, or
+/// the upstream rationale for the 300.
 pub const TX_TURNAROUND_BUDGET_MS: i64 = 1_225;
 
 /// A whole FT4 slot, so a receive-only monitor can spend one.

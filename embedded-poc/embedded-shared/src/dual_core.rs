@@ -339,9 +339,66 @@ pub struct DecodeConfig {
     pub slot_end_hint: Option<fn() -> Option<i64>>,
 }
 
-/// This station's key-up relative to the FT8 slot boundary:
-/// `TX_START_OFFSET_S` = 0.5 s. Results after it cannot be answered in
-/// the next period.
+/// This station's **transmit audio start** relative to the FT8 slot
+/// boundary: 0.5 s.
+///
+/// **The name says key-up; WSJT-X keys up earlier than this, and the
+/// difference is the whole point.** Ported from WSJT-X, which fixes
+/// every number in the period (`widgets/mainwindow.cpp`,
+/// `Modulator/Modulator.cpp`, `helper_functions.cpp`). For FT8, with
+/// the period boundary at t = 0:
+///
+/// ```text
+///  0.000 s  the boundary. `m_bTxTime = (t2p >= tx1) && (t2p < tx2)`
+///           with `tx1 = 0` (mainwindow.cpp:4552, 4596), so the
+///           transmit window opens *here*. The message is taken from
+///           the auto-sequencer (`txMsg = ui->txN->text()`,
+///           mainwindow.cpp:4657-4663) and PTT is asserted
+///           (`transceiver_ptt(true)`, mainwindow.cpp:4711) in the
+///           same pass. **A decode that lands after this moment
+///           cannot change what is sent this period.**
+///  +txDelay the rig confirms PTT; `ptt1Timer` then waits
+///           `Configuration::txDelay()`, default **0.200 s**
+///           (Configuration.cpp:1602), or a hard **20 ms** for FT4
+///           (mainwindow.cpp:8252-8253). It fires `startTx2()`
+///           (mainwindow.cpp:861-862), which starts the modulator.
+///  0.500 s  audio begins. `Modulator::start` pads silence so the
+///           waveform lands exactly here — `delay_ms = 500` for FT8,
+///           300 for FT4, 1000 otherwise (Modulator.cpp:71-74), and
+///           `m_silentFrames = (delay_ms - mstr) * frameRate / 1000`.
+///           **A late start is truncated, not shifted**:
+///           `m_ic = (mstr - delay_ms) * frameRate / 1000`
+///           (Modulator.cpp:94-97) skips into the waveform to stay on
+///           the grid. This matches the decoder's own reference,
+///           `xdt = xdt - 0.5` (lib/ft8_decode.f90:210).
+/// 13.140 s  audio ends: 79 x 1920 / 12000 = 12.64 s.
+/// 13.640 s  `m_bTxTime` closes. `tx_duration("FT8") = 1.0 + 12.64`
+///           (helper_functions.cpp:7) — a 1 s guard past audio end,
+///           not extra transmission.
+/// ```
+///
+/// So the 0.5 s this constant names is **the transceiver's, not the
+/// decoder's**: WSJT-X spends it on PTT assert, rig turnaround and
+/// modulator padding, having already committed the message at the
+/// boundary. Two consequences for this pipeline:
+///
+/// 1. **A decode that finishes inside this 0.5 s is too late to
+///    answer**, even though the deadline lets it run. What it is in
+///    time for is the *next* period's choice, and for the screen.
+///    A receiver that must reply in the following period wants its
+///    stage 3 bounded at the boundary, not 0.5 s past it.
+/// 2. Bounding at the boundary is nonetheless **not** what this
+///    constant should become, because stage 3's late path needs the
+///    full slot and the full slot does not exist until the boundary.
+///    The 0.5 s is what makes a late path possible at all; it is
+///    borrowed from the transmitter, and a build that transmits has
+///    to pay it back — see `FT8_KEY_UP_GUARD_MS` on the CoreS3.
+///
+/// WSJT-X never stops a decode for a transmission: `jt9` is a separate
+/// process and `MainWindow::decode()` only declines to *start* one
+/// while the previous is still running. The bound here exists because
+/// this board decodes on the same cores that will drive the
+/// transmitter, which upstream does not have to consider.
 pub const FT8_KEY_UP_AFTER_SLOT_END_US: i64 = 500_000;
 
 /// When stage 3 stops claiming candidates. Both cores check it once per

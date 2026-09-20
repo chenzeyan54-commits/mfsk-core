@@ -241,6 +241,29 @@ const FT8_FINE_SYNC_MIN_SLACK_MS: i64 = match option_env!("MFSK_FT8_FINE_SYNC_MI
 /// for FT4 (`mainwindow.cpp:8252`, `Configuration.cpp:1602`), and a
 /// solid-state radio switches in milliseconds.
 ///
+/// **What that argument got wrong, read against the upstream
+/// schedule** (`dual_core::FT8_KEY_UP_AFTER_SLOT_END_US` has it in
+/// full): `txDelay` is not a lead *added* to the 0.5 s, it is spent
+/// *inside* it. WSJT-X asserts PTT at the period boundary and the
+/// modulator pads silence so audio still lands at 0.5 s — so the
+/// transceiver is not what the 0.5 s is short of. What a transmitting
+/// build actually loses is earlier: the message is taken from the
+/// auto-sequencer **at the boundary** (`mainwindow.cpp:4657-4711`),
+/// so a decode finishing inside this 0.5 s is already too late to be
+/// answered this period.
+///
+/// The guard therefore stays 0 — clearance was never the issue — but
+/// **0 is not "the budget is free"**. Deciding what to send is a
+/// separate, earlier deadline at the boundary itself, and this
+/// constant cannot express it: it moves when stage 3 stops claiming,
+/// not when the QSO state machine is polled. On the air 2026-09-19,
+/// `post_slotend` ran median 332 ms / p90 479 ms against the 500 ms
+/// here (118 slots, `logs/udp_ts_2026-09-19.log`) — inside this
+/// deadline throughout, and past the reply deadline on most slots.
+/// Nothing is wrong today because this board does not transmit; the
+/// number to watch when it does is `post_slotend` against **0**, not
+/// against 500.
+///
 /// The deadline itself stayed, because the thing it protects is not TX
 /// at all: it is the next slot's **audio**. `FT8_KEY_UP_AFTER_SLOT_END_US`
 /// gives stage 3's late path the ~0.5 s past the boundary it needs to

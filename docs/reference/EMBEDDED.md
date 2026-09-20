@@ -585,8 +585,13 @@ Three things come with it, all in `dual_core::run_speculative_slot`:
   depending on grid position, and below 1 336 ms its deadline fell after
   this station's key-up (slot end + 0.5 s). Claiming now also stops at
   key-up minus a guard, with slot end peeked from `slot_q` before the
-  slot is received. The guard is 320 ms because a deadline only stops
-  *claiming*: a candidate already in BP ran on by up to 313 ms.
+  slot is received. The guard was 320 ms, because a deadline only stops
+  *claiming* and a candidate already in BP ran on by up to 313 ms.
+  **It is 0 now**: the clearance it bought was never the constraint —
+  see [The transmit period, as WSJT-X defines
+  it](#the-transmit-period-as-wsjt-x-defines-it) for what the 0.5 s is
+  actually spent on, and for the second deadline this bound does not
+  express.
 
 | `qso3_busy` through the CoreS3 pipeline | decodes a slot | finished after slot end |
 |---|---:|---:|
@@ -597,9 +602,82 @@ Board figures are `MFSK_CORES3_SIM` captures
 (`embedded-poc/m5stack-cores3-app/logs/sim_*_2026-09-1{6,8}.log`); the
 host reproduction that measured the design, call for call against the
 board's own `p1/ready/defer/dec`, is
-`mfsk-core/tests/ft8_embedded_pipeline_mirror.rs`. Only the CoreS3
-enables these (`MFSK_FT8_FINE_SYNC`, `MFSK_FT8_KEY_UP_GUARD_MS`); the S3
-and Core2 apps keep them off, their slot budgets unmeasured with them.
+`mfsk-core/tests/ft8_embedded_pipeline_mirror.rs`.
+
+**Fine sync is off again as of 2026-09-20**, on all three boards. The
+10-a-slot figure above was measured with it on and without a deadline;
+on a radio its ~292 ms comes off the front of the early path and buys
+nothing back (`cut` went 0 → 3, 15, 10, 11 with three slots past
+key-up). `MFSK_FT8_FINE_SYNC` still selects it and both halves are
+measured, because the answer turns on a budget that is not fixed
+forever. `MFSK_FT8_KEY_UP_GUARD_MS` is likewise 0 on every board now.
+
+### The transmit period, as WSJT-X defines it
+
+Every number the key-up bound above rests on is fixed in WSJT-X's own
+source. For FT8, with the T/R period boundary at t = 0:
+
+```text
+ 0.000 s  the boundary. The transmit window opens here —
+          m_bTxTime = (t2p >= tx1) && (t2p < tx2) with tx1 = 0
+          (widgets/mainwindow.cpp:4552, 4596). In the same pass the
+          message is taken from the auto-sequencer (txMsg =
+          ui->txN->text(), mainwindow.cpp:4657-4663) and PTT is
+          asserted (transceiver_ptt(true), mainwindow.cpp:4711),
+          gated only on fTR < 0.75 so a late start is still allowed.
+ +txDelay the rig confirms PTT; ptt1Timer then waits
+          Configuration::txDelay(), default 0.200 s
+          (Configuration.cpp:1602), or a hard 20 ms for FT4
+          (mainwindow.cpp:8252-8253), and fires startTx2()
+          (mainwindow.cpp:861-862).
+ 0.500 s  audio begins. Modulator::start pads silence so the waveform
+          lands exactly here: delay_ms = 500 for FT8, 300 for FT4,
+          1000 otherwise (Modulator/Modulator.cpp:71-74). A late start
+          is TRUNCATED rather than shifted —
+          m_ic = (mstr - delay_ms) * frameRate / 1000
+          (Modulator.cpp:94-97) — so the grid is never given up.
+          The decoder agrees: xdt = xdt - 0.5 (lib/ft8_decode.f90:210).
+13.140 s  audio ends: 79 x 1920 / 12000 = 12.64 s.
+13.640 s  m_bTxTime closes. tx_duration("FT8") = 1.0 + 12.64
+          (helper_functions.cpp:7) — a 1 s guard past audio end, not
+          extra transmission.
+15.000 s  the period ends.
+```
+
+Two things follow, and they are easy to get backwards.
+
+**The 0.5 s belongs to the transceiver, not to the decoder.** WSJT-X
+spends it on PTT assert, rig turnaround and modulator padding, having
+already committed the message at the boundary. `txDelay` is *inside*
+that 0.5 s, not a lead added to it.
+
+**So a decode finishing inside the 0.5 s is too late to be answered
+this period**, even though `FT8_KEY_UP_AFTER_SLOT_END_US` lets stage 3
+run there. There are two deadlines, and this pipeline only encodes
+one: stage 3 stops claiming at slot end + 0.5 s, while *deciding what
+to send* has to be done by slot end. On the air (2026-09-19, 118 slots,
+`logs/udp_ts_2026-09-19.log`) `post_slotend` ran median 332 ms /
+p90 479 ms — inside the encoded deadline throughout, and past the reply
+deadline on most slots. Nothing is wrong today because this board does
+not transmit yet; when it does, the number to watch is `post_slotend`
+against **0**, not against 500.
+
+Keeping the 0.5 s is still right: stage 3's late path needs the full
+slot, and the full slot does not exist until the boundary. The 0.5 s is
+what makes a late path possible at all — it is borrowed from the
+transmitter, and a transmitting build has to pay it back.
+
+WSJT-X itself never has to choose, because `jt9` is a separate process
+and `MainWindow::decode()` only declines to *start* a decode while the
+previous one is running. This board decodes on the cores that will
+drive the transmitter, which upstream does not have to consider.
+
+FT4 has the same structure with `delay_ms = 300` and `txDelay = 20 ms`,
+and upstream is internally inconsistent there — its decoder still
+references 0.5 s (`xdt = ibest/666.67 - 0.5`, `lib/ft4_decode.f90:462`).
+`ft4_rx::TX_TURNAROUND_BUDGET_MS` records what that would cost if the
+modulator's constant governs, and why it has not been changed on the
+strength of one reading.
 
 ### Slot grid acquisition on the CoreS3
 
