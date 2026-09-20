@@ -226,6 +226,36 @@ reported the grid healthy while the band said otherwise.
 
 ### Added
 
+- **`hash-table-small`: the callsign hash table in 7 KB instead of
+  83 KB.** Off by default — host keeps WSJT-X's shape — in the same
+  "host stays faithful, embedded opts into the cheaper path" split as
+  `wspr-pass2-topn` and `wspr-fano-cap-fast`.
+
+  Upstream keeps three tables and can afford to: `packjt77.f90:5-6`
+  indexes the 10- and 12-bit ones by the hash itself, 1 024 and 4 096
+  slots, so a lookup is an array read and no key needs storing. The
+  price is that they are sized by key space rather than by traffic. A
+  receiver hears on the order of 100 distinct callsigns in 15 minutes
+  — measured, CoreS3 on 40 m — so 97 % of those 66 KB hold nothing.
+  With the feature on, each callsign is stored once beside its three
+  hashes in one 256-entry table and looked up by scanning it.
+
+  **What it trades is eviction policy, not capacity.** A
+  direct-indexed slot keeps its callsign until a colliding hash
+  overwrites it, which may be never; one shared LRU evicts by
+  recency, so all three widths forget a station together and an old
+  one renders `<...>` again. The 10- and 12-bit hashes appear in
+  DXpedition and Type-4 messages, which name the station being worked
+  *now*, so the depth that matters should be recent — but **how often
+  this costs a resolution has not been measured on air.** The feature
+  doc in `Cargo.toml` says so and names the instrument.
+
+  256 entries and not 100 because of an allocator threshold: one
+  entry is 28 B, so 100 would be 2.8 KB, under the CoreS3's
+  `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096` and therefore back in
+  the internal DRAM this exists to stop consuming. A test asserts the
+  threshold rather than a comment mentioning it.
+
 - **`unpack77` decodes to fields, and the message verdict reads them
   (#383, breaking).** `unpack77_fields` returns `Wsjt77Fields` — one
   variant per message type, carrying the decoded fields — and
@@ -564,6 +594,34 @@ reported the grid healthy while the band said otherwise.
   of where the decode happened to finish.
 
 ### Fixed
+
+- **The callsign hash table starved the CoreS3's internal DRAM and
+  took WiFi down with it.** Every callsign learned cost three heap
+  allocations plus map nodes — two `BTreeMap<u32, String>` and a
+  `Vec<String>` — about 130 B, all of it small. On a target whose
+  allocator routes sub-4 KB requests to internal DRAM (the CoreS3's
+  `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`), "small" means the
+  scarce pool: internal DRAM fell from 10.7 kB to 3.4 kB over 22
+  minutes of live reception until `esp-aes` could not allocate and
+  WiFi — the only console a USB-host-mode board has — went silent.
+  The decoder itself kept running, which is why this presented as a
+  network fault.
+
+  The table now stores callsigns inline, as upstream does: WSJT-X
+  declares all three of its tables `character(len=13)`
+  (`packjt77.f90:5-7`), the text living *in* the array. The port had
+  been keeping the sizes and losing the shape. Three large
+  allocations replace thousands of tiny ones, which on that board
+  puts them in PSRAM where there are megabytes spare, and `new()`
+  still allocates nothing — `is_plausible_payload` builds a table per
+  `unpack77` call, so an eager allocation there would be worse than
+  the leak.
+
+  `lookup22` also stops wrapping its result in `<>` while `lookup10`
+  and `lookup12` return the bare callsign. Nothing announced that
+  asymmetry and it cost a double-wrapped `<<PA3XYZ>>` during the
+  #383 type-5 port before a test caught it; all three return the same
+  shape now.
 
 - **Three message types were surviving the phantom filter at 100 %
   because a marker string short-circuited it (#383).**
