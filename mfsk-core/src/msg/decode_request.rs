@@ -31,6 +31,7 @@ use crate::engine::pipeline::{DecodeDepth, DecodeStrictness, FftCache, LlrEffort
 use crate::engine::protocol::Protocol;
 
 use super::ap::ApHint;
+use super::wsjt77::Wsjt77Fields;
 // Only `SniperRequest::ap_hint`'s bound names this, and that item is
 // `ft8`-gated below.
 #[cfg(feature = "ft8")]
@@ -82,7 +83,7 @@ pub trait MessagePolicy: Sync {
     /// — see `PolicyAccept`.
     ///
     /// [`MessageCodec::is_plausible`]: crate::engine::protocol::MessageCodec::is_plausible
-    fn accepts(&self, base: bool, base_applies: bool, text: &str) -> bool;
+    fn accepts(&self, base: bool, base_applies: bool, message: &Wsjt77Fields) -> bool;
 }
 
 /// The codec's own verdict and nothing else — what every request starts
@@ -96,7 +97,7 @@ impl MessagePolicy for DefaultPolicy {
     const CAN_REJECT: bool = false;
 
     #[inline]
-    fn accepts(&self, base: bool, base_applies: bool, _text: &str) -> bool {
+    fn accepts(&self, base: bool, base_applies: bool, _message: &Wsjt77Fields) -> bool {
         !base_applies || base
     }
 }
@@ -122,8 +123,8 @@ const _: () = assert!(core::mem::size_of::<DefaultPolicy>() == 0);
 /// It exists as its own policy because the verdict reads the payload
 /// *bits* — [`MessageCodec::is_plausible`] has to, since the message
 /// type lives there — so it cannot be handed to
-/// [`DecodeRequest::message_filter`], which takes a `Fn(&str) -> bool`
-/// because a caller's own rule is about the text.
+/// [`DecodeRequest::message_filter`], which takes a predicate over
+/// the decoded message.
 ///
 /// [`MessageCodec::is_plausible`]: crate::engine::protocol::MessageCodec::is_plausible
 #[derive(Clone, Copy, Debug, Default)]
@@ -131,7 +132,7 @@ pub struct CodecVerdict;
 
 impl MessagePolicy for CodecVerdict {
     #[inline]
-    fn accepts(&self, base: bool, _base_applies: bool, _text: &str) -> bool {
+    fn accepts(&self, base: bool, _base_applies: bool, _message: &Wsjt77Fields) -> bool {
         base
     }
 }
@@ -152,10 +153,10 @@ impl MessagePolicy for CodecVerdict {
 #[derive(Clone, Copy, Debug)]
 pub struct AlsoAccept<F>(pub F);
 
-impl<F: Fn(&str) -> bool + Sync> MessagePolicy for AlsoAccept<F> {
+impl<F: Fn(&Wsjt77Fields) -> bool + Sync> MessagePolicy for AlsoAccept<F> {
     #[inline]
-    fn accepts(&self, base: bool, _base_applies: bool, text: &str) -> bool {
-        base || (self.0)(text)
+    fn accepts(&self, base: bool, _base_applies: bool, message: &Wsjt77Fields) -> bool {
+        base || (self.0)(message)
     }
 }
 
@@ -173,10 +174,10 @@ impl<F: Fn(&str) -> bool + Sync> MessagePolicy for AlsoAccept<F> {
 #[derive(Clone, Copy, Debug)]
 pub struct Only<F>(pub F);
 
-impl<F: Fn(&str) -> bool + Sync> MessagePolicy for Only<F> {
+impl<F: Fn(&Wsjt77Fields) -> bool + Sync> MessagePolicy for Only<F> {
     #[inline]
-    fn accepts(&self, _base: bool, _base_applies: bool, text: &str) -> bool {
-        (self.0)(text)
+    fn accepts(&self, _base: bool, _base_applies: bool, message: &Wsjt77Fields) -> bool {
+        (self.0)(message)
     }
 }
 
@@ -198,6 +199,13 @@ impl<F: Fn(&str) -> bool + Sync> MessagePolicy for Only<F> {
 /// [`FrameDecodable::MESSAGE_FILTER_DEFAULT`] are compile-time
 /// constants, so for a protocol with neither the whole body folds to
 /// `true` and the `String` the unpack would allocate is never built.
+// Constructed only by the protocols that decode through
+// `engine::pipeline` — FT4 and the FST4 sub-modes. FT8 has its own
+// engine and applies the policy inside it, so in a build with neither
+// of those features this type really has no caller. Scoped to exactly
+// that configuration rather than blanket, and caught by the feature
+// matrix rather than by `full`.
+#[cfg_attr(not(any(feature = "ft4", feature = "fst4")), allow(dead_code))]
 pub(crate) struct PolicyAccept<'p, P: FrameDecodable, Pol: MessagePolicy> {
     policy: &'p Pol,
     // `fn() -> P` rather than `P`: the marker must not make this type
@@ -208,6 +216,7 @@ pub(crate) struct PolicyAccept<'p, P: FrameDecodable, Pol: MessagePolicy> {
     _protocol: core::marker::PhantomData<fn() -> P>,
 }
 
+#[cfg_attr(not(any(feature = "ft4", feature = "fst4")), allow(dead_code))]
 impl<'p, P: FrameDecodable, Pol: MessagePolicy> PolicyAccept<'p, P, Pol> {
     pub(crate) fn new(policy: &'p Pol) -> Self {
         Self {
@@ -220,25 +229,33 @@ impl<'p, P: FrameDecodable, Pol: MessagePolicy> PolicyAccept<'p, P, Pol> {
 impl<P, Pol> crate::engine::pipeline::InfoAccept for PolicyAccept<'_, P, Pol>
 where
     P: FrameDecodable,
-    P::Msg: crate::engine::protocol::MessageCodec<Unpacked = alloc::string::String>,
+    P::Msg: crate::engine::protocol::MessageCodec<Unpacked = Wsjt77Fields>,
     Pol: MessagePolicy,
 {
     #[inline]
     fn accept(&self, info: &[u8]) -> bool {
         use crate::engine::protocol::MessageCodec;
-        // `DefaultPolicy` has no opinion, and `CAN_REJECT` is a
-        // constant, so for a request that named no policy the whole
-        // body folds to `true` — neither the codec verdict nor the
-        // `String` the unpack would allocate is ever built.
+        // `DefaultPolicy` has no opinion, and both of these are
+        // compile-time constants, so for a protocol that does not
+        // filter and a request that named no policy the whole body
+        // folds to `true` — the message is never even decoded.
         if !Pol::CAN_REJECT && !P::MESSAGE_FILTER_DEFAULT {
             return true;
         }
-        let payload = &info[..77];
-        let base = <P::Msg as MessageCodec>::is_plausible(payload);
-        let text = <P::Msg>::default()
-            .unpack(payload, &crate::engine::protocol::DecodeContext::default())
-            .unwrap_or_default();
-        self.policy.accepts(base, P::MESSAGE_FILTER_DEFAULT, &text)
+        // One decode, shared by the codec verdict and the caller's own
+        // rule. Nothing below this renders a message and splits it
+        // back into tokens.
+        let Some(message) = <P::Msg>::default().unpack(
+            &info[..77],
+            &crate::engine::protocol::DecodeContext::default(),
+        ) else {
+            // A codeword whose message will not unpack names nothing.
+            // WSJT-X refuses it too (`ft4_decode.f90:437`).
+            return false;
+        };
+        let base = <P::Msg as MessageCodec>::is_plausible(&message);
+        self.policy
+            .accepts(base, P::MESSAGE_FILTER_DEFAULT, &message)
     }
 }
 
@@ -765,7 +782,7 @@ impl<'a, P: SupportsMessageFilter, Pol: MessagePolicy> DecodeRequest<'a, P, Pol>
     /// `&dyn`, so the whole predicate monomorphises into the decode.
     /// A request that never calls this carries [`DefaultPolicy`], which
     /// is zero-sized.
-    pub fn also_accept<F: Fn(&str) -> bool + Sync>(
+    pub fn also_accept<F: Fn(&Wsjt77Fields) -> bool + Sync>(
         self,
         f: F,
     ) -> DecodeRequest<'a, P, AlsoAccept<F>> {
@@ -780,7 +797,10 @@ impl<'a, P: SupportsMessageFilter, Pol: MessagePolicy> DecodeRequest<'a, P, Pol>
     /// permissive `f` will surface phantom decodes the default hides.
     /// Prefer [`Self::also_accept`] unless the whole verdict is wrong
     /// for the deployment.
-    pub fn message_filter<F: Fn(&str) -> bool + Sync>(self, f: F) -> DecodeRequest<'a, P, Only<F>> {
+    pub fn message_filter<F: Fn(&Wsjt77Fields) -> bool + Sync>(
+        self,
+        f: F,
+    ) -> DecodeRequest<'a, P, Only<F>> {
         self.with_policy(Only(f))
     }
 
@@ -1143,7 +1163,7 @@ impl<'a, P: SupportsSniper, Pol: MessagePolicy> SniperRequest<'a, P, Pol> {
 
     /// See [`DecodeRequest::also_accept`] — same contract. A sniper
     /// search reaches the same per-candidate text stage.
-    pub fn also_accept<F: Fn(&str) -> bool + Sync>(
+    pub fn also_accept<F: Fn(&Wsjt77Fields) -> bool + Sync>(
         self,
         f: F,
     ) -> SniperRequest<'a, P, AlsoAccept<F>>
@@ -1154,7 +1174,10 @@ impl<'a, P: SupportsSniper, Pol: MessagePolicy> SniperRequest<'a, P, Pol> {
     }
 
     /// See [`DecodeRequest::message_filter`] — same contract.
-    pub fn message_filter<F: Fn(&str) -> bool + Sync>(self, f: F) -> SniperRequest<'a, P, Only<F>>
+    pub fn message_filter<F: Fn(&Wsjt77Fields) -> bool + Sync>(
+        self,
+        f: F,
+    ) -> SniperRequest<'a, P, Only<F>>
     where
         P: SupportsMessageFilter,
     {

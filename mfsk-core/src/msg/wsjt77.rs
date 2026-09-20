@@ -584,28 +584,304 @@ pub fn register_callsigns(msg: &[u8], ht: &mut CallsignHashTable) {
 }
 
 pub fn unpack77_with_hash(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
-    let text = unpack77_body(msg, ht)?;
-    // `packjt77.f90:616` — the last thing upstream's `unpack77` does,
-    // for every type: `if(msg(1:4).eq.'CQ <') unpk77_success=.false.`
-    // A CQ is addressed to nobody, so the second field cannot be a
-    // hash: nothing can have introduced it. A 28-bit field landing in
-    // the 22-bit hash range renders as `<...>` and produced exactly
-    // that shape here.
-    if text.starts_with("CQ <") {
-        return None;
-    }
-    Some(text)
+    unpack77_fields(msg, ht).map(|m| m.to_string())
 }
 
-fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
+/// Whether one callsign *field* is plausible.
+///
+/// A field, not a token: [`Wsjt77Fields::callsigns`] yields exactly the
+/// places a callsign can appear, so this never has to guess whether it
+/// is looking at a grid or a report. Three things can legitimately be
+/// there:
+///
+/// - a directed-CQ token (`CQ`, `DE`, `QRZ`, `CQ DX`, `CQ POTA`,
+///   `CQ 123`) — `unpack28` renders the first three token codes and
+///   the directed-CQ range as words;
+/// - a hashed callsign, `<CALL>` or the unresolved `<...>`;
+/// - an actual callsign, which goes to the ITU prefix allowlist.
+pub fn is_plausible_call(field: &str) -> bool {
+    if matches!(field, "CQ" | "DE" | "QRZ") || field.starts_with("CQ ") {
+        return true;
+    }
+    if field.starts_with('<') && field.ends_with('>') {
+        return true;
+    }
+    is_plausible_callsign(field)
+}
+
+/// A decoded 77-bit message, **as fields** rather than as the string
+/// they render to.
+///
+/// This is what [`unpack77_fields`] produces and what every later stage
+/// consumes. The rendered form (its [`Display`](core::fmt::Display)) is for
+/// humans, and asking a question of it means splitting it back into
+/// tokens and guessing which ones were callsigns — the inverse of the
+/// work `unpack77` just did, and wrong in ways that are invisible:
+/// judging `JA1ABC 3Y0Z 6A EMA` by its tokens tests `6A` and `EMA`
+/// against a callsign grammar, and judging `JA1ABC PM95 20` tests
+/// `PM95` and `20`. Issue #383's filter did exactly that, and refused
+/// three message types outright for as long as it existed.
+///
+/// Every field here was range-checked during unpacking — the ARRL
+/// section index, the grid indices, the RTTY exchange — so the only
+/// question left for a consumer is whether the *callsigns* are
+/// plausible, which is what [`Wsjt77Fields::callsigns`] is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Wsjt77Fields {
+    /// `i3=0, n3=0` — 13 characters from a 42-symbol alphabet. Nearly
+    /// every bit pattern is one, so there is nothing here to check.
+    FreeText(String),
+    /// `i3=0, n3=1` — `CALL1 RR73; CALL2 <hash10> REPORT`.
+    DxPedition {
+        call1: String,
+        call2: String,
+        /// The 10-bit hash, rendered `<CALL>` or `<...>`.
+        call3: String,
+        report: String,
+    },
+    /// `i3=0, n3=3|4` — `CALL1 CALL2 [R] <ntx><class> SECTION`.
+    FieldDay {
+        call1: String,
+        call2: String,
+        ack: bool,
+        transmitters: u32,
+        class: char,
+        section: &'static str,
+    },
+    /// `i3=0, n3=5` — 71 bits as up to 18 hex digits. Valid by
+    /// construction, like [`Self::FreeText`].
+    Telemetry(String),
+    /// `i3=0, n3=6` — the WSPR types. `call` is a plain or hashed
+    /// callsign; `tail` is the grid and power as rendered.
+    Wspr { call: String, tail: String },
+    /// `i3=1|2` — the standard message. `exchange` is the grid, the
+    /// report, `RRR`/`RR73`/`73`, or empty for a bare `CQ CALL`.
+    Standard {
+        call1: String,
+        call2: String,
+        exchange: String,
+    },
+    /// `i3=3` — ARRL RTTY Roundup.
+    RttyRoundup {
+        thank_you: bool,
+        call1: String,
+        call2: String,
+        ack: bool,
+        rst: String,
+        exchange: String,
+    },
+    /// `i3=4` — one non-standard callsign and one 12-bit hash, or a
+    /// `CQ` from the non-standard one.
+    Nonstandard {
+        call1: String,
+        call2: Option<String>,
+        exchange: &'static str,
+    },
+    /// `i3=5` — EU VHF contest. **Both callsigns are hashes**, so the
+    /// only evidence the message is real is that one of them resolved.
+    EuVhfContest {
+        call1: String,
+        call2: String,
+        ack: bool,
+        exchange: String,
+        grid6: String,
+    },
+}
+
+/// The placeholder this module's hash resolvers emit when a
+/// hash is not in the table.
+pub const UNRESOLVED_HASH: &str = "<...>";
+
+impl Wsjt77Fields {
+    /// The callsign-bearing fields, in the order they render.
+    ///
+    /// Tokens like `CQ`, `CQ DX` and `<...>` come through as they are;
+    /// [`is_plausible_call`] is what decides whether each is
+    /// acceptable.
+    pub fn callsigns(&self) -> impl Iterator<Item = &str> {
+        let (a, b, c) = match self {
+            Self::FreeText(_) | Self::Telemetry(_) => (None, None, None),
+            Self::DxPedition {
+                call1,
+                call2,
+                call3,
+                ..
+            } => (Some(&**call1), Some(&**call2), Some(&**call3)),
+            Self::FieldDay { call1, call2, .. }
+            | Self::Standard { call1, call2, .. }
+            | Self::RttyRoundup { call1, call2, .. }
+            | Self::EuVhfContest { call1, call2, .. } => (Some(&**call1), Some(&**call2), None),
+            Self::Wspr { call, .. } => (Some(&**call), None, None),
+            Self::Nonstandard { call1, call2, .. } => (Some(&**call1), call2.as_deref(), None),
+        };
+        [a, b, c].into_iter().flatten()
+    }
+
+    /// Whether this looks like a message someone sent, rather than a
+    /// CRC survivor.
+    ///
+    /// The layers below are error *detection* — LDPC parity, then the
+    /// CRC — and neither says anything about the message. A CRC-14
+    /// false positive is a codeword the decoder converged on that is
+    /// not the transmitted one, so its 77 bits are effectively
+    /// uniform, and better than half of those unpack to a
+    /// syntactically valid message.
+    ///
+    /// **This has no WSJT-X counterpart** — `ft8b.f90` accepts on
+    /// `nbadcrc` and `nharderrors <= 36`. It exists because this
+    /// crate's strategies *subtract* each decode from the audio before
+    /// looking again, so a wrong one is not a cosmetic error: its
+    /// waveform is removed from the residual and takes the real signal
+    /// underneath with it. See
+    /// `FrameDecodable::MESSAGE_FILTER_DEFAULT` for the measurement.
+    pub fn is_plausible(&self) -> bool {
+        match self {
+            // Nothing to check — see the variant docs.
+            Self::FreeText(_) | Self::Telemetry(_) => true,
+            // Both callsigns are hashes; the message names neither
+            // station unless one resolved, and an unresolved pair is
+            // indistinguishable from a CRC survivor. 138 700 of every
+            // 2 M uniform payloads reach this type
+            // (`phantom_survival_rates`), so accepting it blind is a
+            // 44 % rise in the surviving phantom population in
+            // exchange for rows nobody can read.
+            Self::EuVhfContest { call1, call2, .. } => {
+                call1 != UNRESOLVED_HASH || call2 != UNRESOLVED_HASH
+            }
+            _ => self.callsigns().all(is_plausible_call),
+        }
+    }
+}
+
+impl core::fmt::Display for Wsjt77Fields {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::FreeText(t) | Self::Telemetry(t) => write!(f, "{t}"),
+            Self::DxPedition {
+                call1,
+                call2,
+                call3,
+                report,
+            } => write!(f, "{call1} RR73; {call2} {call3} {report}"),
+            Self::FieldDay {
+                call1,
+                call2,
+                ack,
+                transmitters,
+                class,
+                section,
+            } => {
+                let r = if *ack { "R " } else { "" };
+                write!(f, "{call1} {call2} {r}{transmitters}{class} {section}")
+            }
+            Self::Wspr { call, tail } => write!(f, "{call} {tail}"),
+            Self::Standard {
+                call1,
+                call2,
+                exchange,
+            } => {
+                if exchange.is_empty() {
+                    write!(f, "{call1} {call2}")
+                } else {
+                    write!(f, "{call1} {call2} {exchange}")
+                }
+            }
+            Self::RttyRoundup {
+                thank_you,
+                call1,
+                call2,
+                ack,
+                rst,
+                exchange,
+            } => {
+                let tu = if *thank_you { "TU; " } else { "" };
+                let r = if *ack { "R " } else { "" };
+                write!(f, "{tu}{call1} {call2} {r}{rst} {exchange}")
+            }
+            Self::Nonstandard {
+                call1,
+                call2,
+                exchange,
+            } => match call2 {
+                None => write!(f, "{call1}"),
+                Some(c2) if exchange.is_empty() => write!(f, "{call1} {c2}"),
+                Some(c2) => write!(f, "{call1} {c2} {exchange}"),
+            },
+            Self::EuVhfContest {
+                call1,
+                call2,
+                ack,
+                exchange,
+                grid6,
+            } => {
+                let r = if *ack { "R " } else { "" };
+                write!(f, "{call1} {call2} {r}{exchange} {grid6}")
+            }
+        }
+    }
+}
+
+/// Whether a decoded payload looks like a message someone sent.
+///
+/// Decodes once with [`unpack77_fields`] and asks
+/// [`Wsjt77Fields::is_plausible`]. There is no text stage: nothing
+/// here renders a message and splits it back into tokens.
+pub fn is_plausible_payload(msg: &[u8]) -> bool {
+    is_plausible_payload_with_hash(msg, &CallsignHashTable::new())
+}
+
+/// [`is_plausible_payload`] with the caller's hashed-callsign table.
+///
+/// It matters for exactly one type. The EU VHF contest message
+/// (`i3=5`) carries **two hashes and no plain callsign**, so the only
+/// evidence it is real is that one of them resolves — and against an
+/// empty table none can, which refuses the type outright.
+///
+/// **No decode path supplies a table here yet**, so that is the
+/// shipped behaviour: `i3=5` is refused wherever the verdict is
+/// applied. That is deliberate rather than overlooked — an unresolved
+/// `<...> <...> R 590003 IO91NP` names neither station, so it is not a
+/// message an operator can act on. Threading the table that
+/// [`unpack77_with_hash`] already takes down to this point is the fix,
+/// and it is a change to the request API rather than to this function.
+pub fn is_plausible_payload_with_hash(msg: &[u8], ht: &CallsignHashTable) -> bool {
+    unpack77_fields(msg, ht).is_some_and(|m| m.is_plausible())
+}
+
+/// The one decode: bits to fields. `unpack77`/`unpack77_with_hash`
+/// render the result; `Wsjt77Fields::is_plausible` judges it. Nothing
+/// downstream re-parses the rendered string.
+pub fn unpack77_fields(msg: &[u8], ht: &CallsignHashTable) -> Option<Wsjt77Fields> {
     let n3 = read_bits(msg, 71, 3);
     let i3 = read_bits(msg, 74, 3);
+    let decoded = unpack77_dispatch(msg, ht, i3, n3)?;
+    // `packjt77.f90:616` — the last thing upstream's `unpack77` does,
+    // for every type: `if(msg(1:4).eq.'CQ <') unpk77_success=.false.`
+    // A CQ is addressed to nobody, so the station it names cannot be a
+    // hash: nothing can have introduced one. Upstream tests the
+    // assembled string's first four characters; the fields say the
+    // same thing without the substring.
+    let refuse = {
+        let mut calls = decoded.callsigns();
+        matches!((calls.next(), calls.next()), (Some(a), Some(b))
+            if (a == "CQ" || a.starts_with("CQ ")) && b.starts_with('<'))
+    };
+    if refuse {
+        return None;
+    }
+    Some(decoded)
+}
 
+fn unpack77_dispatch(msg: &[u8], ht: &CallsignHashTable, i3: u32, n3: u32) -> Option<Wsjt77Fields> {
     match i3 {
         0 => match n3 {
             0 => {
                 let text = unpack_free_text(msg);
-                if text.is_empty() { None } else { Some(text) }
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(Wsjt77Fields::FreeText(text))
+                }
             }
             1 => {
                 // DXpedition: CALL1 RR73; CALL2 <hash10> REPORT
@@ -635,7 +911,12 @@ fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
                 } else {
                     "<...>".to_string()
                 };
-                Some(format!("{} RR73; {} {} {}", c1, c2, c3, crpt))
+                Some(Wsjt77Fields::DxPedition {
+                    call1: c1,
+                    call2: c2,
+                    call3: c3,
+                    report: crpt,
+                })
             }
             5 => {
                 // `packjt77.f90:360` — telemetry, 71 bits shown as 18 hex
@@ -651,7 +932,9 @@ fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
                 // Upstream blanks leading '0's and left-justifies, which
                 // for an all-zero payload leaves an empty message — it
                 // reports success either way, and so do we.
-                Some(hex.trim_start_matches('0').to_string())
+                Some(Wsjt77Fields::Telemetry(
+                    hex.trim_start_matches('0').to_string(),
+                ))
             }
             6 => {
                 // `packjt77.f90:372` — WSPR-type. `itype` comes from bits
@@ -672,7 +955,10 @@ fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
                         let igrid4 = read_bits(msg, 28, 15);
                         let idbm = wspr_dbm(read_bits(msg, 43, 5))?;
                         let grid = to_grid4(igrid4)?;
-                        Some(format!("{} {} {}", unpack28_h(n28, ht), grid, idbm))
+                        Some(Wsjt77Fields::Wspr {
+                            call: unpack28_h(n28, ht),
+                            tail: format!("{} {}", grid, idbm),
+                        })
                     }
                     2 => {
                         let n28 = read_bits(msg, 0, 28);
@@ -680,13 +966,19 @@ fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
                         let idbm = wspr_dbm(read_bits(msg, 44, 5))?;
                         let call = unpack28_h(n28, ht);
                         let composed = wspr_prefix_suffix(npfx, &call)?;
-                        Some(format!("{} {}", composed, idbm))
+                        Some(Wsjt77Fields::Wspr {
+                            call: composed,
+                            tail: idbm.to_string(),
+                        })
                     }
                     _ => {
                         let n22 = read_bits(msg, 0, 22);
                         let igrid6 = read_bits(msg, 22, 25);
                         let grid = to_grid(igrid6)?;
-                        Some(format!("{} {}", unpack28_h(n22 + NTOKENS, ht), grid))
+                        Some(Wsjt77Fields::Wspr {
+                            call: unpack28_h(n22 + NTOKENS, ht),
+                            tail: grid,
+                        })
                     }
                 }
             }
@@ -726,8 +1018,14 @@ fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
                 // whose leading blank doubles as the separator for
                 // `ntx < 10`. Formatting the number directly makes all
                 // four collapse into one, with identical output.
-                let r = if ir == 1 { "R " } else { "" };
-                Some(format!("{} {} {}{}{} {}", c1, c2, r, ntx, class, sec))
+                Some(Wsjt77Fields::FieldDay {
+                    call1: c1,
+                    call2: c2,
+                    ack: ir == 1,
+                    transmitters: ntx,
+                    class,
+                    section: sec,
+                })
             }
             _ => None,
         },
@@ -786,11 +1084,11 @@ fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
                 }
             };
 
-            if report.is_empty() {
-                Some(format!("{} {}", c1, c2))
-            } else {
-                Some(format!("{} {} {}", c1, c2, report))
-            }
+            Some(Wsjt77Fields::Standard {
+                call1: c1,
+                call2: c2,
+                exchange: report,
+            })
         }
 
         3 => {
@@ -823,12 +1121,14 @@ fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
                 // phantom population (`phantom_survival_rates`).
                 return None;
             };
-            let prefix = if itu == 1 { "TU; " } else { "" };
-            let r_prefix = if ir == 1 { "R " } else { "" };
-            Some(format!(
-                "{}{} {} {}{} {}",
-                prefix, c1, c2, r_prefix, rst, exch
-            ))
+            Some(Wsjt77Fields::RttyRoundup {
+                thank_you: itu == 1,
+                call1: c1,
+                call2: c2,
+                ack: ir == 1,
+                rst,
+                exchange: exch,
+            })
         }
 
         5 => {
@@ -856,11 +1156,13 @@ fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
             let c2 = resolve_hash22(n22, ht);
             // `packjt77.f90:607` — `write(cexch,'(i2,i4.4)') nrs,iserial`.
             let nrs = 52 + irpt;
-            let r = if ir == 1 { "R " } else { "" };
-            Some(format!(
-                "{} {} {}{:02}{:04} {}",
-                c1, c2, r, nrs, iserial, grid
-            ))
+            Some(Wsjt77Fields::EuVhfContest {
+                call1: c1,
+                call2: c2,
+                ack: ir == 1,
+                exchange: format!("{:02}{:04}", nrs, iserial),
+                grid6: grid,
+            })
         }
 
         4 => {
@@ -882,7 +1184,11 @@ fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
                 .to_string();
 
             if icq == 1 {
-                return Some(format!("CQ {}", nonstd));
+                return Some(Wsjt77Fields::Nonstandard {
+                    call1: "CQ".to_string(),
+                    call2: Some(nonstd),
+                    exchange: "",
+                });
             }
 
             let hashed = resolve_hash12(n12, ht);
@@ -892,13 +1198,18 @@ fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
                 (nonstd, hashed)
             };
 
-            match nrpt {
-                0 => Some(format!("{} {}", c1, c2)),
-                1 => Some(format!("{} {} RRR", c1, c2)),
-                2 => Some(format!("{} {} RR73", c1, c2)),
-                3 => Some(format!("{} {} 73", c1, c2)),
-                _ => None,
-            }
+            let exchange = match nrpt {
+                0 => "",
+                1 => "RRR",
+                2 => "RR73",
+                3 => "73",
+                _ => return None,
+            };
+            Some(Wsjt77Fields::Nonstandard {
+                call1: c1,
+                call2: Some(c2),
+                exchange,
+            })
         }
 
         _ => None,
@@ -1183,303 +1494,6 @@ fn has_plausible_prefix(s: &str) -> bool {
     // (the other gap-prone shape that catches CRC false-positives).
     if prefix.len() == 2 && prefix[0].is_ascii_uppercase() && prefix[1].is_ascii_digit() {
         return is_known_letter_digit_prefix(prefix);
-    }
-    true
-}
-
-/// Check if a decoded FT8 message looks plausible (not a false positive).
-///
-/// CRC-14 provides 1/16384 false-positive probability per candidate.  This
-/// function adds a secondary filter by validating that callsign-like tokens
-/// follow ITU format rules (must contain a digit) and use the FT8 character
-/// set.  Special tokens (CQ, reports, grids, hash placeholders) are skipped.
-/// A token that is either a hashed-callsign placeholder (`<...>`, which
-/// [`unpack28_h`] emits when the hash is not in the table) or a callsign
-/// passing the ITU prefix allowlist.
-fn plausible_call_token(w: &str) -> bool {
-    (w.starts_with('<') && w.ends_with('>')) || is_plausible_callsign(w)
-}
-
-/// Recognise the Type-3 (ARRL RTTY Roundup) message and judge it, or
-/// return `None` when the words are not that shape.
-///
-/// `packjt77.f90:532-551` renders it as
-/// `[TU;] CALL CALL [R] 5N9 EXCH`, where the report is `crpt` from
-/// `write(crpt,'("5",i1,"9")') irpt+2` (so `529`..=`599`) and the
-/// exchange is either a US state / Canadian province from
-/// [`RTTY_STATES`] or a four-digit serial `0001`..=`7999`.
-///
-/// Its absence was a recall bug, not a gap: the contest exchange is not
-/// made of callsigns, so the generic loop refused every message of this
-/// type — real ones included — and FT4's golden recording is half RTTY
-/// Roundup, it being a contest mode. That went unnoticed because FT4
-/// did not apply the filter until issue #383 step 5.
-fn rtty_roundup_plausible(words: &[&str]) -> Option<bool> {
-    // `packjt77.f90:534` prefixes the whole message when `itu` is set.
-    let w: &[&str] = match words.first() {
-        Some(&"TU;") => &words[1..],
-        _ => words,
-    };
-    let tail: &[&str] = match (w.len(), w.get(2)) {
-        (4, _) => &w[2..],
-        (5, Some(&"R")) => &w[3..],
-        _ => return None,
-    };
-    let (rst, exch) = (tail[0], tail[1]);
-    match rst.as_bytes() {
-        [b'5', b'2'..=b'9', b'9'] => {}
-        _ => return None,
-    }
-    let serial = exch.len() == 4
-        && exch.bytes().all(|b| b.is_ascii_digit())
-        && matches!(exch.parse::<u32>(), Ok(1..=7999));
-    if !serial && !RTTY_STATES.contains(&exch) {
-        return None;
-    }
-    Some(plausible_call_token(w[0]) && plausible_call_token(w[1]))
-}
-
-/// Recognise the Type-5 (EU VHF contest) message and judge it, or
-/// return `None` when the words are not that shape.
-///
-/// `packjt77.f90:609-610` renders it as
-/// `<CALL> <CALL> [R] <nrs><serial> GRID6`, where `nrs` is 52..=59, the
-/// serial is four digits and the grid is strictly six characters.
-///
-/// **Both callsigns are always hashes** — `pack77_5` refuses to build
-/// the type unless the operator wrote them `<CALL>` — so unlike every
-/// other type here there is no callsign to check, and the exchange
-/// fields span their encodable ranges almost completely. Accepting the
-/// shape alone would make this a 100 %-survival type: 138 700 of 2 M
-/// uniform payloads reach it, a 44 % increase in the surviving phantom
-/// population on its own (`phantom_survival_rates`).
-///
-/// What distinguishes a real one is that its hashes *resolve*. A
-/// station running this exchange has already put both callsigns in the
-/// table; a CRC survivor's 12- and 22-bit hashes land on an entry with
-/// probability ~`n/2^12` and ~`n/2^22`. So require at least one side to
-/// have come back as a callsign rather than as `<...>`.
-fn eu_vhf_contest_plausible(words: &[&str]) -> Option<bool> {
-    let tail: &[&str] = match (words.len(), words.get(2)) {
-        (4, _) => &words[2..],
-        (5, Some(&"R")) => &words[3..],
-        _ => return None,
-    };
-    let (exch, grid) = (tail[0], tail[1]);
-    if !is_grid6(grid) {
-        return None;
-    }
-    if exch.len() != 6 || !exch.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    if !matches!(exch[..2].parse::<u32>(), Ok(52..=59)) {
-        return None;
-    }
-    let hashed = |w: &str| w.starts_with('<') && w.ends_with('>');
-    if !hashed(words[0]) || !hashed(words[1]) {
-        return None;
-    }
-    Some(words[0] != "<...>" || words[1] != "<...>")
-}
-
-/// The six-character grid `packjt77.f90`'s `is_grid6` statement
-/// function accepts: field letters `A`..=`R`, square digits, subsquare
-/// letters `A`..=`X`.
-fn is_grid6(g: &str) -> bool {
-    let b = g.as_bytes();
-    b.len() == 6
-        && (b'A'..=b'R').contains(&b[0])
-        && (b'A'..=b'R').contains(&b[1])
-        && b[2].is_ascii_digit()
-        && b[3].is_ascii_digit()
-        && (b'A'..=b'X').contains(&b[4])
-        && (b'A'..=b'X').contains(&b[5])
-}
-
-/// Recognise the ARRL Field Day exchange and judge it, or return `None`
-/// when the words are not that shape and the caller should fall through
-/// to its generic per-token loop.
-///
-/// `packjt77.f90:350-357` renders the type as
-/// `CALL CALL [R] <ntx><class> SEC`, where `ntx` is 1..=32 (a 4-bit
-/// field, +16 for the `n3 = 4` continuation), `class` is `A`..=`H` (3
-/// bits) and `SEC` is one of the 86 [`ARRL_SECTIONS`].
-fn field_day_plausible(words: &[&str]) -> Option<bool> {
-    let tail: &[&str] = match (words.len(), words.get(2)) {
-        (4, _) => &words[2..],
-        (5, Some(&"R")) => &words[3..],
-        _ => return None,
-    };
-    let (ntx_class, sec) = (tail[0], tail[1]);
-    if !ARRL_SECTIONS.contains(&sec) {
-        return None;
-    }
-    let split = ntx_class.len().checked_sub(1)?;
-    let (ntx, class) = ntx_class.split_at(split);
-    if !matches!(class.as_bytes(), [b'A'..=b'H']) {
-        return None;
-    }
-    if !matches!(ntx.parse::<u32>(), Ok(1..=32)) {
-        return None;
-    }
-    Some(plausible_call_token(words[0]) && plausible_call_token(words[1]))
-}
-
-/// [`is_plausible_message`], but judging the **payload bits**, which is
-/// where the message type lives.
-///
-/// The text-only form cannot do this job, and the reason is structural
-/// rather than a missing rule. Two of the types `unpack77` produces
-/// carry no redundancy at all:
-///
-/// - **free text** (`i3=0, n3=0`) packs 13 characters from a 42-symbol
-///   alphabet into 71 bits — `42^13` is within a factor of two of
-///   `2^71`, so very nearly every bit pattern is a valid message;
-/// - **telemetry** (`i3=0, n3=5`) is 71 bits shown as 18 hex digits,
-///   and every pattern is valid by construction.
-///
-/// Nothing in the text separates a CRC survivor from real traffic
-/// there. Refusing the type loses the traffic — `73 GL` and
-/// `TNX QSO BOB` are free text, and FT8 carries a great deal of it —
-/// and accepting "anything that parses as no structured type" would
-/// re-admit every other type's garbage through the same door, because
-/// garbage parses as nothing. Upstream has no filter here at all.
-///
-/// So the exemption is scoped by *type*, which only the bits can tell
-/// us. Every other type has fields to check, and goes through
-/// [`is_plausible_message`] on its rendered text as before.
-pub fn is_plausible_payload(msg: &[u8]) -> bool {
-    is_plausible_payload_with_hash(msg, &CallsignHashTable::new())
-}
-
-/// [`is_plausible_payload`] with the caller's hashed-callsign table.
-///
-/// It matters for exactly one type. The EU VHF contest message
-/// (`i3=5`) carries **two hashes and no plain callsign**, so the only
-/// evidence it is real is that one of them resolves — and against an
-/// empty table none can, which refuses the type outright.
-///
-/// **No decode path supplies a table here yet**, so that is the
-/// shipped behaviour: `i3=5` is refused wherever the filter is on.
-/// That is deliberate rather than overlooked — an unresolved
-/// `<...> <...> R 590003 IO91NP` names neither station, so it is not a
-/// message an operator can act on, and accepting the type blind would
-/// admit 138 700 of every 2 M uniform payloads (a 44 % rise in the
-/// surviving phantom population, measured by `phantom_survival_rates`)
-/// in exchange for rows nobody can read. Threading the table that
-/// `unpack77_with_hash` already takes down to this point is the fix,
-/// and it is a change to the request API rather than to this function.
-pub fn is_plausible_payload_with_hash(msg: &[u8], ht: &CallsignHashTable) -> bool {
-    if msg.len() < 77 {
-        return false;
-    }
-    let n3 = read_bits(msg, 71, 3);
-    let i3 = read_bits(msg, 74, 3);
-    if i3 == 0 && (n3 == 0 || n3 == 5) {
-        // Valid by construction; see the doc comment above. `unpack77`
-        // still has to succeed — free text refuses the all-blank
-        // message, which is what a silent slot decodes to.
-        return unpack77_with_hash(msg, ht).is_some();
-    }
-    unpack77_with_hash(msg, ht).is_some_and(|text| plausible_text(&text))
-}
-
-#[deprecated(
-    since = "0.11.0",
-    note = "text alone cannot judge a 77-bit message: the type lives in bits 71..77, and \
-            free text and telemetry carry no redundancy a text rule could see. This \
-            function refused those two types, and ARRL RTTY Roundup, in their entirety \
-            for as long as it existed. Use `is_plausible_payload`, which dispatches on \
-            the type first (issue #383)."
-)]
-pub fn is_plausible_message(text: &str) -> bool {
-    plausible_text(text)
-}
-
-/// The text half of [`is_plausible_payload`]: judge a message whose
-/// type has already been established as one with fields worth checking.
-///
-/// Not public. On its own it is the thing the deprecation note above
-/// describes — correct only once a caller has ruled out the types it
-/// cannot see.
-fn plausible_text(text: &str) -> bool {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    if words.is_empty() {
-        return false;
-    }
-
-    // ARRL Field Day (`unpack77` type 0.3 / 0.4). Its exchange tokens
-    // are not callsigns, so the generic loop below cannot judge it —
-    // but the two leading tokens *are*, and until Field Day's body was
-    // ported this function saw only a `[FD]` marker and returned `true`
-    // on the spot, skipping even those. `phantom_survival_rates`
-    // measured that as a 100 % survival rate for the type: not because
-    // the messages were plausible, but because nothing looked at them.
-    if let Some(ok) = field_day_plausible(&words) {
-        return ok;
-    }
-    if let Some(ok) = eu_vhf_contest_plausible(&words) {
-        return ok;
-    }
-    if let Some(ok) = rtty_roundup_plausible(&words) {
-        return ok;
-    }
-
-    for (idx, &w) in words.iter().enumerate() {
-        // Known non-callsign tokens
-        // `RR73;` is DXpedition type 0.1's literal separator
-        // (`packjt77.f90:329`); every other token in that message is a
-        // callsign, a `<...>` hash placeholder or a report, all of
-        // which the arms below already judge. Listing it here is what
-        // lets them: the type used to short-circuit this whole loop on
-        // a `text.contains("RR73;")`, so its two real callsigns were
-        // never checked and it survived the filter at 100 %.
-        if matches!(
-            w,
-            "CQ" | "DE" | "QRZ" | "RRR" | "RR73" | "RR73;" | "73" | "R" | "" | "DX"
-        ) {
-            continue;
-        }
-        // "CQ NNN" compound tokens
-        if w.starts_with("CQ") {
-            continue;
-        }
-        // CQ activity suffix: token right after CQ, all uppercase ≤4 chars
-        // e.g., POTA, SOTA, NA, EU (unpack28 directional CQ, C4 alphabet)
-        if idx == 1 && words[0] == "CQ" && w.len() <= 4 && w.bytes().all(|b| b.is_ascii_uppercase())
-        {
-            continue;
-        }
-        // Hash placeholder
-        if w.starts_with('<') && w.ends_with('>') {
-            continue;
-        }
-        // Reports: R+NN, R-NN, +NN, -NN
-        if w.starts_with("R+") || w.starts_with("R-") {
-            continue;
-        }
-        if (w.starts_with('+') || w.starts_with('-')) && w[1..].parse::<i32>().is_ok() {
-            continue;
-        }
-        // 4-char grid locator
-        if w.len() == 4 {
-            let b = w.as_bytes();
-            if b[0].is_ascii_uppercase()
-                && b[1].is_ascii_uppercase()
-                && b[2].is_ascii_digit()
-                && b[3].is_ascii_digit()
-            {
-                continue;
-            }
-        }
-
-        // Remaining tokens should be callsigns — validate against
-        // the ITU prefix allowlist (stricter than is_valid_callsign,
-        // catches CRC-14 false positives whose decoded callsign-like
-        // tokens land in unallocated letter+digit prefix gaps).
-        if !is_plausible_callsign(w) {
-            return false;
-        }
     }
     true
 }
@@ -2057,45 +2071,50 @@ mod tests {
         assert!(!is_valid_callsign("//////")); // nonsense
     }
 
+    /// Every shape a callsign *field* can legitimately hold.
+    ///
+    /// These used to be whole-message strings run through a token
+    /// loop, which had to guess which tokens were callsigns — and got
+    /// it wrong for three message types. `Wsjt77Fields::callsigns`
+    /// yields the fields, so the question is per field, which is the
+    /// question that was always being asked.
     #[test]
-    fn plausible_message_standard() {
-        assert!(plausible_text("CQ JA1ABC PM95"));
-        assert!(plausible_text("CQ DX R6WA LN32"));
-        assert!(plausible_text("JA1ABC 3Y0Z -12"));
-        assert!(plausible_text("JA1ABC 3Y0Z RRR"));
-        assert!(plausible_text("JA1ABC 3Y0Z 73"));
-        assert!(plausible_text("CQ 3Y0Z JD34"));
-        assert!(plausible_text("OH3NIV ZS6S R-12"));
+    fn plausible_call_accepts_every_shape_a_field_can_hold() {
+        // Token codes and the directed-CQ range, which `unpack28`
+        // renders as words rather than callsigns.
+        for f in [
+            "CQ", "DE", "QRZ", "CQ DX", "CQ POTA", "CQ NA", "CQ SOTA", "CQ 123",
+        ] {
+            assert!(is_plausible_call(f), "{f} is a token, not a callsign");
+        }
+        // Hashes, resolved and not.
+        for f in ["<...>", "<JA1ABC>", "<KH1/KH7Z>", "<G4ABC/P>"] {
+            assert!(is_plausible_call(f), "{f} is a hash");
+        }
+        // Ordinary calls, compound calls, and CEPT prefixes.
+        for f in [
+            "JA1ABC", "3Y0Z", "R6WA", "ZS6S", "W1AW", "JR1UJX/P", "JH4IUV/P", "JL1NIE/1",
+            "F/JA1ABC", "JR9ECD/P", "K1ABC", "W9XYZ",
+        ] {
+            assert!(is_plausible_call(f), "{f} is a real callsign");
+        }
     }
 
+    /// The other half: fields that no allocation could produce. The
+    /// last three are CRC survivors observed on `qso3_busy.wav`.
     #[test]
-    fn plausible_message_nonstandard() {
-        // Type 4 non-standard callsigns
-        assert!(plausible_text("JR1UJX/P JH1GIN PM96"));
-        assert!(plausible_text("<...> JH4IUV/P RR73"));
-        assert!(plausible_text("CQ JR9ECD/P"));
-        assert!(plausible_text("F/JA1ABC 3Y0Z -12"));
-        assert!(plausible_text("CQ SOTA JL1NIE/1"));
-
-        // Hash placeholders
-        assert!(plausible_text("<...> JA1ABC -12"));
-        assert!(plausible_text("JA1ABC <...> RRR"));
-
-        // CQ with activity suffix
-        assert!(plausible_text("CQ POTA JA1ABC PM95"));
-        assert!(plausible_text("CQ NA W1AW FN31"));
-        assert!(plausible_text("CQ SOTA JL1NIE/P"));
-
-        // Contest/DXpedition markers
-        assert!(plausible_text("JA1ABC 3Y0Z 6A EMA"));
-    }
-
-    #[test]
-    fn plausible_message_rejected() {
-        // No valid callsign structure
-        assert!(!plausible_text("NFW/0811 73"));
-        assert!(!plausible_text("ABCDEF GHIJKL"));
-        assert!(!plausible_text(""));
+    fn plausible_call_rejects_what_no_allocation_produces() {
+        for f in [
+            "",
+            "NFW/0811",
+            "ABCDEF",
+            "GHIJKL",
+            "294TOW/R",
+            "G47OXF",
+            "HVA1DPFV3L",
+        ] {
+            assert!(!is_plausible_call(f), "{f:?} must be refused");
+        }
     }
 
     #[test]
@@ -2161,7 +2180,7 @@ mod tests {
 
         // Verify the resolved message passes plausibility
         assert!(
-            plausible_text(&text_ht),
+            is_plausible_payload_with_hash(&msg, &ht),
             "resolved message should be plausible: {text_ht}"
         );
     }
@@ -2175,7 +2194,7 @@ mod tests {
         assert_eq!(text, "CQ JL1NIE/1");
 
         // Verify it passes plausibility
-        assert!(plausible_text(&text));
+        assert!(is_plausible_payload(&msg));
     }
 
     #[test]
@@ -2390,14 +2409,14 @@ mod tests {
         let text = unpack77_with_hash(&m, &ht).expect("type 5 unpacks");
         assert_eq!(text, "<PA3XYZ> <...> R 590003 IO91NP");
         assert!(
-            plausible_text(&text),
+            is_plausible_payload_with_hash(&m, &ht),
             "a resolved hash is what makes it plausible: {text}"
         );
         // Without the table the same bits are indistinguishable from a
         // CRC survivor.
         let blind = unpack77(&m).expect("type 5 unpacks");
         assert_eq!(blind, "<...> <...> R 590003 IO91NP");
-        assert!(!plausible_text(&blind));
+        assert!(!is_plausible_payload(&m));
     }
 
     /// `packjt77.f90:599` — the 25-bit grid field has 18_662_400 valid
@@ -2415,12 +2434,20 @@ mod tests {
     /// indistinguishable from a CRC survivor and must not pass.
     #[test]
     fn eu_vhf_contest_needs_a_resolved_hash() {
-        assert!(!plausible_text("<...> <...> R 590003 IO91NP"));
-        assert!(plausible_text("<PA3XYZ> <...> R 590003 IO91NP"));
-        assert!(plausible_text("<...> <G4ABC/P> 590003 IO91NP"));
-        // Right shape, impossible RS(T) / grid.
-        assert!(!plausible_text("<PA3XYZ> <...> R 510003 IO91NP"));
-        assert!(!plausible_text("<PA3XYZ> <...> R 590003 IO91NZ"));
+        let eu = |c1: &str, c2: &str| Wsjt77Fields::EuVhfContest {
+            call1: c1.to_string(),
+            call2: c2.to_string(),
+            ack: true,
+            exchange: "590003".to_string(),
+            grid6: "IO91NP".to_string(),
+        };
+        assert!(!eu(UNRESOLVED_HASH, UNRESOLVED_HASH).is_plausible());
+        assert!(eu("<PA3XYZ>", UNRESOLVED_HASH).is_plausible());
+        assert!(eu(UNRESOLVED_HASH, "<G4ABC/P>").is_plausible());
+        // The exchange and grid need no check here: `irpt` is 3 bits so
+        // the RS(T) is always 52..=59, the serial is an 11-bit field,
+        // and `to_grid6` already refused 44 % of the grid field during
+        // unpacking. Re-testing them was what the text rule did.
     }
 
     /// The DXpedition body was already ported; what was missing was
@@ -2428,10 +2455,53 @@ mod tests {
     /// the literal `RR73;`, so both callsign fields went unchecked.
     #[test]
     fn dxpedition_text_is_judged_on_its_callsigns() {
-        assert!(plausible_text("K1ABC RR73; W9XYZ <KH1/KH7Z> -11"));
-        assert!(plausible_text("K1ABC RR73; W9XYZ <...> +03"));
-        assert!(!plausible_text("NFW/0811 RR73; W9XYZ <...> -11"));
-        assert!(!plausible_text("K1ABC RR73; NFW/0811 <...> -11"));
+        let dx = |c1: &str, c2: &str, c3: &str| Wsjt77Fields::DxPedition {
+            call1: c1.to_string(),
+            call2: c2.to_string(),
+            call3: c3.to_string(),
+            report: "-11".to_string(),
+        };
+        assert!(dx("K1ABC", "W9XYZ", "<KH1/KH7Z>").is_plausible());
+        assert!(dx("K1ABC", "W9XYZ", UNRESOLVED_HASH).is_plausible());
+        assert!(!dx("NFW/0811", "W9XYZ", UNRESOLVED_HASH).is_plausible());
+        assert!(!dx("K1ABC", "NFW/0811", UNRESOLVED_HASH).is_plausible());
+    }
+
+    /// `packjt77.f90:616` — a CQ names no station, so the station field
+    /// cannot be a hash. Upstream tests the assembled message's first
+    /// four characters; this crate did too, and the RTTY Roundup's
+    /// optional `TU; ` prefix shifted the message far enough to defeat
+    /// it. Asking the callsign *fields* has no such blind spot.
+    #[test]
+    fn a_cq_to_a_hash_is_refused_even_behind_a_prefix() {
+        // i3=3, itu=1 (the `TU; ` prefix), call1 = the CQ token,
+        // call2 = a 28-bit value inside the 22-bit hash range, and an
+        // exchange that is otherwise valid.
+        let hashed = NTOKENS + 1;
+        let m = bits77(&[
+            (0, 1, 1),
+            (1, 28, 2),
+            (29, 28, hashed),
+            (58, 3, 7),
+            (61, 13, 8005),
+            (74, 3, 3),
+        ]);
+        assert_eq!(
+            unpack77(&m),
+            None,
+            "a `TU; CQ <...>` message must be refused"
+        );
+
+        // Same message without the prefix, to show the refusal is
+        // about the fields rather than about `TU;`.
+        let m = bits77(&[
+            (1, 28, 2),
+            (29, 28, hashed),
+            (58, 3, 7),
+            (61, 13, 8005),
+            (74, 3, 3),
+        ]);
+        assert_eq!(unpack77(&m), None);
     }
 
     /// `packjt77.f90:532-551` — the RTTY Roundup exchange is built only
@@ -2491,16 +2561,25 @@ mod tests {
     /// on — and a garbage callsign in it has to not.
     #[test]
     fn field_day_text_is_judged_on_its_callsigns() {
-        assert!(plausible_text("JA1ABC 3Y0Z 6A EMA"));
-        assert!(plausible_text("JA1ABC 3Y0Z R 32H DX"));
-        assert!(plausible_text("<...> 3Y0Z 6A EMA"));
+        let fd = |c1: &str, c2: &str| Wsjt77Fields::FieldDay {
+            call1: c1.to_string(),
+            call2: c2.to_string(),
+            ack: false,
+            transmitters: 6,
+            class: 'A',
+            section: "EMA",
+        };
+        assert!(fd("JA1ABC", "3Y0Z").is_plausible());
+        assert!(fd(UNRESOLVED_HASH, "3Y0Z").is_plausible());
         // Same shape, but the first token is not a plausible callsign:
         // the old marker path returned `true` without looking.
-        assert!(!plausible_text("NFW/0811 3Y0Z 6A EMA"));
+        assert!(!fd("NFW/0811", "3Y0Z").is_plausible());
         // Right shape, wrong section / class / count.
-        assert!(!plausible_text("JA1ABC 3Y0Z 6A ZZZ"));
-        assert!(!plausible_text("JA1ABC 3Y0Z 6J EMA"));
-        assert!(!plausible_text("JA1ABC 3Y0Z 33A EMA"));
+        // `ZZZ` / `6J` / `33A` used to be tested here. They are now
+        // unrepresentable: `section` comes from the 86-entry table,
+        // `class` from `b'A' + nclass` over 3 bits, and `transmitters`
+        // from a 4-bit field plus the n3=4 offset. The text rule was
+        // re-checking ranges `unpack77` had already enforced.
     }
 
     /// `packjt77.f90:494,509` — a CQ cannot acknowledge and cannot

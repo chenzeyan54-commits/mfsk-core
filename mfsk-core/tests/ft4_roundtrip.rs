@@ -97,13 +97,13 @@ fn encode_decode_clean_signal_1000hz() {
     // text — confirms the full trait chain (FEC → MessageCodec::unpack).
     let codec = mfsk_core::msg::Wsjt77Message;
     let ctx = mfsk_core::engine::DecodeContext::default();
-    let text = codec
+    // `unpack` returns the decoded fields; the callsigns are fields,
+    // not tokens that happen to look like callsigns.
+    let decoded = codec
         .unpack(got.message77(), &ctx)
-        .expect("unpack returns a valid text");
-    assert!(
-        text.contains("CQ") && text.contains("JA1ABC"),
-        "text = '{text}'"
-    );
+        .expect("unpack returns a decoded message");
+    let calls: Vec<&str> = decoded.callsigns().collect();
+    assert_eq!(calls, ["CQ", "JA1ABC"], "decoded = '{decoded}'");
 }
 
 #[test]

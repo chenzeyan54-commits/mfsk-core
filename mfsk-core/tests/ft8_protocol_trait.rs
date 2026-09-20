@@ -110,8 +110,17 @@ fn ft8_message_unpack_renders_text() {
     };
     let payload = msg.pack(&fields).unwrap();
     let ctx = mfsk_core::engine::DecodeContext::default();
-    let text = msg.unpack(&payload, &ctx).unwrap();
-    assert!(text.contains("CQ"));
-    assert!(text.contains("JA1ABC"));
-    assert!(text.contains("PM95"));
+    // `unpack` now returns the decoded *fields*; the rendering is a
+    // `Display` away, and the fields say the same thing without a
+    // substring test.
+    let decoded = msg.unpack(&payload, &ctx).unwrap();
+    assert_eq!(
+        decoded,
+        mfsk_core::msg::wsjt77::Wsjt77Fields::Standard {
+            call1: "CQ".into(),
+            call2: "JA1ABC".into(),
+            exchange: "PM95".into(),
+        }
+    );
+    assert_eq!(decoded.to_string(), "CQ JA1ABC PM95");
 }
