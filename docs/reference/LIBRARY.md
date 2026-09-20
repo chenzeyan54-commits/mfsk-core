@@ -131,8 +131,9 @@ DecodeRequest::<P>::new(audio, freq_min, freq_max, sync_min, max_cand)
 | `.ap_hint(&ApHint)` | `&ApHint` | none | `SupportsWideBandAp` — **FT8, FT4, every FST4 sub-mode** | lock message bits from an a-priori hypothesis |
 | `.sic_rounds(n)` | `usize`, clamped `1..=3` | none | `SupportsSicRounds` — **FT8, FT4** | flat successive-interference cancellation |
 | `.sic_early()` | — | none | `SupportsSicEarly` — **FT8** | checkpoint-emulation early decode, fixed 3-checkpoint structure |
-| `.also_accept(f)` | `Fn(&str) -> bool` | none | `SupportsMessageFilter` — **FT8** | accept what the codec accepts **plus** what `f` accepts — [§2.5](#26-message-acceptance) |
-| `.message_filter(f)` | `Fn(&str) -> bool` | none | `SupportsMessageFilter` — **FT8** | replace the codec's verdict with `f` — [§2.5](#26-message-acceptance) |
+| `.also_accept(f)` | `Fn(&Wsjt77Fields) -> bool` | none | `SupportsMessageFilter` — **FT8, FT4, every FST4 sub-mode** | accept what the codec accepts **plus** what `f` accepts — [§2.6](#26-message-acceptance) |
+| `.message_filter(f)` | `Fn(&Wsjt77Fields) -> bool` | none | `SupportsMessageFilter` — **FT8, FT4, every FST4 sub-mode** | replace the codec's verdict with `f` — [§2.6](#26-message-acceptance) |
+| `.codec_filter()` | — | on for FT8, off elsewhere | `SupportsMessageFilter` — **FT8, FT4, every FST4 sub-mode** | apply the codec's own verdict on a protocol that does not by default — [§2.6](#26-message-acceptance) |
 | `.on_result(cb)` | `FnMut(&Row)` | none | all | deliver rows as they are found — [§2.4](#24-streaming-delivery) |
 | `.budget(check)` | `FnMut() -> bool` | none | all | caller-supplied deadline predicate — [§2.3](#23-compute-budget) |
 | `.sniper(...)` | `(audio, target_hz, max_cand)` | — | `SupportsSniper` — **FT8** | build a `SniperRequest` instead |
@@ -186,6 +187,7 @@ for r in &results {
 | `.ap_hint(&h)` | none | as `DecodeRequest` |
 | `.also_accept(f)` | none | as `DecodeRequest` |
 | `.message_filter(f)` | none | as `DecodeRequest` |
+| `.codec_filter()` | on (FT8) | as `DecodeRequest` |
 | `.on_result(cb)` | none | as `DecodeRequest` |
 | `.budget(check)` | none | as `DecodeRequest` |
 | `.decode()` | — | same `DecodeOutcome<P>` shape |

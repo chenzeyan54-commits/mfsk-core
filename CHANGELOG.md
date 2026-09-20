@@ -340,14 +340,27 @@ reported the grid healthy while the band said otherwise.
   decodes the reference recording with and without a no-op policy and
   compares whole result rows.
 
-  **FT8 only**, gated on `SupportsMessageFilter` — a compile error on
-  the others rather than a silent no-op. Not a statement about the
-  codec (FT4 and every FST4 sub-mode share `Wsjt77Message`) but about
-  the pipeline: FT8's bespoke engine forms the message string inside
-  the per-candidate ladder, where a rejection lets the ladder keep
-  going, while the generic engine FT4 and FST4 share returns
-  information bits and never forms a string, because `engine` does not
-  depend on `msg`.
+  **`Ft8`, `Ft4` and every FST4 sub-mode**, gated on
+  `SupportsMessageFilter` — a compile error on a protocol that has no
+  place to apply one, rather than a builder method that silently does
+  nothing. The gate is not a statement about the codec (all three share
+  `Wsjt77Message`, so the verdict means the same thing for each) but
+  about the pipeline, and the two pipelines reach the message text from
+  opposite sides of the `engine` / `msg` boundary. FT8's bespoke engine
+  forms the string inside the per-candidate ladder, where a rejection
+  lets the ladder keep going. The generic engine FT4 and FST4 share
+  returns information bits and never forms a string — `engine` does not
+  depend on `msg` — so it reaches the policy through a new `InfoAccept`
+  seam, with `PolicyAccept` on the `msg` side doing the unpacking.
+
+  **This entry said "FT8 only" at the moment 0.11.0 was tagged, and it
+  was already wrong when it did**: the seam merged 14 commits before
+  the tag and nothing came back to update the entry. Corrected
+  2026-09-21; the copy published to crates.io with 0.11.0 still carries
+  the old text. What *is* FT8-only is applying the codec's verdict with
+  no caller involved — `FrameDecodable::MESSAGE_FILTER_DEFAULT` is
+  `false` for FT4 and FST4, because turning it on there is a behaviour
+  change nobody has measured against their sensitivity curves yet.
 
 - **`unpack77` decodes every message type `packjt77.f90` defines
   (#383).** Three were missing and returned `None`, which is a dropped

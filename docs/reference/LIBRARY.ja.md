@@ -133,8 +133,9 @@ DecodeRequest::<P>::new(audio, freq_min, freq_max, sync_min, max_cand)
 | `.ap_hint(&ApHint)` | `&ApHint` | 無し | `SupportsWideBandAp` — **FT8・FT4・FST4 全サブモード** | 事前仮説からメッセージビットを固定 |
 | `.sic_rounds(n)` | `usize`、`1..=3` にクランプ | 無し | `SupportsSicRounds` — **FT8, FT4** | 平坦な逐次干渉除去 |
 | `.sic_early()` | — | 無し | `SupportsSicEarly` — **FT8** | チェックポイント模倣の早期デコード（3 チェックポイント固定構造） |
-| `.also_accept(f)` | `Fn(&str) -> bool` | 無し | `SupportsMessageFilter` — **FT8** | codec が通すもの **＋** `f` が通すもの — [§2.5](#26-メッセージの受理) |
-| `.message_filter(f)` | `Fn(&str) -> bool` | 無し | `SupportsMessageFilter` — **FT8** | codec の判定を `f` で置き換える — [§2.5](#26-メッセージの受理) |
+| `.also_accept(f)` | `Fn(&Wsjt77Fields) -> bool` | 無し | `SupportsMessageFilter` — **FT8・FT4・FST4 全サブモード** | codec が通すもの **＋** `f` が通すもの — [§2.6](#26-メッセージの受理) |
+| `.message_filter(f)` | `Fn(&Wsjt77Fields) -> bool` | 無し | `SupportsMessageFilter` — **FT8・FT4・FST4 全サブモード** | codec の判定を `f` で置き換える — [§2.6](#26-メッセージの受理) |
+| `.codec_filter()` | — | FT8 は on、他は off | `SupportsMessageFilter` — **FT8・FT4・FST4 全サブモード** | 既定で判定しないプロトコルで codec 自身の判定を適用する — [§2.6](#26-メッセージの受理) |
 | `.on_result(cb)` | `FnMut(&Row)` | 無し | 全部 | 見つかった順に行を配信 — [§2.4](#24-ストリーミング配信) |
 | `.budget(check)` | `FnMut() -> bool` | 無し | 全部 | 呼び出し側の締切述語 — [§2.3](#23-計算予算) |
 | `.sniper(...)` | `(audio, target_hz, max_cand)` | — | `SupportsSniper` — **FT8** | 代わりに `SniperRequest` を作る |
@@ -188,6 +189,7 @@ for r in &results {
 | `.ap_hint(&h)` | 無し | 同上 |
 | `.also_accept(f)` | 無し | 同上 |
 | `.message_filter(f)` | 無し | 同上 |
+| `.codec_filter()` | on（FT8） | 同上 |
 | `.on_result(cb)` | 無し | 同上 |
 | `.budget(check)` | 無し | 同上 |
 | `.decode()` | — | 同じ `DecodeOutcome<P>` |

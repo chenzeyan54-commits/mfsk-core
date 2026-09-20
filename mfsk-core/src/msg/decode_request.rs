@@ -261,20 +261,30 @@ where
 
 /// Protocols whose decode path has a message-*text* stage a
 /// [`MessagePolicy`] can be applied at, so
-/// [`DecodeRequest::also_accept`] / [`DecodeRequest::message_filter`]
-/// are callable. **FT8 only, for now.**
+/// [`DecodeRequest::also_accept`] / [`DecodeRequest::message_filter`] /
+/// [`DecodeRequest::codec_filter`] are callable. **`Ft8`, `Ft4` and
+/// every FST4 sub-mode.**
 ///
-/// Not a statement about the message codec: `Ft8`, `Ft4` and every FST4
-/// sub-mode share `Wsjt77Message`, so the verdict would mean the same
-/// thing for all of them. It is a statement about the *pipeline*. FT8
-/// has its own bespoke engine (`ft8::decode_block`) which unpacks to
-/// text inside the per-candidate ladder and already filters there; the
-/// generic engine FT4 and FST4 share (`engine::pipeline`) returns
-/// information bits and never forms a string, because `engine` does not
-/// depend on `msg` and so cannot call `unpack77` at all. Giving those
-/// two a text stage is its own change with its own measurement — the
-/// candidate ladder gets to continue past a rejection, which is a
-/// recall question, not just a filtering one.
+/// Not a statement about the message codec: all three share
+/// `Wsjt77Message`, so the verdict means the same thing for each. It is
+/// a statement about the *pipeline*, and the two pipelines reach the
+/// stage from opposite sides of the `engine` / `msg` boundary. FT8 has
+/// its own bespoke engine (`ft8::decode_block`), which unpacks to text
+/// inside the per-candidate ladder and applies the policy there. FT4
+/// and the FST4 sub-modes share `engine::pipeline`, which returns
+/// information bits and never forms a string — `engine` does not depend
+/// on `msg`, so it cannot call `unpack77` at all — and reach the policy
+/// through the [`InfoAccept`] seam instead, with `PolicyAccept`
+/// unpacking on the `msg` side of it.
+///
+/// **This doc used to say "FT8 only, for now", and that giving FT4 and
+/// FST4 a text stage was "its own change with its own measurement".**
+/// That change is the `InfoAccept` seam, which shipped in the same
+/// release the sentence did; the sentence outlived it by a few commits.
+/// What is still FT8-only is applying the codec's verdict with no
+/// caller involved — see [`FrameDecodable::MESSAGE_FILTER_DEFAULT`].
+///
+/// [`InfoAccept`]: crate::engine::pipeline::InfoAccept
 ///
 /// Gating it means a caller who tries gets a compile error naming the
 /// missing capability, rather than a builder method that silently does

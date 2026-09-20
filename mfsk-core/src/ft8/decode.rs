@@ -1850,11 +1850,11 @@ impl<'a> DecodeRequest<'a, Ft8> {
     }
 }
 
-/// FT8 is the one protocol whose decode path forms a message string
-/// inside the per-candidate ladder, which is where a policy has to be
-/// applied for a rejection to let the ladder keep going — see
-/// [`SupportsMessageFilter`]'s own doc comment for why FT4 and FST4
-/// cannot take one yet.
+/// FT8 forms the message string inside its own per-candidate ladder,
+/// which is where the policy is applied, so a rejection lets the ladder
+/// keep going. FT4 and the FST4 sub-modes reach the same stage from the
+/// other side of the `engine` / `msg` boundary — see
+/// [`SupportsMessageFilter`]'s own doc comment.
 impl SupportsMessageFilter for Ft8 {
     fn __strategy_for<Pol: MessagePolicy>(
         tag: StrategyTag,
