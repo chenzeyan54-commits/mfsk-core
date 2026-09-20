@@ -55,9 +55,9 @@ Figures are asserted, not just observed — see each protocol's
 
 | Protocol | Golden-WAV recall | Precision (extra decodes) | AWGN gap vs. WSJT-X | Status |
 |----------|-------------------|---------------------------|----------------------|--------|
-| FT8 *(host)* | 8/8 (WSJT-X), 18/18 (JTDX) | 20 total, **0 uncorroborated** — all 12 beyond the WSJT-X 8 are in the JTDX 20-entry golden | AWGN ≈ −21.6 dB (WSJT-X: −20 to −21 dB) | at/above parity |
+| FT8 *(host)* | 8/8 (WSJT-X), 18/18 (JTDX) | 20 total, **0 uncorroborated** — all 12 beyond the WSJT-X 8 are in the JTDX 20-entry golden | AWGN ≈ −21.6 dB (WSJT-X: −20 to −21 dB); CCIR good/moderate/poor ≈ −21.11 / −20.00 / −19.67 dB, re-measured 2026-09-20 — see `FT8_BENCHMARK.md` §12 | at/above parity |
 | FT8 *(ship)* | 7/8 (WSJT-X) — misses `K1BZM DK8NE -10` at −17 dB, which needs AP context (issue #150) | 14 total, **0 uncorroborated** — all 7 extras are in the JTDX 20-entry golden | Not separately swept; the ship config trades recall for the ESP32 time budget | by design |
-| FT4      | 6/6 | **0** (budget 0) | AWGN ≈ −16.9 dB live-binary match/slight edge vs. real `jt9 -5` on the same corpus (was compared against a −17.5 dB *published* figure, ~0.6 dB "gap" that direct measurement doesn't reproduce — see FT4 section, 2026-08-08) | at/above parity |
+| FT4      | 6/6 | **0** (budget 0) | AWGN ≈ **−18.00 dB** (0.11.0: was ≈ −16.9 dB until the a-priori pass was fixed and the always-on blind-CQ pass added — see the FT4 section and `CHANGELOG.md` 0.11.0). 0.5 dB ahead of WSJT-X's published −17.5 dB, where it had been 0.6 dB behind | above parity |
 | FST4     | 1/1 (FST4-60A only) | **0** (budget 0) | Live-binary match vs. real `jt9 -7` on the same corpus at 2 of 3 tested sub-modes (FST4-60 exact match, FST4-120 ~0.04 dB); the previously-documented 0.10-0.60 dB "gaps" were vs. *published* figures, not verified against a real binary until 2026-08-08 — see FST4 section | at/above parity |
 | WSPR     | 9/9 | **0 phantoms**, and 0 across 5 chained slots with a carried callsign table | AWGN 50% ≈ −31.5 dB, matches live `wsprd` cell for cell | at parity |
 | JT9      | 7/7 | **0** (budget 0) | AWGN 50% ≈ −26.6 dB, exceeds real `jt9 -9` at its own default depth (`-d1`) — see JT9 section, task #24 | above parity |

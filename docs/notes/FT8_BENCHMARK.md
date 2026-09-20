@@ -599,3 +599,41 @@ candidates, not introduce false positives on directed-QSO golden
 entries.
 
 Issue [#190](https://github.com/jl1nie/mfsk-core/issues/190) closed.
+
+## 12. Pre-0.11.0 tier-C re-measurement — the section-9 figures are stale by up to 1.1 dB (2026-09-20)
+
+Sections 9 and 10 record what the sweep said on 2026-07-26 and are
+correct as of that date. They are no longer the current numbers. The
+tier-C run before the 0.11.0 tag, on the same corpus and seeds
+(`scripts/run-sensitivity-sweeps.sh ft8`, 180 trials per channel):
+
+| Channel | 2026-07-26 (§9) | 2026-09-20 | Δ |
+|---|---|---|---|
+| AWGN | ≈ −21.4 dB | **−21.60 dB** | −0.2 dB |
+| CCIR good | ≈ −20.8 dB | **−21.11 dB** | −0.3 dB |
+| CCIR moderate | ≈ −18.9 dB | **−20.00 dB** | **−1.1 dB** |
+| CCIR poor | ≈ −19.0 dB | **−19.67 dB** | −0.7 dB |
+
+Every delta is in the more-sensitive direction, and CCIR moderate is
+the one worth naming: 1.1 dB is far outside the ~0.5 dB single-run
+noise §9 itself warns about.
+
+**No single commit did this, and this pass did not measure which
+ones.** Between the two dates the coarse-sync lag window was widened
+to ±2.5 s and `PASS1_LIMIT` identified as the real constraint
+(issue #280), `fine_sync_12k` landed, and the FT4/FST4 a-priori fix
+went in — the last of which is documented as worth 1.1 dB on FT4's own
+AWGN curve, so a fading-channel gain of the same order on FT8 is not
+surprising. Attributing it properly needs a bisect over the sweep,
+which is a measurement campaign rather than a release check.
+
+`docs/notes/sweep-baseline.json` is the machine-checked copy of these
+four numbers and was refreshed in the same run; `BENCHMARKS.md`'s FT8
+summary row already carried ≈ −21.6 dB and gained the three fading
+channels.
+
+**`FT8_BENCHMARK.ja.md` is not in step and was not updated here.** It
+stops at §6 (2026-07-18), so §7 through §11 were already untranslated
+before this section existed; adding a Japanese §12 on its own would
+put the newest numbers after a four-section hole rather than at the
+end of a story. Translating the backlog is its own piece of work.
