@@ -357,15 +357,30 @@ That makes it a judgement call rather than a port, and judgement calls
 belong to the caller. Two builder methods adjust it:
 
 ```rust
+use mfsk_core::ft8::Ft8;
+use mfsk_core::msg::decode_request::DecodeRequest;
+
+/// Whatever the deployment knows and the ITU allowlist does not.
+fn is_special_event_call(token: &str) -> bool {
+    token.starts_with("8J")
+}
+
+let audio = vec![0i16; 180_000]; // 15 s @ 12 kHz
+
 // The default filter, plus callsigns it does not know about.
-DecodeRequest::<Ft8>::new(&audio, 200.0, 3000.0, 1.5, 200)
+let widened = DecodeRequest::<Ft8>::new(&audio, 200.0, 3000.0, 1.5, 20)
     .also_accept(|text| text.split_whitespace().all(is_special_event_call))
     .decode();
 
 // No opinion at all — every CRC-passing string, phantoms included.
-DecodeRequest::<Ft8>::new(&audio, 200.0, 3000.0, 1.5, 200)
+let unfiltered = DecodeRequest::<Ft8>::new(&audio, 200.0, 3000.0, 1.5, 20)
     .message_filter(|_| true)
     .decode();
+
+// Silence carries neither real signals nor CRC survivors, so even the
+// filterless run comes back empty.
+assert!(widened.results.is_empty());
+assert!(unfiltered.results.is_empty());
 ```
 
 `.also_accept(f)` can only widen: it cannot lose a decode the default

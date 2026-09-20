@@ -382,15 +382,29 @@ JT9 の多段 AGC/IFFT/コヒーレント加算パイプラインは単純な帯
 2つのビルダーメソッドがこれを調整する:
 
 ```rust
+use mfsk_core::ft8::Ft8;
+use mfsk_core::msg::decode_request::DecodeRequest;
+
+/// 配備先が知っていて ITU 許可リストが知らないもの。
+fn is_special_event_call(token: &str) -> bool {
+    token.starts_with("8J")
+}
+
+let audio = vec![0i16; 180_000]; // 15 s @ 12 kHz
+
 // 既定のフィルタ ＋ それが知らないコールサイン。
-DecodeRequest::<Ft8>::new(&audio, 200.0, 3000.0, 1.5, 200)
+let widened = DecodeRequest::<Ft8>::new(&audio, 200.0, 3000.0, 1.5, 20)
     .also_accept(|text| text.split_whitespace().all(is_special_event_call))
     .decode();
 
 // 一切の判断をしない — CRC を通った文字列は全部、ファントム込みで。
-DecodeRequest::<Ft8>::new(&audio, 200.0, 3000.0, 1.5, 200)
+let unfiltered = DecodeRequest::<Ft8>::new(&audio, 200.0, 3000.0, 1.5, 20)
     .message_filter(|_| true)
     .decode();
+
+// 無音には実信号も CRC 生存者も無いので、フィルタ無しの方も空で返る。
+assert!(widened.results.is_empty());
+assert!(unfiltered.results.is_empty());
 ```
 
 `.also_accept(f)` は広げることしかできない — 既定が拾えたデコードを失うことは
