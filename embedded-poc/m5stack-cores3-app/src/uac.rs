@@ -1350,6 +1350,27 @@ extern "C" fn driver_event_cb(
         }
     };
     DRIVER_EVENTS.fetch_add(1, Ordering::Relaxed);
+    // **Latch it, because the log line may never arrive.**
+    //
+    // Enumeration happens inside `start_host`, which runs as soon as
+    // the UDP sink object exists — and on 2026-09-20 that was 33 s
+    // before WiFi finished associating, so every line between the two
+    // was written and dropped. The resulting log showed no
+    // `TxConnected` and no `RxConnected` while the receiver was plainly
+    // decoding, which says nothing about the radio and everything
+    // about the path the evidence took.
+    //
+    // A counter survives that. `usb_host_lib_info`'s periodic line
+    // reports it, so "did the OUT interface ever appear" is answerable
+    // from any later point in the log.
+    match driver_event {
+        DriverEvent::RxConnected { iface_num, .. } => {
+            RX_IFACE_SEEN.store(iface_num as i32, Ordering::Relaxed);
+        }
+        DriverEvent::TxConnected { iface_num, .. } => {
+            TX_IFACE_SEEN.store(iface_num as i32, Ordering::Relaxed);
+        }
+    }
     log::info!("uac: driver event {driver_event:?}");
     if let Some(sender) = EVENT_SENDER.get() {
         if let Err(e) = sender.send(driver_event) {
@@ -2305,10 +2326,29 @@ fn spawn_device_count_probe() {
                 // ログパネルは数行しか出ないので、変化時だけだと
                 // 起動直後の 1 行が流れて消えて読めない。
                 if info.num_devices != last || since_log >= 5 {
+                    // The latched interface numbers ride along: they
+                    // answer "did an audio IN / OUT interface ever
+                    // appear" from any point in the log, which the
+                    // one-shot enumeration lines cannot when the
+                    // network that carries them is not up yet.
+                    let (rx, tx) = (
+                        RX_IFACE_SEEN.load(Ordering::Relaxed),
+                        TX_IFACE_SEEN.load(Ordering::Relaxed),
+                    );
+                    let fmt = |v: i32| {
+                        if v < 0 {
+                            String::from("never")
+                        } else {
+                            format!("iface {v}")
+                        }
+                    };
                     log::info!(
-                        "uac: usb_host_lib_info — num_devices={} num_clients={}",
+                        "uac: usb_host_lib_info — num_devices={} num_clients={} | audio IN {} \
+                         | audio OUT {}",
                         info.num_devices,
-                        info.num_clients
+                        info.num_clients,
+                        fmt(rx),
+                        fmt(tx),
                     );
                     last = info.num_devices;
                     since_log = 0;
@@ -2329,6 +2369,17 @@ static DEVICE_COUNT: AtomicI32 = AtomicI32::new(-1);
 static CLIENT_COUNT: AtomicI32 = AtomicI32::new(-1);
 /// クラスドライバのイベント通知回数。0 のままなら UAC ドライバは
 /// 一度も呼ばれていない。
+/// Interface number of the last `RxConnected` / `TxConnected` the
+/// driver raised, or `-1` if it never has. See the latch in
+/// `driver_event_cb`: the enumeration log can be written before the
+/// network that carries it exists, and a missing line then reads as a
+/// missing interface.
+static RX_IFACE_SEEN: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+/// See [`RX_IFACE_SEEN`]. **`-1` here is the answer to "does the
+/// IC-705 offer a USB audio OUT interface at all"**, which nothing has
+/// established yet.
+static TX_IFACE_SEEN: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+
 static DRIVER_EVENTS: AtomicU32 = AtomicU32::new(0);
 /// 直近のエラーコード (0 = なし)。
 static LAST_ERR: AtomicU32 = AtomicU32::new(0);
