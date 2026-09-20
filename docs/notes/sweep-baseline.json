@@ -4,22 +4,22 @@
     "note": "Provenance for the 50%-recall crossing SNRs below. Written and read by scripts/sweep-regression-check.py; scripts/release-status.sh uses each protocol's own date to decide what a release actually needs re-swept. Entries stamped c757d32 were seeded before this block existed and carry no trial count \u2014 the CSVs were not kept. Every later entry is written by --update-baseline from the run itself.",
     "protocols": {
       "fst4": {
-        "date": "2026-09-13",
-        "commit": "ee4ae2cb",
+        "date": "2026-09-20",
+        "commit": "8585dbb2",
         "machine": "AMD Ryzen 9 9900X 12-Core Processor",
         "trials": 4880,
         "groups": 20
       },
       "ft4": {
-        "date": "2026-09-14",
-        "commit": "0e925be5",
+        "date": "2026-09-20",
+        "commit": "8585dbb2",
         "machine": "AMD Ryzen 9 9900X 12-Core Processor",
         "trials": 720,
         "groups": 4
       },
       "ft8": {
-        "date": "2026-09-14",
-        "commit": "0e925be5",
+        "date": "2026-09-20",
+        "commit": "8585dbb2",
         "machine": "AMD Ryzen 9 9900X 12-Core Processor",
         "trials": 720,
         "groups": 4
