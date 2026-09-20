@@ -42,7 +42,14 @@ pub fn coarse_sync(
     max_cand: usize,
 ) -> Vec<SyncCandidate> {
     coarse_sync_inner(
-        spec, freq_min, freq_max, sync_min, max_cand, None, None, None,
+        spec,
+        freq_min,
+        freq_max,
+        sync_min,
+        max_cand,
+        None,
+        None,
+        PartialBlock2::Score,
     )
 }
 
@@ -81,7 +88,7 @@ pub fn coarse_sync_with_lag(
         max_cand,
         None,
         Some(sync_lag_s),
-        None,
+        PartialBlock2::Score,
     )
 }
 
@@ -117,7 +124,7 @@ pub fn coarse_sync_with_allsum(
         max_cand,
         Some(allsum),
         None,
-        None,
+        PartialBlock2::Score,
     )
 }
 
@@ -144,7 +151,7 @@ pub fn coarse_sync_with_allsum_and_lag(
         max_cand,
         Some(allsum),
         Some(sync_lag_s),
-        None,
+        PartialBlock2::Score,
     )
 }
 
@@ -171,6 +178,78 @@ pub fn coarse_sync_with_allsum_and_lag(
 /// `coarse_sync_inner` for why that is a divergence from WSJT-X and
 /// why it is opt-in; whole-slot callers use
 /// [`coarse_sync_with_allsum_and_lag`] and are unaffected.
+/// What to do with a lag whose Costas block 2 is not fully covered by
+/// the spectrogram's real rows.
+///
+/// A streaming producer emits its bundle before the slot ends, so its
+/// tail rows are present and zero. Those rows add nothing to either
+/// sum, so the score is not *wrong* — `ft8_coarse_partial_blocks`
+/// measures a zeroed tail as bit-identical to the same symbols
+/// skipped — it is simply computed over fewer Costas symbols.
+///
+/// **How much fewer, in the shipped configuration: one.** Under
+/// `fixed-point` `NSSY = NSPS / NSTEP = 2`, so block 2 runs from
+/// `jstrt + 2*72 = 150` to `162`, the real rows end at 173, and the
+/// widest lag the ±1.0 s search reaches is 13 — which leaves
+/// `(173 - 163) / 2 + 1 = 6` of 7 symbols. That bounds every
+/// "the score is noisier" argument about this population at
+/// `sqrt(20/21)`, i.e. 2 %.
+///
+/// A third variant that shrank a partial score toward the noise floor
+/// by exactly that factor was written and measured on 2026-09-20
+/// (`mirror_partial_block2_policies`, three recordings, fixed-point):
+/// it moved 8 of 77 candidates out of a 30-deep pass-1 list, 2 of 31
+/// out of the refined top-15, and **changed no decode count on any
+/// fixture at any phase**. It was removed rather than shipped. If this
+/// population needs handling, the handle is not its score.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartialBlock2 {
+    /// Score it and take the result — what WSJT-X does (`sync8.f90`
+    /// guards the read and skips the symbol). Correct for a whole-slot
+    /// caller, whose spectrogram ends where its slot does, and the
+    /// shipping behaviour of the streaming path too.
+    Score,
+    /// Refuse to score the lag at all.
+    ///
+    /// **One-sided**, and that is not a choice — negative lag moves
+    /// block 2 *earlier*, where it is always fully covered, so nothing
+    /// below `-0.88 s` is ever gated. An earlier version of this doc
+    /// claimed the gate costs the 0.26-1.35 % of on-air decodes seen
+    /// below `-0.88 s`; it cannot, and the measurement below confirms
+    /// the gated arm keeps every distinct message at aligned phases.
+    ///
+    /// **A no-op at the shipped window, and kept anyway** (decided
+    /// 2026-09-20). Since `decode_pipeline` searches exactly the
+    /// coverage ceiling, no lag it visits truncates block 2 and this
+    /// never fires. It stays because the alternative to narrowing the
+    /// window — emitting earlier and gating instead of searching
+    /// narrower — is a real experiment, and deleting the gate would
+    /// close it. Do not remove it as dead code without that decision
+    /// being revisited.
+    ///
+    /// What it does cost is real stations **above** `+0.88 s`, which
+    /// exist whenever the recording's own alignment puts them there.
+    /// Measured at grid-locked phases (±0.10 s, fixed-point,
+    /// `mirror_partial_block2_policies`): `qso3_busy` 137 → 140
+    /// decodes, `qso1` 49 → 36 and one distinct station lost, `qso2`
+    /// 45 → 34. **Do not turn this on from one fixture.**
+    Gate {
+        /// How many leading time rows hold a real spectrum.
+        valid_rows: usize,
+    },
+}
+
+/// [`coarse_sync_with_allsum_and_lag`] for a spectrogram only part of
+/// which is filled, **scoring only the lags that still have all three
+/// Costas blocks** — i.e. [`PartialBlock2::Gate`], whose doc carries
+/// what that costs and what it does not.
+///
+/// `valid_rows` is how many leading time rows hold a spectrum. A
+/// streaming producer emits its bundle before the slot ends and must
+/// still declare the full `n_time`, because that is what sets the
+/// allsum's stride ([`coarse_allsum_len`]) — so its tail rows are
+/// present and zero, and block 2's trailing symbols reach into them at
+/// large positive lag.
 pub fn coarse_sync_with_allsum_lag_and_rows(
     spec: &Spectrogram,
     freq_min: f32,
@@ -189,7 +268,64 @@ pub fn coarse_sync_with_allsum_lag_and_rows(
         max_cand,
         Some(allsum),
         Some(sync_lag_s),
-        Some(valid_rows),
+        PartialBlock2::Gate { valid_rows },
+    )
+}
+
+/// [`coarse_sync_with_lag`] with the incomplete-block-2 policy chosen
+/// by the caller, building its own allsum.
+///
+/// The allsum is a precompute and does not change any score, so this
+/// and [`coarse_sync_with_allsum_lag_and_partial`] rank identically —
+/// which is what lets a host harness compare policies without also
+/// reproducing the board's allsum plumbing.
+pub fn coarse_sync_with_lag_and_partial(
+    spec: &Spectrogram,
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    max_cand: usize,
+    sync_lag_s: f32,
+    partial: PartialBlock2,
+) -> Vec<SyncCandidate> {
+    coarse_sync_inner(
+        spec,
+        freq_min,
+        freq_max,
+        sync_min,
+        max_cand,
+        None,
+        Some(sync_lag_s),
+        partial,
+    )
+}
+
+/// [`coarse_sync_with_allsum_lag_and_rows`] with the policy chosen by
+/// the caller rather than fixed at [`PartialBlock2::Gate`].
+///
+/// Exists so the two treatments of an incomplete block 2 can be
+/// measured against each other on the same slot. See
+/// [`PartialBlock2`]; a whole-slot caller wants
+/// [`coarse_sync_with_allsum_and_lag`] and none of this.
+pub fn coarse_sync_with_allsum_lag_and_partial(
+    spec: &Spectrogram,
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    max_cand: usize,
+    allsum: &[CoarseAcc],
+    sync_lag_s: f32,
+    partial: PartialBlock2,
+) -> Vec<SyncCandidate> {
+    coarse_sync_inner(
+        spec,
+        freq_min,
+        freq_max,
+        sync_min,
+        max_cand,
+        Some(allsum),
+        Some(sync_lag_s),
+        partial,
     )
 }
 
@@ -354,7 +490,7 @@ fn coarse_sync_inner(
     max_cand: usize,
     external_allsum: Option<&[CoarseAcc]>,
     sync_lag_override_s: Option<f32>,
-    valid_rows: Option<usize>,
+    partial: PartialBlock2,
 ) -> Vec<SyncCandidate> {
     let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
     let tstep = NSTEP as f32 / SAMPLE_RATE_HZ;
@@ -578,9 +714,17 @@ fn coarse_sync_inner(
             // its fill point and pays for the divergence. Upstream
             // never needs it, because upstream's spectrogram ends
             // where its slot ends.
-            if valid_rows.is_some_and(|v| {
-                valid_trailing_symbol_count(m_base[2][0], lag, v.min(n_time)) < COSTAS.len()
-            }) {
+            // Costas symbols block 2 actually carries: its trailing
+            // ones go at positive lag or past the fill point. Block 1
+            // is always whole and block 0 loses only leading symbols
+            // at negative lag, which `sync_tail` does not see.
+            let n_cov2 = match partial {
+                PartialBlock2::Score => bk2_n_end,
+                PartialBlock2::Gate { valid_rows } => {
+                    valid_trailing_symbol_count(m_base[2][0], lag, valid_rows.min(n_time))
+                }
+            };
+            if matches!(partial, PartialBlock2::Gate { .. }) && n_cov2 < COSTAS.len() {
                 sync2d[idx(fi, lag)] = f32::NEG_INFINITY;
                 continue;
             }
@@ -819,7 +963,8 @@ fn valid_trailing_symbol_count(base_step: i32, lag: i32, n_time: usize) -> usize
 mod tests {
     use super::super::super::params::{COSTAS, COSTAS_POS};
     use super::{
-        NSSY, Spectrogram, bounded_sync_lag_steps, coarse_sync_inner, valid_trailing_symbol_count,
+        NSSY, PartialBlock2, Spectrogram, bounded_sync_lag_steps, coarse_sync_inner,
+        valid_trailing_symbol_count,
     };
 
     /// Time rows in a standard 15 s FT8 spectrogram, on whichever grid
@@ -842,7 +987,16 @@ mod tests {
         let spec =
             Spectrogram::from_parts(n_freq, N_TIME, vec![Default::default(); n_freq * N_TIME]);
 
-        let candidates = coarse_sync_inner(&spec, 200.0, 300.0, 1.5, 10, None, Some(2.5), None);
+        let candidates = coarse_sync_inner(
+            &spec,
+            200.0,
+            300.0,
+            1.5,
+            10,
+            None,
+            Some(2.5),
+            PartialBlock2::Score,
+        );
 
         assert!(candidates.is_empty());
     }

@@ -52,9 +52,9 @@ use mfsk_core::engine::scalar::Cmplx;
 use mfsk_core::engine::sync::SyncCandidate;
 use mfsk_core::ft8::decode::{DecodeDepth, DecodeResult};
 use mfsk_core::ft8::decode_block::{
-    DEFAULT_Q_THRESH, RefinedCandidate, SpecCell, coarse_sync_with_lag, compute_spectrogram,
-    goertzel_window_end_sample, process_candidates_into_with_cs_scratch_tuned,
-    refine_candidates_into,
+    DEFAULT_Q_THRESH, PartialBlock2, RefinedCandidate, SpecCell, coarse_sync_with_lag,
+    coarse_sync_with_lag_and_partial, compute_spectrogram, goertzel_window_end_sample,
+    process_candidates_into_with_cs_scratch_tuned, refine_candidates_into,
 };
 use mfsk_core::ft8::params::DEFAULT_BP_MAX_ITER;
 use mfsk_core::msg::wsjt77::unpack77;
@@ -111,7 +111,14 @@ fn max_cand() -> usize {
 /// large-lag half of block 2 would have used zero, which is a
 /// measurement, not a guess — that is what this axis is for.
 const SHIP_EMIT_PAIR: usize = 87;
-const SHIP_SYNC_LAG_S: f32 = 1.0;
+/// What `decode_pipeline` passes to `dual_core::set_sync_lag_s`.
+///
+/// **0.88 since 2026-09-20**, swept here — see
+/// `mirror_partial_block2_policies`. It was 1.0, which `jz = round(lag
+/// / 0.08)` turned into 13 rows, i.e. ±1.04 s; the sweep's `±1.04` arm
+/// still reproduces that count exactly. 0.88 is 11 rows, the widest
+/// lag whose block 2 still lands inside the rows pair 87 fills.
+const SHIP_SYNC_LAG_S: f32 = 0.88;
 /// `SpecBundle`'s audio prefix at the shipping emit point: "always >=
 /// 168 000 samples".
 const SHIP_PREFIX_SAMPLES: usize = 168_000;
@@ -482,8 +489,79 @@ fn coarse_fallback_enabled() -> bool {
     std::env::var("MFSK_MIRROR_COARSE_FALLBACK").is_ok()
 }
 
+/// What this run does with a lag whose Costas block 2 is not covered
+/// by the rows `spec_valid_rows()` leaves real.
+///
+/// `MFSK_MIRROR_PARTIAL=score|gate`; `score` is the shipping
+/// board's behaviour and the default, so every other test in this file
+/// keeps measuring what ships.
+fn partial_policy() -> PartialBlock2 {
+    match std::env::var("MFSK_MIRROR_PARTIAL").as_deref() {
+        Ok("gate") => PartialBlock2::Gate {
+            valid_rows: spec_valid_rows(),
+        },
+        _ => PartialBlock2::Score,
+    }
+}
+
+/// The `|dt|` past which block 2 is not fully covered, in seconds —
+/// `stage1_inc::max_lag_s` re-derived here so the mirror does not
+/// depend on the embedded crate.
+fn partial_ceiling_s() -> f32 {
+    // Block 2's last Costas symbol sits at row 162; a lag of `j` rows
+    // moves it to `162 + j`, and rows `0 ..= spec_valid_rows() - 1`
+    // are real, so it is covered while `162 + j <= valid - 1`.
+    let j = spec_valid_rows() as i32 - 163;
+    if j <= 0 {
+        0.0
+    } else {
+        j as f32 * (NSTEP_SAMPLES as f32 / 12_000.0)
+    }
+}
+
 /// `dual_core::coarse_sync_split_with_allsum`, sequential.
 fn coarse_split(spec: &mfsk_core::ft8::decode_block::Spectrogram) -> Vec<SyncCandidate> {
+    coarse_split_with(spec, partial_policy())
+}
+
+/// [`coarse_split`] with the policy named outright, for the comparison
+/// that has to run all three in one process.
+fn coarse_split_with(
+    spec: &mfsk_core::ft8::decode_block::Spectrogram,
+    partial: PartialBlock2,
+) -> Vec<SyncCandidate> {
+    if partial == PartialBlock2::Score {
+        return coarse_split_score(spec);
+    }
+    let mid = 0.5 * (FREQ_MIN + FREQ_MAX);
+    let mut all = coarse_sync_with_lag_and_partial(
+        spec,
+        FREQ_MIN,
+        mid,
+        SYNC_MIN,
+        pass1_limit(),
+        sync_lag_s(),
+        partial,
+    );
+    all.extend(coarse_sync_with_lag_and_partial(
+        spec,
+        mid,
+        FREQ_MAX,
+        SYNC_MIN,
+        pass1_limit(),
+        sync_lag_s(),
+        partial,
+    ));
+    all.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
+    all.truncate(pass1_limit());
+    all
+}
+
+fn coarse_split_score(spec: &mfsk_core::ft8::decode_block::Spectrogram) -> Vec<SyncCandidate> {
     let mid = 0.5 * (FREQ_MIN + FREQ_MAX);
     let mut all = coarse_sync_with_lag(spec, FREQ_MIN, mid, SYNC_MIN, pass1_limit(), sync_lag_s());
     all.extend(coarse_sync_with_lag(
@@ -738,6 +816,10 @@ fn stage3(audio: &[i16], cands: Vec<RefinedCandidate>) -> Vec<DecodeResult> {
 
 /// `dual_core::run_speculative_slot`, one slot.
 fn run_slot(slot: &[i16]) -> SlotOut {
+    run_slot_with(slot, partial_policy())
+}
+
+fn run_slot_with(slot: &[i16], partial: PartialBlock2) -> SlotOut {
     assert_eq!(slot.len(), SLOT);
     COARSE_DT.with(|m| m.borrow_mut().clear());
     PENDING_FB.with(|p| p.borrow_mut().clear());
@@ -749,7 +831,7 @@ fn run_slot(slot: &[i16]) -> SlotOut {
         }
     }
 
-    let mut pass1 = coarse_split(&spec);
+    let mut pass1 = coarse_split_with(&spec, partial);
     if apply_12k_refine(&slot[..prefix_samples()], &mut pass1) {
     } else if fine_refine_enabled() {
         pass1 = fine_refine(fine_refine_audio(slot), pass1);
@@ -831,10 +913,14 @@ fn run_slot(slot: &[i16]) -> SlotOut {
 }
 
 fn at_phase(slot: &[i16], phi_s: f32) -> SlotOut {
+    at_phase_with(slot, phi_s, partial_policy())
+}
+
+fn at_phase_with(slot: &[i16], phi_s: f32, partial: PartialBlock2) -> SlotOut {
     let k = ((phi_s * 12_000.0).round() as i64).rem_euclid(SLOT as i64) as usize;
     let mut rotated = slot.to_vec();
     rotated.rotate_left(k);
-    run_slot(&rotated)
+    run_slot_with(&rotated, partial)
 }
 
 /// `MFSK_MIRROR_WAV=<file under embedded-poc/assets/>` swaps the
@@ -2691,4 +2777,133 @@ fn how_much_of_the_refine_budget_is_the_same_carrier_twice() {
         "  At ~72 ms a candidate on the board, that is {:.0} ms a slot spent on a second\n           look at a station already being refined.",
         72.0 * dup as f32 / phases.len() as f32
     );
+}
+
+/// The three treatments of an incomplete Costas block 2, on the same
+/// slot at the same phases.
+///
+/// Measured on a radio (CoreS3, 40 m, 2026-09-20) a partial-coverage
+/// candidate outranked real stations on most slots and was rank 0 or 1
+/// on several, so the shipping `Score` spends refined slots on a
+/// population that cannot decode. `Gate` removes it and takes the real
+/// signals below `-0.88 s` with it; `Shrink` ranks it fairly instead.
+/// This is the host measurement that decides between them.
+///
+/// ```sh
+/// cargo test -p mfsk-core --release --no-default-features \
+///     --features alloc,ft8,fft-extern,fixed-point,internal-testing \
+///     --test ft8_embedded_pipeline_mirror \
+///     -- --ignored --nocapture mirror_partial_block2_policies
+/// ```
+#[test]
+#[ignore = "diagnostic — incomplete-block-2 policy comparison"]
+fn mirror_partial_block2_policies() {
+    let slot = load_slot();
+    let (lo, hi, dphi) = match std::env::var("MFSK_GRID_PHASE") {
+        Ok(v) => {
+            let f: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            assert_eq!(f.len(), 3, "MFSK_GRID_PHASE wants start,end,step");
+            (f[0], f[1], f[2])
+        }
+        Err(_) => (-0.40, 0.40, 0.01),
+    };
+    let ceiling = partial_ceiling_s();
+    println!(
+        "  emit_pair={} valid_rows={} ceiling=±{ceiling:.2}s search=±{:.2}s",
+        emit_pair(),
+        spec_valid_rows(),
+        sync_lag_s(),
+    );
+
+    // **`Gate` and an asymmetric window are the same experiment.**
+    // The gate admits `lag <= 11` — `(173 - 150 - lag) / 2 + 1 >= 7` —
+    // which is `dt <= +0.88 s` exactly, and it never touches negative
+    // lag. So the `gate` arm below *is* `-1.00 .. +0.88`, computed the
+    // expensive way (score the lag, then discard it) rather than by
+    // not visiting it. The arm that is genuinely different is the
+    // symmetric narrowing, which also gives up `-1.04 .. -0.88`.
+    let ship = SHIP_SYNC_LAG_S;
+    let gate = PartialBlock2::Gate {
+        valid_rows: spec_valid_rows(),
+    };
+    // The window is quantised to whole rows (`jz = round(lag / 0.08)`),
+    // so these four are every distinct search width between 0.80 and
+    // the shipped 1.00 — asking for 0.84 gets 0.88's grid.
+    let arms: [(&str, PartialBlock2, f32); 6] = [
+        ("score +-0.80", PartialBlock2::Score, 0.80),
+        ("score +-0.88", PartialBlock2::Score, 0.88),
+        ("score +-0.96", PartialBlock2::Score, 0.96),
+        ("score +-1.04", PartialBlock2::Score, 1.04),
+        ("score ship  ", PartialBlock2::Score, ship),
+        ("gate  ship  ", gate, ship),
+    ];
+
+    // Per arm: total decodes over the sweep, the distinct messages it
+    // ever found, and how many pass-1 candidates sat past the ceiling.
+    println!(
+        "  arm           lags  phases  dec_total  dec_best  distinct_msgs  partial_p1  \
+         partial_top15"
+    );
+    for (name, partial, lag) in arms {
+        SYNC_LAG_OVERRIDE.with(|c| c.set(Some(lag)));
+        // Lag steps actually visited, as a stand-in for coarse cost:
+        // the loop is `-jz..=jz` and `jz` is the window in rows.
+        let n_lags = 2 * (lag / (NSTEP_SAMPLES as f32 / 12_000.0)).round() as i32 + 1;
+        let (mut total, mut best, mut n_partial, mut n_partial_top) =
+            (0usize, 0usize, 0usize, 0usize);
+        let mut msgs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut phases = 0usize;
+        let mut step = 0i32;
+        while lo + step as f32 * dphi <= hi + 1e-6 {
+            let phi = lo + step as f32 * dphi;
+            let out = at_phase_with(&slot, phi, partial);
+            total += out.results.len();
+            best = best.max(out.results.len());
+            for r in &out.results {
+                if let Some(m) = unpack77(r.message77()) {
+                    msgs.insert(m);
+                }
+            }
+            // Pass 1 again, purely to count the population. Cheap
+            // against the decode it sits beside, and it keeps the
+            // count honest: it is the same ranking `run_slot_with`
+            // just used.
+            let k = ((phi * 12_000.0).round() as i64).rem_euclid(SLOT as i64) as usize;
+            let mut rotated = slot.to_vec();
+            rotated.rotate_left(k);
+            let mut spec = compute_spectrogram(&rotated, FREQ_MAX);
+            for t in spec_valid_rows()..spec.n_time {
+                let row = t * spec.n_freq;
+                for cell in &mut spec.data[row..row + spec.n_freq] {
+                    *cell = SpecCell::default();
+                }
+            }
+            let p1 = coarse_split_with(&spec, partial);
+            for (rank, c) in p1.iter().enumerate() {
+                // **Positive lag only.** Negative lag moves block 2
+                // earlier, where it is always fully covered; what a
+                // negative lag truncates is block 0, and block 0 is
+                // absent from `sync_tail` anyway, so the `max()` of
+                // the two is untouched. Counting `|dt|` overstates
+                // this population — it was counted that way on the
+                // board on 2026-09-20 and the gate arm then appeared
+                // to leave candidates behind that it had in fact
+                // removed.
+                if c.dt_sec > ceiling {
+                    n_partial += 1;
+                    if rank < max_cand() {
+                        n_partial_top += 1;
+                    }
+                }
+            }
+            phases += 1;
+            step += 1;
+        }
+        println!(
+            "  {name}  {n_lags:4}  {phases:6}  {total:9}  {best:8}  {:13}  {n_partial:10}  \
+             {n_partial_top:13}",
+            msgs.len(),
+        );
+    }
+    SYNC_LAG_OVERRIDE.with(|c| c.set(None));
 }
