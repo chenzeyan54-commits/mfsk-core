@@ -62,6 +62,29 @@ not switch roles — the decision was made at boot.
 In host mode the USB-Serial-JTAG device is gone, so the board cannot be
 flashed and has no serial console. WiFi is the only channel; see §6.
 
+**For a bare CoreS3, the battery is the session length — and the fix
+is a powered base, not a shorter session.** The rule above only says
+the USB-C port must not have VBUS on it. Power arriving anywhere
+*else* is invisible to that decision, so a base feeding the bottom
+connector — a DIN Base, for instance — leaves the board in host mode
+and running indefinitely. That is the setup for anything unattended.
+
+On battery alone the limit is real, because in host mode the board is
+*sourcing* 5 V to the radio rather than drawing any. One measured
+session (2026-09-21, IC-705 on 40 m, WiFi associated, FT8 decoding
+every slot, starting at `bat=3714mV`) ran **40 minutes, 160 slots**,
+then stopped mid-log with no warning and no error. The line before the
+cut showed free internal DRAM unchanged and a normal 7-decode slot:
+the battery, not a fault. 3714 mV is a partly-charged cell — a full
+pack reads about 4200 mV and lasts longer by an amount nobody has
+measured.
+
+One more thing that cost time when it happened: **a board that goes
+quiet is not necessarily broken.** Its own `coredump:` line on the
+next boot separates the cases — `none stored — last boot was clean`
+after a power cutoff, a stored dump after a crash. Read that before
+investigating anything else.
+
 ### On-board devices this firmware uses
 
 | Device | Address | Used for |
