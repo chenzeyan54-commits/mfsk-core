@@ -12,7 +12,6 @@ use core::fmt::Write as _;
 use mfsk_core::ft8::decode::DecodeDepth;
 use mfsk_core::ft8::decode_block::{DEFAULT_Q_THRESH, NFFT_SPEC};
 
-
 use embedded_shared::{dual_core, esp_dsp_fft, pipeline, stage1_inc, wav_sim};
 use esp_idf_svc::sys::QueueHandle_t;
 
@@ -344,6 +343,67 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
     .expect("spawn wf drainer");
 
     log::info!("decode pipeline ready (q_thresh={DEFAULT_Q_THRESH}, band 200..3000 Hz, cores3-app phase 0)");
+
+    // **What the transmit side costs, measured before it exists.**
+    //
+    // The reply deadline is the slot boundary, not `slot end + 0.5 s`
+    // (`dual_core::FT8_KEY_UP_AFTER_SLOT_END_US`), and the chain
+    // between "the decoder is done" and "audio is on the air" — pick
+    // the message, `pack77`, PTT, the rig's settle, synthesise
+    // 151 680 samples — is in no budget anywhere. On this board
+    // `post_slotend` runs median 332 ms and p90 479 ms against a 500 ms
+    // bound, so the size of that chain decides whether the decoder has
+    // to give time back once TX lands.
+    //
+    // Pure compute: no PTT, no audio interface, nothing reaches the
+    // radio. `MFSK_CORES3_TX_SYNTH_BENCH=1` at build time.
+    if option_env!("MFSK_CORES3_TX_SYNTH_BENCH").is_some() {
+        use mfsk_core::ft8::wave_gen::{message_to_tones, tones_to_i16_into};
+        // 79 symbols x 1920 samples at 12 kHz — the 12.64 s frame.
+        const TX_SAMPLES_12K: usize = 79 * 1920;
+        let t_pack0 = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+        let packed = mfsk_core::msg::wsjt77::pack77("CQ", MY_CALL, MY_GRID);
+        let t_pack1 = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+        match packed {
+            None => log::warn!("tx-synth bench: pack77 failed for CQ {MY_CALL} {MY_GRID}"),
+            Some(msg77) => {
+                // Five runs: the first carries the 303 KB allocation
+                // the TX scheduler would also pay, the rest do not, and
+                // the difference is the part a preallocated buffer
+                // could remove.
+                let mut first = 0i64;
+                let mut best = i64::MAX;
+                let mut buf: alloc::vec::Vec<i16> = alloc::vec::Vec::new();
+                for run in 0..5 {
+                    let t0 = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+                    if run == 0 {
+                        buf = alloc::vec![0i16; TX_SAMPLES_12K];
+                    }
+                    let tones = message_to_tones(&msg77);
+                    tones_to_i16_into(&mut buf, &tones, 1_500.0, 20_000);
+                    let dt = unsafe { esp_idf_svc::sys::esp_timer_get_time() } - t0;
+                    if run == 0 {
+                        first = dt;
+                    } else {
+                        best = best.min(dt);
+                    }
+                }
+                log::warn!(
+                    "tx-synth bench: pack77 {} us | synth first (with 303 KB alloc) {} ms | \
+                     synth best (buffer reused) {} ms | {} samples",
+                    t_pack1 - t_pack0,
+                    first / 1_000,
+                    best / 1_000,
+                    TX_SAMPLES_12K
+                );
+                log::warn!(
+                    "tx-synth bench: WSJT-X puts TX audio at +0.5 s and PTT at the boundary; \
+                     the rig settle is ~100 ms (IC-705). Decoder must be done by \
+                     0.5 s - 0.1 s - synth."
+                );
+            }
+        }
+    }
 
     let mut qso = QsoManager::new(MY_CALL, MY_GRID);
     // **The callsign hash table, and the fact that it has to live
