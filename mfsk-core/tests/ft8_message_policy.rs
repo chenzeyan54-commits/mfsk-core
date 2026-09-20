@@ -67,35 +67,26 @@ fn rows(out: &mfsk_core::msg::decode_request::DecodeOutcome<Ft8>) -> Vec<String>
     v
 }
 
+/// FT8 applies its codec verdict by default, so naming it explicitly
+/// and widening it with a predicate that never fires must both be
+/// no-ops.
 #[test]
-fn the_default_policy_changes_nothing() {
+fn the_default_policy_is_the_codec_verdict() {
     let a = audio();
     let base = rows(&req(&a).decode());
     assert!(!base.is_empty(), "the reference recording must decode");
 
-    // `AlsoAccept` whose predicate never fires: the union with the
-    // codec's verdict is the codec's verdict.
+    let named = rows(&req(&a).codec_filter().decode());
+    assert_eq!(base, named, "codec_filter() must reproduce the default");
+
     let widened = rows(&req(&a).also_accept(|_| false).decode());
     assert_eq!(base, widened, "also_accept(|_| false) must be a no-op");
-
-    // Replacing the verdict with the verdict itself.
-    let replaced = rows(
-        &req(&a)
-            .message_filter(mfsk_core::msg::wsjt77::is_plausible_message)
-            .decode(),
-    );
-    assert_eq!(
-        base, replaced,
-        "message_filter(is_plausible_message) must reproduce the default"
-    );
 }
 
 #[test]
 fn also_accept_can_only_widen() {
     let a = audio();
     let base = rows(&req(&a).decode());
-    // A predicate that accepts everything: the union is everything the
-    // decoder found, so the default's rows must all still be there.
     let wide = rows(&req(&a).also_accept(|_| true).decode());
     for r in &base {
         assert!(
@@ -103,10 +94,7 @@ fn also_accept_can_only_widen() {
             "also_accept dropped a default decode: {r}"
         );
     }
-    assert!(
-        wide.len() >= base.len(),
-        "also_accept(|_| true) cannot shrink the result set"
-    );
+    assert!(wide.len() >= base.len());
 }
 
 #[test]
@@ -121,14 +109,13 @@ fn message_filter_replaces_the_verdict() {
         none.results.len()
     );
 
+    // Opting out entirely is how a caller gets WSJT-X's own acceptance
+    // rule (`nbadcrc` + `nharderrors <= 36`) with nothing on top.
     let all = rows(&req(&a).message_filter(|_| true).decode());
     for r in &base {
         assert!(all.contains(r), "message_filter(|_| true) lost {r}");
     }
-    assert!(
-        all.len() >= base.len(),
-        "removing the filter cannot shrink the result set"
-    );
+    assert!(all.len() >= base.len());
 }
 
 /// `.also_accept()` rebuilds the strategy function pointer for the new

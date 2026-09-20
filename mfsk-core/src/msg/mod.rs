@@ -61,7 +61,6 @@ pub use q65::Q65Message;
 pub use wspr::{Wspr50Message, WsprMessage};
 
 use alloc::format;
-use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::engine::{DecodeContext, MessageCodec, MessageFields};
@@ -75,7 +74,10 @@ use crate::engine::{DecodeContext, MessageCodec, MessageFields};
 pub struct Wsjt77Message;
 
 impl MessageCodec for Wsjt77Message {
-    type Unpacked = String;
+    /// The decoded *fields*, not the string they render to — see
+    /// [`wsjt77::Wsjt77Fields`]. `unpack77`/`unpack77_with_hash` are
+    /// still there for callers that only want the rendering.
+    type Unpacked = wsjt77::Wsjt77Fields;
     const PAYLOAD_BITS: u32 = 77;
     const CRC_BITS: u32 = 14;
 
@@ -115,9 +117,9 @@ impl MessageCodec for Wsjt77Message {
         if let Some(any) = ctx.callsign_hash_table.as_ref()
             && let Some(ht) = any.downcast_ref::<CallsignHashTable>()
         {
-            return wsjt77::unpack77_with_hash(&buf, ht);
+            return wsjt77::unpack77_fields(&buf, ht);
         }
-        wsjt77::unpack77(&buf)
+        wsjt77::unpack77_fields(&buf, &CallsignHashTable::new())
     }
 
     /// Wsjt77 reserves the trailing K-77 info bits for a CRC. Two
@@ -139,11 +141,11 @@ impl MessageCodec for Wsjt77Message {
         }
     }
 
-    /// [`wsjt77::is_plausible_message`] — the ITU-prefix callsign
-    /// allowlist plus the structural checks for the message types whose
-    /// exchange fields are not callsigns (ARRL Field Day, EU VHF
-    /// contest). See its own doc comment for what each part costs.
-    fn is_plausible(text: &str) -> bool {
-        wsjt77::is_plausible_message(text)
+    /// [`wsjt77::Wsjt77Fields::is_plausible`] — the ITU-prefix
+    /// allowlist over the callsign *fields*, with free text and
+    /// telemetry exempt (nothing in them to check) and the EU VHF
+    /// contest requiring a resolved hash (nothing else in it to check).
+    fn is_plausible(message: &Self::Unpacked) -> bool {
+        message.is_plausible()
     }
 }

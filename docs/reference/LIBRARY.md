@@ -338,41 +338,58 @@ JT9 decodes against each other, not against other protocols.
 
 Everything below this point in the stack is error *detection*: the
 LDPC parity check, then the CRC. Neither says anything about whether
-the string that comes out is a message someone sent. A CRC-14 false
-positive is a codeword the decoder converged on that is not the
-transmitted one, so its 77 information bits are effectively uniform —
-and with `max_cand = 200` × 4 LLR variants × OSD, 1/16384 produces one
-or two of them per FT8 slot. Better than half of those unpack to a
-syntactically valid message.
+what comes out is a message someone sent. A CRC-14 false positive is a
+codeword the decoder converged on that is not the transmitted one, so
+its 77 information bits are effectively uniform, and better than half
+of those unpack to a syntactically valid message.
 
-`MessageCodec::is_plausible` is what refuses them: for
-`Wsjt77Message`, an ITU prefix allowlist over the callsign tokens plus
-structural checks for the message types whose exchange fields are not
-callsigns. **It has no WSJT-X counterpart** — `ft8b.f90` gates on
-`nbadcrc` and `nharderrors` alone. It exists because this crate's
-default search is deeper than upstream's and reaches candidates
-upstream never scores.
+`MessageCodec::is_plausible` is what refuses them. **It has no WSJT-X
+counterpart** — `ft8b.f90` accepts on `nbadcrc` and
+`nharderrors <= 36`, and this crate's own ceiling is that same 36 — so
+it is a judgement call rather than a port, and the judgement belongs
+to whoever knows the band.
 
-That makes it a judgement call rather than a port, and judgement calls
-belong to the caller. Two builder methods adjust it:
+**It judges fields, not text.** `unpack` returns `Wsjt77Fields`, the
+decoded message as its fields, and the verdict reads the *callsign*
+fields. Asking anything of the rendered string instead means splitting
+it back into tokens and guessing which ones were callsigns: judging
+`JA1ABC 3Y0Z 6A EMA` that way tests `6A` and `EMA` against a callsign
+grammar, and judging `JA1ABC PM95 20` tests `PM95` and `20`. The
+verdict did exactly that until issue #383, and refused ARRL RTTY
+Roundup, free text and telemetry outright for as long as it existed.
+Everything else a text rule might check — the ARRL section index, the
+grid bounds, the RTTY exchange range — was already enforced during
+unpacking.
+
+Two of the types have no callsign to check, and are handled by name:
+free text and telemetry carry no redundancy at all (nearly every bit
+pattern is a valid one), so they are accepted; the EU VHF contest
+carries two hashes and nothing else, so it is accepted only when one
+of them resolves.
+
+Three builder methods, all on `SupportsMessageFilter` — **`Ft8`, `Ft4`
+and every FST4 sub-mode**:
 
 ```rust
 use mfsk_core::ft8::Ft8;
 use mfsk_core::msg::decode_request::DecodeRequest;
 
 /// Whatever the deployment knows and the ITU allowlist does not.
-fn is_special_event_call(token: &str) -> bool {
-    token.starts_with("8J")
+fn is_special_event_call(call: &str) -> bool {
+    call.starts_with("8J")
 }
 
 let audio = vec![0i16; 180_000]; // 15 s @ 12 kHz
 
-// The default filter, plus callsigns it does not know about.
+// The codec verdict, plus callsigns it does not know about. The
+// closure sees the decoded message, so `callsigns()` is exactly the
+// callsign fields — never a grid or a report.
 let widened = DecodeRequest::<Ft8>::new(&audio, 200.0, 3000.0, 1.5, 20)
-    .also_accept(|text| text.split_whitespace().all(is_special_event_call))
+    .also_accept(|m| m.callsigns().all(is_special_event_call))
     .decode();
 
-// No opinion at all — every CRC-passing string, phantoms included.
+// No opinion at all — every CRC-passing message, phantoms included.
+// This is WSJT-X's own acceptance rule with nothing on top.
 let unfiltered = DecodeRequest::<Ft8>::new(&audio, 200.0, 3000.0, 1.5, 20)
     .message_filter(|_| true)
     .decode();
@@ -383,28 +400,32 @@ assert!(widened.results.is_empty());
 assert!(unfiltered.results.is_empty());
 ```
 
-`.also_accept(f)` can only widen: it cannot lose a decode the default
-would have made. `.message_filter(f)` replaces the verdict outright,
-and the thing it replaces removes roughly two thirds of the CRC
-survivors that reach it — a permissive `f` will surface phantom rows
-the default hides. Prefer the first unless the whole verdict is wrong
-for the deployment.
+`.also_accept(f)` widens the verdict and can only add. `.codec_filter()`
+applies the verdict and nothing else — the one-line way to get it on a
+protocol that does not run it by default. `.message_filter(f)` replaces
+it outright, and the thing it replaces removes roughly two thirds of
+the CRC survivors that reach it, so a permissive `f` will surface
+phantom rows.
+
+**On by default for FT8 only, and the reason is subtraction.** A wrong
+decode is not a cosmetic error on a path that subtracts what it
+accepts: `.sic_rounds()` and `.sic_early()` remove the decoded
+waveform from the audio before looking again. Measured on
+`qso3_busy.wav`, with the verdict off `.sic_early()` accepts the
+phantom `CQ G47OXF RD84`, subtracts it, and loses the real
+`CQ EA2BFM IN83` underneath — 18/18 becomes 17/18. On the single-pass
+path the same verdict removes two garbage rows at `max_cand = 200` and
+**nothing at all** at the depth that ships on embedded hardware. FT4
+and FST4 leave it off until their own sensitivity sweeps say
+otherwise.
 
 **Zero-cost when unused.** The policy is a type parameter, not a
 `&dyn Fn` like `.on_result()` and `.budget()`: a request that names
-neither method carries `DefaultPolicy`, which is a zero-sized type
-whose verdict inlines to the bare codec call. The two hooks fire once
-per *decode*; this one fires once per candidate that reaches the text
-stage, which is why it is worth the type parameter.
-
-**FT8 only**, gated on `SupportsMessageFilter`. Not a statement about
-the codec — FT4 and every FST4 sub-mode share `Wsjt77Message` — but
-about the pipeline. FT8's bespoke engine forms the message string
-inside the per-candidate ladder, where rejecting one lets the ladder
-keep going; the generic engine FT4 and FST4 share returns information
-bits and never forms a string at all, because `engine` does not depend
-on `msg`. Calling either method on those protocols is a compile error
-naming the missing capability, not a silent no-op.
+none of the three carries `DefaultPolicy`, a zero-sized type, and for
+a protocol that does not filter by default the message is not even
+decoded — both conditions are compile-time constants. Those two hooks
+fire once per *decode*; this one fires once per candidate that reaches
+the message stage, which is why it is worth the type parameter.
 
 ---
 

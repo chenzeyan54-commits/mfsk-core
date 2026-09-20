@@ -23,7 +23,6 @@ use num_traits::Float;
 
 use super::super::decode::{ApHint, DecodeDepth, DecodeResult, DecodeStrictness, LlrEffort};
 use super::super::llr::sync_quality;
-use super::super::message::unpack77;
 use super::super::params::{COSTAS, DEFAULT_BP_MAX_ITER, LDPC_N, NSPS, NTONES};
 use super::super::wave_gen::message_to_tones;
 use super::coarse_sync::coarse_sync;
@@ -41,6 +40,9 @@ use crate::fec::ldpc::bp::check_crc14;
 #[cfg(feature = "fft-rustfft")]
 use crate::fec::ldpc::osd::osd_decode_deep;
 use crate::msg::decode_request::{DefaultPolicy, MessagePolicy};
+use crate::msg::hash_table::CallsignHashTable;
+use crate::msg::wsjt77::Wsjt77Fields;
+use crate::msg::wsjt77::unpack77_fields;
 use num_complex::Complex;
 
 // ── Stage-timing trace (host diagnostic only) ───────────────────────────────
@@ -1826,13 +1828,18 @@ where
 #[cfg(feature = "fft-rustfft")]
 const BLIND_CQ_MIN_NSYNC: u32 = 12;
 
-/// FT8's message codec verdict, as a function item so the policy layer
-/// can inline it. `<Ft8 as Protocol>::Msg` is `Wsjt77Message`, whose
-/// `is_plausible` is `msg::wsjt77::is_plausible_message` — named through
-/// the trait rather than directly so that a protocol swapping its codec
-/// cannot leave this pointing at the old one.
-fn codec_is_plausible(text: &str) -> bool {
-    <<crate::ft8::Ft8 as crate::engine::protocol::Protocol>::Msg as crate::engine::protocol::MessageCodec>::is_plausible(text)
+/// FT8 applies its codec verdict by default — see
+/// `FrameDecodable::MESSAGE_FILTER_DEFAULT` for the measurement that
+/// says so. Named rather than repeated as a literal at both sites.
+const FT8_FILTERS: bool =
+    <crate::ft8::Ft8 as crate::msg::decode_request::FrameDecodable>::MESSAGE_FILTER_DEFAULT;
+
+/// FT8's message codec verdict, named through the trait rather than
+/// called directly so that a protocol swapping its codec cannot leave
+/// this pointing at the old one.
+fn codec_is_plausible(message: &Wsjt77Fields) -> bool {
+    use crate::engine::protocol::{MessageCodec, Protocol};
+    <<crate::ft8::Ft8 as Protocol>::Msg as MessageCodec>::is_plausible(message)
 }
 
 /// Per-candidate decode core — runs the LLR-staircase, OSD fallback,
@@ -2177,30 +2184,28 @@ pub(in crate::ft8) fn process_one_candidate_inner<Pol: MessagePolicy>(
                         *dst = if val == 1 { apmag } else { -apmag };
                     }
                 }
-                // Inline AP-result validator: hard-error gate, unpack,
-                // plausibility, locked-call substring check.
+                // Inline AP-result validator: hard-error gate, decode,
+                // the acceptance policy, then the locked-call check.
                 let validate = |msg77: [u8; 77], hard_errors: u32| -> bool {
                     if hard_errors >= max_errors {
                         return false;
                     }
-                    let Some(text) = unpack77(&msg77) else {
+                    let Some(message) = unpack77_fields(&msg77, &CallsignHashTable::new()) else {
                         return false;
                     };
-                    if !policy.accepts(codec_is_plausible, true, &text) {
+                    if !policy.accepts(codec_is_plausible(&message), FT8_FILTERS, &message) {
                         return false;
                     }
-                    let upper = text.to_uppercase();
-                    if let Some(ref c1) = ap_cfg.call1
-                        && !upper.contains(&c1.to_uppercase())
-                    {
-                        return false;
-                    }
-                    if let Some(ref c2) = ap_cfg.call2
-                        && !upper.contains(&c2.to_uppercase())
-                    {
-                        return false;
-                    }
-                    true
+                    // The hypothesis locked these callsigns into the
+                    // codeword, so they have to come back out of the
+                    // *callsign fields*. This used to be a substring
+                    // test over the whole rendered message, which a
+                    // grid or an exchange could satisfy by accident.
+                    let holds = |want: &Option<alloc::string::String>| match want {
+                        None => true,
+                        Some(w) => message.callsigns().any(|c| c.eq_ignore_ascii_case(w)),
+                    };
+                    holds(&ap_cfg.call1) && holds(&ap_cfg.call2)
                 };
 
                 // AP + BP
@@ -2239,13 +2244,14 @@ pub(in crate::ft8) fn process_one_candidate_inner<Pol: MessagePolicy>(
     }
 
     let (bp, pass_id) = accepted?;
-    let text = unpack77(&bp.message77)?;
-    // Plausibility filter — reject CRC-passing-but-garbage
-    // messages. With max_cand=200 × 4 LLR variants × OSD,
-    // CRC-14's 1/16384 false-positive rate produces ~1-2 random
-    // strings per slot. Same filter the host wide-band path
-    // uses (`decode_frame::process_candidate`).
-    if !policy.accepts(codec_is_plausible, true, &text) {
+    // One decode, then the acceptance policy. Rejecting a
+    // CRC-passing-but-garbage message matters here beyond the decode
+    // list: `.sic_rounds()` and `.sic_early()` subtract what they
+    // accept, so a wrong one removes its waveform from the residual
+    // and takes the real signal underneath with it — see
+    // `FrameDecodable::MESSAGE_FILTER_DEFAULT`.
+    let message = unpack77_fields(&bp.message77, &CallsignHashTable::new())?;
+    if !policy.accepts(codec_is_plausible(&message), FT8_FILTERS, &message) {
         return None;
     }
     if known.iter().any(|r| r.message77() == bp.message77) {

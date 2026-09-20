@@ -667,7 +667,7 @@ pub trait MessageCodec: Default + 'static {
         true
     }
 
-    /// Judge a message this codec already unpacked, as *text*.
+    /// Judge a message this codec already unpacked.
     ///
     /// The layer below this one is the CRC, and a CRC false positive is
     /// a codeword the decoder converged on that is not the transmitted
@@ -676,6 +676,15 @@ pub trait MessageCodec: Default + 'static {
     /// `false` here is how a codec refuses one on grounds the bits
     /// cannot express: a callsign whose prefix the ITU never allocated,
     /// an exchange field outside the range its contest defines.
+    ///
+    /// [`Self::Unpacked`] rather than text, because a rendered message
+    /// has to be split back into tokens to ask anything of it and the
+    /// split cannot know which token was which field. Judging
+    /// `JA1ABC 3Y0Z 6A EMA` that way tests `6A` and `EMA` against a
+    /// callsign grammar; judging `JA1ABC PM95 20` tests `PM95` and
+    /// `20`. `Wsjt77Message`'s verdict did exactly that and refused
+    /// three message types outright for as long as it existed
+    /// (issue #383).
     ///
     /// Default: accept unconditionally. Appropriate for codecs whose
     /// own field checks are the whole story, and for any codec whose
@@ -693,8 +702,8 @@ pub trait MessageCodec: Default + 'static {
     /// [`Self::verify_info`] has it: the verdict is a property of the
     /// codec, and a function item passes into the policy layer without
     /// an indirection.
-    fn is_plausible(text: &str) -> bool {
-        let _ = text;
+    fn is_plausible(message: &Self::Unpacked) -> bool {
+        let _ = message;
         true
     }
 }

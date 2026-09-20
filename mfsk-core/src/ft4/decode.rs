@@ -15,7 +15,8 @@ use crate::engine::pipeline;
 pub use crate::engine::pipeline::{DecodeDepth, DecodeResult, DecodeStrictness, FftCache};
 pub use crate::msg::ApHint;
 use crate::msg::decode_request::{
-    DecodeOutcome, DecodeRequest, FrameDecodable, MessagePolicy, SupportsSicRounds,
+    DecodeOutcome, DecodeRequest, FrameDecodable, MessagePolicy, StrategyTag,
+    SupportsMessageFilter, SupportsSicRounds,
 };
 
 /// FT4 downsample configuration: 12 kHz → ~666.7 Hz baseband, covering four
@@ -108,7 +109,8 @@ impl FrameDecodable for Ft4 {
             .iter()
             .map(|(m, v, pid)| (m.as_slice(), v.as_slice(), *pid))
             .collect();
-        let (raw, fft_cache, budget) = pipeline::decode_frame_budgeted::<Ft4>(
+        let accept = crate::msg::decode_request::PolicyAccept::<Ft4, Pol>::new(&req.policy);
+        let (raw, fft_cache, budget) = pipeline::decode_frame_budgeted::<Ft4, _>(
             req.audio,
             &FT4_DOWNSAMPLE,
             req.freq_min,
@@ -124,6 +126,7 @@ impl FrameDecodable for Ft4 {
             on_result,
             req.budget,
             &ap,
+            &accept,
         );
         DecodeOutcome {
             results: pipeline::dedup_known(raw, req.known),
@@ -135,6 +138,27 @@ impl FrameDecodable for Ft4 {
 
 impl crate::msg::decode_request::SupportsWideBandAp for Ft4 {}
 
+/// FT4 reaches the message-text stage through the generic pipeline's
+/// [`InfoAccept`] seam rather than an engine of its own, so both of its
+/// strategies carry the policy and either can be rebuilt for a new one.
+///
+/// [`InfoAccept`]: crate::engine::pipeline::InfoAccept
+impl SupportsMessageFilter for Ft4 {
+    fn __strategy_for<Pol: MessagePolicy>(
+        tag: StrategyTag,
+    ) -> fn(&DecodeRequest<'_, Self, Pol>) -> DecodeOutcome<Self> {
+        match tag {
+            StrategyTag::SinglePass => Self::__single_pass::<Pol>,
+            StrategyTag::FlatSic => Self::__flat_sic::<Pol>,
+            // Unreachable by construction, not by assumption:
+            // `.sic_early()` lives on `impl<P: SupportsSicEarly>`, and
+            // FT4 does not implement that trait, so nothing can put
+            // this tag on an FT4 request.
+            StrategyTag::StagedSic => unreachable!("FT4 has no staged-SIC strategy"),
+        }
+    }
+}
+
 impl SupportsSicRounds for Ft4 {
     fn __flat_sic<Pol: MessagePolicy>(req: &DecodeRequest<'_, Self, Pol>) -> DecodeOutcome<Self> {
         // Same rationale as `__single_pass` above — this strategy is
@@ -145,7 +169,8 @@ impl SupportsSicRounds for Ft4 {
         let on_result: Option<&(dyn Fn(&DecodeResult) + Sync)> = filtered_cb
             .as_ref()
             .map(|f| f as &(dyn Fn(&DecodeResult) + Sync));
-        let (raw, budget) = pipeline::decode_frame_subtract::<Ft4>(
+        let accept = crate::msg::decode_request::PolicyAccept::<Ft4, Pol>::new(&req.policy);
+        let (raw, budget) = pipeline::decode_frame_subtract::<Ft4, _>(
             req.audio,
             &FT4_DOWNSAMPLE,
             &FT4_SUBTRACT,
@@ -188,6 +213,7 @@ impl SupportsSicRounds for Ft4 {
             req.fft_cache.as_ref().map(FftCache::as_slice),
             on_result,
             req.budget,
+            &accept,
         );
         // Multi-pass SIC has no single "the" cache (residual changes every
         // pass) — rebuild from the original audio, matching the shape
