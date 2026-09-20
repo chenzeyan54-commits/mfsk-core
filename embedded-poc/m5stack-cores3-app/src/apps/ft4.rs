@@ -366,6 +366,15 @@ fn slot_loop() -> ! {
     // decode does not make the replay drift slower than real time.
     let t_start = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
     let mut fed: u64 = 0;
+    // **Callsign hashes, resolved across slots.** A 28-bit callsign
+    // field can carry a 22-bit hash instead of a call, and that only
+    // names a station the table has heard before — so the table
+    // outlives the slot and lives here. `rx::decode_candidate` runs on
+    // two cores and cannot hold a `&mut` to it (its own comment: "no
+    // shared mutable state ... which is what lets two cores run it at
+    // once"), so the resolving and the learning both happen below,
+    // after the workers have joined.
+    let mut calls = mfsk_core::msg::CallsignHashTable::new();
 
     loop {
         block.clear();
@@ -511,6 +520,16 @@ fn slot_loop() -> ! {
                 None => String::new(),
             },
         );
+        // Resolve against earlier slots, then learn this slot's own
+        // calls for the next — in decode order, which is the order
+        // WSJT-X registers them in.
+        let mut o = o;
+        for d in o.decodes.iter_mut() {
+            if let Some(t) = mfsk_core::msg::wsjt77::unpack77_learn(&d.msg77, &mut calls) {
+                d.msg = t;
+            }
+        }
+        let o = o;
         if let Ok(mut ui) = UI.lock() {
             ui.update_status(|st| {
                 st.free_heap_kb = free_heap_kb();

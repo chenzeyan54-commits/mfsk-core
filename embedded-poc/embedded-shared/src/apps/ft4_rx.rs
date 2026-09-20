@@ -361,6 +361,13 @@ impl SlotAccum {
 /// One decoded transmission.
 pub struct Ft4Decode {
     pub msg: String,
+    /// The raw 77-bit payload, so the caller can resolve hashed
+    /// callsigns and register this decode's own calls after the
+    /// parallel workers have joined. `decode_candidate` runs on two
+    /// cores and cannot hold a `&mut CallsignHashTable`; `msg` above
+    /// is therefore the unresolved rendering, and a caller with a
+    /// table replaces it.
+    pub msg77: [u8; 77],
     pub freq_hz: f32,
     pub dt_sec: f32,
     pub snr_db: f32,
@@ -598,13 +605,13 @@ fn decode_candidate(
         false,
         false,
     )?;
-    let text = r
-        .message77()
-        .try_into()
-        .ok()
-        .and_then(|m77: &[u8; 77]| unpack77(m77))?;
+    let m77: [u8; 77] = r.message77().try_into().ok()?;
+    // Still unpacked here, because a payload that cannot be rendered
+    // is not a decode and this is where that is decided.
+    let text = unpack77(&m77)?;
     Some(Ft4Decode {
         msg: text,
+        msg77: m77,
         freq_hz: r.freq_hz,
         dt_sec: r.dt_sec,
         snr_db: r.snr_db,

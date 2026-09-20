@@ -467,6 +467,15 @@ pub fn unpack77_learn(msg: &[u8], ht: &mut CallsignHashTable) -> Option<String> 
 
 /// Register the callsign fields of a 77-bit message into `ht`.
 ///
+/// **Public because resolving and learning cannot always happen in the
+/// same place.** The FT4 receiver runs `decode_candidate` on two cores
+/// at once and its own comment names the reason it can: "no shared
+/// mutable state". A `&mut` table there is not an option, so that
+/// caller resolves with a shared borrow inside the workers and calls
+/// this once per decode afterwards, single-threaded.
+/// [`unpack77_learn`] is the convenience form for callers that have
+/// no such constraint.
+///
 /// Walks the same `i3`/`n3` layout [`unpack77_with_hash`] does, but
 /// only the callsign fields — the 28-bit standard-call tokens and, for
 /// `i3 = 4`, the 58-bit nonstandard call, which is the field whose
@@ -476,7 +485,7 @@ pub fn unpack77_learn(msg: &[u8], ht: &mut CallsignHashTable) -> Option<String> 
 /// low tokens, so every candidate is filtered through
 /// [`is_standard_callsign`]; the nonstandard call is registered as-is,
 /// which is the whole point of it.
-fn register_callsigns(msg: &[u8], ht: &mut CallsignHashTable) {
+pub fn register_callsigns(msg: &[u8], ht: &mut CallsignHashTable) {
     if msg.len() != 77 {
         return;
     }
