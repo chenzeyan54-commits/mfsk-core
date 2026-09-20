@@ -1115,10 +1115,11 @@ fn unpack77_dispatch(msg: &[u8], ht: &CallsignHashTable, i3: u32, n3: u32) -> Op
                 // divergence**: refuse instead. `pack77_3` cannot
                 // produce such a value, so the only thing that reaches
                 // here is a CRC survivor, and the `[RTTY]` marker this
-                // used to return made `is_plausible_message`
-                // short-circuit past the callsign check — those 22 of
-                // 8192 exchange codes were the entire surviving i3=3
-                // phantom population (`phantom_survival_rates`).
+                // used to return made the verdict of the day — then a
+                // text rule — short-circuit past the callsign check.
+                // Those 22 of 8192 exchange codes were the entire
+                // surviving i3=3 phantom population
+                // (`phantom_survival_rates`).
                 return None;
             };
             Some(Wsjt77Fields::RttyRoundup {
@@ -2451,10 +2452,11 @@ mod tests {
     }
 
     /// The DXpedition body was already ported; what was missing was
-    /// anyone looking at it. `is_plausible_message` short-circuited on
-    /// the literal `RR73;`, so both callsign fields went unchecked.
+    /// anyone looking at it. The verdict of the day short-circuited on
+    /// the literal `RR73;` in the rendered string, so both callsign
+    /// fields went unchecked.
     #[test]
-    fn dxpedition_text_is_judged_on_its_callsigns() {
+    fn dxpedition_is_judged_on_its_callsigns() {
         let dx = |c1: &str, c2: &str, c3: &str| Wsjt77Fields::DxPedition {
             call1: c1.to_string(),
             call2: c2.to_string(),
@@ -2556,11 +2558,12 @@ mod tests {
         }
     }
 
-    /// The Field Day exchange has to survive [`is_plausible_message`]
-    /// now that it no longer carries a `[FD]` marker to short-circuit
-    /// on — and a garbage callsign in it has to not.
+    /// The Field Day exchange has to survive
+    /// [`Wsjt77Fields::is_plausible`] now that it no longer carries a
+    /// `[FD]` marker to short-circuit on — and a garbage callsign in
+    /// it has to not.
     #[test]
-    fn field_day_text_is_judged_on_its_callsigns() {
+    fn field_day_is_judged_on_its_callsigns() {
         let fd = |c1: &str, c2: &str| Wsjt77Fields::FieldDay {
             call1: c1.to_string(),
             call2: c2.to_string(),
@@ -2624,7 +2627,7 @@ mod tests {
     }
 
     /// One valid message of **every type `unpack77` produces**, through
-    /// [`is_plausible_message`].
+    /// the codec verdict.
     ///
     /// A filter that refuses a whole message type is not strict, it is
     /// broken: the type's traffic is lost outright, and no amount of
@@ -2722,9 +2725,7 @@ mod tests {
             let text = unpack77_with_hash(m, &ht)
                 .unwrap_or_else(|| panic!("{name} must unpack — fix the decoder, not the filter"));
             // The shipped verdict is `is_plausible_payload`, which
-            // dispatches on the type in the bits; `is_plausible_message`
-            // is the text half it delegates to for the types that have
-            // fields to check.
+            // decodes once and asks `Wsjt77Fields::is_plausible`.
             if !is_plausible_payload_with_hash(m, &ht) {
                 refused.push(alloc::format!("{name}: {text:?}"));
             }
@@ -2753,7 +2754,7 @@ mod tests {
     /// is not the transmitted one, so its 77 information bits are
     /// effectively uniform — which makes uniform random payloads the
     /// right model for the population both `unpack77`'s per-type
-    /// validity checks and `is_plausible_message` exist to reject.
+    /// validity checks and the codec verdict exist to reject.
     ///
     /// The `(i3, n3)` breakdown is here because WSJT-X does **not**
     /// treat the acceptance surface as mode-independent, even though
@@ -2784,7 +2785,7 @@ mod tests {
     ///     --lib phantom_survival -- --ignored --nocapture
     /// ```
     #[test]
-    #[ignore = "diagnostic — phantom survival through unpack77 and is_plausible_message"]
+    #[ignore = "diagnostic — phantom survival through unpack77 and the codec verdict"]
     fn phantom_survival_rates() {
         const N: usize = 2_000_000;
         // A deterministic LCG, so the number is comparable across

@@ -193,6 +193,41 @@ reported the grid healthy while the band said otherwise.
 
 ### Added
 
+- **`unpack77` decodes to fields, and the message verdict reads them
+  (#383, breaking).** `unpack77_fields` returns `Wsjt77Fields` — one
+  variant per message type, carrying the decoded fields — and
+  `Display` renders it, byte for byte as before.
+  `Wsjt77Fields::callsigns()` yields exactly the callsign fields, and
+  `Wsjt77Fields::is_plausible()` is the verdict.
+
+  The old shape decoded a message into fields and then threw them
+  away, so anything asking a question of it had to split the rendered
+  string back into tokens and guess which ones were callsigns. Judging
+  `JA1ABC 3Y0Z 6A EMA` that way tests `6A` and `EMA` against a
+  callsign grammar, and judging `JA1ABC PM95 20` tests `PM95` and
+  `20` — which is why the filter refused three whole message types.
+  Fields have no such ambiguity, and everything a text rule might
+  re-check (the ARRL section index, the grid bounds, the RTTY exchange
+  range) was already enforced during unpacking.
+
+  **Breaking surface**, all of it in `msg`:
+
+  | before | after |
+  |---|---|
+  | `pub fn is_plausible_message(&str)` | removed — use `is_plausible_payload` or `Wsjt77Fields::is_plausible` |
+  | `<Wsjt77Message as MessageCodec>::Unpacked = String` | `= Wsjt77Fields` (`Display` for the old rendering) |
+  | `MessageCodec::is_plausible(&[u8])` | `is_plausible(&Self::Unpacked)` |
+  | `.also_accept(f)` / `.message_filter(f)` taking `Fn(&str)` | taking `Fn(&Wsjt77Fields)` |
+
+  `unpack77` and `unpack77_with_hash` are unchanged and still return
+  `Option<String>`, so a caller that only wants the rendering needs no
+  edit.
+
+  One incidental fix fell out: `packjt77.f90:616`'s "a CQ cannot name a
+  hashed station" refusal was a string-prefix test, and the RTTY
+  Roundup's optional `TU; ` prefix shifted the message far enough to
+  defeat it. Asking the fields has no blind spot.
+
 - **`DecodeRequest::also_accept(f)` / `.message_filter(f)` /
   `.codec_filter()` — a caller-supplied message-acceptance policy
   (#383).** `MessageCodec` gained `is_plausible`, the codec's own
@@ -253,7 +288,7 @@ reported the grid healthy while the band said otherwise.
   measurement of what each stage actually removes (#383).** A CRC
   false positive's information bits are uniform, so `#[ignore]`d
   `phantom_survival_rates` runs 2 M uniform 77-bit payloads through
-  `unpack77` and `is_plausible_message` and prints the survival rate
+  `unpack77` and the codec verdict and prints the survival rate
   per `(i3, n3)` cell, plus what each mode's own pre-gate would remove
   on top — `msk144decodeframe.f90:103`, `ft8b.f90:510-511`, and the
   nothing that `ft4_decode.f90` and `fst4_decode.f90` apply.
@@ -499,9 +534,10 @@ reported the grid healthy while the band said otherwise.
 
 - **Three message types were surviving the phantom filter at 100 %
   because a marker string short-circuited it (#383).**
-  `is_plausible_message` returned `true` on finding `[FD]`, `[RTTY]`
-  or `RR73;` anywhere in the text, which skipped the ITU-prefix
-  callsign check for the whole message. They were not surviving
+  The then-current `is_plausible_message` returned `true` on finding
+  `[FD]`, `[RTTY]` or `RR73;` anywhere in the text, which skipped the
+  ITU-prefix callsign check for the whole message. (That function is
+  gone by the end of this release — see **Changed** below.) They were not surviving
   because they were plausible; nothing was looking at them. Field Day
   and DXpedition are now judged on the callsigns they carry, and
   `[RTTY]` — which upstream never produces, its 22 out-of-range
