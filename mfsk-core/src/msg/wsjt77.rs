@@ -1956,6 +1956,86 @@ mod tests {
         }
     }
 
+    /// How much of the phantom population each stage removes.
+    ///
+    /// A CRC-14 false positive is a codeword the decoder converged on
+    /// that is not the transmitted one, so its 77 information bits are
+    /// effectively uniform — which makes uniform random payloads the
+    /// right model for the population both `unpack77`'s per-type
+    /// validity checks and `is_plausible_message` exist to reject.
+    ///
+    /// Run it against this commit and against the tree before the
+    /// `unpack77` port to see what the port moved:
+    ///
+    /// ```sh
+    /// cargo test -p mfsk-core --features full,internal-testing --release \
+    ///     --lib phantom_survival -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "diagnostic — phantom survival through unpack77 and is_plausible_message"]
+    fn phantom_survival_rates() {
+        const N: usize = 2_000_000;
+        // A deterministic LCG, so the number is comparable across
+        // commits without a dev-dependency.
+        let mut x: u64 = 0x2026_0920_0000_0001;
+        let mut next_bit = || {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((x >> 33) & 1) as u8
+        };
+        let (mut unpacked, mut plausible) = (0usize, 0usize);
+        let mut by_i3 = [0usize; 8];
+        let mut plausible_by_i3 = [0usize; 8];
+        for _ in 0..N {
+            let mut m = [0u8; 77];
+            for b in m.iter_mut() {
+                *b = next_bit();
+            }
+            let i3 = read_bits(&m, 74, 3) as usize;
+            if let Some(text) = unpack77(&m) {
+                unpacked += 1;
+                by_i3[i3] += 1;
+                if is_plausible_message(&text) {
+                    plausible += 1;
+                    plausible_by_i3[i3] += 1;
+                }
+            }
+        }
+        let pct = |a: usize, b: usize| {
+            if b == 0 {
+                0.0
+            } else {
+                100.0 * a as f64 / b as f64
+            }
+        };
+        println!("  random 77-bit payloads: {N}");
+        println!(
+            "  unpack77 accepts          {unpacked:>9}  ({:.3} % of payloads)",
+            pct(unpacked, N)
+        );
+        println!(
+            "  is_plausible_message keeps{plausible:>9}  ({:.3} % of those unpack77 accepted)",
+            pct(plausible, unpacked)
+        );
+        println!(
+            "  surviving both            {plausible:>9}  ({:.4} % of payloads)",
+            pct(plausible, N)
+        );
+        println!("  i3   unpack77    kept   kept%");
+        for i3 in 0..8 {
+            if by_i3[i3] == 0 {
+                continue;
+            }
+            println!(
+                "  {i3:<4} {:>8} {:>7} {:>6.1}",
+                by_i3[i3],
+                plausible_by_i3[i3],
+                pct(plausible_by_i3[i3], by_i3[i3])
+            );
+        }
+    }
+
     /// `packjt77.f90:360` — telemetry, 71 bits as 18 hex digits.
     /// Returned `None` before this was ported: a dropped decode.
     #[test]
