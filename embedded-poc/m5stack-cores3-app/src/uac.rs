@@ -2311,6 +2311,176 @@ pub fn start_host() -> Result<()> {
 /// 何も見えていないということで、UAC ドライバより手前の問題になる。
 ///
 /// Refs #163.
+/// No-op client callback. The dump opens devices to read descriptors
+/// and never submits a transfer, so it has no events to handle — but
+/// `usb_host_client_register` requires a function pointer.
+extern "C" fn dump_client_cb(
+    _event: *const sys::usb_host_client_event_msg_t,
+    _arg: *mut core::ffi::c_void,
+) {
+}
+
+/// Print every enumerated device and every interface it offers.
+///
+/// **Written because the comments around `uac_host_device_start`
+/// already told the reader to "check the device descriptor dump in the
+/// UDP log", and there was no such dump.** The OUT interface's
+/// channels/bits/rate have been a guess since the probe was written,
+/// and whether the radio offers an audio OUT interface at all is
+/// unestablished — both are answerable straight from the descriptors.
+///
+/// An IC-705 on USB should show a CDC/serial function for CI-V and an
+/// audio function with a streaming interface each way, which is what
+/// `num_devices=3` has been hinting at without saying.
+///
+/// Registers its own client rather than borrowing the UAC driver's:
+/// the host stack allows several, and a reader that owns nothing
+/// cannot disturb the capture that is running.
+fn dump_enumeration() {
+    let cfg = sys::usb_host_client_config_t {
+        is_synchronous: false,
+        max_num_event_msg: 5,
+        __bindgen_anon_1: sys::usb_host_client_config_t__bindgen_ty_1 {
+            async_: sys::usb_host_client_config_t__bindgen_ty_1__bindgen_ty_1 {
+                client_event_callback: Some(dump_client_cb),
+                callback_arg: core::ptr::null_mut(),
+            },
+        },
+    };
+    let mut client: sys::usb_host_client_handle_t = core::ptr::null_mut();
+    // SAFETY: called after the host library is installed; `cfg` lives
+    // for the duration of the call.
+    let err = unsafe { sys::usb_host_client_register(&cfg, &mut client) };
+    if err != sys::ESP_OK {
+        log::warn!("uac: enumeration dump — client_register failed err={err:#x}");
+        return;
+    }
+
+    let mut addrs = [0u8; 8];
+    let mut n: core::ffi::c_int = 0;
+    // SAFETY: `addrs` is `len` bytes and `n` is written by the callee.
+    let err = unsafe {
+        sys::usb_host_device_addr_list_fill(addrs.len() as i32, addrs.as_mut_ptr(), &mut n)
+    };
+    if err != sys::ESP_OK {
+        log::warn!("uac: enumeration dump — addr_list_fill failed err={err:#x}");
+        unsafe { sys::usb_host_client_deregister(client) };
+        return;
+    }
+    log::warn!("uac: enumeration dump — {n} device(s)");
+
+    for &addr in addrs.iter().take(n.max(0) as usize) {
+        let mut dev: sys::usb_device_handle_t = core::ptr::null_mut();
+        // SAFETY: `client` is registered; `dev` is written on success.
+        if unsafe { sys::usb_host_device_open(client, addr, &mut dev) } != sys::ESP_OK {
+            log::warn!("uac:   addr {addr}: open failed");
+            continue;
+        }
+        let mut dd: *const sys::usb_device_desc_t = core::ptr::null();
+        // SAFETY: `dev` is open; the pointer returned is owned by the
+        // stack and valid until the device is closed.
+        if unsafe { sys::usb_host_get_device_descriptor(dev, &mut dd) } == sys::ESP_OK
+            && !dd.is_null()
+        {
+            // The bindings wrap the packed body in an anonymous
+            // union, and it is `#[repr(packed)]`, so every field is
+            // copied out rather than referenced — a reference into a
+            // packed struct is UB even unread.
+            //
+            // SAFETY: the union has a single variant in these
+            // bindings and the stack filled the descriptor.
+            let (vid, pid, cls, sub, proto, ncfg) = unsafe {
+                let d = core::ptr::addr_of!((*dd).__bindgen_anon_1);
+                (
+                    core::ptr::addr_of!((*d).idVendor).read_unaligned(),
+                    core::ptr::addr_of!((*d).idProduct).read_unaligned(),
+                    core::ptr::addr_of!((*d).bDeviceClass).read_unaligned(),
+                    core::ptr::addr_of!((*d).bDeviceSubClass).read_unaligned(),
+                    core::ptr::addr_of!((*d).bDeviceProtocol).read_unaligned(),
+                    core::ptr::addr_of!((*d).bNumConfigurations).read_unaligned(),
+                )
+            };
+            log::warn!(
+                "uac:   addr {addr}: VID {vid:04x} PID {pid:04x} class {cls}/{sub}/{proto} \
+                 configs {ncfg}"
+            );
+        }
+        let mut cd: *const sys::usb_config_desc_t = core::ptr::null();
+        // SAFETY: as above.
+        if unsafe { sys::usb_host_get_active_config_descriptor(dev, &mut cd) } == sys::ESP_OK
+            && !cd.is_null()
+        {
+            // Same anonymous-union wrapping as the device descriptor.
+            // SAFETY: as above.
+            let total = unsafe {
+                core::ptr::addr_of!((*cd).__bindgen_anon_1.wTotalLength).read_unaligned()
+            } as usize;
+            // SAFETY: the stack guarantees `wTotalLength` bytes behind
+            // the descriptor; walked read-only.
+            let bytes = unsafe { core::slice::from_raw_parts(cd as *const u8, total) };
+            walk_config(bytes);
+        }
+        // SAFETY: opened above by this client.
+        unsafe { sys::usb_host_device_close(client, dev) };
+    }
+    // SAFETY: registered above, and every device it opened is closed.
+    unsafe { sys::usb_host_client_deregister(client) };
+}
+
+/// Walk a configuration descriptor's TLV chain, printing interfaces
+/// and endpoints.
+///
+/// Manual rather than through a helper because what matters is the
+/// *audio streaming* interfaces and their directions, and a generic
+/// pretty-printer buries those in the class-specific records the UAC
+/// spec puts between them.
+fn walk_config(bytes: &[u8]) {
+    const T_INTERFACE: u8 = 0x04;
+    const T_ENDPOINT: u8 = 0x05;
+    let mut i = 0usize;
+    while i + 2 <= bytes.len() {
+        let len = bytes[i] as usize;
+        if len < 2 || i + len > bytes.len() {
+            break;
+        }
+        match bytes[i + 1] {
+            T_INTERFACE if len >= 9 => {
+                let (num, alt, neps) = (bytes[i + 2], bytes[i + 3], bytes[i + 4]);
+                let (cls, sub, proto) = (bytes[i + 5], bytes[i + 6], bytes[i + 7]);
+                let name = match (cls, sub) {
+                    (0x01, 0x01) => " (audio control)",
+                    (0x01, 0x02) => " (AUDIO STREAMING)",
+                    (0x02, _) => " (CDC control — CI-V)",
+                    (0x0a, _) => " (CDC data — CI-V)",
+                    _ => "",
+                };
+                log::warn!(
+                    "uac:     iface {num} alt {alt}: class {cls:#04x}/{sub:#04x}/{proto:#04x} \
+                     {neps} endpoint(s){name}"
+                );
+            }
+            T_ENDPOINT if len >= 7 => {
+                let addr = bytes[i + 2];
+                let attr = bytes[i + 3];
+                let mps = u16::from_le_bytes([bytes[i + 4], bytes[i + 5]]);
+                log::warn!(
+                    "uac:       ep {:#04x} {} {} maxpkt {mps}",
+                    addr,
+                    if addr & 0x80 != 0 { "IN " } else { "OUT" },
+                    match attr & 0x03 {
+                        0 => "control",
+                        1 => "isochronous",
+                        2 => "bulk",
+                        _ => "interrupt",
+                    },
+                );
+            }
+            _ => {}
+        }
+        i += len;
+    }
+}
+
 fn spawn_device_count_probe() {
     let _ = crate::board::spawn_named(c"uac_probe", 3072, || {
         let mut last: i32 = -1;
@@ -2342,6 +2512,15 @@ fn spawn_device_count_probe() {
                             format!("iface {v}")
                         }
                     };
+                    // **Dump the descriptors the first time the device
+                    // count settles**, not at install: enumeration
+                    // finishes after `start_host` returns, and on
+                    // 2026-09-20 the network that carries the log was
+                    // 33 s behind it. Printed from this loop the dump
+                    // lands wherever the log is actually reaching.
+                    if info.num_devices > 0 && !DUMPED.swap(true, Ordering::Relaxed) {
+                        dump_enumeration();
+                    }
                     log::info!(
                         "uac: usb_host_lib_info — num_devices={} num_clients={} | audio IN {} \
                          | audio OUT {}",
@@ -2374,6 +2553,9 @@ static CLIENT_COUNT: AtomicI32 = AtomicI32::new(-1);
 /// `driver_event_cb`: the enumeration log can be written before the
 /// network that carries it exists, and a missing line then reads as a
 /// missing interface.
+/// One-shot guard for [`dump_enumeration`].
+static DUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 static RX_IFACE_SEEN: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
 /// See [`RX_IFACE_SEEN`]. **`-1` here is the answer to "does the
 /// IC-705 offer a USB audio OUT interface at all"**, which nothing has
