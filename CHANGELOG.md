@@ -11,14 +11,27 @@ merely capable.
 **1. The public API breaks**, and the two halves break very
 differently:
 
-*`mfsk-core` (the crates.io crate) breaks narrowly.* `SniperRequest` is
-gated on a new `SupportsSniper`, implemented for `Ft8` alone, so
-`DecodeRequest::<Ft4>::sniper` and the five FST4 equivalents no longer
-exist; `SniperRequest` itself is `ft8`-gated. `ProtocolMeta` gained
-fields, which breaks a struct literal but not a read. **A consumer that
-does not use the sniper on FT4 or FST4 sees no change at all** — the
-wide-band decode API, every protocol's entry points and the message
-codecs are untouched.
+*`mfsk-core` (the crates.io crate) breaks in two places.*
+
+*The search API.* `SniperRequest` is gated on a new `SupportsSniper`,
+implemented for `Ft8` alone, so `DecodeRequest::<Ft4>::sniper` and the
+five FST4 equivalents no longer exist; `SniperRequest` itself is
+`ft8`-gated. `ProtocolMeta` gained fields, which breaks a struct
+literal but not a read.
+
+*The message codecs* (#383). `Wsjt77Message`'s `Unpacked` is
+`Wsjt77Fields` rather than `String`, `MessageCodec::is_plausible`
+takes the unpacked value instead of the payload bytes,
+`is_plausible_message` is gone, and `CallsignHashTable::lookup22`
+returns `&str`. The full list is the table under **Added** below.
+
+**A consumer that decodes and renders needs no edit** — `unpack77` and
+`unpack77_with_hash` still return `Option<String>`, and the wide-band
+decode API and every protocol's entry points are untouched. One that
+asked the codec a *question*, or read a hash back out of the table,
+does. (An earlier draft of this paragraph said the message codecs were
+untouched and that a non-sniper consumer saw no change at all. Both
+were wrong, and both contradicted this release's own #383 entry.)
 
 *`mfsk-ffi` is rewritten.* Every pre-v2 decode symbol is gone, along
 with `MfskProtocol`, `MfskResult`, `MfskResultList`, `MfskSamples` and
@@ -281,6 +294,12 @@ reported the grid healthy while the band said otherwise.
   | `<Wsjt77Message as MessageCodec>::Unpacked = String` | `= Wsjt77Fields` (`Display` for the old rendering) |
   | `MessageCodec::is_plausible(&[u8])` | `is_plausible(&Self::Unpacked)` |
   | `.also_accept(f)` / `.message_filter(f)` taking `Fn(&str)` | taking `Fn(&Wsjt77Fields)` |
+  | `CallsignHashTable::lookup22 -> Option<String>` | `-> Option<&str>`, and no longer `<>`-wrapped |
+
+  `DecodeRequest` and `SniperRequest` gained a third type parameter,
+  `Pol: MessagePolicy = DefaultPolicy`. It is defaulted, so
+  `DecodeRequest<'_, Ft8>` still names the same type and no type
+  position needs an edit.
 
   `unpack77` and `unpack77_with_hash` are unchanged and still return
   `Option<String>`, so a caller that only wants the rendering needs no
