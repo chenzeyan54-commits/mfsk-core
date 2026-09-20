@@ -33,7 +33,11 @@ use esp_idf_hal::{
     spi::{config::Config as SpiConfig, SpiDeviceDriver, SpiDriver, SpiDriverConfig, SPI3},
     units::FromValueType,
 };
-use mipidsi::{models::ILI9342CRgb565, options::ColorInversion, Builder};
+use mipidsi::{
+    models::ILI9342CRgb565,
+    options::{ColorInversion, ColorOrder},
+    Builder,
+};
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
@@ -130,6 +134,22 @@ pub fn run_log_panel(
     let mut display = match Builder::new(ILI9342CRgb565, di)
         .display_size(320, 240)
         .invert_colors(ColorInversion::Inverted) // M5GFX core2 cfg.invert = true
+        // **BGR, not RGB** — the same wiring the CoreS3 turned out to
+        // have (`5c852029`), on the same ILI9342C and the same
+        // M5GFX-derived `invert`. mipidsi defaults to RGB, so every
+        // colour this UI drew came out with red and blue exchanged.
+        // Green, white, grey and black are unaffected, which is most
+        // of this screen and why nothing here ever looked wrong.
+        //
+        // That commit deliberately left this board alone, on the
+        // grounds that its screen had not been looked at and a blind
+        // flip would be the same mistake in the other direction. What
+        // resolved it is not a photo of this panel but the operator's
+        // own reading of the pair (2026-09-20): same chip, so the same
+        // wiring. **Still not seen on this board** — the Core2 has not
+        // been flashed since. If its colours ever read as swapped, this
+        // line is the first thing to try removing.
+        .color_order(ColorOrder::Bgr)
         .init(&mut delay)
     {
         Ok(d) => d,

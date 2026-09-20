@@ -602,6 +602,14 @@ reported the grid healthy while the band said otherwise.
   that board's screen has not been looked at and a blind flip would be
   the same mistake in the other direction.
 
+- **Core2's panel is BGR too.** The entry above deliberately left
+  `m5stack-core2-app` on RGB, on the grounds that its screen had not
+  been looked at and a blind flip would be the same mistake in the
+  other direction. It is the same ILI9342C with the same M5GFX-derived
+  `invert`, and the operator's reading of the pair settles it: same
+  chip, same wiring. Set. **Not seen on that board** — the Core2 has
+  not been flashed since, and if its colours ever read as swapped this
+  is the line to try removing.
 - **CoreS3: the audio task now outranks the decoder, and what that
   exposed.** Both were priority 5 — the decode pipeline and the
   UAC reader are `std::thread`s, so they took
