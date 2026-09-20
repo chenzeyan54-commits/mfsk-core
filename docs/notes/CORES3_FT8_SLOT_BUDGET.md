@@ -51,11 +51,37 @@ is never stopped by running out of time; it finishes what it claimed.
 are on the screen and in the next period's queue but cannot be answered
 this period. At the shipped emit point that is 0.52 decodes a slot.
 
-**The refine budget is 44 % waste.** 6.58 of the 15 stage-3 slots
-produce nothing, every slot, in every arm — the figure is 51-58 % hit
-rate across five builds and does not move with anything tried today.
+**The refine budget is 44 % unproductive.** 6.58 of the 15 stage-3
+slots produce nothing, every slot, in every arm — the hit rate is
+51-58 % across five builds and does not move with anything tried.
 **That is ten times the boundary loss and it is the largest single
 number in the table.**
+
+### …and it is the sensitivity floor, not a recoverable loss
+
+Called "waste" here at first, and it is not. Three levers were
+measured against it and all three came back empty:
+
+- **depth** — pass-1 ranks 16-25 convert at ~0.1 % (§4)
+- **allocation** — `share_cand_budget` gains ~0 on a centred grid,
+  because this band's deferred candidates hold no stations (§4)
+- **duplicates** — `how_much_of_the_refine_budget_is_the_same_carrier_twice`
+  finds **0 of 615** refined candidates to be a second look at a
+  carrier already in the set, across 41 phases. Coarse sync already
+  dedupes; the `dedupe+sort` step in its own profile line is that.
+
+So the 15 are 15 distinct carriers and 6.6 of them do not decode,
+which leaves two populations: noise peaks coarse sync cannot tell from
+signal, and real stations too weak for a decoder with **no OSD, no SIC
+and no AP**. `m5stack-cores3-app`'s own note has already priced the
+second one — "it decodes 7 on `qso3_busy` where host JTDX gets ~18;
+that gap is the cost of the leanness, and it is the right trade for
+battery-budgeted field operation. **Not a bug to chase.**"
+
+**Treat the 44 % as that trade, not as an opportunity.** Everything
+that would move it — OSD, SIC, AP, a better coarse discriminator — is
+either deliberately excluded or is a decoder project rather than a
+budget one.
 
 ## 3. So the receiver is selection-limited, not time-limited
 

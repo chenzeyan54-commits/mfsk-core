@@ -2627,3 +2627,68 @@ fn mirror_acquisition_unreachable_phases() {
         sum_clamp as f32 / n_starts as f32,
     );
 }
+
+/// **How many of the refined candidates are the same station twice?**
+///
+/// The slot-budget note's largest number is that 44 % of the 15
+/// stage-3 slots produce nothing, every slot, on the air. Depth does
+/// not recover it (pass-1 ranks 16-25 convert at ~0.1 %), so the
+/// question is what the 15 are spent on. Coarse sync works a 3.125 Hz
+/// grid and a strong carrier lights more than one cell, so some of
+/// those slots may be second and third looks at a station already
+/// being refined — `dedup_by_message` runs *after* stage 3 and cannot
+/// give the time back.
+#[test]
+#[ignore = "diagnostic — duplicate carriers inside the refined set"]
+fn how_much_of_the_refine_budget_is_the_same_carrier_twice() {
+    let slot = load_slot();
+    let mut phases: Vec<f32> = Vec::new();
+    let mut p = -0.40f32;
+    while p <= 0.40 + 1e-6 {
+        phases.push(p);
+        p += 0.02;
+    }
+    // A duplicate for this purpose: close enough in frequency that one
+    // carrier could produce both, and close enough in time that they
+    // are the same transmission rather than two stations sharing a
+    // slot. FT8 tone spacing is 6.25 Hz and the coarse grid is 3.125.
+    const DF_HZ: f32 = 6.5;
+    const DDT_S: f32 = 0.20;
+
+    let (mut tot, mut dup, mut worst) = (0usize, 0usize, 0usize);
+    for &phi in &phases {
+        // `coarse_split` is what the board's pass 1 is; the refined
+        // set is its top `max_cand`, which is what pass 2 keeps.
+        let k = ((phi * 12_000.0).round() as i64).rem_euclid(SLOT as i64) as usize;
+        let mut rotated = slot.clone();
+        rotated.rotate_left(k);
+        let spec = compute_spectrogram(&rotated, FREQ_MAX);
+        let pass1 = coarse_split(&spec);
+        let mut kept: Vec<(f32, f32)> = Vec::new();
+        let mut d = 0usize;
+        for c in pass1.iter().take(max_cand()) {
+            if kept
+                .iter()
+                .any(|(f, t)| (f - c.freq_hz).abs() <= DF_HZ && (t - c.dt_sec).abs() <= DDT_S)
+            {
+                d += 1;
+            } else {
+                kept.push((c.freq_hz, c.dt_sec));
+            }
+            tot += 1;
+        }
+        dup += d;
+        worst = worst.max(d);
+    }
+    println!(
+        "\n  {} phases, {} refined candidates: {dup} are a carrier already in the set          ({:.1} %), worst slot {worst} of {}",
+        phases.len(),
+        tot,
+        100.0 * dup as f32 / tot as f32,
+        max_cand()
+    );
+    println!(
+        "  At ~72 ms a candidate on the board, that is {:.0} ms a slot spent on a second\n           look at a station already being refined.",
+        72.0 * dup as f32 / phases.len() as f32
+    );
+}
