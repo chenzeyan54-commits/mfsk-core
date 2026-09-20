@@ -208,6 +208,116 @@ fn resolve_hash12(n12: u32, ht: &CallsignHashTable) -> String {
 }
 
 /// Decode a 15-bit Maidenhead grid square index.
+/// The 5-bit power field of a WSPR-type message, in dBm.
+///
+/// `packjt77.f90:395` — `idbm=nint(idbm*10.0/3.0)` then a `0..60` range
+/// check, which is the check that makes a random 5-bit field fail
+/// rather than render.
+fn wspr_dbm(raw: u32) -> Option<u32> {
+    // `(20 * raw + 3) / 6` is `nint(raw * 10 / 3)` exactly, in integers:
+    // a half-way case would need `2 * raw ≡ 3 (mod 6)`, whose left side
+    // is even and right side odd, so there are none and any correct
+    // rounding agrees. Integer because `f32::round` is `std`-only here
+    // and this file compiles under `no_std` — which the feature matrix
+    // caught and a `full`-only build would not have.
+    let dbm = (20 * raw + 3) / 6;
+    if dbm > 60 {
+        return None;
+    }
+    Some(dbm)
+}
+
+/// The 16-bit add-on field of a WSPR type-2 message: a base-36 prefix
+/// below `NZZZ`, a 1-3 character suffix above it.
+///
+/// Ported from `packjt77.f90:413-441`, including the `npfx > 12959`
+/// rejection — the one branch there that sets `unpk77_success=.false.`
+/// and returns.
+fn wspr_prefix_suffix(npfx: u32, call: &str) -> Option<String> {
+    const A2: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const NZZZ: u32 = 46_656; // 36^3
+    if npfx < NZZZ {
+        let mut n = npfx;
+        let mut cpfx = [b' '; 3];
+        for i in (0..3).rev() {
+            cpfx[i] = A2[(n % 36) as usize];
+            n /= 36;
+            if n == 0 {
+                break;
+            }
+        }
+        let pfx = core::str::from_utf8(&cpfx).ok()?.trim();
+        return Some(format!("{}/{}", pfx, call));
+    }
+    let n = npfx - NZZZ;
+    // At most three characters, so a fixed buffer rather than a `Vec`:
+    // `vec!` is not in scope under `no_std` here, and nothing about a
+    // 3-byte suffix wants the heap.
+    let mut buf = [0u8; 3];
+    let sfx: &[u8] = if n <= 35 {
+        buf[0] = A2[n as usize];
+        &buf[..1]
+    } else if n <= 1295 {
+        buf[0] = A2[(n / 36) as usize];
+        buf[1] = A2[(n % 36) as usize];
+        &buf[..2]
+    } else if n <= 12_959 {
+        buf[0] = A2[(n / 360) as usize];
+        buf[1] = A2[((n / 10) % 36) as usize];
+        buf[2] = A2[(n % 10) as usize];
+        &buf[..3]
+    } else {
+        return None;
+    };
+    Some(format!("{}/{}", call, core::str::from_utf8(sfx).ok()?))
+}
+
+/// 6-character Maidenhead grid from the 25-bit field of a WSPR-type
+/// (`i3=0, n3=6`) message.
+///
+/// Ported from `packjt77.f90`'s `to_grid`, bounds included: every digit
+/// is range-checked, and `j5 == j6 == 24` is the sentinel for a
+/// four-character grid, which upstream renders by leaving characters
+/// 5-6 blank.
+fn to_grid6(n: u32) -> Option<String> {
+    let mut n = n;
+    let j1 = n / (18 * 10 * 10 * 25 * 25);
+    if j1 > 17 {
+        return None;
+    }
+    n -= j1 * (18 * 10 * 10 * 25 * 25);
+    let j2 = n / (10 * 10 * 25 * 25);
+    if j2 > 17 {
+        return None;
+    }
+    n -= j2 * (10 * 10 * 25 * 25);
+    let j3 = n / (10 * 25 * 25);
+    if j3 > 9 {
+        return None;
+    }
+    n -= j3 * (10 * 25 * 25);
+    let j4 = n / (25 * 25);
+    if j4 > 9 {
+        return None;
+    }
+    n -= j4 * (25 * 25);
+    let j5 = n / 25;
+    let j6 = n - j5 * 25;
+    if j5 > 24 || j6 > 24 {
+        return None;
+    }
+    let mut g = String::with_capacity(6);
+    g.push((b'A' + j1 as u8) as char);
+    g.push((b'A' + j2 as u8) as char);
+    g.push((b'0' + j3 as u8) as char);
+    g.push((b'0' + j4 as u8) as char);
+    if j5 != 24 || j6 != 24 {
+        g.push((b'A' + j5 as u8) as char);
+        g.push((b'A' + j6 as u8) as char);
+    }
+    Some(g)
+}
+
 fn to_grid4(n: u32) -> Option<String> {
     if n > MAX_GRID4 {
         return None;
@@ -443,6 +553,59 @@ fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
                     "<...>".to_string()
                 };
                 Some(format!("{} RR73; {} {} {}", c1, c2, c3, crpt))
+            }
+            5 => {
+                // `packjt77.f90:360` — telemetry, 71 bits shown as 18 hex
+                // digits with leading zeros blanked. Not implemented here
+                // until now, so a telemetry message was a dropped decode
+                // rather than a rejected one.
+                let hex = format!(
+                    "{:06X}{:06X}{:06X}",
+                    read_bits(msg, 0, 23),
+                    read_bits(msg, 23, 24),
+                    read_bits(msg, 47, 24)
+                );
+                // Upstream blanks leading '0's and left-justifies, which
+                // for an all-zero payload leaves an empty message — it
+                // reports success either way, and so do we.
+                Some(hex.trim_start_matches('0').to_string())
+            }
+            6 => {
+                // `packjt77.f90:372` — WSPR-type. `itype` comes from bits
+                // 48..50 (1-based in Fortran), i.e. `msg[47..50]` here.
+                let (j48, j49, j50) = (msg[47] & 1, msg[48] & 1, msg[49] & 1);
+                let itype = if j50 == 1 {
+                    2
+                } else if j49 == 0 {
+                    1
+                } else if j48 == 0 {
+                    3
+                } else {
+                    return None;
+                };
+                match itype {
+                    1 => {
+                        let n28 = read_bits(msg, 0, 28);
+                        let igrid4 = read_bits(msg, 28, 15);
+                        let idbm = wspr_dbm(read_bits(msg, 43, 5))?;
+                        let grid = to_grid4(igrid4)?;
+                        Some(format!("{} {} {}", unpack28_h(n28, ht), grid, idbm))
+                    }
+                    2 => {
+                        let n28 = read_bits(msg, 0, 28);
+                        let npfx = read_bits(msg, 28, 16);
+                        let idbm = wspr_dbm(read_bits(msg, 44, 5))?;
+                        let call = unpack28_h(n28, ht);
+                        let composed = wspr_prefix_suffix(npfx, &call)?;
+                        Some(format!("{} {}", composed, idbm))
+                    }
+                    _ => {
+                        let n22 = read_bits(msg, 0, 22);
+                        let igrid6 = read_bits(msg, 22, 25);
+                        let grid = to_grid6(igrid6)?;
+                        Some(format!("{} {}", unpack28_h(n22 + NTOKENS, ht), grid))
+                    }
+                }
             }
             3 | 4 => {
                 // `packjt77.f90:343,345` — the same token-range check
@@ -1791,6 +1954,74 @@ mod tests {
                 "CQ with irpt={irpt} must be refused"
             );
         }
+    }
+
+    /// `packjt77.f90:360` — telemetry, 71 bits as 18 hex digits.
+    /// Returned `None` before this was ported: a dropped decode.
+    #[test]
+    fn telemetry_decodes_as_eighteen_hex_digits() {
+        let m = bits77(&[
+            (0, 23, 0x12_3456),
+            (23, 24, 0x78_9ABC),
+            (47, 24, 0xDE_F012),
+            (71, 3, 5),
+        ]);
+        assert_eq!(unpack77(&m).as_deref(), Some("123456789ABCDEF012"));
+        // Leading zeros are blanked, as upstream's loop does — *all* of
+        // them, across the group boundary: the three fields render as
+        // `000000` `0000AB` `CD0000` and ten zeros come off the front.
+        let z = bits77(&[(23, 24, 0x00_00AB), (47, 24, 0xCD_0000), (71, 3, 5)]);
+        assert_eq!(unpack77(&z).as_deref(), Some("ABCD0000"));
+    }
+
+    /// `packjt77.f90:387` — WSPR type 1, `CALL GRID4 DBM`.
+    #[test]
+    fn wspr_type1_decodes_call_grid_power() {
+        let grid = pack_grid4("PM95").expect("PM95 packs");
+        // idbm raw 6 -> round(6*10/3) = 20 dBm. itype 1 needs j49 = j50 = 0.
+        let m = bits77(&[(0, 28, call28()), (28, 15, grid), (43, 5, 6), (71, 3, 6)]);
+        assert_eq!(unpack77(&m).as_deref(), Some("JA1ABC PM95 20"));
+        // `idbm` out of the 0..60 range is upstream's rejection, and the
+        // reason a random 5-bit field fails instead of rendering.
+        let bad = bits77(&[(0, 28, call28()), (28, 15, grid), (43, 5, 31), (71, 3, 6)]);
+        assert!(
+            unpack77(&bad).is_none(),
+            "idbm 31 -> 103 dBm must be refused"
+        );
+    }
+
+    /// `packjt77.f90:403` — WSPR type 2, base-36 prefix or suffix.
+    #[test]
+    fn wspr_type2_decodes_prefix_and_suffix() {
+        // "ABC" = 10*36^2 + 11*36 + 12. itype 2 needs j50 = 1.
+        let pfx = bits77(&[
+            (0, 28, call28()),
+            (28, 16, 13_368),
+            (44, 5, 6),
+            (49, 1, 1),
+            (71, 3, 6),
+        ]);
+        assert_eq!(unpack77(&pfx).as_deref(), Some("ABC/JA1ABC 20"));
+        // Suffix form: npfx - NZZZ = 10 -> 'A'.
+        let sfx = bits77(&[
+            (0, 28, call28()),
+            (28, 16, 46_656 + 10),
+            (44, 5, 6),
+            (49, 1, 1),
+            (71, 3, 6),
+        ]);
+        assert_eq!(unpack77(&sfx).as_deref(), Some("JA1ABC/A 20"));
+    }
+
+    /// `packjt77.f90:444` — WSPR type 3, hashed call plus a 6-char grid.
+    #[test]
+    fn wspr_type3_decodes_hashed_call_and_grid() {
+        // PM95 in the 25-bit grid field, with the j5 = j6 = 24 sentinel
+        // that upstream uses for a four-character grid.
+        let igrid6 = 15 * 1_125_000 + 12 * 62_500 + 9 * 6_250 + 5 * 625 + 24 * 25 + 24;
+        // itype 3 needs j50 = 0, j49 = 1, j48 = 0.
+        let m = bits77(&[(0, 22, 1234), (22, 25, igrid6), (48, 1, 1), (71, 3, 6)]);
+        assert_eq!(unpack77(&m).as_deref(), Some("<...> PM95"));
     }
 
     /// `packjt77.f90:616` — nothing can have introduced the hash a
