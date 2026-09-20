@@ -56,6 +56,23 @@ const RTTY_STATES: &[&str] = &[
     "X97", "X98", "X99",
 ];
 
+/// ARRL Sections used by the Type-0.3 / 0.4 (Field Day) message format.
+/// Mirrors WSJT-X `packjt77.f90:227-236` `csec` (NSEC=86), in order, so
+/// the 7-bit `isec` field indexes it 1-based exactly as upstream does.
+///
+/// The length is load-bearing, not decorative: `packjt77.f90:338`
+/// refuses the whole message when `isec` falls outside `1..=86`, and a
+/// 7-bit field spans `0..=127` — so 42 of the 128 codes are invalid and
+/// rejecting them is 33 % of the Field Day phantom surface.
+const ARRL_SECTIONS: &[&str] = &[
+    "AB", "AK", "AL", "AR", "AZ", "BC", "CO", "CT", "DE", "EB", "EMA", "ENY", "EPA", "EWA", "GA",
+    "GH", "IA", "ID", "IL", "IN", "KS", "KY", "LA", "LAX", "NS", "MB", "MDC", "ME", "MI", "MN",
+    "MO", "MS", "MT", "NC", "ND", "NE", "NFL", "NH", "NL", "NLI", "NM", "NNJ", "NNY", "TER", "NTX",
+    "NV", "OH", "OK", "ONE", "ONN", "ONS", "OR", "ORG", "PAC", "PR", "QC", "RI", "SB", "SC", "SCV",
+    "SD", "SDG", "SF", "SFL", "SJV", "SK", "SNJ", "STX", "SV", "TN", "UT", "VA", "VI", "VT", "WCF",
+    "WI", "WMA", "WNY", "WPA", "WTX", "WV", "WWA", "WY", "DX", "PE", "NB",
+];
+
 // ── Token boundaries ─────────────────────────────────────────────────────────
 
 const NTOKENS: u32 = 2_063_592;
@@ -608,15 +625,43 @@ fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
                 }
             }
             3 | 4 => {
+                // `packjt77.f90:333-357` — ARRL Field Day, laid out
+                // `2b28,b1,b4,b3,b7` (`:337`) over the 71 payload bits:
+                // two callsigns, the `R` flag, the transmitter count,
+                // the class letter and the ARRL section.
+                let (n28a, n28b) = (read_bits(msg, 0, 28), read_bits(msg, 28, 28));
                 // `packjt77.f90:343,345` — the same token-range check
                 // upstream applies to Field Day's two callsign fields.
-                let (n28a, n28b) = (read_bits(msg, 0, 28), read_bits(msg, 28, 28));
                 if n28a <= 2 || n28b <= 2 {
                     return None;
                 }
+                let ir = msg[56] & 1;
+                let intx = read_bits(msg, 57, 4);
+                let nclass = read_bits(msg, 61, 3);
+                let isec = read_bits(msg, 64, 7) as usize;
+                // `packjt77.f90:338` — `isec` is a 1-based index into an
+                // 86-entry table carried in a 7-bit field, so 42 of its
+                // 128 codes name no section at all. Upstream refuses the
+                // message; this was the last unported check of the four
+                // the type carries, and it is the largest single filter
+                // in the family (see `phantom_survival_rates`).
+                if isec < 1 || isec > ARRL_SECTIONS.len() {
+                    return None;
+                }
+                let sec = ARRL_SECTIONS[isec - 1];
+                // `packjt77.f90:346-347`: the count is 1-based, and
+                // n3=4 is simply the +16 continuation of n3=3's range.
+                let ntx = intx + 1 + if n3 == 4 { 16 } else { 0 };
+                let class = (b'A' + nclass as u8) as char;
                 let c1 = unpack28_h(n28a, ht);
                 let c2 = unpack28_h(n28b, ht);
-                Some(format!("{} {} [FD]", c1, c2))
+                // `packjt77.f90:350-357` writes this as four separate
+                // cases because its `cntx` is a fixed-width `character*3`
+                // whose leading blank doubles as the separator for
+                // `ntx < 10`. Formatting the number directly makes all
+                // four collapse into one, with identical output.
+                let r = if ir == 1 { "R " } else { "" };
+                Some(format!("{} {} {}{}{} {}", c1, c2, r, ntx, class, sec))
             }
             _ => None,
         },
@@ -1039,14 +1084,61 @@ fn has_plausible_prefix(s: &str) -> bool {
 /// function adds a secondary filter by validating that callsign-like tokens
 /// follow ITU format rules (must contain a digit) and use the FT8 character
 /// set.  Special tokens (CQ, reports, grids, hash placeholders) are skipped.
+/// A token that is either a hashed-callsign placeholder (`<...>`, which
+/// [`unpack28_h`] emits when the hash is not in the table) or a callsign
+/// passing the ITU prefix allowlist.
+fn plausible_call_token(w: &str) -> bool {
+    (w.starts_with('<') && w.ends_with('>')) || is_plausible_callsign(w)
+}
+
+/// Recognise the ARRL Field Day exchange and judge it, or return `None`
+/// when the words are not that shape and the caller should fall through
+/// to its generic per-token loop.
+///
+/// `packjt77.f90:350-357` renders the type as
+/// `CALL CALL [R] <ntx><class> SEC`, where `ntx` is 1..=32 (a 4-bit
+/// field, +16 for the `n3 = 4` continuation), `class` is `A`..=`H` (3
+/// bits) and `SEC` is one of the 86 [`ARRL_SECTIONS`].
+fn field_day_plausible(words: &[&str]) -> Option<bool> {
+    let tail: &[&str] = match (words.len(), words.get(2)) {
+        (4, _) => &words[2..],
+        (5, Some(&"R")) => &words[3..],
+        _ => return None,
+    };
+    let (ntx_class, sec) = (tail[0], tail[1]);
+    if !ARRL_SECTIONS.contains(&sec) {
+        return None;
+    }
+    let split = ntx_class.len().checked_sub(1)?;
+    let (ntx, class) = ntx_class.split_at(split);
+    if !matches!(class.as_bytes(), [b'A'..=b'H']) {
+        return None;
+    }
+    if !matches!(ntx.parse::<u32>(), Ok(1..=32)) {
+        return None;
+    }
+    Some(plausible_call_token(words[0]) && plausible_call_token(words[1]))
+}
+
 pub fn is_plausible_message(text: &str) -> bool {
     let words: Vec<&str> = text.split_whitespace().collect();
     if words.is_empty() {
         return false;
     }
 
+    // ARRL Field Day (`unpack77` type 0.3 / 0.4). Its exchange tokens
+    // are not callsigns, so the generic loop below cannot judge it —
+    // but the two leading tokens *are*, and until Field Day's body was
+    // ported this function saw only a `[FD]` marker and returned `true`
+    // on the spot, skipping even those. `phantom_survival_rates`
+    // measured that as a 100 % survival rate for the type: not because
+    // the messages were plausible, but because nothing looked at them.
+    if let Some(ok) = field_day_plausible(&words) {
+        return ok;
+    }
+
     // Contest/DXpedition markers — trust the unpack result
-    if text.contains("[FD]") || text.contains("[RTTY]") || text.contains("RR73;") {
+    if text.contains("[RTTY]") || text.contains("RR73;") {
         return true;
     }
 
@@ -1705,7 +1797,7 @@ mod tests {
         assert!(is_plausible_message("CQ SOTA JL1NIE/P"));
 
         // Contest/DXpedition markers
-        assert!(is_plausible_message("JA1ABC 3Y0Z [FD]"));
+        assert!(is_plausible_message("JA1ABC 3Y0Z 6A EMA"));
     }
 
     #[test]
@@ -1905,14 +1997,94 @@ mod tests {
     #[test]
     fn field_day_rejects_a_token_in_a_callsign_field() {
         for n3 in [3u32, 4] {
-            let good = bits77(&[(0, 28, call28()), (28, 28, call28()), (71, 3, n3)]);
+            // `isec = 11` ("EMA") — any value in `1..=86` will do, but
+            // it can no longer be left at 0: `packjt77.f90:338` refuses
+            // that, so the control needs a real section.
+            let good = bits77(&[
+                (0, 28, call28()),
+                (28, 28, call28()),
+                (64, 7, 11),
+                (71, 3, n3),
+            ]);
             assert!(unpack77(&good).is_some(), "control must decode (n3={n3})");
-            let m = bits77(&[(0, 28, 0), (28, 28, call28()), (71, 3, n3)]);
+            let m = bits77(&[(0, 28, 0), (28, 28, call28()), (64, 7, 11), (71, 3, n3)]);
             assert!(
                 unpack77(&m).is_none(),
                 "Field Day call1 = DE must be refused"
             );
         }
+    }
+
+    /// `packjt77.f90:337-357` — the Field Day body, which was a bare
+    /// `[FD]` marker until the exchange fields were ported.
+    #[test]
+    fn field_day_decodes_the_exchange() {
+        let call = pack28("JA1ABC").expect("JA1ABC packs");
+        let dx = pack28("3Y0Z").expect("3Y0Z packs");
+        // n3=3, R=0, intx=5 (=> ntx 6), class=0 ('A'), isec=11 ("EMA").
+        let m = bits77(&[
+            (0, 28, call),
+            (28, 28, dx),
+            (57, 4, 5),
+            (61, 3, 0),
+            (64, 7, 11),
+            (71, 3, 3),
+        ]);
+        assert_eq!(unpack77(&m).as_deref(), Some("JA1ABC 3Y0Z 6A EMA"));
+
+        // n3=4 is the same layout with +16 transmitters; R=1 inserts the
+        // acknowledgement, class=7 is 'H', isec=84 is the "DX" catch-all.
+        let m = bits77(&[
+            (0, 28, call),
+            (28, 28, dx),
+            (56, 1, 1),
+            (57, 4, 15),
+            (61, 3, 7),
+            (64, 7, 84),
+            (71, 3, 4),
+        ]);
+        assert_eq!(unpack77(&m).as_deref(), Some("JA1ABC 3Y0Z R 32H DX"));
+    }
+
+    /// `packjt77.f90:338` — `isec` indexes an 86-entry table from a
+    /// 7-bit field, so 42 of its 128 codes name no ARRL section. This
+    /// was the last unported check of the four the type carries.
+    #[test]
+    fn field_day_rejects_an_out_of_range_section() {
+        let fd = |isec: u32| {
+            bits77(&[
+                (0, 28, call28()),
+                (28, 28, call28()),
+                (64, 7, isec),
+                (71, 3, 3),
+            ])
+        };
+        assert!(unpack77(&fd(0)).is_none(), "isec = 0 is below the table");
+        assert!(unpack77(&fd(1)).is_some(), "isec = 1 is \"AB\"");
+        assert!(unpack77(&fd(86)).is_some(), "isec = 86 is \"NB\"");
+        for isec in 87..128 {
+            assert!(
+                unpack77(&fd(isec)).is_none(),
+                "isec = {isec} names no section"
+            );
+        }
+    }
+
+    /// The Field Day exchange has to survive [`is_plausible_message`]
+    /// now that it no longer carries a `[FD]` marker to short-circuit
+    /// on — and a garbage callsign in it has to not.
+    #[test]
+    fn field_day_text_is_judged_on_its_callsigns() {
+        assert!(is_plausible_message("JA1ABC 3Y0Z 6A EMA"));
+        assert!(is_plausible_message("JA1ABC 3Y0Z R 32H DX"));
+        assert!(is_plausible_message("<...> 3Y0Z 6A EMA"));
+        // Same shape, but the first token is not a plausible callsign:
+        // the old marker path returned `true` without looking.
+        assert!(!is_plausible_message("NFW/0811 3Y0Z 6A EMA"));
+        // Right shape, wrong section / class / count.
+        assert!(!is_plausible_message("JA1ABC 3Y0Z 6A ZZZ"));
+        assert!(!is_plausible_message("JA1ABC 3Y0Z 6J EMA"));
+        assert!(!is_plausible_message("JA1ABC 3Y0Z 33A EMA"));
     }
 
     /// `packjt77.f90:494,509` — a CQ cannot acknowledge and cannot
@@ -1956,13 +2128,35 @@ mod tests {
         }
     }
 
-    /// How much of the phantom population each stage removes.
+    /// How much of the phantom population each stage removes, and what
+    /// a **per-mode** `(i3, n3)` pre-gate would add on top.
     ///
-    /// A CRC-14 false positive is a codeword the decoder converged on
-    /// that is not the transmitted one, so its 77 information bits are
+    /// A CRC false positive is a codeword the decoder converged on that
+    /// is not the transmitted one, so its 77 information bits are
     /// effectively uniform — which makes uniform random payloads the
     /// right model for the population both `unpack77`'s per-type
     /// validity checks and `is_plausible_message` exist to reject.
+    ///
+    /// The `(i3, n3)` breakdown is here because WSJT-X does **not**
+    /// treat the acceptance surface as mode-independent, even though
+    /// `unpack77` itself is shared:
+    ///
+    /// - `msk144decodeframe.f90:103` rejects `i3=0 & n3∈{1,3,4,>5}`,
+    ///   `i3=3` and `i3>5` *before* calling `unpack77` — DXpedition,
+    ///   ARRL Field Day, WSPR-type and RTTY Roundup exchanges, none of
+    ///   which are ever sent on a meteor-scatter link. Ported as
+    ///   `msk144::frame_decode::n3_i3_plausible`.
+    /// - `ft8b.f90:510-511` rejects `i3>5`, `i3=0 & n3>6` and
+    ///   `i3=0 & n3=2` — but every one of those is already refused by
+    ///   `unpack77` itself (`packjt77.f90:613`, `:457`, `:330`), so it
+    ///   removes nothing the shared layer had not already removed.
+    /// - `ft4_decode.f90:432` and `fst4_decode.f90:489` gate on
+    ///   nothing but the all-zero codeword.
+    ///
+    /// So the question this answers is: for a mode that transmits only
+    /// a subset of the 77-bit message styles, how much of the surviving
+    /// phantom population is reachable *only* through the styles it
+    /// never sends?
     ///
     /// Run it against this commit and against the tree before the
     /// `unpack77` port to see what the port moved:
@@ -1984,24 +2178,62 @@ mod tests {
                 .wrapping_add(1_442_695_040_888_963_407);
             ((x >> 33) & 1) as u8
         };
+
+        /// `ft8b.f90:510-511`.
+        fn ft8_gate(i3: u8, n3: u8) -> bool {
+            !(i3 > 5 || (i3 == 0 && n3 > 6) || (i3 == 0 && n3 == 2))
+        }
+        /// `msk144decodeframe.f90:103`.
+        fn msk144_gate(i3: u8, n3: u8) -> bool {
+            !((i3 == 0 && (n3 == 1 || n3 == 3 || n3 == 4 || n3 > 5)) || i3 == 3 || i3 > 5)
+        }
+        /// FT4 / FST4: no `(i3, n3)` pre-gate at all.
+        fn no_gate(_i3: u8, _n3: u8) -> bool {
+            true
+        }
+        /// Named alias purely to keep `clippy::type_complexity` quiet
+        /// at the array below.
+        type Gate = fn(u8, u8) -> bool;
+        let gates: [(&str, Gate); 3] = [
+            ("none (FT4/FST4)", no_gate),
+            ("ft8b.f90:510", ft8_gate),
+            ("msk144decodeframe:103", msk144_gate),
+        ];
+
         let (mut unpacked, mut plausible) = (0usize, 0usize);
-        let mut by_i3 = [0usize; 8];
-        let mut plausible_by_i3 = [0usize; 8];
+        // Survivors of both stages, counted under each pre-gate.
+        let mut survived_gated = [0usize; 3];
+        // Per `(i3, n3)` cell, keyed `i3 * 8 + n3`. Only `i3 = 0`
+        // varies in `n3` (every other type reuses those three bits as
+        // payload), so the other rows are collapsed on print.
+        let mut cell_unpacked = [0usize; 64];
+        let mut cell_plausible = [0usize; 64];
+
         for _ in 0..N {
             let mut m = [0u8; 77];
             for b in m.iter_mut() {
                 *b = next_bit();
             }
-            let i3 = read_bits(&m, 74, 3) as usize;
-            if let Some(text) = unpack77(&m) {
-                unpacked += 1;
-                by_i3[i3] += 1;
-                if is_plausible_message(&text) {
-                    plausible += 1;
-                    plausible_by_i3[i3] += 1;
+            let n3 = read_bits(&m, 71, 3) as u8;
+            let i3 = read_bits(&m, 74, 3) as u8;
+            let Some(text) = unpack77(&m) else {
+                continue;
+            };
+            unpacked += 1;
+            let cell = (i3 as usize) * 8 + n3 as usize;
+            cell_unpacked[cell] += 1;
+            if !is_plausible_message(&text) {
+                continue;
+            }
+            plausible += 1;
+            cell_plausible[cell] += 1;
+            for (k, (_, gate)) in gates.iter().enumerate() {
+                if gate(i3, n3) {
+                    survived_gated[k] += 1;
                 }
             }
         }
+
         let pct = |a: usize, b: usize| {
             if b == 0 {
                 0.0
@@ -2022,17 +2254,69 @@ mod tests {
             "  surviving both            {plausible:>9}  ({:.4} % of payloads)",
             pct(plausible, N)
         );
-        println!("  i3   unpack77    kept   kept%");
-        for i3 in 0..8 {
-            if by_i3[i3] == 0 {
+
+        println!("\n  what each mode's own (i3,n3) pre-gate removes from those survivors:");
+        println!("  {:<24} {:>9} {:>9}", "pre-gate", "survive", "vs none");
+        for (k, (name, _)) in gates.iter().enumerate() {
+            println!(
+                "  {name:<24} {:>9} {:>8.1} %",
+                survived_gated[k],
+                pct(survived_gated[k], survived_gated[0])
+            );
+        }
+
+        // `n3` is only a type selector for `i3 = 0`; for every other
+        // type those three bits carry payload, so that row is printed
+        // once with `n3` collapsed rather than as eight meaningless
+        // sub-rows.
+        println!("\n  i3   n3   unpack77     kept   kept%   style");
+        let row = |i3: u8, n3: Option<u8>, u: usize, p: usize, style: &str| {
+            let n3s = match n3 {
+                Some(v) => alloc::format!("{v}"),
+                None => "*".into(),
+            };
+            println!(
+                "  {i3:<4} {n3s:<4} {u:>8} {p:>8} {:>6.1}   {style}",
+                pct(p, u)
+            );
+        };
+        for n3 in 0u8..8 {
+            let cell = n3 as usize;
+            if cell_unpacked[cell] == 0 {
                 continue;
             }
-            println!(
-                "  {i3:<4} {:>8} {:>7} {:>6.1}",
-                by_i3[i3],
-                plausible_by_i3[i3],
-                pct(plausible_by_i3[i3], by_i3[i3])
+            let style = match n3 {
+                0 => "free text",
+                1 => "DXpedition",
+                3 | 4 => "ARRL Field Day",
+                5 => "telemetry",
+                6 => "WSPR type 1/2/3",
+                _ => "?",
+            };
+            row(
+                0,
+                Some(n3),
+                cell_unpacked[cell],
+                cell_plausible[cell],
+                style,
             );
+        }
+        for i3 in 1u8..8 {
+            let base = (i3 as usize) * 8;
+            let u: usize = cell_unpacked[base..base + 8].iter().sum();
+            if u == 0 {
+                continue;
+            }
+            let p: usize = cell_plausible[base..base + 8].iter().sum();
+            let style = match i3 {
+                1 => "standard",
+                2 => "EU VHF /P",
+                3 => "ARRL RTTY Roundup",
+                4 => "nonstandard call",
+                5 => "EU VHF contest",
+                _ => "?",
+            };
+            row(i3, None, u, p, style);
         }
     }
 
