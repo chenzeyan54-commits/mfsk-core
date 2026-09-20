@@ -499,7 +499,81 @@ pub fn power_state() -> (bool, u8, u8, u8) {
     )
 }
 
+/// How long VBUS is held low before it is raised, in milliseconds.
+///
+/// A USB device only re-enumerates if it sees its supply go away, and
+/// "go away" means its own bulk capacitance discharges below the
+/// threshold at which it considers itself unpowered — not just this
+/// board's switch opening. 200 ms is chosen to be comfortably past
+/// that for a radio-sized load and is **not measured**; if a device is
+/// still found missing after a restart, this is the first number to
+/// raise.
+const VBUS_CYCLE_LOW_MS: u32 = 200;
+
+/// The AW9523B output registers as they were found, **before**
+/// [`enable_usb_host_vbus`] touched them. Reported by
+/// [`log_boot_summary`]; `VBUS_PRE_VALID` is 0 until it has run.
+static VBUS_PRE0: AtomicU8 = AtomicU8::new(0);
+static VBUS_PRE1: AtomicU8 = AtomicU8::new(0);
+static VBUS_PRE_VALID: AtomicU8 = AtomicU8::new(0);
+
 pub fn enable_usb_host_vbus(i2c: &mut I2cDriver<'_>) -> Result<()> {
+    // **Drop VBUS before raising it, every time.**
+    //
+    // The three enables live in an AW9523B, which has its own supply
+    // and is not reset when the ESP32 restarts. This function used to
+    // only ever *set* bits (`p1 | BOOST_EN`, `p0 | USB_OTG_EN |
+    // BUS_OUT_EN`), so on a warm restart — the touch menu's
+    // `TIME: NTP` commit restarts the board, and so does any
+    // `boot_mode` change — the bits were already high and the writes
+    // were electrically a no-op. VBUS never fell, the radio never saw
+    // a bus reset, and it did not re-enumerate; meanwhile the host
+    // stack came up with no memory of it. The board then sat at
+    // `num_devices=0` showing `nodev` until the cable was pulled by
+    // hand, which is the only other way to interrupt the device's
+    // supply.
+    //
+    // Observed 2026-09-20: four consecutive host-mode boots at
+    // `num_devices=0` with zero slots, after a session that had been
+    // enumerating three devices minutes earlier. Portable operation
+    // plugs and unplugs constantly, so recovery cannot depend on a
+    // cable being pulled.
+    //
+    // Same shape as the AXP2101 `0x90` trap in `embedded-poc/CLAUDE.md`
+    // — a read-modify-write that can only set bits cannot undo a state
+    // an earlier boot left behind. Write the off state explicitly.
+    let before0 = read_reg(i2c, AW9523B_I2C_ADDR, AW9523_REG_OUT0)?;
+    let before1 = read_reg(i2c, AW9523B_I2C_ADDR, AW9523_REG_OUT1)?;
+    // **Latched for `[boot-summary]`, not logged here.** This runs
+    // before WiFi associates, so a line emitted at this point is
+    // overwritten in the staging ring and never reaches the only
+    // console a host-mode board has. That is written down in
+    // `embedded-poc/CLAUDE.md` — "add to `[boot-summary]` rather than
+    // adding another one-shot log line" — and a `log::warn!` here
+    // produced exactly zero lines in a whole session before it was
+    // moved.
+    //
+    // The premise this checks: on a warm restart the host bits should
+    // already be set (the AW9523B has its own supply and no ESP32
+    // reset reaches it), and on a cold one they should be clear. If
+    // both boots report "clear", the diagnosis below is wrong.
+    VBUS_PRE0.store(before0, Ordering::Relaxed);
+    VBUS_PRE1.store(before1, Ordering::Relaxed);
+    VBUS_PRE_VALID.store(1, Ordering::Relaxed);
+    write_reg(
+        i2c,
+        AW9523B_I2C_ADDR,
+        AW9523_REG_OUT0,
+        before0 & !(AW9523_P0_USB_OTG_EN | AW9523_P0_BUS_OUT_EN),
+    )?;
+    write_reg(
+        i2c,
+        AW9523B_I2C_ADDR,
+        AW9523_REG_OUT1,
+        before1 & !AW9523_P1_BOOST_EN,
+    )?;
+    esp_idf_svc::hal::delay::FreeRtos::delay_ms(VBUS_CYCLE_LOW_MS);
+
     // Boost first, then the gate. P1_7 runs the converter that makes
     // the 5 V; P0_5 puts that rail on the USB connector. The other
     // order hands the connector a supply that is still ramping.
@@ -651,6 +725,22 @@ pub fn log_boot_summary(i2c: &mut I2cDriver<'_>) {
     let out0 = read_reg(i2c, AW9523B_I2C_ADDR, AW9523_REG_OUT0);
     let out1 = read_reg(i2c, AW9523B_I2C_ADDR, AW9523_REG_OUT1);
     let st1 = read_reg(i2c, AXP2101_I2C_ADDR, AXP2101_REG_STATUS1);
+    // What the expander held before this boot enabled anything — the
+    // one reading that says whether a restart actually interrupted the
+    // radio's supply. See `enable_usb_host_vbus`.
+    if VBUS_PRE_VALID.load(Ordering::Relaxed) != 0 {
+        let (p0, p1) = (
+            VBUS_PRE0.load(Ordering::Relaxed),
+            VBUS_PRE1.load(Ordering::Relaxed),
+        );
+        let host_bits = p1 & AW9523_P1_BOOST_EN != 0
+            || p0 & (AW9523_P0_USB_OTG_EN | AW9523_P0_BUS_OUT_EN) != 0;
+        log::warn!(
+            "[boot-summary] VBUS pre-enable OUT0={p0:#04x} OUT1={p1:#04x} host bits {} \
+             (cycled low {VBUS_CYCLE_LOW_MS} ms)",
+            if host_bits { "ALREADY SET" } else { "clear" },
+        );
+    }
     log::warn!(
         "[boot-summary] AXP 0x90={} status1={} | AW9523 OUT0={} OUT1={} | bat={}mV vbus={}mV",
         ldo.map(|v| format!("0x{v:02x}"))
