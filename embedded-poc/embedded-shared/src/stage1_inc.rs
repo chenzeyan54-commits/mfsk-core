@@ -121,6 +121,46 @@ const SPEC_EMIT_PAIR: usize = match option_env!("MFSK_FT8_SPEC_EMIT_PAIR") {
     None => 87, // emit when next_pair == 87 (= pairs 0..86 done, m=0..173 valid)
 };
 const _: () = assert!(SPEC_EMIT_PAIR <= N_PAIRS, "SPEC_EMIT_PAIR > N_PAIRS");
+
+/// The largest `±lag` coarse sync can score **entirely inside the rows
+/// this emit point fills**, in seconds.
+///
+/// One authority for a number three comments used to state
+/// independently, two of them disagreeing by a row
+/// (`dual_core::EMBEDDED_SYNC_LAG_S` and `decode_pipeline`'s
+/// reverted-widen note both said `(174 - 162) * 0.08 = 0.96`; the code
+/// says 0.88). Derived, not asserted:
+///
+/// - emit pair `P` fills rows `m = 0 ..= 2P - 1`
+/// - block 2's last Costas symbol sits at
+///   `jstrt + NSSY*COSTAS_POS[2] + NSSY*(COSTAS.len()-1)`
+///   = `6 + 2*72 + 2*6` = **162**, and a lag of `j` rows moves it to
+///   `162 + j`
+/// - `coarse_sync::valid_trailing_symbol_count` reads up to
+///   `n_time - 1`, so the symbol is inside the filled region while
+///   `162 + j <= 2P - 1`, i.e. `j <= 2P - 163`
+/// - a row is `NSTEP / SAMPLE_RATE_HZ` = 0.08 s
+///
+/// **Exceeding it is not an error, and that is the danger.** The
+/// spectrogram is declared `N_TIME` rows long whatever the emit point
+/// is (`emit_spec_bundle`), so a lag past this bound reads rows that
+/// are *zero* rather than absent, and a correlation against zeros does
+/// not come out small — it comes out whatever the score's
+/// normalisation makes of it. That is what the ±1.75 s widen
+/// experiment hit on a radio (candidates at −1.64 / +1.72 / +1.08 with
+/// scores of 20-30 and nothing decoded, 2026-09-19); the shipped
+/// ±1.0 s is a smaller instance of the same thing, two rows over.
+pub const fn max_lag_s(emit_pair: usize) -> f32 {
+    // `2P - 163` as above, floored at zero.
+    let steps = (2 * emit_pair) as i32 - 163;
+    if steps <= 0 {
+        return 0.0;
+    }
+    steps as f32 * (NSTEP as f32 / SAMPLE_RATE_HZ)
+}
+
+/// [`max_lag_s`] for the emit point this build ships.
+pub const SPEC_EMIT_MAX_LAG_S: f32 = max_lag_s(SPEC_EMIT_PAIR);
 // Below this the emitted spectrogram stops covering block 2 at all
 // (last Costas at m=162 => pair 81), and coarse sync would be scoring
 // one sync block out of three without saying so.
@@ -409,11 +449,26 @@ pub fn spawn_with_wf(
         r, PD_PASS,
         "xTaskCreatePinnedToCore(stage1_inc) failed: {r}"
     );
+    // **The emit point and the lag, side by side, every boot.** They
+    // are set in two different crates and the relation between them is
+    // silent when broken (see `max_lag_s`), so the numbers go in the
+    // log rather than in a comment that can drift from either.
+    let lag = crate::dual_core::sync_lag_s();
     log::info!(
-        "stage1_inc: spawned (APP_CPU prio 6 — preempts dsp_worker); n_time={} n_pairs={} n_freq={}",
+        "stage1_inc: spawned (APP_CPU prio 6 — preempts dsp_worker); n_time={} n_pairs={} \
+         n_freq={}; emit_pair={} fills {} rows → lag ceiling {:.2} s, configured {:.2} s{}",
         N_TIME,
         N_PAIRS,
-        n_freq
+        n_freq,
+        SPEC_EMIT_PAIR,
+        2 * SPEC_EMIT_PAIR,
+        SPEC_EMIT_MAX_LAG_S,
+        lag,
+        if lag > SPEC_EMIT_MAX_LAG_S {
+            " — OVER: the outermost lags score against zero rows"
+        } else {
+            ""
+        }
     );
 }
 

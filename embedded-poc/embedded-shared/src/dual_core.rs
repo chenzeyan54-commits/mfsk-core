@@ -105,7 +105,7 @@ pub fn set_sync_lag_s(lag_s: f32) {
     );
 }
 
-fn sync_lag_s() -> f32 {
+pub(crate) fn sync_lag_s() -> f32 {
     SYNC_LAG_MS.load(core::sync::atomic::Ordering::Acquire) as f32 / 1_000.0
 }
 
