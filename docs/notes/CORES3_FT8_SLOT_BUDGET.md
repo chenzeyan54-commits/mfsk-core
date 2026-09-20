@@ -98,6 +98,62 @@ slot where the band has 8.4 with a maximum of 13.
 It is measurable on the host mirror with no radio time: run the board
 pipeline at `max_cand` 15 and 30 over the same phases and compare.
 
+### Measured, 2026-09-20 — and the answer is "nothing is there"
+
+81 phases per point, fixed-point, emit pair 87:
+
+| | `qso3_busy` | `qso1` | `qso2` |
+|---|---:|---:|---:|
+| `max_cand` 15 (shipped) | 6.53 | 2.10 | 2.10 |
+| `max_cand` 20 | 6.63 | 2.10 | 2.10 |
+| `max_cand` 25 | 6.63 | 2.11 | 2.12 |
+| `max_cand` 30 | 6.63 | **2.78** | **2.86** |
+
+**Pass-1 ranks 16-25 convert at about 0.1 %.** Ten more candidates buy
+one hundredth of a decode. The 44 % refine waste is not recoverable by
+looking deeper — coarse sync's tail is noise, and the prior board
+result (15→20→25 giving 8→7→8) was right for the wrong fixture.
+
+**The jump at 30 is not depth.** `max_cand_late = max_cand −
+n_early_refined` is 30 − 27.8 = 2.2 there, so the deferred path
+receives a budget for the first time. The proof is that
+`share_cand_budget` reaches the same place at `max_cand` 15 — 2.75 and
+2.86 against 2.78 and 2.86 — for **half the compute**.
+
+| candidate class | count | decodes bought | per candidate |
+|---|---:|---:|---:|
+| ready, pass-1 ranks 16-25 | 10 | +0.01 | ~0.1 % |
+| deferred | 2.2-3.0 | +0.68-0.76 | **~30 %** |
+
+A deferred candidate is worth about 250 ready ones at those ranks, and
+the shipped allocation gives the deferred path **zero**.
+
+### Which settles the emit point too
+
+| | `qso3_busy` | `qso1` | `qso2` |
+|---|---:|---:|---:|
+| 85, arrival allocation | 6.02 | **0.64** | **0.62** |
+| 85, value allocation | 6.31 | 2.74 | 2.86 |
+
+Emitting earlier raises `defer` (2.2 → 7.0 on `qso1`), so moving the
+emit point *without* fixing the allocation collapses the recording that
+has stations in the deferred set. Fixed, it returns to the level of
+87 + value. **So the emit point does not buy decodes; it buys the
+fraction that lands in time** (on the air, late 0.70 → 0.04), and it
+requires the allocation change as a precondition.
+
+Three caveats, because the numbers above are host fixtures:
+
+1. **The allocation's gains land after the boundary.** Deferred
+   candidates are refined on the full slot, which arrives at the
+   boundary, so they raise `dec` and not `intime`. They are decodes
+   for the screen and for the next period's choice.
+2. **`qso1`/`qso2` are more sensitive than the band.** The board's own
+   emit-85 arm lost 0.23 decodes where `qso1` loses 70 %, because on
+   this band the decodable stations are mostly in the ready set.
+3. **The board's `defer` is 1.2-1.8**, between `qso3_busy`'s 1.0 (no
+   gain) and `qso1`/`qso2`'s 2.2-3.0 (+0.7). Expect +0.2 to +0.5.
+
 ## 5. What a sample can resolve
 
 Today's per-slot spread, over 280 slots: `dec` sd 1.94, `intime` sd
@@ -128,19 +184,24 @@ the table above says how long an arm has to be.
 
 ## 6. Order of work this implies
 
-1. **Measure the pass-1 16-30 hit rate on the mirror.** Host only. It
-   decides whether selection work has a ceiling worth chasing.
+1. ~~Measure the pass-1 16-30 hit rate on the mirror.~~ **Done
+   2026-09-20: ranks 16-25 convert at ~0.1 %, and the value is in the
+   deferred candidates instead — see §4.** Depth is a dead end;
+   allocation is not.
 2. **Instrument rather than A-B** for anything whose predicted effect
    is under ~0.8 decodes: the block-2 gate's `gate2=`, and
    `share_cand_budget`'s reallocation count.
-3. **Test the package, not the parts.** If (1) says the unexamined
-   candidates convert, the combination to measure is emit 85 +
-   `share_cand_budget` together, against 87 + neither — because that is
-   the pairing the model says is coherent. One long arm, not three
-   short ones.
-4. **Leave the emit point at 87** until (3), and leave the gate off.
-   Both are wired and default-off; neither costs anything sitting
-   there.
+3. **Turn `share_cand_budget` on.** The mechanism is now confirmed
+   rather than assumed — it buys exactly what doubling `max_cand`
+   buys, for no extra work, and degenerates to today's behaviour when
+   `defer` is 0. The board measurement that kept it off would need
+   ~200 slots an arm to resolve +0.3, which is more radio time than
+   the risk justifies for a reallocation that cannot cost work.
+4. **Then the emit point becomes a latency decision, not a recall
+   one.** With the allocation fixed, 85 costs no decodes and moves
+   0.7 a slot from after the reply boundary to before it. Revisit it
+   there, and leave the block-2 gate off until its `gate2=`
+   instrumentation says it ever fires on the air.
 
 ## 7. What was reverted today, and why it is recorded
 
