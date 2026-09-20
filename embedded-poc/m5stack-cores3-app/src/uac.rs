@@ -2518,7 +2518,17 @@ fn spawn_device_count_probe() {
                     // 2026-09-20 the network that carries the log was
                     // 33 s behind it. Printed from this loop the dump
                     // lands wherever the log is actually reaching.
-                    if info.num_devices > 0 && !DUMPED.swap(true, Ordering::Relaxed) {
+                    // **Three times, not once.** The first attempt at
+                    // this was a one-shot on the first device sighting
+                    // and it landed in the same hole everything else
+                    // did: the loop starts within a second of boot,
+                    // WiFi associated 33 s later, and the dump was
+                    // written to a sink with nowhere to send it. The
+                    // periodic lines are ~12 s apart, so three of them
+                    // outlast any plausible association delay, and a
+                    // descriptor dump repeated twice costs a few log
+                    // lines against a whole reflash cycle.
+                    if info.num_devices > 0 && DUMPED.fetch_add(1, Ordering::Relaxed) < 3 {
                         dump_enumeration();
                     }
                     log::info!(
@@ -2553,8 +2563,10 @@ static CLIENT_COUNT: AtomicI32 = AtomicI32::new(-1);
 /// `driver_event_cb`: the enumeration log can be written before the
 /// network that carries it exists, and a missing line then reads as a
 /// missing interface.
-/// One-shot guard for [`dump_enumeration`].
-static DUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// How many times [`dump_enumeration`] has run. Repeated rather than
+/// one-shot so it cannot be swallowed by a log path that is not up
+/// yet — see the call site.
+static DUMPED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 static RX_IFACE_SEEN: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
 /// See [`RX_IFACE_SEEN`]. **`-1` here is the answer to "does the
