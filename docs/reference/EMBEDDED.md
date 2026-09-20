@@ -679,6 +679,44 @@ references 0.5 s (`xdt = ibest/666.67 - 0.5`, `lib/ft4_decode.f90:462`).
 modulator's constant governs, and why it has not been changed on the
 strength of one reading.
 
+### The coarse search window is a dependent variable
+
+`stage1_inc` emits its spectrogram at pair 87, filling rows 0..173.
+Block 2's last Costas symbol sits at row 162, so a lag of 11 rows still
+lands it inside real data and a lag of 12 does not: **0.88 s is the
+widest lag this emit point covers**, and it is `stage1_inc::max_lag_s`.
+
+Searching wider does not fail loudly. Rows past the fill point are
+present and zero, they add nothing to either sum, and the score is a
+self-normalising ratio — so a lag beyond the ceiling is scored over
+fewer Costas symbols and competes on equal terms with one scored over
+all of them.
+
+The window shipped at `1.0`, which `jz = round(lag / 0.08)` turned into
+13 rows — ±1.04 s. Swept on the host mirror over every distinct width
+the row grid allows (fixed-point, 51 capture phases per recording,
+`mirror_partial_block2_policies`):
+
+| window | lag steps | `qso3_busy` | `qso1` | `qso2` |
+|---|---|---|---|---|
+| ±0.80 | 21 | 331 | 88 | 87 |
+| **±0.88** | **23** | **337** | **118** | **115** |
+| ±0.96 | 25 | 335 | 116 | 112 |
+| ±1.04 | 27 | 335 | 112 | 112 |
+
+A maximum on all three recordings, no distinct station lost, and 15 %
+off coarse sync. On a radio, 30 slots gave 9.97 ± 1.80 against 63
+baseline slots at 8.54 ± 1.93 — but that is a before-and-after on an
+opening band; a block-alternating harness (`MFSK_FT8_LAG_AB`) put the
+window's own share at +0.50 over 24 slots, agreeing with the host
+sweep. What is not a statistic: deferred candidates went from 1.27 a
+slot to 0, because the ones that needed the whole slot were the ones at
+the extremes of the old window.
+
+`decode_pipeline` clamps the window to `SPEC_EMIT_MAX_LAG_S` rather
+than trusting it to match — move the emit point and the ceiling moves
+with it.
+
 ### Slot grid acquisition on the CoreS3
 
 Without a disciplined clock the FT8 controller places its slot grid
@@ -689,7 +727,7 @@ corrections, all found on the board:
 - **The capture's offset into its slot is counted.** The capture starts
   whenever acquisition is armed, part-way into a slot, and its phases are
   measured from that first sample. Uncounted, a capture ~1 s into its
-  slot left the grid 1.1 s short — outside the ±1.0 s per-slot search —
+  slot left the grid 1.1 s short — outside the per-slot search, ±1.0 s at the time and ±0.88 s since —
   and cost a second acquisition, about three minutes without a decode.
   What remains is the trial decodes' median bias, ~0.2 s either way.
 - **Every trial phase is ranked by decode count**, rather than the first
@@ -769,6 +807,67 @@ The bring-up checklist is kept for the next time that path breaks:
 [`UAC_BRINGUP_CORES3.md`](../notes/UAC_BRINGUP_CORES3.md). Read
 `embedded-poc/CLAUDE.md`'s "USB host VBUS on CoreS3" and "Stacks, heaps,
 and the space between them" before touching the board.
+
+### Transmitting over the same USB cable
+
+Receive-only until 2026-09-20; the first frame reached the radio that
+day, as digital silence. What the experiment settled is a constraint
+nothing in this tree had written down.
+
+**The audio device is not the radio.** An IC-705 enumerates as three
+devices behind an internal TI hub: the hub itself (`0451:2046`), an
+Icom CDC composite carrying two CI-V serial pairs (`0c26:0036`), and a
+**PCM2901 audio codec** (`08bb:2901`). Audio OUT is that codec's
+interface 1, audio IN its interface 2.
+
+**Only 48 kHz mono 16-bit can be opened**, and the limit is the host
+controller's, not the radio's. `uac_host_device_start` refuses 2 ch /
+16 bit / 48 kHz with `ESP_ERR_NOT_SUPPORTED` even though the radio
+lists that format. The refusal comes from `hcd_pipe_alloc`:
+
+```text
+E HCD DWC: EP MPS (192) exceeds supported limit (128)
+```
+
+An ESP32-S3 has no HS PHY, so `otg_dfifo_depth` is 256 lines; the
+default `CONFIG_USB_HOST_HW_BUFFER_BIAS_BALANCED` gives
+`ptx_fifo_lines = 256/8 = 32`, and the periodic-OUT MPS limit is
+`32 * 4` = **128 bytes**. The radio's OUT alt settings:
+
+| alt | format | maxpkt | rates |
+|---|---|---|---|
+| 1 | 2 ch 16-bit | 192 — over the limit | 32 k / 44.1 k / 48 k |
+| **2** | **1 ch 16-bit** | **96** | 32 k / 44.1 k / 48 k |
+| 3 | 2 ch 8-bit | 96 | as above |
+| 4 | 1 ch 8-bit | 48 | as above |
+
+Alt 2 is the only 16-bit format that fits. FT8 transmit is mono
+anyway, so nothing is lost — but the stream must then be *written* as
+mono: the driver sizes its isochronous packet from the channel count
+it accepted, so writing L = R into it hands the radio twice the audio
+it is pacing for.
+
+**Do not reach for `CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT`.** It
+raises the limit to ~824 B and admits alt 1, and it takes the RX FIFO
+from 160 lines to 34 — on the board whose receive path already lost
+2.6-6.5 % of its audio to an isochronous URB budget (see
+`embedded-poc/CLAUDE.md`). Spending the receive FIFO to buy a transmit
+format is the wrong trade on a receiver.
+
+Measured, twice, identically (`MFSK_CORES3_TX_PROBE=1`, amplitude 0):
+632 chunks of 20 ms in **12 603 ms** against 12 640 ms of audio — 0.3 %
+short, i.e. paced by the ring's own backpressure rather than by this
+board's ability to synthesise. GMFSK synthesis runs from
+`engine::dsp::gfsk::GfskStream`, a rotating phasor rather than `sinf`,
+at ~440 us per 20 ms chunk.
+
+**This is a probe, not a transmit path.** It runs from the enumeration
+callback and blocks that task for the frame's whole 12.6 s, with
+`RxConnected` queued behind it — one slot of every capture. A real
+transmitter has to be driven by the QSO state machine on the slot
+grid. See `m5stack-cores3-app/CLAUDE.md`'s "TX/QSO feasibility" for the
+phase plan, and confirm the radio's `PTT SOURCE` is not `VOX` before
+running any of it at a nonzero amplitude.
 
 ## WSPR on embedded
 

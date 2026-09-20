@@ -193,6 +193,56 @@ reported the grid healthy while the band said otherwise.
 
 ### Added
 
+- **CoreS3 FT8: the coarse search window is now the emit point's
+  coverage ceiling, and clamped to it.** `stage1_inc` emits at pair 87,
+  filling rows 0..173; block 2's last Costas symbol is at row 162, so
+  0.88 s is the widest lag that lands it inside real data. The window
+  shipped at `1.0`, which `jz = round(lag / 0.08)` turned into 13 rows
+  — ±1.04 s — and searching past the ceiling does not fail loudly:
+  unfilled rows are present and zero, they add nothing to either sum,
+  and a self-normalising ratio over fewer Costas symbols competes on
+  equal terms with one over all of them. Swept on the host mirror over
+  every distinct width the row grid allows (fixed-point, 51 capture
+  phases per recording, `mirror_partial_block2_policies`) — decodes
+  331/88/87 at ±0.80, **337/118/115 at ±0.88**, 335/116/112 at ±0.96,
+  335/112/112 at ±1.04 on `qso3_busy`/`qso1`/`qso2`: a maximum on all
+  three, no distinct station lost, and 23 lag steps instead of 27, i.e.
+  15 % off coarse sync (100-180 ms a slot on this board). On a radio,
+  30 slots at 9.97 ± 1.80 against 63 baseline slots at 8.54 ± 1.93 —
+  but that is a before-and-after on an opening band, and a
+  block-alternating harness (`MFSK_FT8_LAG_AB`) put the window's own
+  share at +0.50 over 24 slots, agreeing with the host sweep rather
+  than the +1.43. What is not a statistic: deferred candidates went
+  from 1.27 a slot to 0, because the ones that needed the whole slot
+  were the ones at the extremes of the old window.
+  `docs/reference/EMBEDDED.md` "The coarse search window is a dependent
+  variable" has the derivation; `decode_pipeline` clamps rather than
+  trusting the two to agree, because the version of this invariant that
+  was only written down is the one being fixed.
+
+- **`ft8::decode_block::PartialBlock2`** names what a streaming caller
+  does with a lag whose Costas block 2 is not fully covered — `Score`
+  (WSJT-X's own behaviour, and what ships) or `Gate` (refuse the lag),
+  with `coarse_sync_with_lag_and_partial` /
+  `coarse_sync_with_allsum_lag_and_partial` to select it. It replaces
+  an `Option<usize>` that said nothing about why, and exists so the two
+  can be compared on one slot. Default behaviour is unchanged to the
+  bit. A third variant that shrank a partial score toward the noise
+  floor by `sqrt(N / N_full)` was written, measured and deleted: under
+  `fixed-point` the widest lag a ±1.0 s search reaches still keeps 6 of
+  7 symbols, so the correction is `sqrt(20/21)` = 2 %, and it changed
+  no decode count on any fixture at any phase.
+
+- **CoreS3 can transmit audio to the radio** (`MFSK_CORES3_TX_PROBE=1`,
+  amplitude 0 by default — a probe, not yet a transmit path). A whole
+  FT8 frame is synthesised a chunk at a time by
+  `engine::dsp::gfsk::GfskStream` and written to the IC-705's USB audio
+  OUT interface: 632 chunks of 20 ms in 12 603 ms against 12 640 ms of
+  audio, twice, identically. See **Fixed** for the format constraint
+  that had to be found first, and `docs/reference/EMBEDDED.md`
+  "Transmitting over the same USB cable".
+
+
 - **CoreS3: the time source is a setting, behind a two-level menu.** The
   overlay listed five receivers and nothing else, so the one thing a
   portable station has to decide before it can decode — where the slot
@@ -376,6 +426,48 @@ reported the grid healthy while the band said otherwise.
   of where the decode happened to finish.
 
 ### Fixed
+
+- **CoreS3: USB audio transmit works in one format only, and it is not
+  the one the radio advertises first.** `uac_host_device_start` refused
+  2 ch / 16 bit / 48 kHz with `ESP_ERR_NOT_SUPPORTED` — a format the
+  IC-705's own descriptor lists. The refusal is not the UAC driver's:
+  `hcd_pipe_alloc` rejects the pipe with `EP MPS (192) exceeds
+  supported limit (128)`. An ESP32-S3 has no HS PHY, so
+  `otg_dfifo_depth` is 256 lines, the default BALANCED bias gives
+  `ptx_fifo_lines = 256/8 = 32`, and the periodic-OUT limit is
+  `32 * 4` = 128 bytes; alt 1 carries 192. Mono 16-bit is 96 B/frame
+  and is the only 16-bit OUT format that fits (alts 3-6 are 8-bit).
+  `CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT` would admit alt 1 and
+  take the RX FIFO from 160 lines to 34 — on the board whose receive
+  path already lost 2.6-6.5 % of its audio to an isochronous URB
+  budget — so the probe walks a short format ladder instead and
+  `write_ft8_frame` emits the channel count `device_start` accepted.
+  Writing L = R into a stream the driver paces as mono hands the radio
+  twice the audio it expects. The audio device is also not the radio:
+  an IC-705 is a TI hub, an Icom CDC composite and a **PCM2901**
+  codec, and the OUT interface belongs to the codec.
+
+- **CoreS3: the transmit path overflowed its task stack the first time
+  it ever ran.** Until `device_start` succeeded, `handle_tx_connected`'s
+  body was code no measurement had covered: the silent-write buffer
+  (1 920 B, live across the call) plus `write_ft8_frame`'s 3 840 B and
+  480 B put 6 240 B on a 4 096 B stack. The first `start` that
+  succeeded ran them and the board rebooted 30 s into the capture, with
+  no panic on any console that still existed. Buffers moved to the
+  heap, `APP_TASK_STACK` raised to 8 192, and the frame loop given a
+  progress guard so it cannot spin forever inside an enumeration
+  callback.
+
+- **CoreS3: the TX probe's outcome survives the log path now.**
+  `handle_tx_connected` runs during enumeration, tens of seconds before
+  the network that carries its log, so its result was missing from
+  every capture. `TX_STAGE` (0..6) rides the periodic
+  `usb_host_lib_info` line and separates "never entered" from "open
+  failed" from "still inside the 12.6 s frame" — three states one
+  `esp_err_t` could not tell apart. The enumeration dump now also
+  prints each interface's Type I format descriptor and `bInterval`,
+  not just endpoint sizes.
+
 
 - **CoreS3 FT8: the USB audio path was silently dropping 6.5 % of its
   samples, and that was the grid bug.**
