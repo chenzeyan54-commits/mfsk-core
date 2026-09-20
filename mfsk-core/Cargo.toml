@@ -157,6 +157,40 @@ wspr-pass2-topn = []
 # cheaper path" split as `wspr-pass2-topn` above.
 wspr-fano-cap-fast = []
 
+# Replace the callsign hash table's three tables with one 256-entry
+# table — an embedded trade in the same "host stays faithful, embedded
+# opts into the cheaper thing" shape as the two above. 83 KB to 7 KB.
+#
+# Upstream keeps three tables because on a PC it can. The 10- and
+# 12-bit ones are arrays indexed by the hash itself — 1 024 and 4 096
+# slots, `packjt77.f90:5-6` — which needs no search and stores no key,
+# at the cost of sizing them by key space rather than by traffic. A
+# receiver hears on the order of 100 distinct callsigns in 15 minutes
+# (measured, CoreS3 on 40 m, 2026-09-20), so 97 % of those 66 KB hold
+# nothing. This feature stores each callsign once beside its three
+# hashes and scans for the one wanted.
+#
+# **What it costs is eviction policy, not capacity.** A direct-indexed
+# slot keeps its callsign until a colliding hash overwrites it, which
+# may be never; one unified LRU evicts by recency, so all three widths
+# forget a station together and an old one renders `<...>` again. The
+# 10- and 12-bit hashes appear in DXpedition and Type-4 messages,
+# which name the station being worked *now*, so the depth that matters
+# should be recent — but **how often this actually costs a resolution
+# has not been measured on air.** The instrument exists: count
+# `<...>`-bearing decodes per slot with and without this flag, the way
+# `m5stack-cores3-app/src/decode_pipeline.rs` already counted 69 of
+# 380. Measure before relying on it, as `wspr-fano-cap-fast` was.
+#
+# 256 and not 100 because of an allocator threshold: one entry is
+# 28 B, so 100 would be 2.8 KB — under the CoreS3's
+# `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`, putting the result back
+# in the internal DRAM this exists to stop consuming. 256 is 7.2 KB,
+# over the line and into PSRAM, and still a quarter of upstream's
+# 1 000. `hash_table.rs`'s
+# `the_unified_table_stays_above_the_psram_threshold` asserts it.
+hash-table-small = []
+
 # Use the streaming down-converter (`wspr::ddc`) instead of wsprd's
 # whole-slot FFT channelizer (`wspr::baseband::decimate_to_baseband`).
 # Off by default — host keeps the reference, which is exact.
@@ -317,7 +351,7 @@ rustfft = "6"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","msk144","packet-bytes","uvpacket","parallel","full","fft-rustfft","fft-extern","fixed-point","profile-coarse","nstep-half","wspr-pass2-topn","wspr-fano-cap-fast","wspr-ddc","wspr-ddc-cascade"))',
+    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","msk144","packet-bytes","uvpacket","parallel","full","fft-rustfft","fft-extern","fixed-point","profile-coarse","nstep-half","wspr-pass2-topn","wspr-fano-cap-fast","hash-table-small","wspr-ddc","wspr-ddc-cascade"))',
 ] }
 
 # Build docs.rs with every protocol feature enabled so users browsing

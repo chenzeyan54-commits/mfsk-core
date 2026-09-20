@@ -20,9 +20,6 @@ const C38: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/";
 /// Magic constant for multiplicative hash (from WSJT-X).
 const HASH_MAGIC: u64 = 47_055_833_459;
 
-/// Maximum entries in the 22-bit LRU table.
-const MAX_HASH22: usize = 1000;
-
 /// Compute the FT8 callsign hash at a given bit width.
 ///
 /// The callsign is left-padded to 11 characters, converted to a base-38
@@ -63,9 +60,10 @@ pub fn ihashcall(call: &str, m: u32) -> u32 {
 /// minutes of live reception until `esp-aes` could not allocate and
 /// WiFi — the only console a USB-host-mode board has — went silent.
 ///
-/// Inline entries make the whole table three large allocations
-/// instead of thousands of tiny ones, which on that board puts it in
-/// PSRAM where there are megabytes spare.
+/// Inline entries make the whole table a few large allocations
+/// instead of thousands of tiny ones — three by default, one under
+/// `hash-table-small` — which on that board puts it in PSRAM where
+/// there are megabytes spare.
 ///
 /// Zero is the empty marker: every character `ihashcall` accepts is
 /// printable, so a leading NUL cannot be a callsign.
@@ -100,13 +98,65 @@ impl core::fmt::Debug for Call13 {
     }
 }
 
+/// Maximum entries in the 22-bit LRU table (`packjt77.f90:4`,
+/// `MAXHASH=1000`). Host only — under `hash-table-small` there is one
+/// unified table instead and this does not exist.
+#[cfg(not(feature = "hash-table-small"))]
+const MAX_HASH22: usize = 1000;
+
 /// Slots in the 10-bit table — the whole key space, as upstream
 /// (`packjt77.f90:5`, `dimension(0:1023)`). 13 KB once allocated.
+#[cfg(not(feature = "hash-table-small"))]
 const N_HASH10: usize = 1024;
 
 /// Slots in the 12-bit table (`packjt77.f90:6`, `dimension(0:4095)`).
 /// 53 KB once allocated, and the reason allocation is lazy.
+#[cfg(not(feature = "hash-table-small"))]
 const N_HASH12: usize = 4096;
+
+/// Entries in the unified table `hash-table-small` uses.
+///
+/// **256 and not 100, because of an allocator threshold.** One entry
+/// is 28 B (a `Call13` padded to 16 by the three `u32` hashes beside
+/// it), so 100 entries is 2.8 kB — under the CoreS3's
+/// `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`, which would put the
+/// whole point of this rewrite back in internal DRAM. 256 entries is
+/// 7.2 kB, over the line and into PSRAM, and still a quarter of
+/// upstream's 1 000.
+///
+/// As history: a CoreS3 on 40 m logged 100 distinct callsigns in its
+/// first 15 minutes (2026-09-20), so 256 is roughly 40 minutes of
+/// memory.
+#[cfg(feature = "hash-table-small")]
+const N_ENTRIES: usize = 256;
+
+/// One learned callsign and the three hashes it answers to.
+///
+/// `hash-table-small` only. Upstream keeps three separate tables
+/// because on a PC it can: the 10- and 12-bit ones are arrays indexed
+/// by the hash itself, 1 024 and 4 096 slots, needing no search and no
+/// stored key. That is 66 KB to hold what a receiver actually sees —
+/// 100 distinct callsigns in 15 minutes of a busy band — so 97 % of it
+/// is empty. Storing the callsign once with its three hashes and
+/// scanning for the one wanted is 7 KB for the same job.
+///
+/// The cost is eviction policy. A direct-indexed slot keeps its
+/// callsign until a colliding hash overwrites it, which may be never;
+/// here all three widths share one LRU, so a station heard long enough
+/// ago renders `<...>` again. The 10- and 12-bit hashes appear in
+/// DXpedition and Type-4 messages, both of which name the station
+/// being worked *now*, so the depth that matters is recent — but the
+/// rate at which this costs a resolution has not been measured on air.
+/// Count `<...>` per decode before and after, the way
+/// `decode_pipeline.rs` already does.
+#[cfg(feature = "hash-table-small")]
+#[derive(Clone, Copy, Debug)]
+struct Entry {
+    call: Call13,
+    h10: u32,
+    h12: u32,
+    h22: u32,
+}
 
 /// Runtime callsign hash lookup table.
 ///
@@ -115,23 +165,36 @@ const N_HASH12: usize = 4096;
 ///
 /// **`new()` allocates nothing, and that is load-bearing.**
 /// `wsjt77::is_plausible_payload` builds a fresh empty table on every
-/// call, so an eager 83 KB here would land on every `unpack77`. The
-/// three blocks are allocated on the first [`Self::insert`] and not
-/// before.
+/// call, so an eager allocation here would land on every `unpack77`.
+/// The storage appears on the first [`Self::insert`] and not before.
+///
+/// Two shapes, chosen at compile time. The default is upstream's —
+/// three tables, the 10- and 12-bit ones direct-indexed over their key
+/// spaces (83 KB). `hash-table-small` is one LRU of `N_ENTRIES`
+/// holding each callsign once beside its three hashes (7 KB); see
+/// `Entry` for what that trades. (Plain spans and not intra-doc
+/// links: both items are `#[cfg]`-ed away in the build that renders
+/// these docs.)
 #[derive(Debug, Clone)]
 pub struct CallsignHashTable {
     /// 10-bit hash → callsign, direct-indexed over the whole key
     /// space. `None` until the first insert.
+    #[cfg(not(feature = "hash-table-small"))]
     calls10: Option<Vec<Call13>>,
     /// 12-bit hash → callsign, direct-indexed. `None` until the first
     /// insert.
+    #[cfg(not(feature = "hash-table-small"))]
     calls12: Option<Vec<Call13>>,
     /// The 22-bit LRU: `hash22[i]` names `calls22[i]`, most recent
     /// first, exactly as `packjt77.f90:7,12`'s parallel arrays do.
-    /// `None` until the first insert.
+    #[cfg(not(feature = "hash-table-small"))]
     calls22: Option<Vec<Call13>>,
+    #[cfg(not(feature = "hash-table-small"))]
     hash22: Option<Vec<u32>>,
-    /// Live entries in the LRU, `<= MAX_HASH22` — upstream's `nzhash`.
+    /// The unified LRU, most recent first.
+    #[cfg(feature = "hash-table-small")]
+    entries: Option<Vec<Entry>>,
+    /// Live entries — upstream's `nzhash`.
     n22: usize,
 }
 
@@ -139,32 +202,21 @@ impl CallsignHashTable {
     /// Create an empty hash table. Allocates nothing.
     pub fn new() -> Self {
         Self {
+            #[cfg(not(feature = "hash-table-small"))]
             calls10: None,
+            #[cfg(not(feature = "hash-table-small"))]
             calls12: None,
+            #[cfg(not(feature = "hash-table-small"))]
             calls22: None,
+            #[cfg(not(feature = "hash-table-small"))]
             hash22: None,
+            #[cfg(feature = "hash-table-small")]
+            entries: None,
             n22: 0,
         }
     }
 
-    /// Allocate the three blocks, if they are not there yet.
-    ///
-    /// `vec![Call13::EMPTY; N]` and not `Box::new([Call13::EMPTY; N])`:
-    /// the latter builds the array as a temporary first, and 53 KB of
-    /// temporary is an embedded task's whole stack. Two of this
-    /// project's "heap corruption" investigations turned out to be
-    /// stack overflows (`embedded-poc/CLAUDE.md`, "Stacks, heaps, and
-    /// the space between them").
-    fn ensure(&mut self) {
-        if self.calls10.is_none() {
-            self.calls10 = Some(alloc::vec![Call13::EMPTY; N_HASH10]);
-            self.calls12 = Some(alloc::vec![Call13::EMPTY; N_HASH12]);
-            self.calls22 = Some(alloc::vec![Call13::EMPTY; MAX_HASH22]);
-            self.hash22 = Some(alloc::vec![0u32; MAX_HASH22]);
-        }
-    }
-
-    /// Register a decoded callsign, populating all three tables.
+    /// Register a decoded callsign.
     ///
     /// Skips empty strings, `<...>` placeholders, and strings shorter
     /// than 2 characters. Strips `<>` brackets if present.
@@ -193,53 +245,116 @@ impl CallsignHashTable {
         let n12 = ihashcall(base, 12);
         let n22 = ihashcall(base, 22);
         let entry = Call13::from_str(base);
+        let _ = (n10, n12, entry);
 
-        self.ensure();
-        // `ihashcall` returns the top `m` bits, so these are in range
-        // by construction; the guard mirrors `packjt77.f90:94,97`
-        // rather than trusting that across a future change.
-        if let Some(t) = self.calls10.as_mut()
-            && let Some(slot) = t.get_mut(n10 as usize)
+        #[cfg(not(feature = "hash-table-small"))]
         {
-            *slot = entry;
-        }
-        if let Some(t) = self.calls12.as_mut()
-            && let Some(slot) = t.get_mut(n12 as usize)
-        {
-            *slot = entry;
+            // `vec![Call13::EMPTY; N]` and not `Box::new([_; N])`: the
+            // latter builds the array as a temporary first, and 53 KB
+            // of temporary is an embedded task's whole stack. Two of
+            // this project's "heap corruption" investigations turned
+            // out to be stack overflows (`embedded-poc/CLAUDE.md`,
+            // "Stacks, heaps, and the space between them").
+            if self.calls10.is_none() {
+                self.calls10 = Some(alloc::vec![Call13::EMPTY; N_HASH10]);
+                self.calls12 = Some(alloc::vec![Call13::EMPTY; N_HASH12]);
+                self.calls22 = Some(alloc::vec![Call13::EMPTY; MAX_HASH22]);
+                self.hash22 = Some(alloc::vec![0u32; MAX_HASH22]);
+            }
+            // `ihashcall` returns the top `m` bits, so these are in
+            // range by construction; the guard mirrors
+            // `packjt77.f90:94,97` rather than trusting that across a
+            // future change.
+            if let Some(t) = self.calls10.as_mut()
+                && let Some(slot) = t.get_mut(n10 as usize)
+            {
+                *slot = entry;
+            }
+            if let Some(t) = self.calls12.as_mut()
+                && let Some(slot) = t.get_mut(n12 as usize)
+            {
+                *slot = entry;
+            }
+            // 22-bit LRU, `packjt77.f90:99-112`: refresh in place if
+            // the hash is already known, else push everything down and
+            // take the front.
+            let (Some(hashes), Some(calls)) = (self.hash22.as_mut(), self.calls22.as_mut()) else {
+                return;
+            };
+            if let Some(pos) = hashes[..self.n22].iter().position(|&h| h == n22) {
+                calls[pos] = entry;
+                hashes[..=pos].rotate_right(1);
+                calls[..=pos].rotate_right(1);
+                return;
+            }
+            if self.n22 < MAX_HASH22 {
+                self.n22 += 1;
+            }
+            hashes[..self.n22].rotate_right(1);
+            calls[..self.n22].rotate_right(1);
+            hashes[0] = n22;
+            calls[0] = entry;
         }
 
-        // 22-bit LRU, `packjt77.f90:99-112`: refresh in place if the
-        // hash is already known, else push everything down and take
-        // the front.
-        let (Some(hashes), Some(calls)) = (self.hash22.as_mut(), self.calls22.as_mut()) else {
-            return;
-        };
-        if let Some(pos) = hashes[..self.n22].iter().position(|&h| h == n22) {
-            calls[pos] = entry;
-            hashes[..=pos].rotate_right(1);
-            calls[..=pos].rotate_right(1);
-            return;
+        #[cfg(feature = "hash-table-small")]
+        {
+            let t = self.entries.get_or_insert_with(|| {
+                alloc::vec![
+                    Entry {
+                        call: Call13::EMPTY,
+                        h10: 0,
+                        h12: 0,
+                        h22: 0,
+                    };
+                    N_ENTRIES
+                ]
+            });
+            let new = Entry {
+                call: entry,
+                h10: n10,
+                h12: n12,
+                h22: n22,
+            };
+            // Same LRU discipline as the 22-bit table above, keyed on
+            // the 22-bit hash: it is the widest, so two callsigns
+            // sharing it is 1-in-4M rather than 1-in-1024.
+            if let Some(pos) = t[..self.n22].iter().position(|e| e.h22 == n22) {
+                t[pos] = new;
+                t[..=pos].rotate_right(1);
+                return;
+            }
+            if self.n22 < N_ENTRIES {
+                self.n22 += 1;
+            }
+            t[..self.n22].rotate_right(1);
+            t[0] = new;
         }
-        if self.n22 < MAX_HASH22 {
-            self.n22 += 1;
-        }
-        hashes[..self.n22].rotate_right(1);
-        calls[..self.n22].rotate_right(1);
-        hashes[0] = n22;
-        calls[0] = entry;
     }
 
     /// Look up a 10-bit hash. Returns the callsign if found.
     pub fn lookup10(&self, n10: u32) -> Option<&str> {
-        let e = self.calls10.as_ref()?.get(n10 as usize)?;
-        (!e.is_empty()).then(|| e.as_str())
+        #[cfg(not(feature = "hash-table-small"))]
+        {
+            let e = self.calls10.as_ref()?.get(n10 as usize)?;
+            (!e.is_empty()).then(|| e.as_str())
+        }
+        #[cfg(feature = "hash-table-small")]
+        {
+            self.scan(|e| e.h10 == n10)
+        }
     }
 
     /// Look up a 12-bit hash. Returns the callsign if found.
     pub fn lookup12(&self, n12: u32) -> Option<&str> {
-        let e = self.calls12.as_ref()?.get(n12 as usize)?;
-        (!e.is_empty()).then(|| e.as_str())
+        #[cfg(not(feature = "hash-table-small"))]
+        {
+            let e = self.calls12.as_ref()?.get(n12 as usize)?;
+            (!e.is_empty()).then(|| e.as_str())
+        }
+        #[cfg(feature = "hash-table-small")]
+        {
+            self.scan(|e| e.h12 == n12)
+        }
     }
 
     /// Look up a 22-bit hash. Returns the callsign, **unwrapped**.
@@ -251,13 +366,35 @@ impl CallsignHashTable {
     /// caught it. All three return the same shape now; the callers
     /// that want `<>` add it.
     pub fn lookup22(&self, n22: u32) -> Option<&str> {
-        let hashes = self.hash22.as_ref()?;
-        let pos = hashes[..self.n22].iter().position(|&h| h == n22)?;
-        Some(self.calls22.as_ref()?[pos].as_str())
+        #[cfg(not(feature = "hash-table-small"))]
+        {
+            let hashes = self.hash22.as_ref()?;
+            let pos = hashes[..self.n22].iter().position(|&h| h == n22)?;
+            Some(self.calls22.as_ref()?[pos].as_str())
+        }
+        #[cfg(feature = "hash-table-small")]
+        {
+            self.scan(|e| e.h22 == n22)
+        }
+    }
+
+    /// Most-recent-first scan of the unified table.
+    ///
+    /// Linear, and that is the whole point: at [`N_ENTRIES`] the scan
+    /// is a few hundred `u32` compares against a decode that has just
+    /// spent milliseconds in BP, and it buys back 76 KB.
+    #[cfg(feature = "hash-table-small")]
+    fn scan(&self, pred: impl Fn(&Entry) -> bool) -> Option<&str> {
+        let t = self.entries.as_ref()?;
+        t[..self.n22]
+            .iter()
+            .find(|e| !e.call.is_empty() && pred(e))
+            .map(|e| e.call.as_str())
     }
 
     /// Clear all entries, keeping the blocks for reuse.
     pub fn clear(&mut self) {
+        #[cfg(not(feature = "hash-table-small"))]
         for t in [
             self.calls10.as_mut(),
             self.calls12.as_mut(),
@@ -267,6 +404,12 @@ impl CallsignHashTable {
         .flatten()
         {
             t.fill(Call13::EMPTY);
+        }
+        #[cfg(feature = "hash-table-small")]
+        if let Some(t) = self.entries.as_mut() {
+            for e in t.iter_mut() {
+                e.call = Call13::EMPTY;
+            }
         }
         self.n22 = 0;
     }
@@ -289,6 +432,38 @@ impl Default for CallsignHashTable {
 mod tests {
     use super::*;
 
+    /// How many callsigns the table holds before evicting. The two
+    /// builds store them differently — see [`CallsignHashTable`] — so
+    /// the shared tests below ask for the cap rather than naming one.
+    #[cfg(not(feature = "hash-table-small"))]
+    const CAP: usize = MAX_HASH22;
+    #[cfg(feature = "hash-table-small")]
+    const CAP: usize = N_ENTRIES;
+
+    /// The `i`-th most recently learned callsign.
+    fn nth(t: &CallsignHashTable, i: usize) -> &str {
+        #[cfg(not(feature = "hash-table-small"))]
+        {
+            t.calls22.as_ref().unwrap()[i].as_str()
+        }
+        #[cfg(feature = "hash-table-small")]
+        {
+            t.entries.as_ref().unwrap()[i].call.as_str()
+        }
+    }
+
+    /// Whether any storage has been allocated yet.
+    fn allocated(t: &CallsignHashTable) -> bool {
+        #[cfg(not(feature = "hash-table-small"))]
+        {
+            t.calls10.is_some()
+        }
+        #[cfg(feature = "hash-table-small")]
+        {
+            t.entries.is_some()
+        }
+    }
+
     #[test]
     fn hash_basic() {
         // Verify hash values are deterministic and non-zero
@@ -303,11 +478,12 @@ mod tests {
     }
 
     /// `new()` must allocate nothing — `wsjt77::is_plausible_payload`
-    /// builds one per `unpack77` call, and the three blocks are 83 KB.
+    /// builds one per `unpack77` call, and the storage is 83 KB by
+    /// default.
     #[test]
     fn an_empty_table_holds_no_blocks_and_answers_nothing() {
         let t = CallsignHashTable::new();
-        assert!(t.calls10.is_none() && t.calls12.is_none() && t.calls22.is_none());
+        assert!(!allocated(&t), "new() must not allocate");
         assert_eq!(t.lookup10(0), None);
         assert_eq!(t.lookup12(0), None);
         assert_eq!(t.lookup22(0), None);
@@ -324,32 +500,85 @@ mod tests {
         }
         assert_eq!(t.len22(), 3);
         // Most recent first.
-        assert_eq!(t.calls22.as_ref().unwrap()[0].as_str(), "W1AW");
-        assert_eq!(t.calls22.as_ref().unwrap()[2].as_str(), "JA1ABC");
+        assert_eq!(nth(&t, 0), "W1AW");
+        assert_eq!(nth(&t, 2), "JA1ABC");
 
         // Re-inserting the oldest refreshes it in place, no growth.
         t.insert("JA1ABC");
         assert_eq!(t.len22(), 3);
-        assert_eq!(t.calls22.as_ref().unwrap()[0].as_str(), "JA1ABC");
-        assert_eq!(t.calls22.as_ref().unwrap()[2].as_str(), "3Y0Z");
+        assert_eq!(nth(&t, 0), "JA1ABC");
+        assert_eq!(nth(&t, 2), "3Y0Z");
         // And every one of them still resolves.
         for c in ["JA1ABC", "3Y0Z", "W1AW"] {
             assert_eq!(t.lookup22(ihashcall(c, 22)), Some(c), "{c}");
         }
     }
 
-    /// The LRU is capped; the 10-/12-bit tables are bounded by their
-    /// key spaces instead, a collision overwriting.
+    /// The LRU is capped; by default the 10-/12-bit tables are bounded
+    /// by their key spaces instead, a collision overwriting. Either
+    /// way nothing grows without limit, which is the property that
+    /// matters on a board with 10 kB of internal DRAM to spare.
     #[test]
     fn the_tables_stay_within_their_bounds() {
         let mut t = CallsignHashTable::new();
-        for i in 0..(MAX_HASH22 + 50) {
+        for i in 0..(CAP + 50) {
             t.insert(&alloc::format!("A{i}BC"));
         }
-        assert_eq!(t.len22(), MAX_HASH22);
-        assert_eq!(t.calls22.as_ref().unwrap().len(), MAX_HASH22);
-        assert_eq!(t.calls10.as_ref().unwrap().len(), N_HASH10);
-        assert_eq!(t.calls12.as_ref().unwrap().len(), N_HASH12);
+        assert_eq!(t.len22(), CAP);
+        #[cfg(not(feature = "hash-table-small"))]
+        {
+            assert_eq!(t.calls22.as_ref().unwrap().len(), MAX_HASH22);
+            assert_eq!(t.calls10.as_ref().unwrap().len(), N_HASH10);
+            assert_eq!(t.calls12.as_ref().unwrap().len(), N_HASH12);
+        }
+        #[cfg(feature = "hash-table-small")]
+        assert_eq!(t.entries.as_ref().unwrap().len(), N_ENTRIES);
+    }
+
+    /// The whole point of `hash-table-small`: one entry answers all
+    /// three widths, and eviction is therefore shared.
+    ///
+    /// The default build cannot assert the second half — its 10- and
+    /// 12-bit tables are direct-indexed, so a callsign pushed out of
+    /// the 22-bit LRU still resolves there until something collides
+    /// with it. That difference is the trade this feature makes, and
+    /// it is worth having written down as an assertion rather than as
+    /// a sentence in a doc comment.
+    #[cfg(feature = "hash-table-small")]
+    #[test]
+    fn the_unified_table_shares_one_entry_across_all_three_widths() {
+        let mut t = CallsignHashTable::new();
+        t.insert("JA1ABC");
+        assert_eq!(t.entries.as_ref().unwrap().len(), N_ENTRIES);
+        assert_eq!(t.lookup10(ihashcall("JA1ABC", 10)), Some("JA1ABC"));
+        assert_eq!(t.lookup12(ihashcall("JA1ABC", 12)), Some("JA1ABC"));
+        assert_eq!(t.lookup22(ihashcall("JA1ABC", 22)), Some("JA1ABC"));
+
+        // Push it past the end of the LRU; all three widths forget it
+        // together.
+        for i in 0..N_ENTRIES {
+            t.insert(&alloc::format!("A{i}BC"));
+        }
+        assert_eq!(t.lookup22(ihashcall("JA1ABC", 22)), None);
+        assert_eq!(t.lookup12(ihashcall("JA1ABC", 12)), None);
+        assert_eq!(t.lookup10(ihashcall("JA1ABC", 10)), None);
+    }
+
+    /// 256 entries of 28 B is 7.2 kB — deliberately over the CoreS3's
+    /// `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`, so the one
+    /// allocation lands in PSRAM instead of the internal DRAM this
+    /// rewrite exists to stop consuming. Shrinking `N_ENTRIES` below
+    /// ~147 would silently undo that, so the threshold is an
+    /// assertion.
+    #[cfg(feature = "hash-table-small")]
+    #[test]
+    fn the_unified_table_stays_above_the_psram_threshold() {
+        let bytes = N_ENTRIES * core::mem::size_of::<Entry>();
+        assert!(
+            bytes > 4096,
+            "{N_ENTRIES} x {} B = {bytes} B would land in internal DRAM",
+            core::mem::size_of::<Entry>()
+        );
     }
 
     /// A 13-character callsign is the longest `character*13` holds, and
@@ -374,7 +603,7 @@ mod tests {
         assert_eq!(t.len22(), 0);
         assert_eq!(t.lookup22(ihashcall("JA1ABC", 22)), None);
         assert_eq!(t.lookup10(ihashcall("JA1ABC", 10)), None);
-        assert!(t.calls10.is_some(), "blocks are kept for reuse");
+        assert!(allocated(&t), "blocks are kept for reuse");
     }
 
     #[test]
@@ -398,11 +627,11 @@ mod tests {
     #[test]
     fn lru_eviction() {
         let mut t = CallsignHashTable::new();
-        // Fill beyond MAX_HASH22
-        for i in 0..MAX_HASH22 + 10 {
+        // Fill beyond the cap
+        for i in 0..CAP + 10 {
             t.insert(&format!("T{:04}X", i));
         }
-        assert_eq!(t.len22(), MAX_HASH22);
+        assert_eq!(t.len22(), CAP);
     }
 
     #[test]
