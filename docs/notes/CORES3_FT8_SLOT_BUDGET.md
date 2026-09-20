@@ -350,10 +350,9 @@ The wiring is reverted; the sweep stays as the record.
 The gap is real and the cheap in-slot probe does not close it. What is
 left, in order of how much of the 40 s of dark band each removes:
 
-1. **Make acquisition shorter.** It is 25 s of capture because
-   `acquire_slot_phases` wants three windows; whether two windows over
-   17 s find the grid as often is a host question with the existing
-   fixtures, and it is worth a third of the outage.
+1. ~~Make acquisition shorter.~~ **Measured 2026-09-20: shortening is
+   a wash, and the same measurement found something better.** See
+   below.
 2. **`share_cand_budget` as drift insurance** (§4). It gains ~0 on a
    centred grid, and the board's decodes reach +0.84 s against a
    deferred edge at +0.86 s — so it is what keeps stations from being
@@ -361,3 +360,71 @@ left, in order of how much of the 40 s of dark band each removes:
 3. **Keep the grid from drifting at all**, which is where the RTC and
    NTP work of this week went and is the only one of the three that
    has already paid.
+
+## 9. Acquisition: the capture length is not the lever, the order is
+
+`tests/ft8_acquire_capture_length.rs`, 40 capture phases per point,
+three recordings, scored the way the board accepts — the true phase
+within ±1.0 s of one of the five clusters it would try, since a trial
+corrects its centre by the median DT of what it decoded.
+
+| tiling | capture | qso3 | qso1 | qso2 | total | E[outage] |
+|---|---:|---:|---:|---:|---:|---:|
+| 3 × ±2.5 s @ 5 s (shipped) | 25.0 s | 40/40 | 34/40 | 32/40 | **88 %** | 42 s |
+| 2 × ±3.75 s @ 7.5 s | 22.5 s | 34/40 | 34/40 | 28/40 | 80 % | 41 s |
+| 2 × ±4.5 s @ 6 s | 21.0 s | 37/40 | 30/40 | 27/40 | 78 % | 41 s |
+| 2 × ±5.0 s @ 5 s | 20.0 s | 36/40 | 26/40 | 18/40 | 67 % | 44 s |
+| 1 × ±6.24 s | 15.0 s | 32/40 | 28/40 | 20/40 | 67 % | 39 s |
+
+The shipped tiling reaching 40/40 on `qso3_busy` is the instrument
+agreeing with the record — `acquire_slot_phases`' own doc says "one of
+the first five every time" for that recording.
+
+**Every shortening loses as much success as it saves time.** Expected
+outage — time to a *successful* acquisition, retrying on failure —
+sits at 39-44 s across the whole table. Capture length is not the
+lever.
+
+### What the same table found instead
+
+**One tile over the first 15 s already succeeds two thirds of the
+time**, and those 15 s are collected before the shipped acquisition
+has finished listening. So the question is not how long to capture but
+what order to do the work in: try one tile as soon as a slot exists,
+and keep capturing only if it misses.
+
+That is worth something only if the three-tile stage succeeds on the
+cases the one-tile stage failed. Measured:
+
+| | 1 tile | 3 tiles | **3 given 1 missed** | E[outage] |
+|---|---:|---:|---:|---:|
+| `qso3_busy` | 32/40 | 40/40 | **8/8** | 24 s vs 37 s |
+| `qso1` | 28/40 | 34/40 | **9/12** | 27 s vs 44 s |
+| `qso2` | 20/40 | 32/40 | **14/20** | 34 s vs 46 s |
+
+**70-100 % of the first stage's misses are rescued, and the reason is
+geometric rather than lucky.** One tile at ±6.24 s covers 12.48 s of
+the 15 s period, so 2.52 s — 17 %, about 6.7 of 40 phases — is outside
+its reach by construction. `qso3_busy` misses exactly 8. The second
+stage's tiles at 5 s and 10 s are precisely what covers that hole, so
+the rescue is a property of the tiling and not of the recording.
+
+**Expected dark band falls 26-39 %** for the same total work, ordered
+so the common case exits early.
+
+Caveat on the absolute numbers: the stage times (20 s for one tile,
+38 s for the full sequence, 37 s shipped) are read off the code's own
+measurements — "three tiled searches at 543-635 ms each and up to five
+full-slot decodes at ~1.1 s, 10-15 s in total" — and not measured for
+an implementation that does not exist yet. The **ratio** is what the
+table supports.
+
+### What it would take
+
+Not a parameter. `arm_acquisition` fills a ring to
+`ACQUIRE_CAPTURE_SAMPLES` and `decode_pipeline` waits for the whole
+thing; a progressive acquisition needs the ring readable at 15 s,
+extendable to 25 s if the first stage misses, and a trial loop that
+can run twice against a growing buffer. The `rust_oom` recorded beside
+`ACQUIRE_CAPTURE_SAMPLES` is the standing warning about what a second
+buffer costs.
