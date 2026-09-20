@@ -384,7 +384,7 @@ fn unpack_free_text(msg: &[u8]) -> String {
 /// Supported types:
 /// - `0/0`  Free text
 /// - `0/1`  DXpedition RR73
-/// - `0/3`, `0/4`  ARRL Field Day (callsigns only, exchange shown as `[FD]`)
+/// - `0/3`, `0/4`  ARRL Field Day: `CALL1 CALL2 [R] <ntx><class> SEC`
 /// - `1`    Standard: `CALL1 CALL2 GRID` or `CALL1 CALL2 REPORT`
 /// - `2`    Standard with `/P`
 /// - `4`    One non-standard callsign + 12-bit hashed counterpart
@@ -744,7 +744,18 @@ fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
             } else if (1..=7999).contains(&nexch) {
                 format!("{:04}", nexch)
             } else {
-                return Some(format!("{} {} [RTTY]", c1, c2));
+                // `packjt77.f90:532-551` builds `msg` only inside the
+                // `imult` / `nserial` range arms, so an exchange
+                // outside both leaves it blank — upstream still reports
+                // success and prints an empty line. **Deliberate
+                // divergence**: refuse instead. `pack77_3` cannot
+                // produce such a value, so the only thing that reaches
+                // here is a CRC survivor, and the `[RTTY]` marker this
+                // used to return made `is_plausible_message`
+                // short-circuit past the callsign check — those 22 of
+                // 8192 exchange codes were the entire surviving i3=3
+                // phantom population (`phantom_survival_rates`).
+                return None;
             };
             let prefix = if itu == 1 { "TU; " } else { "" };
             let r_prefix = if ir == 1 { "R " } else { "" };
@@ -1137,16 +1148,18 @@ pub fn is_plausible_message(text: &str) -> bool {
         return ok;
     }
 
-    // Contest/DXpedition markers — trust the unpack result
-    if text.contains("[RTTY]") || text.contains("RR73;") {
-        return true;
-    }
-
     for (idx, &w) in words.iter().enumerate() {
         // Known non-callsign tokens
+        // `RR73;` is DXpedition type 0.1's literal separator
+        // (`packjt77.f90:329`); every other token in that message is a
+        // callsign, a `<...>` hash placeholder or a report, all of
+        // which the arms below already judge. Listing it here is what
+        // lets them: the type used to short-circuit this whole loop on
+        // a `text.contains("RR73;")`, so its two real callsigns were
+        // never checked and it survived the filter at 100 %.
         if matches!(
             w,
-            "CQ" | "DE" | "QRZ" | "RRR" | "RR73" | "73" | "R" | "" | "DX"
+            "CQ" | "DE" | "QRZ" | "RRR" | "RR73" | "RR73;" | "73" | "R" | "" | "DX"
         ) {
             continue;
         }
@@ -2044,6 +2057,45 @@ mod tests {
             (71, 3, 4),
         ]);
         assert_eq!(unpack77(&m).as_deref(), Some("JA1ABC 3Y0Z R 32H DX"));
+    }
+
+    /// The DXpedition body was already ported; what was missing was
+    /// anyone looking at it. `is_plausible_message` short-circuited on
+    /// the literal `RR73;`, so both callsign fields went unchecked.
+    #[test]
+    fn dxpedition_text_is_judged_on_its_callsigns() {
+        assert!(is_plausible_message("K1ABC RR73; W9XYZ <KH1/KH7Z> -11"));
+        assert!(is_plausible_message("K1ABC RR73; W9XYZ <...> +03"));
+        assert!(!is_plausible_message("NFW/0811 RR73; W9XYZ <...> -11"));
+        assert!(!is_plausible_message("K1ABC RR73; NFW/0811 <...> -11"));
+    }
+
+    /// `packjt77.f90:532-551` — the RTTY Roundup exchange is built only
+    /// inside the `imult` (8001..=8171) and `nserial` (1..=7999) range
+    /// arms. 22 of the 8192 codes fall outside both; upstream leaves
+    /// the message blank there, and this refuses it.
+    #[test]
+    fn rtty_roundup_refuses_an_out_of_range_exchange() {
+        let rr = |nexch: u32| {
+            bits77(&[
+                (1, 28, call28()),
+                (29, 28, call28()),
+                (61, 13, nexch),
+                (74, 3, 3),
+            ])
+        };
+        for nexch in [0, 8000, 8172, 8191] {
+            assert!(
+                unpack77(&rr(nexch)).is_none(),
+                "nexch = {nexch} is unusable"
+            );
+        }
+        for nexch in [1, 7999, 8001, 8171] {
+            assert!(
+                unpack77(&rr(nexch)).is_some(),
+                "nexch = {nexch} is in range"
+            );
+        }
     }
 
     /// `packjt77.f90:338` — `isec` indexes an 86-entry table from a
