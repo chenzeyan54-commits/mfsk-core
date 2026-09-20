@@ -217,3 +217,88 @@ the table above says how long an arm has to be.
 Both are here because the observation in a comment is evidence and the
 explanation beside it may not be. See
 `mfsk-core/tests/ft8_coarse_partial_blocks.rs`.
+
+## 8. Robustness: the gap between ±0.88 s and a 25 s acquisition
+
+Everything above is about yield. This section is about the failure the
+receiver actually has in the field, which is not yield at all.
+
+```text
+grid error ≤ 0.88 s   the per-slot search absorbs it
+grid error > 0.88 s   ???
+                      → 3 under-par slots → 25 s capture → 10-15 s of
+                        compute → ~40 s with the band dark
+```
+
+There is no middle. On a radio on 2026-09-19 the grid sat 1.65 s out,
+every slot decoded nothing, and the receiver spent **two minutes and
+two acquisitions** getting back — while the stations were in the audio
+the whole time.
+
+### Why the obvious fix does not work
+
+Widen the search. It was tried, to ±1.75 s, and reverted: candidates
+appeared at −1.64 / +1.72 / +1.08 with scores of 20-30, `ready` fell to
+14, and nothing decoded. §7 has the mechanism — a lag past the row
+bound leaves the candidate scored on two Costas blocks instead of
+three, the ratio is not penalised for the missing evidence, and
+`PASS1_LIMIT` is 30, so junk crowds the shortlist.
+
+And the width is bounded anyway:
+
+```text
+lag_max(P) = (2P − 163) × 0.08     P = 87 → 0.88 s,  P = 92 → 1.68 s
+```
+
+**±2.5 s is not reachable on the embedded time grid at any emit
+point.** The host does not reach it either — `bounded_sync_lag_steps`
+clamps to 62 steps and block 2's last symbol lands at 387 of 371 rows,
+so upstream at ±2.5 s is *also* running on a truncated block 2 at the
+extremes. "±2.5 s" means "two blocks are acceptable at the edges".
+
+**So the streaming head start and the search width are the same
+resource** — rows of spectrogram — and at a fixed emit point, decoding
+early and searching wide are in direct competition.
+
+### The split that resolves it
+
+The same separation that fixed the emit/late problem: **decoding fast
+and knowing where the grid is are different jobs, and only one of them
+needs the answer before key-up.**
+
+| | window | gated | runs on | purpose |
+|---|---|---|---|---|
+| decode search | ±0.88 s | yes | the bundle, before the boundary | this period's reply |
+| **grid probe** | **±2.5 s (clamps to ±2.48)** | **no** | the same bundle, after the boundary | where the grid is |
+
+The probe may accept two-block candidates precisely because it does
+not decode. It is looking for the **circular median dt of a cluster**,
+and an outlier that scores high on two blocks does not move a median.
+Phantoms are free here in a way they are never free in a decode.
+
+It needs no new spectrogram, which is what makes it affordable: the
+bundle already carries 174 rows and the allsum is lag-independent, so
+the probe is the same data with more lag bins.
+
+```text
+n_lag = 27  (±1.0 s)   coarse 103 ms measured on the board
+n_lag = 63  (±2.48 s)  ~240 ms estimated, same band, same cores
+```
+
+**And it costs nothing in steady state**, because it only runs when the
+grid is unproven — the condition that today arms a 25 s capture. The
+trade it offers is one slot and ~240 ms against forty seconds of dark
+band.
+
+### Increments
+
+1. **Measure and report only.** Run the probe, log its dt estimate and
+   the agreement among its candidates, act on nothing. On the air this
+   says whether a wide search on a partly-filled bundle produces a
+   number worth trusting — which is exactly the question the ±1.75 s
+   experiment failed to ask before wiring its output into the search.
+2. Act on it: a one-shot grid shift, the way cold acquisition applies
+   one, when the probe and the under-par run agree.
+3. Only then consider whether acquisition's 25 s capture is still the
+   right answer for errors past 1.68 s, or whether it becomes the rare
+   fallback it was always meant to be.
