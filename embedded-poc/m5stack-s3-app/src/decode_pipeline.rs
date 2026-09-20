@@ -225,6 +225,17 @@ where
             n_deferred,
             n_early_refined: _,
             n_in_time: _,
+            // The gate-2 coverage counters (`bbbb3044`). This board
+            // is the acoustic-fallback demo — no USB host, so no live
+            // slot budget to tune against — and the search-ceiling
+            // work they instrument was done on the CoreS3. Named and
+            // ignored rather than elided with `..`, so the next field
+            // added to `SpeculativeOut` breaks this build too: that
+            // is the only thing standing in for CI here, which
+            // `paths-ignore`s the whole tree.
+            pass2_us: _,
+            n_gate2_p1: _,
+            gate2_best_rank: _,
             n_cut: _,
             n_fallback: _,
             bootstrap_dt_med,

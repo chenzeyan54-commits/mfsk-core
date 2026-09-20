@@ -48,7 +48,12 @@ heapless = "0.8"
 num-complex = { version = "0.4", default-features = false }
 
 # mfsk-core / FFI: 兄弟クレートと同じ feature 構成。
-mfsk-core = { path = "../../mfsk-core", default-features = false, features = ["alloc", "std", "ft8", "fft-extern", "fixed-point", "profile-coarse", "nstep-half", "internal-testing"] }
+# `hash-table-small`: one 256-entry callsign table (7 KB) instead of
+# upstream's three (83 KB). Same `SPIRAM_MALLOC_ALWAYSINTERNAL = 4096`
+# as the CoreS3, so the same reasoning applies — see that crate's
+# `Cargo.toml` for the measurement, and `mfsk-core/Cargo.toml` for
+# what the flag trades.
+mfsk-core = { path = "../../mfsk-core", default-features = false, features = ["alloc", "std", "ft8", "fft-extern", "fixed-point", "profile-coarse", "nstep-half", "internal-testing", "hash-table-small"] }
 
 # 共有 embedded glue (streaming buffer / esp_dsp_fft / dual_core / Q3i8 LLR)
 embedded-shared = { path = "../embedded-shared", features = ["aes3"] }

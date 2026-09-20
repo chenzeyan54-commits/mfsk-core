@@ -414,9 +414,33 @@ impl CallsignHashTable {
         self.n22 = 0;
     }
 
-    /// Number of entries in the 22-bit table (for diagnostics).
+    /// Distinct callsigns currently held, out of [`Self::capacity22`].
+    ///
+    /// The only count here that means what it says. The default
+    /// build's 10- and 12-bit tables are indexed by the hash, so a
+    /// collision overwrites and their length would count *occupied
+    /// slots* rather than stations — 39 and 41 against 42 real
+    /// callsigns, measured on air 2026-09-20. Neither is exposed.
     pub fn len22(&self) -> usize {
         self.n22
+    }
+
+    /// Callsigns held before the LRU starts evicting.
+    ///
+    /// Build-dependent — upstream's `MAXHASH` by default, smaller
+    /// under `hash-table-small` — so a caller reporting occupancy
+    /// asks rather than naming a number. `len22() == capacity22()`
+    /// with unresolved hashes still appearing is the signal that the
+    /// cap is too low for the traffic.
+    pub fn capacity22(&self) -> usize {
+        #[cfg(not(feature = "hash-table-small"))]
+        {
+            MAX_HASH22
+        }
+        #[cfg(feature = "hash-table-small")]
+        {
+            N_ENTRIES
+        }
     }
 }
 

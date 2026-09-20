@@ -56,7 +56,12 @@ num-complex = { version = "0.4", default-features = false }
 # board is an LX6. Its FPU is a different unit, nobody has run the A/B
 # on it, and the numbers in this crate's own logs were all taken with
 # the i16 hot loop. Drop it when someone measures the LX6.
-mfsk-core = { path = "../../mfsk-core", default-features = false, features = ["alloc", "std", "ft8", "fft-extern", "fixed-point", "fixed-point-llr", "profile-coarse", "nstep-half", "internal-testing"] }
+# `hash-table-small`: one 256-entry callsign table (7 KB) instead of
+# upstream's three (83 KB). Same `SPIRAM_MALLOC_ALWAYSINTERNAL = 4096`
+# as the CoreS3, so the same reasoning applies — see that crate's
+# `Cargo.toml` for the measurement, and `mfsk-core/Cargo.toml` for
+# what the flag trades.
+mfsk-core = { path = "../../mfsk-core", default-features = false, features = ["alloc", "std", "ft8", "fft-extern", "fixed-point", "fixed-point-llr", "profile-coarse", "nstep-half", "internal-testing", "hash-table-small"] }
 
 embedded-shared = { path = "../embedded-shared" }
 # Core2 has no native USB-Serial-JTAG — disable that feature so

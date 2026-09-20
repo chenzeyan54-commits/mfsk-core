@@ -115,6 +115,16 @@ pub fn run() -> ! {
             n_deferred,
             n_early_refined: _,
             n_in_time: _,
+            // The gate-2 coverage counters (`bbbb3044`). This board
+            // is wav_sim only — classic ESP32, no USB peripheral — so
+            // there is no live slot budget for them to instrument.
+            // Named and ignored rather than elided with `..`, so the
+            // next field added to `SpeculativeOut` breaks this build
+            // too: that is the only thing standing in for CI here,
+            // which `paths-ignore`s the whole tree.
+            pass2_us: _,
+            n_gate2_p1: _,
+            gate2_best_rank: _,
             bootstrap_dt_med: _,
             t_post_recv,
             t_coarse_done,

@@ -43,6 +43,12 @@ FEATURE_MATRIX=(
   "alloc ft8 fft-extern fixed-point"
   "alloc ft4 fft-extern"
   "alloc ft4 fft-extern fixed-point"
+  # The shape all three boards actually build: `hash-table-small`
+  # swaps `msg::hash_table`'s storage wholesale, so it has a `#[cfg]`
+  # split in every method and its own tests. `full` does not include
+  # it (host stays on upstream's three tables), which is exactly the
+  # situation this matrix exists for.
+  "alloc ft8 fft-extern fixed-point hash-table-small"
   "full"
 )
 for features in "${FEATURE_MATRIX[@]}"; do

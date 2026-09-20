@@ -638,11 +638,42 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
     // `unpack77` renders `<...>` forever: 69 of 380 decodes on 7041
     // kHz carried one (2026-09-20), 13 of them the same station.
     //
-    // PSRAM by way of the global allocator, and bounded by
-    // construction: the 10- and 12-bit tables cannot exceed 1 024 and
-    // 4 096 entries, and the 22-bit one is an LRU capped at
-    // `MAX_HASH22`.
+    // **It is 7 kB in PSRAM now, and it did not used to be.** This
+    // comment read "PSRAM by way of the global allocator, and bounded
+    // by construction", and both halves were wrong in the way that
+    // matters. The entry counts really were bounded — by the hash key
+    // spaces, collisions overwriting — but a count bound is not a
+    // memory bound, and every entry was a `String` plus map nodes,
+    // ~130 B of *small* allocations.
+    // `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096` routes small to
+    // internal DRAM, so the table grew in the one pool this board has
+    // ~40 kB of: it fell 10.7 kB -> 3.4 kB over 22 minutes of live
+    // reception on 2026-09-20 until `esp-aes` could not allocate and
+    // WiFi — the only console a host-mode board has — went silent,
+    // while the decoder carried on. It presented as a network fault.
+    //
+    // Two changes upstream of here fixed it: callsigns are stored
+    // inline (`msg::hash_table::Call13`, which is what WSJT-X's
+    // `character*13` always was), and this crate builds `mfsk-core`
+    // with `hash-table-small`, which folds the three tables into one
+    // 256-entry table. One 7.2 kB allocation, deliberately over the
+    // 4 096 threshold so it lands in PSRAM, and it never grows again.
+    //
+    // **What is still unmeasured is the cost of that.** One shared
+    // LRU evicts by recency, so all three hash widths forget a
+    // station together where direct-indexed slots kept theirs until a
+    // collision. The `ht=` and `unres=` fields on the `t2:` line
+    // below are the instrument: `ht=` saturating at 256 while
+    // `unres=` climbs is eviction costing resolutions, and is the
+    // signal to raise `N_ENTRIES`.
     let mut calls = mfsk_core::msg::CallsignHashTable::new();
+    // Cumulative over the session, not per slot — the question is
+    // whether the unresolved *rate* drifts up as the LRU fills, which
+    // a per-slot count at these decode rates cannot show. Compare
+    // against the pre-rewrite baseline: 69 of 380 decodes on 7041 kHz
+    // carried a `<...>` (2026-09-20), 13 of them the same station.
+    let mut unresolved_total: u32 = 0;
+    let mut rendered_total: u32 = 0;
     let initial = qso.call_cq(None);
     push_tx_line(&qso, Some(&initial));
 
@@ -1059,8 +1090,36 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             (t_early_done - t_coarse_done) / 1_000,
         );
         log::info!(
-            "SLOT[{wav_idx}] t2: tail_use={}ms post_slotend={}ms slot_wait={}ms late={}ms \
-             audio={}sa p2={}/{}/{}us",
+            "SLOT[{wav_idx}] t2: ht={}/{} unres={}/{} tail_use={}ms post_slotend={}ms \
+             slot_wait={}ms late={}ms audio={}sa p2={}/{}/{}us",
+            // `ht=<live>/<cap>` and `unres=<with-placeholder>/<total>`,
+            // beside the `int=` the `uac: rx tick` line already
+            // reports. Together they answer the one question the hash
+            // table rewrite left open.
+            //
+            // `int=` no longer has anything to do with this table —
+            // it is one fixed 7.2 kB PSRAM allocation now. What is
+            // open is whether folding three tables into one
+            // recency-evicting LRU costs resolutions. `ht=` pinned at
+            // the cap with `unres=` climbing says yes; `ht=` below
+            // the cap says the table has not even filled and any
+            // `<...>` is a station genuinely never heard.
+            //
+            // `len22` and not the number of callsigns *inserted*.
+            // Before the rewrite the 10-/12-bit tables were keyed on
+            // the hash, so a collision overwrote and their `len()`
+            // counted occupied slots rather than stations — 39 and 41
+            // against 42 real callsigns, measured on air 2026-09-20.
+            // `len22` was the one number that meant what it said, and
+            // in the unified table it is the only one there is.
+            //
+            // The counters lag the line by one slot: this logs before
+            // the decodes below are rendered. They are cumulative, so
+            // it does not matter, but it is why slot 0 reads 0/0.
+            calls.len22(),
+            calls.capacity22(),
+            unresolved_total,
+            rendered_total,
             tail_use / 1_000,
             post_slotend / 1_000,
             (t_slot_recv - t_early_done) / 1_000,
@@ -1930,6 +1989,14 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                 if let Some(text) =
                     mfsk_core::msg::wsjt77::unpack77_learn(r.message77(), &mut calls)
                 {
+                    rendered_total += 1;
+                    // `<...>` is what `unpack77` emits for a hash the
+                    // table could not resolve, so counting the
+                    // rendered text is counting exactly the failures
+                    // — no need to reach into the fields.
+                    if text.contains("<...>") {
+                        unresolved_total += 1;
+                    }
                     let mut msg: heapless::String<22> = heapless::String::new();
                     let take = text.len().min(msg.capacity());
                     let _ = msg.push_str(&text[..take]);

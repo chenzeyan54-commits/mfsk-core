@@ -245,7 +245,19 @@ num-complex = { version = "0.4", default-features = false }
 # depends on). Crate-wide like `wspr-bench`'s features below, not
 # scoped to just the `fst4-bench` bin — Cargo has no per-bin feature
 # sets within one crate.
-mfsk-core = { path = "../../mfsk-core", default-features = false, features = ["alloc", "std", "ft8", "ft4", "fft-extern", "fixed-point", "profile-coarse", "nstep-half", "internal-testing"] }
+# `hash-table-small`: one 256-entry callsign table (7 KB) instead of
+# upstream's three (83 KB). This board is where the default shape was
+# measured doing harm — every callsign learned cost ~130 B in small
+# allocations, `SPIRAM_MALLOC_ALWAYSINTERNAL = 4096` routed every one
+# of them to internal DRAM, and it fell 10.7 kB -> 3.4 kB over 22
+# minutes of live reception until `esp-aes` could not allocate and
+# WiFi went silent (2026-09-20). Inline storage fixed the allocation
+# count; this flag also fixes the size. What it trades is eviction
+# policy — all three hash widths now share one LRU, so an old station
+# renders `<...>` again. Not yet measured on air; count
+# `<...>`-bearing decodes per slot the way `decode_pipeline.rs`
+# already does before relying on it.
+mfsk-core = { path = "../../mfsk-core", default-features = false, features = ["alloc", "std", "ft8", "ft4", "fft-extern", "fixed-point", "profile-coarse", "nstep-half", "internal-testing", "hash-table-small"] }
 
 # Shared decode-pipeline layer (streaming, dual_core, stage1_inc, esp_dsp_fft).
 embedded-shared = { path = "../embedded-shared", features = ["aes3", "ft4-bench"] }
