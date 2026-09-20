@@ -290,15 +290,74 @@ grid is unproven — the condition that today arms a 25 s capture. The
 trade it offers is one slot and ~240 ms against forty seconds of dark
 band.
 
-### Increments
+### Built, measured, and abandoned — 2026-09-20
 
-1. **Measure and report only.** Run the probe, log its dt estimate and
-   the agreement among its candidates, act on nothing. On the air this
-   says whether a wide search on a partly-filled bundle produces a
-   number worth trusting — which is exactly the question the ±1.75 s
-   experiment failed to ask before wiring its output into the search.
-2. Act on it: a one-shot grid shift, the way cold acquisition applies
-   one, when the probe and the under-par run agree.
-3. Only then consider whether acquisition's 25 s capture is still the
-   right answer for errors past 1.68 s, or whether it becomes the rare
-   fallback it was always meant to be.
+Increment 1 was "report and act on nothing", and it reported enough to
+end the line of work the same afternoon.
+
+**First cut, medoid + `r`.** On a radio with a healthy NTP grid
+(decode median +0.04 s) eight consecutive slots read −0.85, +0.91,
++0.28, +0.36, +0.04, +0.04, +1.64, +0.04 with `r` between 0.87 and
+0.98 throughout. Three right out of eight, and `r` cannot tell which
+three. That much was already written down: `acquire_slot_phase` marks
+itself superseded for exactly this, "`r` up to 1.00 while being ~7 s
+wrong", and says to select on score mass instead.
+
+**Second cut, `circular_dt_clusters` mass.** On the same band the
+gross outliers vanished — eleven slots, every reading within 0.29 s of
+the decode median, `sd` 0.159, at **157 ms** a slot. Which proves only
+that it is not lying when the grid is *already fine*.
+
+**The question it exists for, swept on the host**
+(`mfsk-core/tests/ft8_wide_grid_probe.rs`, offsets −2.4..+2.4 s in
+0.2 s steps, three recordings):
+
+| | inside ±0.88 s | **beyond ±0.88 s** |
+|---|---|---|
+| `qso3_busy` | 9/9 | **10/16** |
+| `qso1` | 9/9 | **5/16** |
+| `qso2` | 5/9 | **4/16** |
+
+**19 of 48 where it matters.** It is right where it is redundant and
+wrong where it is needed, and the errors are systematic rather than
+noisy: on `qso1`/`qso2` a grid 1.4 s early reads back as 0.2 s early —
+the probe pulls toward the middle of its own window instead of
+following the displacement.
+
+`dom` does not rescue a single reading either. Means of 5.2 on hits
+against 3.5 on misses for `qso3_busy`, and **2.9 on hits against 3.7
+on misses** for `qso2` — the wrong way round. There is no per-slot
+statistic here that a consumer could gate on.
+
+Running the whole band instead of `allsum_head`'s lower half was
+tried, on the theory that half the stations meant half the mass:
+9/16, 4/16, 4/16. Slightly worse, for double the time.
+
+**Why it cannot be fixed by a better statistic.** Negative lag
+truncates Costas block 0 from −0.48 s (`jstrt` = 6) and positive lag
+truncates block 2 from +0.88 s, so **every candidate in the region of
+interest is a partial-evidence score** and the real stations lose
+their advantage precisely where the probe needs them to keep it. It is
+the same fact that killed the ±1.75 s widen (§7), and the summary
+statistic was never the problem. `ft8::acquire` uses three tiles over
+25 s for this reason, and even so its first cluster is "usable 23
+times in 40" and it resolves the rest by *trying a decode*.
+
+The wiring is reverted; the sweep stays as the record.
+
+### Where robustness goes instead
+
+The gap is real and the cheap in-slot probe does not close it. What is
+left, in order of how much of the 40 s of dark band each removes:
+
+1. **Make acquisition shorter.** It is 25 s of capture because
+   `acquire_slot_phases` wants three windows; whether two windows over
+   17 s find the grid as often is a host question with the existing
+   fixtures, and it is worth a third of the outage.
+2. **`share_cand_budget` as drift insurance** (§4). It gains ~0 on a
+   centred grid, and the board's decodes reach +0.84 s against a
+   deferred edge at +0.86 s — so it is what keeps stations from being
+   dropped outright as the grid walks toward that edge.
+3. **Keep the grid from drifting at all**, which is where the RTC and
+   NTP work of this week went and is the only one of the three that
+   has already paid.
