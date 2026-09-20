@@ -537,7 +537,44 @@ and `synth_i16_into`'s own 607 KB — which is uncomfortably close to
 the ~1.44 MB that produced the `rust_oom` recorded beside
 `uac::ACQUIRE_CAPTURE_SAMPLES`.
 
-### The optimisations are real but secondary
+### Built and measured, same afternoon
+
+`engine::dsp::gfsk::GfskStream` — the waveform a chunk at a time, no
+buffer of its own:
+
+```text
+  batch (shipped)   472 ms   + 1.2 MB of PSRAM temporaries
+  stream            277 ms   total, 439 us per 20 ms chunk, **2.2 % duty**,
+                             zero temporaries beyond a 23 KB pulse table
+```
+
+Two wins at once, and the second is the one that matters. The total
+fell 41 % because the 1.2 MB of PSRAM round trips are gone and the
+per-sample `sin` is a rotating phasor — the same trick
+`engine::dsp::ddc`'s mixer uses, split into a constant carrier
+rotation times a small modulation rotation, since the phase increment
+here varies. And **439 us against a 20 ms chunk deadline** takes the
+synthesis off the critical path entirely.
+
+Nothing about the waveform changes: the 3-symbol Gaussian overlap, the
+dummy ramp-in/ramp-out symbols and the half-cosine envelope are all
+reproduced, pinned sample-for-sample against `synth_f32` by
+`stream_matches_the_reference_synthesiser`.
+
+So the schedule closes:
+
+```text
+  decoder must finish by  0.5 − 0.1 (settle) − 0.0004 (first chunk)
+                       ≈  slot end + 400 ms
+```
+
+against a measured `post_slotend` of **median 332 ms, p90 479 ms**.
+The median fits; the p90 is 79 ms over. **Which is where the emit
+point stops being a latency question and becomes the margin** — emit
+85 measured `post_slotend` at 92 ms (§9's table), and that is
+comfortable at every percentile.
+
+### The remaining optimisations are real but secondary
 
 Worth having once the structure is right, and worth noting that this
 path never got the treatment the decode side did: `embedded-shared`

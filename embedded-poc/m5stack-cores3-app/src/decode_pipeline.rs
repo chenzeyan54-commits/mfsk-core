@@ -427,6 +427,37 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                     best / 1_000,
                     TX_SAMPLES_12K
                 );
+                // **The streaming synthesiser, timed the way a
+                // transmitter would drive it**: 20 ms chunks into a
+                // DMA-sized buffer, which is what `tx::play` sends.
+                // No 622 KB `dphi`, no 607 KB f32 temp, no 303 KB
+                // output — the whole waveform never exists.
+                const CHUNK: usize = 240; // 20 ms at 12 kHz
+                let mut chunk = [0i16; CHUNK];
+                let mut stream_us = i64::MAX;
+                for _ in 0..3 {
+                    let t0 = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+                    let mut st = mfsk_core::engine::dsp::gfsk::GfskStream::new(
+                        &tones,
+                        1_500.0,
+                        &mfsk_core::ft8::wave_gen::FT8_GFSK,
+                    );
+                    let mut n = 0usize;
+                    while st.remaining() > 0 {
+                        n += st.fill_i16(&mut chunk, 20_000);
+                    }
+                    let dt = unsafe { esp_idf_svc::sys::esp_timer_get_time() } - t0;
+                    stream_us = stream_us.min(dt);
+                    debug_assert_eq!(n, TX_SAMPLES_12K);
+                }
+                log::warn!(
+                    "tx-synth stream: {} ms total in {} us chunks of 20 ms \
+                     ({} us per chunk, {:.1} % duty against 12.64 s of playback)",
+                    stream_us / 1_000,
+                    stream_us / (TX_SAMPLES_12K / CHUNK) as i64,
+                    stream_us / (TX_SAMPLES_12K / CHUNK) as i64,
+                    100.0 * stream_us as f32 / 12_640_000.0
+                );
                 log::warn!(
                     "tx-synth bench: WSJT-X puts TX audio at +0.5 s and PTT at the boundary; \
                      the rig settle is ~100 ms (IC-705). Decoder must be done by \

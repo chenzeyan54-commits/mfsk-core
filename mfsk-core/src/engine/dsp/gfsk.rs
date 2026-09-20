@@ -57,6 +57,200 @@ pub const fn synth_output_len(nsym: usize, samples_per_symbol: usize) -> usize {
     nsym * samples_per_symbol
 }
 
+/// How often the streaming synthesiser renormalises its phasor — the
+/// same period [`super::ddc`]'s mixer uses, for the same reason.
+const STREAM_RENORM_PERIOD: u32 = 4096;
+
+/// A GMFSK waveform produced in chunks, holding no buffer of its own.
+///
+/// **Why this exists.** [`synth_f32_into`] builds the whole waveform
+/// before returning a sample: a `dphi` array of `(nsym + 2) * nsps`
+/// floats, and [`synth_i16_into`] adds a second full-length f32
+/// temporary on top. For FT8 that is 622 KB and 607 KB, and on a
+/// CoreS3 the pair costs **472 ms** for one 12.64 s frame — measured
+/// 2026-09-20. Against WSJT-X's own transmit schedule (audio at
+/// `slot end + 0.5 s`, PTT at the boundary, ~100 ms of rig settle)
+/// that puts the decoder's deadline *before* the slot it is decoding
+/// has ended. There is no schedule that works with the synthesis on
+/// the critical path.
+///
+/// A transmitter streams to a DMA in chunks — `tx::play` already sends
+/// 20 ms at a time — so the waveform never has to exist all at once.
+/// Per chunk the same work spreads across the 12.64 s of playback: a
+/// 3.7 % duty instead of a deadline.
+///
+/// **Nothing about the waveform changes.** The 3-symbol Gaussian pulse
+/// overlap, the dummy ramp-in and ramp-out symbols that WSJT-X's
+/// `gen_ft8wave.f90` uses to keep the pulse train continuous at the
+/// ends, and the half-cosine envelope over `cfg.ramp_samples` are all
+/// reproduced; `stream_matches_the_reference_synthesiser` pins the
+/// output against [`synth_f32`] sample for sample.
+///
+/// **No `sin` per sample.** The phase increment varies, so the fixed
+/// step `super::ddc`'s mixer uses does not apply directly — but it
+/// splits: a constant carrier rotation, times a *small* modulation
+/// rotation. The modulation increment is at most
+/// `dphi_peak * (NTONES - 1)` ≈ 0.023 rad for FT8, where a three-term
+/// series for `cos`/`sin` is accurate to ~1e-8, so the per-sample cost
+/// is two complex multiplies rather than a libm call. The phasor is
+/// renormalised on the same schedule the DDC uses, for the same
+/// accumulation reason.
+pub struct GfskStream {
+    nsps: usize,
+    nsym: usize,
+    nwave: usize,
+    ramp: usize,
+    dphi_peak: f32,
+    /// The 3-symbol Gaussian pulse, `3 * nsps` long. The only
+    /// allocation, and it is 23 KB for FT8 against the 1.2 MB the
+    /// batch path holds.
+    pulse: Vec<f32>,
+    tones: Vec<u8>,
+    /// `exp(i · 2π f0 / Fs)`, the part of the phase increment that
+    /// does not depend on the sample.
+    carrier: (f32, f32),
+    phasor: (f32, f32),
+    k: usize,
+    since_renorm: u32,
+}
+
+impl GfskStream {
+    /// Prepare to synthesise `tones` at carrier `f0_hz`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tones` is empty.
+    pub fn new(tones: &[u8], f0_hz: f32, cfg: &GfskCfg) -> Self {
+        let nsym = tones.len();
+        assert!(nsym > 0, "GfskStream::new: empty tone sequence");
+        let nsps = cfg.samples_per_symbol;
+        let pulse_len = 3 * nsps;
+        let pulse: Vec<f32> = (0..pulse_len)
+            .map(|i| {
+                let tt = (i as f32 - 1.5 * nsps as f32) / nsps as f32;
+                gfsk_pulse(cfg.bt, tt)
+            })
+            .collect();
+        let dphi_carrier = 2.0 * PI * f0_hz / cfg.sample_rate;
+        Self {
+            nsps,
+            nsym,
+            nwave: synth_output_len(nsym, nsps),
+            ramp: cfg.ramp_samples.min(synth_output_len(nsym, nsps) / 2),
+            dphi_peak: 2.0 * PI * cfg.hmod / nsps as f32,
+            pulse,
+            tones: tones.to_vec(),
+            carrier: (dphi_carrier.cos(), dphi_carrier.sin()),
+            phasor: (1.0, 0.0),
+            k: 0,
+            since_renorm: 0,
+        }
+    }
+
+    /// Samples not yet produced.
+    pub fn remaining(&self) -> usize {
+        self.nwave - self.k
+    }
+
+    /// The modulation part of the phase increment for output sample
+    /// `k`, i.e. `dphi[nsps + k]` in [`synth_f32_into`]'s array minus
+    /// the carrier term.
+    ///
+    /// At most three symbols' pulses overlap any sample, so this is
+    /// O(1) where the batch path pays a full array. The two dummy
+    /// terms are the ramp-in and ramp-out symbols.
+    fn modulation(&self, k: usize) -> f32 {
+        let nsps = self.nsps;
+        let m = nsps + k;
+        let mut d = 0.0f32;
+        let jhi = m / nsps;
+        for j in jhi.saturating_sub(2)..=jhi {
+            if j < self.nsym {
+                let idx = m - j * nsps;
+                if idx < self.pulse.len() {
+                    d += self.dphi_peak * self.pulse[idx] * self.tones[j] as f32;
+                }
+            }
+        }
+        if m < 2 * nsps {
+            d += self.dphi_peak * self.tones[0] as f32 * self.pulse[nsps + m];
+        }
+        let ofs = self.nsym * nsps;
+        if m >= ofs && m - ofs < 2 * nsps {
+            d += self.dphi_peak * self.tones[self.nsym - 1] as f32 * self.pulse[m - ofs];
+        }
+        d
+    }
+
+    /// The half-cosine envelope at sample `k`, `1.0` in the middle.
+    fn envelope(&self, k: usize) -> f32 {
+        if self.ramp == 0 {
+            return 1.0;
+        }
+        let twopi = 2.0 * PI;
+        let n = self.ramp as f32;
+        if k < self.ramp {
+            (1.0 - (twopi * k as f32 / (2.0 * n)).cos()) / 2.0
+        } else if k >= self.nwave - self.ramp {
+            let i = k - (self.nwave - self.ramp);
+            (1.0 + (twopi * i as f32 / (2.0 * n)).cos()) / 2.0
+        } else {
+            1.0
+        }
+    }
+
+    #[inline]
+    fn advance(&mut self) {
+        // `exp(i·d) = exp(i·carrier) · exp(i·mod)`, the second from a
+        // three-term series — see the type's doc for why that is
+        // enough here and a libm call is not needed.
+        let md = self.modulation(self.k);
+        let md2 = md * md;
+        let mod_rot = (1.0 - 0.5 * md2 + md2 * md2 / 24.0, md - md2 * md / 6.0);
+        let (pr, pi) = self.phasor;
+        let (cr, ci) = self.carrier;
+        let (ar, ai) = (pr * cr - pi * ci, pr * ci + pi * cr);
+        self.phasor = (
+            ar * mod_rot.0 - ai * mod_rot.1,
+            ar * mod_rot.1 + ai * mod_rot.0,
+        );
+        self.k += 1;
+        self.since_renorm += 1;
+        if self.since_renorm >= STREAM_RENORM_PERIOD {
+            let (r, i) = self.phasor;
+            let mag = (r * r + i * i).sqrt();
+            if mag > 0.0 {
+                self.phasor = (r / mag, i / mag);
+            }
+            self.since_renorm = 0;
+        }
+    }
+
+    /// Fill `out` with the next samples, returning how many were
+    /// written. Short only at the end of the waveform.
+    pub fn fill_f32(&mut self, out: &mut [f32], amplitude: f32) -> usize {
+        let n = out.len().min(self.remaining());
+        for slot in out.iter_mut().take(n) {
+            *slot = amplitude * self.phasor.1 * self.envelope(self.k);
+            self.advance();
+        }
+        n
+    }
+
+    /// [`Self::fill_f32`] straight to i16, with no intermediate buffer
+    /// — the 607 KB temporary and the 82 ms copy `synth_i16_into`
+    /// spends are what this exists to avoid.
+    pub fn fill_i16(&mut self, out: &mut [i16], amplitude_i16: i16) -> usize {
+        let scale = amplitude_i16 as f32;
+        let n = out.len().min(self.remaining());
+        for slot in out.iter_mut().take(n) {
+            *slot = (scale * self.phasor.1 * self.envelope(self.k)) as i16;
+            self.advance();
+        }
+        n
+    }
+}
+
 /// Synthesise a PCM waveform from an FSK tone sequence into a caller-
 /// provided output buffer. **No allocation** — `out` must already be
 /// sized to [`synth_output_len`]`(tones.len(), cfg.samples_per_symbol)`.
@@ -326,5 +520,119 @@ mod tests {
         let tones: [u8; 4] = [0, 1, 2, 3];
         let mut buf = vec![0.0f32; 100]; // wrong size
         synth_f32_into(&mut buf, &tones, 1500.0, 1.0, &cfg);
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    /// FT8's own configuration — the one the measurement that
+    /// motivated the stream was taken on.
+    const FT8: GfskCfg = GfskCfg {
+        sample_rate: 12_000.0,
+        samples_per_symbol: 1920,
+        bt: 2.0,
+        hmod: 1.0,
+        ramp_samples: 1920 / 8,
+    };
+
+    fn tones() -> Vec<u8> {
+        // A Costas-ish spread so every tone index is exercised and the
+        // pulse overlap has something to do at each boundary.
+        (0..79u32).map(|i| ((i * 5 + 3) % 8) as u8).collect()
+    }
+
+    /// **The stream is the same waveform.** Not "close enough": the
+    /// Gaussian overlap, the dummy ramp symbols and the half-cosine
+    /// envelope all have to survive being produced a chunk at a time,
+    /// and the phasor has to track a `sin` it never calls.
+    #[test]
+    fn stream_matches_the_reference_synthesiser() {
+        let t = tones();
+        let reference = synth_f32(&t, 1_500.0, 1.0, &FT8);
+        let mut stream = GfskStream::new(&t, 1_500.0, &FT8);
+        let mut got = vec![0f32; reference.len()];
+        // Deliberately awkward chunking: 20 ms is what `tx::play`
+        // sends, and a ragged first chunk proves the state carries.
+        let mut at = 0usize;
+        for chunk in [7usize, 240, 1, 1920, 240].into_iter().cycle() {
+            if at >= got.len() {
+                break;
+            }
+            let end = (at + chunk).min(got.len());
+            let n = stream.fill_f32(&mut got[at..end], 1.0);
+            assert_eq!(n, end - at, "stream ran short at {at}");
+            at = end;
+        }
+        assert_eq!(stream.remaining(), 0);
+
+        let worst = reference
+            .iter()
+            .zip(got.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // The phasor accumulates where the reference re-derives `sin`
+        // from a running scalar, so exact equality is not the claim.
+        // 1e-3 of full scale is ~60 dB below the signal and two orders
+        // below the quantisation an i16 transmit path applies next.
+        assert!(
+            worst < 1e-3,
+            "stream deviates from the reference by {worst} of full scale"
+        );
+    }
+
+    /// The envelope is not optional: without it the transmitter keys a
+    /// step, and the splatter is the reason WSJT-X ramps at all.
+    #[test]
+    fn the_ramp_survives_chunking() {
+        let t = tones();
+        let mut stream = GfskStream::new(&t, 1_500.0, &FT8);
+        let mut got = vec![0f32; synth_output_len(t.len(), FT8.samples_per_symbol)];
+        let mut at = 0;
+        while at < got.len() {
+            let end = (at + 240).min(got.len());
+            at += stream.fill_f32(&mut got[at..end], 1.0);
+        }
+        let n = FT8.ramp_samples;
+        // First and last samples are inside the ramp's zero end.
+        assert!(got[0].abs() < 1e-6, "waveform starts at {}", got[0]);
+        assert!(
+            got[got.len() - 1].abs() < 0.02,
+            "waveform ends at {}",
+            got[got.len() - 1]
+        );
+        // And the middle of the ramp is genuinely attenuated, not just
+        // the endpoints.
+        let mid_ramp = got[..n].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let body = got[n..got.len() - n]
+            .iter()
+            .fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(
+            mid_ramp < body,
+            "ramp peak {mid_ramp} not below body peak {body}"
+        );
+    }
+
+    /// i16 without the f32 round trip must land where the f32 path
+    /// scaled to i16 would have.
+    #[test]
+    fn i16_fill_matches_scaling_the_f32_fill() {
+        let t = tones();
+        let f = synth_f32(&t, 1_500.0, 1.0, &FT8);
+        let mut stream = GfskStream::new(&t, 1_500.0, &FT8);
+        let mut got = vec![0i16; f.len()];
+        let mut at = 0;
+        while at < got.len() {
+            let end = (at + 960).min(got.len());
+            at += stream.fill_i16(&mut got[at..end], 20_000);
+        }
+        let worst = f
+            .iter()
+            .zip(got.iter())
+            .map(|(a, b)| ((a * 20_000.0) as i32 - *b as i32).abs())
+            .max()
+            .unwrap_or(0);
+        assert!(worst <= 24, "i16 stream differs by {worst} counts");
     }
 }

@@ -66,7 +66,12 @@ pub fn message_to_tones(message77: &[u8]) -> [u8; NN] {
 
 /// FT8 GFSK configuration: 12 kHz sample rate, 1920 samples/symbol (= 6.25 Hz
 /// tone spacing), BT=2.0, modulation index 1.0, 240-sample raised-cosine ramp.
-const FT8_GFSK: crate::engine::dsp::gfsk::GfskCfg = crate::engine::dsp::gfsk::GfskCfg {
+/// Public so a transmitter can build a
+/// [`GfskStream`](crate::engine::dsp::gfsk::GfskStream) with the same
+/// configuration the batch entry points use — a streaming caller has
+/// to name the config, and there must be exactly one FT8 answer to
+/// what it is.
+pub const FT8_GFSK: crate::engine::dsp::gfsk::GfskCfg = crate::engine::dsp::gfsk::GfskCfg {
     sample_rate: 12_000.0,
     samples_per_symbol: 1920,
     bt: 2.0,
