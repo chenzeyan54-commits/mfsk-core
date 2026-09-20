@@ -12,7 +12,6 @@ use core::fmt::Write as _;
 use mfsk_core::ft8::decode::DecodeDepth;
 use mfsk_core::ft8::decode_block::{DEFAULT_Q_THRESH, NFFT_SPEC};
 
-
 use embedded_shared::{dual_core, esp_dsp_fft, pipeline, stage1_inc, wav_sim};
 use esp_idf_svc::sys::QueueHandle_t;
 
@@ -281,6 +280,30 @@ const FT8_KEY_UP_GUARD_MS: i64 = 0;
 /// same breath without a skip that has to be right about the future.
 const FT8_SLOT_FLOOR_MS: i64 = 0;
 
+/// **The wide grid probe's window, in seconds — `MFSK_FT8_WIDE_PROBE`,
+/// off by default.**
+///
+/// Fills the gap between "the per-slot search absorbs it" (±0.88 s at
+/// the shipped emit point) and "a 25 s cold acquisition", which today
+/// has nothing in it: a grid 1.65 s out on a radio cost two minutes
+/// and two acquisitions with the stations audible throughout
+/// (2026-09-19). See `docs/notes/CORES3_FT8_SLOT_BUDGET.md` §8.
+///
+/// **This increment reports and does not act.** The number it produces
+/// comes from a wide search over a partly-filled bundle, and nothing
+/// has shown that to be trustworthy; the ±1.75 s experiment that wired
+/// a wide search's output straight into the decode path without asking
+/// is what this is deliberately not repeating. A slot line that says
+/// `wide=+1.62/0.83` while `dec=0` is the evidence that would justify
+/// the next increment; one that says `wide=` nothing useful ends it.
+///
+/// 2.5 s asks for WSJT-X's own window; `bounded_sync_lag_steps` clamps
+/// it to what the row grid allows, which is ±2.48 s here.
+const FT8_WIDE_PROBE_S: f32 = match option_env!("MFSK_FT8_WIDE_PROBE") {
+    Some(_) => 2.5,
+    None => 0.0,
+};
+
 /// `dual_core::DecodeConfig::share_cand_budget` — off pending a board
 /// measurement; the host mirror's gain is on `qso1`/`qso2`, which the
 /// SIM harness cannot play.
@@ -520,6 +543,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             key_up_guard_ms: FT8_KEY_UP_GUARD_MS,
             fine_sync_min_slack_ms: FT8_FINE_SYNC_MIN_SLACK_MS,
             share_cand_budget: FT8_SHARE_CAND,
+            wide_probe_lag_s: FT8_WIDE_PROBE_S,
             slot_floor_ms: FT8_SLOT_FLOOR_MS,
             slot_end_hint: Some(slot_end_hint),
         };
@@ -535,6 +559,8 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             n_deferred,
             n_early_refined,
             n_in_time,
+            wide_probe,
+            wide_probe_us,
             // Not read any more: the ±0.2 s/slot nudge it fed was a
             // random walk, not an acquisition (see the lock-and-hold
             // comment below). Acquisition is cold acquisition's job.
@@ -676,7 +702,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         );
         log::info!(
             "SLOT[{wav_idx}] t2: tail_use={}ms post_slotend={}ms slot_wait={}ms late={}ms \
-             audio={}sa",
+             audio={}sa{}",
             tail_use / 1_000,
             post_slotend / 1_000,
             (t_slot_recv - t_early_done) / 1_000,
@@ -685,6 +711,19 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             // shortens it, and a short slot is why a healthy-looking
             // `p1` decodes nothing.
             slot.audio().len(),
+            // **The probe, on the same line as the slot's other
+            // timings, because its cost is the thing that decides
+            // whether it can ever run more often than it does.**
+            // `wide=<dt>/<agreement>` with the microseconds it took;
+            // absent when the probe is off.
+            match wide_probe {
+                Some((dt, r)) =>
+                    alloc::format!(" wide={dt:+.2}/{r:.2} in {}ms", wide_probe_us / 1_000),
+                None if wide_probe_us > 0 => {
+                    alloc::format!(" wide=none in {}ms", wide_probe_us / 1_000)
+                }
+                None => String::new(),
+            }
         );
         // **What the coarse search saw, when nothing decoded.**
         //

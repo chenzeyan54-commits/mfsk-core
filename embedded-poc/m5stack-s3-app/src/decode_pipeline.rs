@@ -212,6 +212,7 @@ where
             // and their wav_sim sources are not paced to a slot clock.
             fine_sync_min_slack_ms: 0,
             share_cand_budget: false,
+            wide_probe_lag_s: 0.0,
             slot_floor_ms: 0,
             slot_end_hint: None,
         };
@@ -224,6 +225,8 @@ where
             n_ready,
             n_deferred,
             n_early_refined: _,
+            wide_probe: _,
+            wide_probe_us: _,
             n_in_time: _,
             n_cut: _,
             n_fallback: _,

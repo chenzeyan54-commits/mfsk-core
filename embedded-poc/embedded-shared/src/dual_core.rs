@@ -165,6 +165,21 @@ pub struct SpeculativeOut {
     /// so `results.len() - n_in_time` is decoded for the screen and
     /// for the period after next, not for this exchange.
     pub n_in_time: usize,
+    /// [`DecodeConfig::wide_probe_lag_s`]'s answer: the circular
+    /// median dt of the strongest candidates in the wide search, and
+    /// how tightly they agree (0..1, the mean resultant length).
+    /// `None` when the probe did not run or found nothing.
+    ///
+    /// **Reported, never acted on** in this increment. A wide search
+    /// over a partly-filled bundle has not been shown to produce a
+    /// number worth trusting, and the ±1.75 s experiment that wired
+    /// its output straight into the search without asking is exactly
+    /// what this is trying not to repeat.
+    pub wide_probe: Option<(f32, f32)>,
+    /// Microseconds the wide probe cost. `0` when it did not run —
+    /// the number that says whether "only when the grid is unproven"
+    /// is a real constraint or a formality.
+    pub wide_probe_us: i64,
     /// Stage-3 candidates the [`DecodeConfig::budget_ms`] deadline
     /// stopped from being tried (speculative + deferred, first attempts
     /// and coarse-position retries alike). `0` when the budget is
@@ -382,6 +397,34 @@ pub struct DecodeConfig {
     /// by the audio sink, which is never behind — does not have that
     /// failure mode.
     pub slot_end_hint: Option<fn() -> Option<i64>>,
+    /// **The wide grid probe: ±lag in seconds, `0.0` for off.**
+    ///
+    /// A second coarse search over the *same* SpecBundle, with the lag
+    /// window opened as far as the row grid allows and **no block-2
+    /// gate**, whose output is a grid-offset estimate rather than
+    /// candidates to decode.
+    ///
+    /// It exists for the gap between "the per-slot search absorbs it"
+    /// (±0.88 s at the shipped emit point) and "a 25 s cold
+    /// acquisition". There is nothing in between today: on a radio
+    /// (2026-09-19) a grid 1.65 s out took two minutes and two
+    /// acquisitions to recover from, with the stations audible
+    /// throughout. See `docs/notes/CORES3_FT8_SLOT_BUDGET.md` §8.
+    ///
+    /// **Two-block candidates are acceptable here precisely because it
+    /// does not decode.** It reports the circular median dt of the
+    /// strongest candidates, and an outlier that scored high on two
+    /// Costas blocks does not move a median. That is why widening the
+    /// *decode* search failed in the same conditions and this can
+    /// succeed: phantoms are free in a median and never free in a
+    /// shortlist.
+    ///
+    /// No new spectrogram: the bundle already holds the rows and the
+    /// allsum is lag-independent, so the probe is the same data with
+    /// more lag bins — 27 of them at ±1.0 s against 63 at the ceiling.
+    /// Run after the early path, since a grid correction applies to
+    /// the *next* slot and must not be charged to this one's budget.
+    pub wide_probe_lag_s: f32,
 }
 
 /// This station's **transmit audio start** relative to the FT8 slot
@@ -555,6 +598,8 @@ pub fn run_speculative_slot(
                 n_deferred: 0,
                 n_early_refined: 0,
                 n_in_time: 0,
+                wide_probe: None,
+                wide_probe_us: 0,
                 n_cut: 0,
                 n_fallback: 0,
                 bootstrap_dt_med: None,
@@ -842,6 +887,35 @@ pub fn run_speculative_slot(
     };
     let t_early_done = unsafe { esp_timer_get_time() };
 
+    // **The wide grid probe.** After the early path, so it is never
+    // charged to the budget that has to beat the reply boundary, and
+    // before the slot is claimed, so it is over the bundle the decoder
+    // already has rather than a spectrogram nobody computed.
+    //
+    // `coarse_sync_split_with_allsum` cannot be reused: it hands half
+    // the band to the worker core, and the worker is about to be
+    // needed for the late path. One core is enough here — the probe
+    // runs only when the grid is unproven, which is when the receiver
+    // is decoding nothing anyway.
+    let wide_probe = if cfg.wide_probe_lag_s > 0.0 {
+        let cands = mfsk_core::ft8::decode_block::coarse_sync_with_allsum_and_lag(
+            &spec.spec,
+            cfg.freq_min,
+            0.5 * (cfg.freq_min + cfg.freq_max),
+            cfg.sync_min,
+            cfg.pass1_limit,
+            &spec.allsum_head,
+            cfg.wide_probe_lag_s,
+        );
+        // Top-5 is `bootstrap_dt_med`'s own k and `ft8::acquire`'s: far
+        // enough down to survive one loud outlier, not so far as to
+        // average in the noise floor.
+        mfsk_core::engine::sync::circular_dt_medoid(&cands, 5, 15.0)
+    } else {
+        None
+    };
+    let t_probe_done = unsafe { esp_timer_get_time() };
+
     let slot = pipeline::recv_box::<Slot>(slot_q);
     let t_slot_recv = unsafe { esp_timer_get_time() };
     let slot_audio: &[i16] = slot.audio();
@@ -954,6 +1028,8 @@ pub fn run_speculative_slot(
         n_deferred,
         n_early_refined,
         n_in_time,
+        wide_probe,
+        wide_probe_us: t_probe_done - t_early_done,
         n_cut,
         n_fallback,
         bootstrap_dt_med,
