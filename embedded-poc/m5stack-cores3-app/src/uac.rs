@@ -197,7 +197,17 @@ const UAC_DRIVER_TASK_CORE: sys::BaseType_t = 0;
 /// `uac_app` task stack. Just runs `recv()` → device_open/start →
 /// spawn reader. 4 KB is overkill but keeps headroom for the OnceLock
 /// + sender state and any future device-cleanup paths.
-const APP_TASK_STACK: usize = 4096;
+// **8 KiB because the transmit path runs here.** `handle_tx_connected`
+// is dispatched from `app_task`, and until 2026-09-20 its body had
+// never executed: `uac_host_device_start` refused every call, so the
+// silent-write buffer and `write_ft8_frame` below it were dead code
+// that no stack measurement had ever covered. The first `start` that
+// succeeded (mono, 96 B/frame) ran them and the task overflowed 4096 B
+// inside a second — a reboot 30 s into the capture with no panic on
+// any surviving console. The buffers are on the heap now; this is the
+// margin, not the fix. The stack is PSRAM-backed (`spawn_psram_thread`),
+// so the extra 4 KiB costs no internal DRAM.
+const APP_TASK_STACK: usize = 8192;
 
 /// Priority of whichever task is feeding the [`AudioSink`] — the USB
 /// reader on a radio, the `MFSK_CORES3_SIM` feeder without one.
@@ -1627,8 +1637,14 @@ const TX_AMPLITUDE: i16 = match option_env!("MFSK_CORES3_TX_AMPLITUDE") {
 /// what `m5stack-s3-app`'s `tx::play` sends, chosen there for DMA
 /// underrun headroom against ringbuffer overhead.
 const TX_CHUNK_12K: usize = 240;
-/// The same chunk as the radio wants it: 4x zero-order hold to 48 kHz,
-/// duplicated L = R, 16-bit. `240 * 4 * 2 * 2`.
+/// Buffer for one chunk at 48 kHz 16-bit after 4x zero-order hold —
+/// sized for the **stereo** worst case, `240 * 4 * 2 * 2`.
+///
+/// The format actually in use is decided at runtime by which entry of
+/// `TX_CONFIGS` `uac_host_device_start` accepts, and on this board
+/// that is mono, which fills half of this. Sized for the larger so
+/// one buffer serves both; `write_ft8_frame` passes the bytes it
+/// really wrote as the transfer length, never `len()`.
 const TX_CHUNK_BYTES: usize = TX_CHUNK_12K * 4 * 2 * 2;
 
 /// Send one FT8 frame to the radio's USB audio input, synthesising it
@@ -1648,6 +1664,13 @@ fn write_ft8_frame(
     msg77: &[u8; 77],
     df_hz: f32,
     amplitude: i16,
+    // Channel count `uac_host_device_start` actually accepted. The
+    // driver sizes its isochronous packet from this, so writing the
+    // other layout does not merely sound wrong — it hands the radio
+    // twice or half the audio it is pacing for. On this board the
+    // accepted format is mono, because a 2-channel 48 kHz alt is
+    // 192 B/frame against a 128 B periodic-OUT FIFO limit.
+    channels: u8,
 ) -> (u32, i64, i64) {
     let tones = mfsk_core::ft8::wave_gen::message_to_tones(msg77);
     let mut stream = mfsk_core::engine::dsp::gfsk::GfskStream::new(
@@ -1656,12 +1679,25 @@ fn write_ft8_frame(
         &mfsk_core::ft8::wave_gen::FT8_GFSK,
     );
     let mut mono = [0i16; TX_CHUNK_12K];
-    let mut out = [0u8; TX_CHUNK_BYTES];
+    // Heap: 3 840 B is most of `APP_TASK_STACK` on its own.
+    let mut out = vec![0u8; TX_CHUNK_BYTES];
     let now_us = || unsafe { esp_idf_svc::sys::esp_timer_get_time() };
     let (mut chunks, mut worst, t_start) = (0u32, 0i64, now_us());
     while stream.remaining() > 0 {
         let t0 = now_us();
         let n = stream.fill_i16(&mut mono, amplitude);
+        // `remaining() > 0` should always yield `n > 0`, and the host
+        // tests pin that against `synth_f32` under ragged chunking.
+        // The guard is here because the alternative to being wrong
+        // about it is a task spinning forever inside an enumeration
+        // callback, on a board whose console is gone.
+        if n == 0 {
+            log::warn!(
+                "uac: tx frame stalled at chunk {chunks} with {} left",
+                stream.remaining()
+            );
+            break;
+        }
         // 4x zero-order hold, L = R. The receive side's
         // `LinearResamplerI16To12k` run backwards; ZOH rather than
         // interpolation because the radio's own input filter is what
@@ -1673,9 +1709,12 @@ fn write_ft8_frame(
             for _ in 0..4 {
                 out[o] = lo;
                 out[o + 1] = hi;
-                out[o + 2] = lo;
-                out[o + 3] = hi;
-                o += 4;
+                o += 2;
+                if channels == 2 {
+                    out[o] = lo;
+                    out[o + 1] = hi;
+                    o += 2;
+                }
             }
         }
         let err = unsafe {
@@ -1696,8 +1735,20 @@ fn write_ft8_frame(
     (chunks, worst, now_us() - t_start)
 }
 
+/// **This blocks `app_task` for the length of the frame, and
+/// `RxConnected` waits behind it.** `app_task` drains one mpsc
+/// receiver in order; the radio delivers `TxConnected` (iface 1)
+/// before `RxConnected` (iface 2), so a 12.64 s frame delays the
+/// receiver by that much. Observed 2026-09-20: `TxConnected` at
+/// `.780`, `RxConnected` queued at `.785` and not served until the
+/// probe returned. That costs the first slot of a capture and nothing
+/// after it, which is the right price for a probe and the wrong one
+/// for anything that ships — a real transmit path has to be driven
+/// from the QSO state machine on its own schedule, not from an
+/// enumeration callback.
 fn handle_tx_connected(addr: u8, iface_num: u8) {
     log::info!("uac: TX_CONNECTED addr={addr} iface={iface_num} — probe start (silence only)");
+    TX_STAGE.store(1, Ordering::Relaxed);
     let dev_config = sys::uac::uac_host_device_config_t {
         addr,
         iface_num,
@@ -1717,26 +1768,70 @@ fn handle_tx_connected(addr: u8, iface_num: u8) {
         log::error!("uac: tx probe device_open failed err={err:#x}");
         return;
     }
+    TX_STAGE.store(2, Ordering::Relaxed);
 
-    // Same fixed config the IN side uses. Unverified for the OUT
-    // interface specifically — the IC-705's TX descriptor has never
-    // been queried, so a `device_start` failure here is expected
-    // information, not a bug: check the device descriptor dump in the
-    // UDP log (same as the RX open-failure comment above) and correct
-    // this constant from what the radio actually reports.
-    let stream_config = sys::uac::uac_host_stream_config_t {
-        channels: STREAM_CHANNELS,
-        bit_resolution: STREAM_BIT_RESOLUTION,
-        sample_freq: STREAM_SAMPLE_FREQ_HZ,
-        flags: 0,
-    };
-    let err = unsafe { sys::uac::uac_host_device_start(handle, &stream_config as *const _) };
+    // **Try several, because the first one is known to be refused and
+    // the reason is a size limit, not a format mismatch.**
+    //
+    // 2026-09-20, measured: `(2, 16, 48000)` — which *does* match the
+    // radio's own OUT descriptor, `iface 1 alt 1` — returns
+    // `ESP_ERR_NOT_SUPPORTED` (0x106). That error does not come from
+    // the UAC driver at all. `hcd_pipe_alloc` rejects the pipe in
+    // `pipe_alloc_hcd_support_verification`: on an ESP32-S3 there is
+    // no HS PHY, so `otg_dfifo_depth` is 256 lines, the BALANCED FIFO
+    // bias gives `ptx_fifo_lines = 256/8 = 32`, and the periodic-OUT
+    // MPS limit is therefore `32 * 4` = **128 bytes**. Alt 1 carries
+    // 192 bytes per frame and does not fit.
+    //
+    // The other way out is `CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT`,
+    // which raises that limit to ~824 B — and takes the RX FIFO from
+    // 160 lines to 34. This board's receive path is the one that
+    // already lost 2.6-6.5 % of its audio to an isochronous URB budget
+    // (see `embedded-poc/CLAUDE.md`), so spending the RX FIFO to gain
+    // a transmit format is the wrong trade.
+    //
+    // Mono is: 48 kHz x 1 ch x 2 B = **96 B/frame**, inside the limit,
+    // and the radio lists three OUT alts at 96. FT8 transmit is mono
+    // anyway — `write_ft8_frame` duplicates L = R today.
+    //
+    // The ladder runs to the end rather than stopping at mono so that
+    // one flash reports which formats this radio and this FIFO admit,
+    // instead of answering one question per hardware session.
+    const TX_CONFIGS: [(u8, u8, u32); 4] = [
+        (2, 16, 48_000), // 192 B/frame — over the 128 B limit, kept as the control
+        (1, 16, 48_000), // 96 B/frame
+        (2, 16, 24_000), // 96 B/frame
+        (1, 16, 24_000), // 48 B/frame
+    ];
+    let mut err = sys::ESP_FAIL;
+    let mut chosen = -1i32;
+    for (idx, (ch, bits, freq)) in TX_CONFIGS.iter().enumerate() {
+        let stream_config = sys::uac::uac_host_stream_config_t {
+            channels: *ch,
+            bit_resolution: *bits,
+            sample_freq: *freq,
+            flags: 0,
+        };
+        err = unsafe { sys::uac::uac_host_device_start(handle, &stream_config as *const _) };
+        log::warn!("uac: tx start {ch}ch/{bits}b/{freq}Hz -> {err:#x}");
+        if err == sys::ESP_OK as sys::esp_err_t {
+            chosen = idx as i32;
+            break;
+        }
+    }
+    TX_CFG_IDX.store(chosen, Ordering::Relaxed);
+    TX_START_ERR.store(err, Ordering::Relaxed);
     if err != sys::ESP_OK as sys::esp_err_t {
-        log::error!(
-            "uac: tx probe device_start failed err={err:#x} (tried {STREAM_CHANNELS}ch / \
-             {STREAM_BIT_RESOLUTION}b / {STREAM_SAMPLE_FREQ_HZ}Hz — this is a guess, not read \
-             from the OUT interface's own descriptor)"
-        );
+        // The config is no longer a guess: the 2026-09-20 enumeration
+        // dump shows the OUT interface (PCM2901, 08bb:2901, iface 1)
+        // carrying `alt 1 ... maxpkt 192`, and 192 B per 1 ms frame is
+        // 48 samples x 2 ch x 2 B — 48 kHz stereo 16-bit, exactly what
+        // `STREAM_*` says. A failure here is therefore about something
+        // other than the format.
+        //
+        // Data only in the line: spelled out it measured 258 bytes
+        // against the fanout's 160.
+        log::error!("uac: tx probe device_start failed err={err:#x} (see enumeration dump)");
         let close_err = unsafe { sys::uac::uac_host_device_close(handle) };
         if close_err != sys::ESP_OK as sys::esp_err_t {
             log::error!("uac: tx probe device_close after start failure failed err={close_err:#x}");
@@ -1744,15 +1839,19 @@ fn handle_tx_connected(addr: u8, iface_num: u8) {
         return;
     }
 
-    let silence = [0u8; TX_PROBE_CHUNK_BYTES];
+    TX_STAGE.store(3, Ordering::Relaxed);
+
+    // Heap, and one buffer rather than a fresh copy per iteration: two
+    // 1 920 B arrays live at once on a task stack that also has to hold
+    // `write_ft8_frame` below.
+    let mut silence = vec![0u8; TX_PROBE_CHUNK_BYTES];
     let mut wrote_ok = 0u32;
     for i in 0..TX_PROBE_WRITES {
-        let mut buf = silence;
         let err = unsafe {
             sys::uac::uac_host_device_write(
                 handle,
-                buf.as_mut_ptr(),
-                buf.len() as u32,
+                silence.as_mut_ptr(),
+                silence.len() as u32,
                 TX_PROBE_WRITE_TIMEOUT_MS,
             )
         };
@@ -1763,6 +1862,8 @@ fn handle_tx_connected(addr: u8, iface_num: u8) {
         }
         esp_idf_svc::hal::delay::FreeRtos::delay_ms(10);
     }
+    TX_SILENT_OK.store(wrote_ok, Ordering::Relaxed);
+    TX_STAGE.store(4, Ordering::Relaxed);
     log::info!("uac: tx probe wrote {wrote_ok}/{TX_PROBE_WRITES} silent chunks OK");
 
     // **The whole transmit chain, at whatever amplitude is configured
@@ -1794,15 +1895,33 @@ fn handle_tx_connected(addr: u8, iface_num: u8) {
                 [0u8; 77]
             }
         };
-        let (chunks, worst_us, total_us) = write_ft8_frame(handle, &msg77, 1_500.0, TX_AMPLITUDE);
+        let channels = if chosen >= 0 {
+            TX_CONFIGS[chosen as usize].0
+        } else {
+            STREAM_CHANNELS
+        };
+        let (chunks, worst_us, total_us) =
+            write_ft8_frame(handle, &msg77, 1_500.0, TX_AMPLITUDE, channels);
+        TX_FRAME_CHUNKS.store(chunks, Ordering::Relaxed);
+        TX_FRAME_MS.store((total_us / 1_000) as i32, Ordering::Relaxed);
+        TX_STAGE.store(5, Ordering::Relaxed);
+        // The frame is 12 640 ms of audio in 632 chunks of 20 ms. A
+        // `total` short of that is the ring not applying backpressure
+        // (the writes are being accepted faster than the endpoint
+        // drains, so the timing proves nothing); a `total` over it is
+        // this board failing to keep up, and `worst` says which chunk.
+        //
+        // **Data only in the line.** Spelled out, this measured 213
+        // bytes against the fanout's 160 (`log_sink::LINE_MAX`) and
+        // arrived with a `~` — the numbers survived, the sentence
+        // explaining them did not, which is the wrong half to lose to
+        // a clip and the wrong place for it anyway.
         log::warn!(
-            "uac: tx frame {} — {chunks} chunks of 20 ms, worst {worst_us} us, total {} ms \
-             (audio is 12 640 ms; a shortfall is the ring not pacing, an excess is this board \
-             not keeping up)",
+            "uac: tx frame {} {chunks}ch worst {worst_us}us total {}ms / 12640ms",
             if TX_AMPLITUDE == 0 {
-                "SILENT (amplitude 0, nothing reaches the air)"
+                "SILENT"
             } else {
-                "AT FULL AMPLITUDE — the radio may be transmitting"
+                "LIVE-RF"
             },
             total_us / 1_000,
         );
@@ -1816,6 +1935,7 @@ fn handle_tx_connected(addr: u8, iface_num: u8) {
     if close_err != sys::ESP_OK as sys::esp_err_t {
         log::error!("uac: tx probe device_close failed err={close_err:#x}");
     }
+    TX_STAGE.store(6, Ordering::Relaxed);
     log::info!("uac: tx probe done, interface closed");
 }
 
@@ -2435,8 +2555,11 @@ fn dump_enumeration() {
 /// pretty-printer buries those in the class-specific records the UAC
 /// spec puts between them.
 fn walk_config(bytes: &[u8]) {
+    use core::fmt::Write as _;
     const T_INTERFACE: u8 = 0x04;
     const T_ENDPOINT: u8 = 0x05;
+    const T_CS_INTERFACE: u8 = 0x24;
+    const CS_FORMAT_TYPE: u8 = 0x02;
     let mut i = 0usize;
     while i + 2 <= bytes.len() {
         let len = bytes[i] as usize;
@@ -2464,7 +2587,7 @@ fn walk_config(bytes: &[u8]) {
                 let attr = bytes[i + 3];
                 let mps = u16::from_le_bytes([bytes[i + 4], bytes[i + 5]]);
                 log::warn!(
-                    "uac:       ep {:#04x} {} {} maxpkt {mps}",
+                    "uac:       ep {:#04x} {} {} maxpkt {mps} ivl {}",
                     addr,
                     if addr & 0x80 != 0 { "IN " } else { "OUT" },
                     match attr & 0x03 {
@@ -2473,6 +2596,49 @@ fn walk_config(bytes: &[u8]) {
                         2 => "bulk",
                         _ => "interrupt",
                     },
+                    // `bInterval == 0` on an ISOC/INTR endpoint is its
+                    // own rejection in `pipe_alloc_hcd_support_verification`,
+                    // separate from the MPS limit, so print it beside
+                    // the size rather than inferring it later.
+                    if len >= 7 { bytes[i + 6] } else { 0 },
+                );
+            }
+            // Class-specific AS interface descriptor. The Type I
+            // Format descriptor is what `uac_host_device_start`
+            // matches `channels` / `bit_resolution` / `sample_freq`
+            // against, so without it a `start` failure cannot be told
+            // from a format this radio does not offer. The endpoint
+            // sizes alone were not enough on 2026-09-20.
+            T_CS_INTERFACE if len >= 8 && bytes[i + 2] == CS_FORMAT_TYPE => {
+                let (ftype, nch, subframe, bits, nfreq) =
+                    (bytes[i + 3], bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]);
+                let mut f: heapless::String<48> = heapless::String::new();
+                if nfreq == 0 {
+                    // Continuous: tSamFreq[0] is lower, [1] is upper.
+                    for k in 0..2 {
+                        let o = i + 8 + k * 3;
+                        if o + 3 <= i + len {
+                            let hz = u32::from(bytes[o])
+                                | (u32::from(bytes[o + 1]) << 8)
+                                | (u32::from(bytes[o + 2]) << 16);
+                            let _ = write!(&mut f, "{}{hz}", if k == 0 { "" } else { ".." });
+                        }
+                    }
+                } else {
+                    for k in 0..usize::from(nfreq).min(4) {
+                        let o = i + 8 + k * 3;
+                        if o + 3 <= i + len {
+                            let hz = u32::from(bytes[o])
+                                | (u32::from(bytes[o + 1]) << 8)
+                                | (u32::from(bytes[o + 2]) << 16);
+                            let _ = write!(&mut f, "{}{hz}", if k == 0 { "" } else { "," });
+                        }
+                    }
+                }
+                log::warn!(
+                    "uac:       fmt type {ftype} {nch}ch {bits}b (sub {subframe}) freq {}                      [{}]",
+                    if nfreq == 0 { "cont" } else { "list" },
+                    f.as_str(),
                 );
             }
             _ => {}
@@ -2531,13 +2697,41 @@ fn spawn_device_count_probe() {
                     if info.num_devices > 0 && DUMPED.fetch_add(1, Ordering::Relaxed) < 3 {
                         dump_enumeration();
                     }
+                    let start = TX_START_ERR.load(Ordering::Relaxed);
+                    let stage = TX_STAGE.load(Ordering::Relaxed);
+                    // **Terse on purpose.** This line carries the whole
+                    // TX answer and the fanout clips at
+                    // `log_sink::LINE_MAX` (160) with a `~`; the
+                    // spelled-out success case measured 161 bytes,
+                    // i.e. the one outcome worth reading would have
+                    // arrived as `... in 1264~`. Same trap the
+                    // `SLOT[...]` line was already split for.
+                    let tx_state = if stage == 0 {
+                        String::from("never entered")
+                    } else if stage == 1 {
+                        String::from("open !ok")
+                    } else if start == i32::MIN {
+                        String::from("open ok, start pending")
+                    } else if start != sys::ESP_OK {
+                        format!("start err {start:#x}")
+                    } else {
+                        format!(
+                            "cfg{} st{stage} sil {}/{} frame {}ch {}ms",
+                            TX_CFG_IDX.load(Ordering::Relaxed),
+                            TX_SILENT_OK.load(Ordering::Relaxed),
+                            TX_PROBE_WRITES,
+                            TX_FRAME_CHUNKS.load(Ordering::Relaxed),
+                            TX_FRAME_MS.load(Ordering::Relaxed),
+                        )
+                    };
                     log::info!(
                         "uac: usb_host_lib_info — num_devices={} num_clients={} | audio IN {} \
-                         | audio OUT {}",
+                         | audio OUT {} | tx {}",
                         info.num_devices,
                         info.num_clients,
                         fmt(rx),
                         fmt(tx),
+                        tx_state,
                     );
                     last = info.num_devices;
                     since_log = 0;
@@ -2563,6 +2757,29 @@ static CLIENT_COUNT: AtomicI32 = AtomicI32::new(-1);
 /// `driver_event_cb`: the enumeration log can be written before the
 /// network that carries it exists, and a missing line then reads as a
 /// missing interface.
+/// Last `uac_host_device_start` result on the OUT interface, silent
+/// writes that succeeded, and frame chunks written — latched for the
+/// same reason the interface numbers are. `handle_tx_connected` runs
+/// during enumeration, which on this board is tens of seconds before
+/// the network that carries its log.
+/// How far [`handle_tx_connected`] got: 0 never entered, 1 entered,
+/// 2 opened, 3 started, 4 silent writes done, 5 frame done, 6 closed.
+///
+/// Without this, `TX_START_ERR`'s initial value means three different
+/// things at once — the handler was never called, `device_open`
+/// failed, or the 12.6 s frame is still running — and telling them
+/// apart costs a whole reflash cycle. It is monotonic and one word,
+/// so reading it late is as good as watching it.
+static TX_STAGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Index into `TX_CONFIGS` that `device_start` accepted, or `-1`.
+static TX_CFG_IDX: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+
+static TX_START_ERR: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(i32::MIN);
+static TX_SILENT_OK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static TX_FRAME_CHUNKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static TX_FRAME_MS: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+
 /// How many times [`dump_enumeration`] has run. Repeated rather than
 /// one-shot so it cannot be swallowed by a log path that is not up
 /// yet — see the call site.
