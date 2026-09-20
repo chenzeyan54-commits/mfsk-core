@@ -165,17 +165,22 @@ pub struct SpeculativeOut {
     /// so `results.len() - n_in_time` is decoded for the screen and
     /// for the period after next, not for this exchange.
     pub n_in_time: usize,
-    /// [`DecodeConfig::wide_probe_lag_s`]'s answer: the circular
-    /// median dt of the strongest candidates in the wide search, and
-    /// how tightly they agree (0..1, the mean resultant length).
-    /// `None` when the probe did not run or found nothing.
+    /// [`DecodeConfig::wide_probe_lag_s`]'s answer:
+    /// `(dt, mass, dominance)` of the heaviest score-mass cluster in
+    /// the wide search — where it is, how much score is in it, and how
+    /// far it beats the runner-up. `None` when the probe did not run
+    /// or found nothing.
+    ///
+    /// **Not agreement.** The first cut reported the medoid's `r` and
+    /// it was measured useless on a radio: 0.93 on a reading 1.6 s
+    /// wrong, 0.94 on a correct one. See the probe's own comment.
     ///
     /// **Reported, never acted on** in this increment. A wide search
     /// over a partly-filled bundle has not been shown to produce a
     /// number worth trusting, and the ±1.75 s experiment that wired
     /// its output straight into the search without asking is exactly
     /// what this is trying not to repeat.
-    pub wide_probe: Option<(f32, f32)>,
+    pub wide_probe: Option<(f32, f32, f32)>,
     /// Microseconds the wide probe cost. `0` when it did not run —
     /// the number that says whether "only when the grid is unproven"
     /// is a real constraint or a formality.
@@ -921,10 +926,42 @@ pub fn run_speculative_slot(
             &spec.allsum_head,
             cfg.wide_probe_lag_s,
         );
-        // Top-5 is `bootstrap_dt_med`'s own k and `ft8::acquire`'s: far
-        // enough down to survive one loud outlier, not so far as to
-        // average in the noise floor.
-        mfsk_core::engine::sync::circular_dt_medoid(&cands, 5, 15.0)
+        // **Score mass, not agreement.** The first cut of this probe
+        // used `circular_dt_medoid(&cands, 5, ..)` and its `r` as a
+        // confidence, and on a radio with a healthy NTP grid it
+        // returned −0.85, +0.91, +0.28, +0.36, +0.04, +0.04, +1.64,
+        // +0.04 across eight consecutive slots — three right out of
+        // eight — with `r` between 0.87 and 0.98 the whole time. The
+        // +1.64 reading carried `r = 0.93` and the correct +0.04
+        // carried 0.94: **`r` does not separate them.**
+        //
+        // `acquire_slot_phase`'s own doc says why, and said it before
+        // this was written: "a tile with no signal still returns its
+        // best peaks, and those cluster just as tightly as real ones,
+        // so it reports `r` up to 1.00 while being ~7 s wrong.
+        // Agreement says the candidates are consistent, not that they
+        // are a signal." The medoid picks whichever of the top-5 is
+        // most central, and over a wide window the top-5 can be mostly
+        // two-block artefacts.
+        //
+        // Mass cannot be faked the same way. A band's stations are
+        // many and land together — 1.07 s end to end on `qso3_busy`,
+        // −0.20..+0.60 on 40 m this morning — so they sum; a two-block
+        // artefact is one or two candidates of ordinary score. The
+        // kernel is 1.0 s rather than `acquire`'s 0.5 so that a whole
+        // station population forms **one** cluster instead of two that
+        // each lose to an artefact.
+        //
+        // Two clusters are asked for, not one, because the number that
+        // says "this is a grid offset and not noise" is how far the
+        // winner beats the runner-up. A real displacement should be
+        // dominant; scattered noise should not.
+        let clusters = mfsk_core::engine::sync::circular_dt_clusters(&cands, 1.0, 15.0, 2);
+        match clusters.as_slice() {
+            [] => None,
+            [(dt, mass)] => Some((*dt, *mass, f32::INFINITY)),
+            [(dt, mass), (_, second), ..] => Some((*dt, *mass, *mass / second.max(1e-6))),
+        }
     } else {
         None
     };

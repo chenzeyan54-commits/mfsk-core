@@ -717,8 +717,10 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             // `wide=<dt>/<agreement>` with the microseconds it took;
             // absent when the probe is off.
             match wide_probe {
-                Some((dt, r)) =>
-                    alloc::format!(" wide={dt:+.2}/{r:.2} in {}ms", wide_probe_us / 1_000),
+                Some((dt, mass, dom)) => alloc::format!(
+                    " wide={dt:+.2} mass={mass:.0} dom={dom:.1} in {}ms",
+                    wide_probe_us / 1_000
+                ),
                 None if wide_probe_us > 0 => {
                     alloc::format!(" wide=none in {}ms", wide_probe_us / 1_000)
                 }
