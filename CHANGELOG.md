@@ -574,6 +574,20 @@ reported the grid healthy while the band said otherwise.
   `ACQUIRE_CAPTURE_SAMPLES` is now load-bearing for the 2.5 s bound,
   which is `(SLOT − (CAPTURE − SLOT)) / 2`, and says so.
 
+  **Confirmed on the board, against the same board without the fix.**
+  `MFSK_CORES3_SIM` with the feed 12.5 s out, i.e. a true grid phase of
+  −2.5 s, the middle of the band that had nothing behind it. Before:
+  the two heaviest clusters (−0.377 s, −3.018 s) were both skipped,
+  trials 3 and 4 decoded nothing, and trial 5 at −5.367 s decoded
+  **one** station and set the grid 0.96 s out — which then ran at 2
+  decodes a slot for six slots, one of them 0 with `cut=15`, before a
+  **second** 25 s acquisition finally placed it. After: trial 2 cuts at
+  10.10 s instead of 11.98 s, decodes 6, and the grid lands at −2.55 s.
+  Steady 6 decodes a slot from the slot after the acquisition, `cut=0`,
+  `hint_err` ±12 ms, one acquisition and no trim — seven slots, 105 s
+  of band, earlier than the same board reached it without the clamp.
+  Reproduced on a second flash (grid −2.46 s, same shape).
+
 - **CoreS3: the panel is BGR, and every colour has been swapped since
   the first screen.** `CSS_ORANGE` (255, 165, 0) reached the panel as
   (0, 165, 255) — sky blue. mipidsi defaults to RGB; the CoreS3's

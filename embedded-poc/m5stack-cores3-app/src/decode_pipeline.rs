@@ -1234,6 +1234,23 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                         // Measured, skip → clamp, decodes at the grid
                         // that results: qso3 4.70 → 6.07, qso1
                         // 3.32 → 3.86, qso2 3.48 → 4.38.
+                        //
+                        // **And on the board, against the board
+                        // without it** (`MFSK_CORES3_SIM`, feed 12.5 s
+                        // out = a true phase of −2.5 s, the middle of
+                        // the band with nothing behind it;
+                        // `logs/sim_acq_{clamp,control_noclamp}_offset12500_2026-09-20.log`).
+                        // Without: the two heaviest clusters
+                        // (−0.377, −3.018) both skipped, trials 3 and
+                        // 4 decoded 0, trial 5 at −5.367 decoded *one*
+                        // and set the grid 0.96 s out — 2 decodes a
+                        // slot for six slots, one of them 0 at
+                        // `cut=15`, then a second 25 s acquisition.
+                        // With: trial 2 cuts at 10.10 s instead of
+                        // 11.98 s, decodes 6, grid lands at −2.55 s,
+                        // steady 6 a slot from the next slot on,
+                        // `cut=0`, one acquisition, no trim. Seven
+                        // slots earlier.
                         let max_off = audio.len().saturating_sub(SLOT_TRIAL_SAMPLES);
                         let want = ((centre * 12_000.0).round() as i64)
                             .rem_euclid(SLOT_TRIAL_SAMPLES as i64)
