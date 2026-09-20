@@ -193,16 +193,25 @@ reported the grid healthy while the band said otherwise.
 
 ### Added
 
-- **`DecodeRequest::also_accept(f)` / `.message_filter(f)` — a
-  caller-supplied message-acceptance policy (#383).** `MessageCodec`
-  gained `is_plausible`, the codec's own verdict on a decoded message's
-  text (default `true`; `Wsjt77Message` overrides it with
-  `is_plausible_message`), and a request now says what to do with that
-  verdict: keep it, widen it with `also_accept`, or replace it with
-  `message_filter`. The filter is mfsk-core's own — `ft8b.f90` gates on
-  `nbadcrc` and `nharderrors` alone — so it is a judgement call, and
-  the judgement belongs to whoever knows the band. `LIBRARY.md` §2.6
-  (and its `.ja.md` twin) is the writeup.
+- **`DecodeRequest::also_accept(f)` / `.message_filter(f)` /
+  `.codec_filter()` — a caller-supplied message-acceptance policy
+  (#383).** `MessageCodec` gained `is_plausible`, the codec's own
+  verdict on a decoded message, and a request now says what to do with
+  that verdict: keep it, apply it explicitly with `codec_filter`,
+  widen it with `also_accept`, or replace it with `message_filter`.
+  The filter is mfsk-core's own — `ft8b.f90` gates on `nbadcrc` and
+  `nharderrors` alone — so it is a judgement call, and the judgement
+  belongs to whoever knows the band. `LIBRARY.md` §2.6 (and its
+  `.ja.md` twin) is the writeup.
+
+  **This API exists because of #373**, @madmedicnl's proposal to teach
+  the decoder WSJT-CB's callsign grammar. A Cargo feature was the
+  wrong shape for a per-operator policy, and #383 was written as the
+  answer to that; wiring the resulting hook up is what then exposed
+  the message-filter bug below. The CB grammar itself stays in its
+  author's hands — a dialect is application policy — but the seam it
+  asked for is here, and it is a better seam than the one first
+  proposed to them.
 
   **A type parameter, not the `&'a dyn Fn` shape `.on_result()` and
   `.budget()` use.** Those fire once per decode; this fires once per
