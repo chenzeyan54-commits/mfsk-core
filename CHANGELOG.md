@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.11.0 — a new C ABI for every mode (breaking), FT4/FST4 a-priori decoding fixed (−1.1 dB AWGN), the sniper becomes FT8-only (breaking), a caller-supplied decode budget, `mfsk-ffi-ft8` retired, the CoreS3 FT8 receiver holds its slot grid
+## 0.11.0 — a new C ABI for every mode (breaking), FT4/FST4 a-priori decoding fixed (−1.1 dB AWGN), the sniper becomes FT8-only (breaking), a caller-supplied decode budget, `mfsk-ffi-ft8` retired, the CoreS3 FT8 receiver holds its slot grid and stops starving its own internal DRAM
 
 **Why a minor bump.** Two independent reasons, either of which would be
 enough by this crate's own convention — the precedent is `0.7.0` (the
@@ -622,6 +622,61 @@ reported the grid healthy while the band said otherwise.
   asymmetry and it cost a double-wrapped `<<PA3XYZ>>` during the
   #383 type-5 port before a test caught it; all three return the same
   shape now.
+
+- **The CoreS3 ran with 352 bytes of contiguous internal DRAM at every
+  slot boundary, and the margin was 188 bytes.** A second, independent
+  cause of the same failure the hash table produced — that one ate the
+  ceiling, this one ate the floor, and fixing either alone leaves the
+  board one allocation away from the same silence.
+
+  FT8's coarse-sync peak search holds four `n_freq`-long arrays at
+  once (`coarse_sync.rs:793-796`, red/jpeak × primary/secondary). With
+  the CoreS3's `freq_max: 3_000.0` and `NFFT_SPEC = 3840`, `n_freq` is
+  977, so each array is 3 908 B — **188 bytes under the 4 096 B
+  threshold that forces an allocation into internal DRAM**. All four
+  land there, 15 632 B of them, for the two seconds straddling every
+  slot boundary. At `freq_max: 3_200.0` they would be 4 164 B, clear
+  the threshold, and none of this would ever have happened.
+
+  Measured against an IC-705 on 40 m (2026-09-21): free internal sat
+  at 17 527 B between slots and fell to 1 699 B across each boundary —
+  a 15 828 B dip that those four arrays account for to 98.8 % — with
+  the largest contiguous block down to 352 B. `CONFIG_SPIRAM_MALLOC_
+  ALWAYSINTERNAL` drops 4096 → 2048, which moves them out:
+
+  | | 4096 | 2048 |
+  |---|---|---|
+  | `coarse` | 87-95 ms | 87-92 ms |
+  | free internal, between slots | 17 527 B | 20 051 B |
+  | free internal, at the boundary | 1 699 B | **15 851 B** |
+  | largest block at the boundary | 352 B | **7 680 B** |
+
+  The cost this was expected to carry does not appear: the peak loop
+  reads those arrays `n_freq × lags` times and PSRAM is slower, but
+  against a ~1.1 s net decode budget the difference is below what the
+  per-slot timer resolves. Note the direction — `embedded-poc/
+  CLAUDE.md`'s board table records that *raising* this to 16384
+  corrupts tlsf with `cs Box × 2` workers; only downward was
+  unexplored.
+
+  The `uac: rx tick` line gains `lrg=`, the largest contiguous internal
+  block, because `int=` alone had been the misleading number: over 363
+  samples the largest block is a median of 51 % of the free total, and
+  at the low points it read 448-512 B while `int` still said 1.4 kB.
+  Every headroom judgement made from `int` was about 2× optimistic.
+
+  All three boards build with `hash-table-small` as well, since all
+  three run `SPIRAM_MALLOC_ALWAYSINTERNAL = 4096` and the same
+  reasoning applies.
+
+- **`m5stack-s3-app` and `m5stack-core2-app` had not compiled since
+  `bbbb3044`.** That commit added three fields to
+  `dual_core::SpeculativeOut` and updated the CoreS3 and `rx_wavsim`,
+  but not the other two boards. `ci.yml` `paths-ignore`s
+  `embedded-poc/**`, so nothing said so for three weeks. Both now name
+  and ignore the new fields rather than eliding them with `..` — the
+  exhaustive pattern breaking is the only thing standing in for CI in
+  that tree, and it is what surfaced this.
 
 - **Three message types were surviving the phantom filter at 100 %
   because a marker string short-circuited it (#383).**
