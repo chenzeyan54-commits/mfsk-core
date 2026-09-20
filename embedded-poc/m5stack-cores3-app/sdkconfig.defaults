@@ -139,7 +139,53 @@ CONFIG_SPIRAM_USE_MALLOC=y
 # Mandatory for dual-core decode: same constraint as both sibling crates.
 # Keeps allocations ≤4096 B in internal DRAM, preventing TLSF corruption
 # when stage-3 cs Box buffers are placed in internal DRAM by both workers.
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# **Lowered from 4096 on 2026-09-21, measured, kept.**
+#
+# At 4096 the FT8 coarse-sync peak search is what empties internal
+# DRAM at every slot boundary. `coarse_sync.rs:793-796` holds four
+# `n_freq`-long arrays at once (red/jpeak x primary/secondary), and
+# with this crate's `freq_max: 3_000.0` and `NFFT_SPEC=3840`,
+# n_freq is 977 -- so each is 3 908 B and the set is 15 632 B. Every
+# one of them is **188 bytes under the threshold**, so all four land
+# in internal DRAM.
+#
+# Measured on air (2026-09-21, IC-705 on 40 m): free internal sits at
+# 17 527 B between slots and falls to 1 699 B across the boundary, a
+# 15 828 B dip that 15 632 B accounts for -- 98.8 %. The largest
+# contiguous block at the floor was 352 B. That is the state the board
+# is in for two seconds of every fifteen, and it is why `esp-aes`
+# could not allocate and WiFi went silent on 2026-09-20.
+#
+# Note how narrow the margin is: at `freq_max: 3_200.0` the same
+# arrays would be 4 164 B, clear the threshold, and the problem would
+# have never existed.
+#
+# 2048 moves those four out and leaves everything <=2048 internal.
+# **Measured on air the same evening, and it costs nothing detectable.**
+# The worry was that `coarse_sync`'s peak loop reads these arrays
+# n_freq x lags times and PSRAM is slower, against a net decode budget
+# of ~1.1 s. It does not show:
+#
+#                        4096            2048
+#   coarse               87-95 ms        87-92 ms
+#   free internal, base  17 527 B        20 051 B
+#   free internal, floor  1 699 B        15 851 B
+#   largest at floor        352 B         7 680 B
+#
+# The boundary dip goes from 15 828 B to 4 200 B and the largest block
+# stops collapsing at all. The remaining 4 kB is whatever is still
+# under the new threshold, and at a 15.8 kB floor it is not a problem.
+#
+# If a future change does make this too slow, the targeted alternative
+# is to make the four one allocation in `mfsk-core` -- 15 632 B clears
+# any threshold on its own and needs no board config. Note it would
+# put the same data in PSRAM, so it buys isolation from other
+# allocations, not speed.
+#
+# Do NOT raise this instead: 16384 was tried and drains internal DRAM
+# with cs Box x 2 workers into tlsf corruption (embedded-poc/CLAUDE.md
+# board table). Only downward is unexplored.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048
 # Lets a task explicitly request its *stack* from PSRAM instead of
 # internal DRAM (opt-in per task via task_caps; nothing that doesn't
 # ask for MALLOC_CAP_SPIRAM is affected). Added 2026-08-15 so
@@ -282,8 +328,10 @@ CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=64
 # `wifi`, `mem_malloc` under `pbuf_alloc` in task `tiT` — and since
 # every reboot reconnects, the loop sustains itself.
 #
-# SPIRAM_MALLOC_ALWAYSINTERNAL stays at 4096; the dual-core decode path
-# needs it there (see embedded-poc/CLAUDE.md).
+# SPIRAM_MALLOC_ALWAYSINTERNAL: see the block at its own setting
+# above. The constraint CLAUDE.md records is against *raising* it
+# (16384 corrupts tlsf); lowering to 2048 was measured on 2026-09-21
+# and is what ships.
 #
 # Not to be confused with CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC, which is
 # genuinely harmful here — see the note above it.
