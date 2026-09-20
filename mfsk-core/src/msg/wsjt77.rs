@@ -207,7 +207,7 @@ fn unpack28_h(n28: u32, ht: &CallsignHashTable) -> String {
         if n < MAX22 {
             // 22-bit hash — try table lookup
             if let Some(resolved) = ht.lookup22(n) {
-                return resolved;
+                return alloc::format!("<{}>", resolved);
             }
             return "<...>".to_string();
         }
@@ -227,11 +227,11 @@ fn resolve_hash12(n12: u32, ht: &CallsignHashTable) -> String {
 /// [`resolve_hash12`] for the 22-bit hash the Type-5 message carries in
 /// its second callsign field (`packjt77.f90:605` `hash22`).
 ///
-/// Note the asymmetry with [`CallsignHashTable::lookup12`]:
-/// `lookup22` already returns the callsign wrapped in `<>`, so this
-/// must not wrap it again. [`unpack28_h`] relies on the same thing.
 fn resolve_hash22(n22: u32, ht: &CallsignHashTable) -> String {
-    ht.lookup22(n22).unwrap_or_else(|| "<...>".to_string())
+    match ht.lookup22(n22) {
+        Some(call) => format!("<{}>", call),
+        None => UNRESOLVED_HASH.to_string(),
+    }
 }
 
 /// Decode a 15-bit Maidenhead grid square index.
