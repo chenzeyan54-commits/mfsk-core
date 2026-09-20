@@ -61,6 +61,39 @@ reported the grid healthy while the band said otherwise.
 
 ### Documentation
 
+- **Tier C ran before this tag, and not one of the 28 groups moved.**
+  FT8, FT4 and all twenty FST4 sub-mode/channel pairs reproduce their
+  stored 50%-crossing SNR to the digit, so
+  `docs/notes/sweep-baseline.json` changed only in provenance. That is
+  the expected result rather than a lucky one: the sweeps use fixed
+  seeds, and this release's decode-path changes are either
+  default-identical by construction (`DefaultPolicy::CAN_REJECT` and
+  `MESSAGE_FILTER_DEFAULT` are both `false` for FT4 and FST4, so
+  `PolicyAccept::accept` folds to `return true` at compile time) or on
+  paths these corpora never reach (FT8's `fine_sync_12k`,
+  partial-Costas and chunked-GMFSK work is streaming and transmit).
+
+  FST4 need not have been in the run. `release-status.sh` listed it
+  because two commits touched `mfsk-core/src/engine`, and the warning
+  it prints beside its own suggestion — "sharing a module name is not
+  sharing a code path" — is the one that applied. Issue #280's lesson,
+  relearned.
+
+- **`BENCHMARKS.md`'s FT4 row was stale against this release.** It
+  carried AWGN ≈ −16.9 dB, written 2026-07-30, while this release's own
+  headline is the a-priori fix taking FT4 from −16.89 to −18.00 dB —
+  the summary table pointed at the number the release exists to have
+  moved. `FT8_BENCHMARK.md` §9's figures were stale by up to 1.1 dB in
+  the more-sensitive direction (CCIR moderate −18.9 → −20.00 dB); §9 is
+  correct as a record of 2026-07-26 and is left alone, with the new §12
+  recording the pre-tag measurement and saying plainly that this pass
+  did not establish which commits did it.
+
+  `FT8_BENCHMARK.ja.md` stopped at §6, so a reader arriving in Japanese
+  saw §4's figures — by then up to 1.8 dB stale — and none of the four
+  investigations that moved them. §7 through §12 are translated; the
+  section counts now match.
+
 - **Fourteen sites still named `mfsk-ffi-ft8` in the present tense.** The
   crate was retired earlier in this release and the reference manuals
   were swept, but outside them four sites pointed a reader at files that
