@@ -70,6 +70,16 @@ pub enum ChunkMsg {
 /// PSRAM-bandwidth contention with main's coarse_sync reads.
 pub struct SpecBundle {
     pub spec: mfsk_core::ft8::decode_block::Spectrogram,
+    /// Leading time rows of `spec` that actually hold a spectrum.
+    ///
+    /// `spec.n_time` is always the full slot's row count, because that
+    /// is what sets the allsum's stride
+    /// (`coarse_allsum_len(n_freq, n_time, ..)`) and the allsums here
+    /// are accumulated against it — so the rows past the emit point are
+    /// present and zero, not absent. Coarse sync needs the difference
+    /// to know which lags still have all of Costas block 2; see
+    /// `stage1_inc::max_lag_s` and `dual_core::FT8_BLOCK2_GATE`.
+    pub valid_rows: usize,
     pub allsum_head: Vec<f32>,
     pub allsum_tail: Vec<f32>,
     pub wav_idx: usize,
@@ -139,6 +149,7 @@ impl SpecBundle {
     /// contract documented at the struct level.
     pub(crate) fn new(
         spec: mfsk_core::ft8::decode_block::Spectrogram,
+        valid_rows: usize,
         allsum_head: Vec<f32>,
         allsum_tail: Vec<f32>,
         wav_idx: usize,
@@ -148,6 +159,7 @@ impl SpecBundle {
     ) -> Self {
         Self {
             spec,
+            valid_rows,
             allsum_head,
             allsum_tail,
             wav_idx,

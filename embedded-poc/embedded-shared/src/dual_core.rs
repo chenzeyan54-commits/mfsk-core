@@ -77,6 +77,35 @@ use crate::pipeline::{self, Slot, SpecBundle};
 /// 2026-09-16 and held there, `dec=6` against 8 at a better phase.
 const EMBEDDED_SYNC_LAG_S: f32 = 1.0;
 
+/// **Refuse to score a lag whose Costas block 2 is incomplete.**
+/// `MFSK_FT8_BLOCK2_GATE=1` at build time; off by default.
+///
+/// The SpecBundle is emitted before the slot ends and declares the
+/// full `n_time` regardless, because that is what sets the allsum's
+/// stride — so its tail rows are present and zero. A lag past
+/// `stage1_inc::max_lag_s` therefore scores block 2 over fewer Costas
+/// symbols. That does not inflate the score (numerator and
+/// denominator are sums over the same symbols; measured bit-identical
+/// in `mfsk-core/tests/ft8_coarse_partial_blocks.rs`) — it raises the
+/// **variance**, and a noisier score competes on equal terms with a
+/// quiet one. On `qso3_busy` at the shipped ±1.0 s that puts two
+/// such candidates in the pass-1 list, one at rank 8, inside the
+/// refined top-`max_cand`: a stage-3 slot (~72 ms) spent on something
+/// that cannot decode, from a budget where only ~11 of 15 finish
+/// before the reply boundary.
+///
+/// **A deliberate divergence from WSJT-X**, which scores the
+/// truncated block and takes the result (`sync8.f90` guards the read
+/// and skips). Upstream never needs it: upstream's spectrogram ends
+/// where its slot ends. This pipeline's does not, and the embedded
+/// FT8 path is already a documented divergence (single-pass BP,
+/// `LlrEffort::Minimal`, no OSD, SIC or AP) for the same reason —
+/// a bounded slot on a battery is a different trade from a desktop.
+///
+/// Off by default until an on-air A-B says what it costs in
+/// *decodes*; candidate counts are not the quantity that decides it.
+pub const FT8_BLOCK2_GATE: bool = option_env!("MFSK_FT8_BLOCK2_GATE").is_some();
+
 /// The lag the next coarse search will use, in milliseconds.
 ///
 /// [`EMBEDDED_SYNC_LAG_S`] is what a *working* grid needs: ±1.0 s is
@@ -549,6 +578,7 @@ pub fn run_speculative_slot(
         cfg.pass1_limit,
         &spec.allsum_head,
         &spec.allsum_tail,
+        FT8_BLOCK2_GATE.then_some(spec.valid_rows),
     );
     let t_coarse_done = unsafe { esp_timer_get_time() };
 
@@ -1049,6 +1079,11 @@ enum Job {
         max_cand: usize,
         allsum_ptr: *const f32,
         allsum_len: usize,
+        /// `None` unless [`FT8_BLOCK2_GATE`]; see
+        /// `pipeline::SpecBundle::valid_rows`. The worker half needs it
+        /// as much as the main half — both score block 2 against the
+        /// same partly-filled spectrogram.
+        valid_rows: Option<usize>,
     },
 }
 
@@ -1187,18 +1222,31 @@ extern "C" fn worker_main(_arg: *mut core::ffi::c_void) {
                 max_cand,
                 allsum_ptr,
                 allsum_len,
+                valid_rows,
             } => {
                 let spec_ref = unsafe { &*spec };
                 let allsum = unsafe { core::slice::from_raw_parts(allsum_ptr, allsum_len) };
-                let result = mfsk_core::ft8::decode_block::coarse_sync_with_allsum_and_lag(
-                    spec_ref,
-                    freq_min,
-                    freq_max,
-                    sync_min,
-                    max_cand,
-                    allsum,
-                    sync_lag_s(),
-                );
+                let result = match valid_rows {
+                    Some(v) => mfsk_core::ft8::decode_block::coarse_sync_with_allsum_lag_and_rows(
+                        spec_ref,
+                        freq_min,
+                        freq_max,
+                        sync_min,
+                        max_cand,
+                        allsum,
+                        sync_lag_s(),
+                        v,
+                    ),
+                    None => mfsk_core::ft8::decode_block::coarse_sync_with_allsum_and_lag(
+                        spec_ref,
+                        freq_min,
+                        freq_max,
+                        sync_min,
+                        max_cand,
+                        allsum,
+                        sync_lag_s(),
+                    ),
+                };
                 let raw = Box::into_raw(Box::new(result));
                 unsafe { queue_send_ptr(COARSE_RESULT_Q.get(), raw) };
             }
@@ -1277,8 +1325,11 @@ pub fn coarse_sync_split_with_allsum(
     max_cand: usize,
     allsum_head: &[f32],
     allsum_tail: &[f32],
+    valid_rows: Option<usize>,
 ) -> Vec<SyncCandidate> {
-    use mfsk_core::ft8::decode_block::coarse_sync_with_allsum_and_lag;
+    use mfsk_core::ft8::decode_block::{
+        coarse_sync_with_allsum_and_lag, coarse_sync_with_allsum_lag_and_rows,
+    };
     let mid = 0.5 * (freq_min + freq_max);
 
     let job = Box::new(Job::CoarseSyncWithAllsum {
@@ -1289,18 +1340,31 @@ pub fn coarse_sync_split_with_allsum(
         max_cand,
         allsum_ptr: allsum_tail.as_ptr(),
         allsum_len: allsum_tail.len(),
+        valid_rows,
     });
     unsafe { queue_send_ptr(JOB_Q.get(), Box::into_raw(job)) };
 
-    let mut local = coarse_sync_with_allsum_and_lag(
-        spec,
-        freq_min,
-        mid,
-        sync_min,
-        max_cand,
-        allsum_head,
-        sync_lag_s(),
-    );
+    let mut local = match valid_rows {
+        Some(v) => coarse_sync_with_allsum_lag_and_rows(
+            spec,
+            freq_min,
+            mid,
+            sync_min,
+            max_cand,
+            allsum_head,
+            sync_lag_s(),
+            v,
+        ),
+        None => coarse_sync_with_allsum_and_lag(
+            spec,
+            freq_min,
+            mid,
+            sync_min,
+            max_cand,
+            allsum_head,
+            sync_lag_s(),
+        ),
+    };
 
     let worker_ptr = unsafe { queue_recv_ptr::<Vec<SyncCandidate>>(COARSE_RESULT_Q.get()) };
     let worker = unsafe { *Box::from_raw(worker_ptr) };

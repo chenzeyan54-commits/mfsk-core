@@ -480,14 +480,20 @@ pub fn spawn_with_wf(
         2 * SPEC_EMIT_PAIR,
         SPEC_EMIT_MAX_LAG_S,
         lag,
-        if lag > SPEC_EMIT_MAX_LAG_S {
-            // Not "scores against zeros" — that explanation was
-            // measured false (`tests/ft8_coarse_partial_blocks.rs`).
-            // What the outermost lags lose is block 2, and a score
-            // over fewer Costas symbols is noisier, not larger.
-            " — OVER: the outermost lags are scored without all of block 2"
-        } else {
-            ""
+        // Not "scores against zeros" — that explanation was measured
+        // false (`tests/ft8_coarse_partial_blocks.rs`). What the
+        // outermost lags lose is block 2, and a score over fewer
+        // Costas symbols is noisier, not larger.
+        //
+        // **The arm of an A-B belongs in the boot line.** Two builds
+        // that differ only in a `option_env!` are otherwise
+        // indistinguishable in a log, and mislabelling one is the
+        // cheapest way to lose a day of radio time.
+        match (lag > SPEC_EMIT_MAX_LAG_S, crate::dual_core::FT8_BLOCK2_GATE) {
+            (true, false) => " — OVER: the outermost lags are scored without all of block 2",
+            (true, true) => " — OVER, block-2 gate ON: those lags are not scored at all",
+            (false, true) => " — block-2 gate ON (no lag reaches the bound)",
+            (false, false) => "",
         }
     );
 }
@@ -675,6 +681,13 @@ fn emit_spec_bundle(ctx: &mut WorkerCtx) {
     let audio_len = ctx.cur.audio_fill;
     let bundle = Box::new(SpecBundle::new(
         mfsk_core::ft8::decode_block::Spectrogram::from_parts(n_freq, N_TIME, spec),
+        // **What is actually filled**, which is not `N_TIME`. Pairs
+        // `0..next_pair-1` have run, each filling two rows. From
+        // `next_pair` rather than `SPEC_EMIT_PAIR` because the loop can
+        // cross the threshold by more than one pair in a single call
+        // when the audio allows, and `finalize_slot`'s late-emit
+        // fallback arrives here with every pair done.
+        (2 * ctx.cur.next_pair).min(N_TIME),
         head,
         tail,
         // wav_idx is only known at SlotEnd; main matches SpecBundle to
