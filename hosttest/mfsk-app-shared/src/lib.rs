@@ -75,3 +75,68 @@ pub mod grid_fix;
 
 #[path = "../../../embedded-poc/mfsk-app-shared/src/grid_state.rs"]
 pub mod grid_state;
+
+/// The FT8/FT4 decoded-row list. Pulled in as a `ui` module tree so
+/// the file's own `crate::ui::state::...` paths resolve unchanged.
+///
+/// Here because [`ui::decoded_list::row_text`] shipped a buffer
+/// narrower than the row width it computed against, and
+/// `heapless::String::push_str` writes nothing rather than truncating:
+/// one decoded row in five rendered with an empty message column on a
+/// JA morning. Nothing on the board could have caught it — the panel
+/// is the only consumer and it has no assertions.
+pub mod ui;
+
+#[cfg(test)]
+mod decoded_row_tests {
+    use super::ui::decoded_list::row_text;
+    use super::ui::state::DecodedRow;
+
+    fn row(msg: &str) -> DecodedRow {
+        let mut m: heapless::String<22> = heapless::String::new();
+        m.push_str(&msg[..msg.len().min(22)]).unwrap();
+        DecodedRow {
+            df_hz: 1891,
+            snr_db: -11,
+            hard_errors: 0,
+            dt_ds: 0,
+            msg: m,
+            slot_seq: 0,
+            first_seq: 0,
+        }
+    }
+
+    /// The regression: 20 characters is an ordinary `/P` exchange and
+    /// it used to render as an empty message column.
+    #[test]
+    fn a_twenty_character_message_reaches_the_row() {
+        let t = row_text(&row("JG3AGB/P JE1NGI PM95"));
+        assert!(
+            t.ends_with("JG3AGB/P JE1NGI PM95"),
+            "message dropped from row: {t:?}"
+        );
+    }
+
+    /// Every length a `DecodedRow` can hold must appear, since `msg`
+    /// is already capped at 22 upstream. Anything that fits the row
+    /// must arrive whole.
+    #[test]
+    fn no_length_up_to_the_row_cap_is_silently_dropped() {
+        for n in 1..=22usize {
+            let msg: String = "JA1ABC/P JE1NGI PM95XY".chars().take(n).collect();
+            let t = row_text(&row(&msg));
+            assert!(
+                t.ends_with(&msg),
+                "length {n} dropped: {t:?} does not end with {msg:?}"
+            );
+        }
+    }
+
+    /// The prefix is the part the operator reads when the message is
+    /// gone, so it has to keep its shape: dB, DT, frequency.
+    #[test]
+    fn the_prefix_is_wsjtx_column_order() {
+        let t = row_text(&row("CQ JA1XXN PM96"));
+        assert!(t.starts_with("-11 +0.0 1891 "), "prefix changed: {t:?}");
+    }
+}

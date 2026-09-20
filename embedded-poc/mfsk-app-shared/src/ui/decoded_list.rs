@@ -13,7 +13,7 @@
 use core::fmt::Write as _;
 
 use embedded_graphics::{
-    mono_font::{ascii::FONT_6X10, MonoTextStyleBuilder},
+    mono_font::{MonoTextStyleBuilder, ascii::FONT_6X10},
     pixelcolor::Rgb565,
     prelude::*,
     primitives::{PrimitiveStyle, Rectangle},
@@ -38,6 +38,55 @@ pub const CHAR_W: u32 = 6;
 /// on. Callers pass their own width; this only sizes the buffer.
 pub const MAX_ROW_CHARS: usize = (crate::ui::state::WF_COLS as u32 / CHAR_W) as usize;
 const ROW_CHARS: usize = MAX_ROW_CHARS;
+
+/// One row's text: `dB DT Freq Message`, clipped to the row width.
+///
+/// **Split out so it can be tested on the host** — this is where the
+/// blank-message bug lived, and `render_in` needs a `DrawTarget` that
+/// `hosttest/mfsk-app-shared` would otherwise have to fake to reach
+/// it. `hosttest` compiles this same file (`#[path]`, never a copy)
+/// and pins the case below.
+///
+/// **The buffer is `ROW_CHARS` wide, and that is not a detail.** It
+/// was `String<32>` while `ROW_CHARS` was 40, and the two are used
+/// together: the room offered to the message was computed from
+/// `ROW_CHARS`, so with a 14-character prefix it offered 25
+/// characters into a buffer with 18 left.
+/// `heapless::String::push_str` is all-or-nothing — it returns `Err`
+/// and writes *nothing* — and a `let _ =` swallowed it, so **every
+/// message of 19 characters or more rendered with a blank message
+/// column**, its SNR, DT and frequency intact. On a JA morning that
+/// is one row in five: `/P` compound calls make
+/// `JG3AGB/P JE1NGI PM95`, exactly 20 characters (71 of 380 decodes,
+/// 2026-09-20 on 7041 kHz).
+pub fn row_text(row: &DecodedRow) -> String<ROW_CHARS> {
+    let mut s: String<ROW_CHARS> = String::new();
+    let snr = row.snr_db.clamp(-30, 30);
+    // **WSJT-X's column order**: dB, DT, Freq, Message. The one it
+    // puts first, UTC, is left out — six characters plus a space does
+    // not fit beside a 22-character message in `ROW_CHARS` (40), and
+    // the status bar already carries the clock.
+    //
+    // `ROW_CHARS` otherwise has the room: 3 + 4 + 4 + three spaces is
+    // 14, so a full-length message still lands with slack.
+    let dt = row.dt_ds.clamp(-99, 99) as f32 / 10.0;
+    let _ = write!(&mut s, "{snr:>+3} {dt:>+4.1} {:>4} ", row.df_hz);
+    // Room comes from the buffer as well as from the row width, so a
+    // future change to either cannot silently blank the column again.
+    // The `- 1` keeps a gap at the right edge.
+    let msg_room = ROW_CHARS
+        .min(s.capacity())
+        .saturating_sub(s.len())
+        .saturating_sub(1);
+    let msg = row.msg.as_str();
+    let msg_take = msg.len().min(msg_room);
+    // Now that the room is real, a failure here would be a bug rather
+    // than a long message; `debug_assert` says so without costing the
+    // release build.
+    let pushed = s.push_str(&msg[..msg_take]);
+    debug_assert!(pushed.is_ok(), "row buffer too small for its own width");
+    s
+}
 
 /// Clear + repaint the decoded list. Idempotent — caller gates by
 /// `UiState::dirty_seq`. Rows whose **first** observation lands in
@@ -179,21 +228,7 @@ where
             .into_styled(PrimitiveStyle::with_fill(bg))
             .draw(display)?;
 
-        let mut s: String<32> = String::new();
-        let snr = row.snr_db.clamp(-30, 30);
-        // **WSJT-X's column order**: dB, DT, Freq, Message. The one it
-        // puts first, UTC, is left out — six characters plus a space
-        // does not fit beside a 22-character message in `ROW_CHARS`
-        // (40), and the status bar already carries the clock.
-        //
-        // `ROW_CHARS` otherwise has the room: 3 + 4 + 4 + three spaces
-        // is 14, so a full-length message still lands with slack.
-        let dt = row.dt_ds.clamp(-99, 99) as f32 / 10.0;
-        let _ = write!(&mut s, "{snr:>+3} {dt:>+4.1} {:>4} ", row.df_hz);
-        let msg_room = ROW_CHARS.saturating_sub(s.len());
-        let msg = row.msg.as_str();
-        let msg_take = msg.len().min(msg_room.saturating_sub(1));
-        let _ = s.push_str(&msg[..msg_take]);
+        let s = row_text(row);
         // Trailing `!` for hard_errors >= 24 dropped 2026-05-17 —
         // SNR column already conveys decode quality (user request).
         Text::with_baseline(s.as_str(), Point::new(0, row_y_text), style, Baseline::Top)

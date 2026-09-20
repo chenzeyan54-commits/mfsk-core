@@ -10,3 +10,6 @@ description = "Runs the host-testable parts of embedded-poc/mfsk-app-shared on t
 [dependencies]
 log = "0.4"
 heapless = "0.8"
+# `ui::decoded_list` draws with it; the row formatter under test lives
+# in that same file and the file is compiled, never copied.
+embedded-graphics = "0.8"

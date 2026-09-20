@@ -166,6 +166,17 @@ pub struct UiState {
     menu_seq: AtomicU32,
 }
 
+/// Required by `clippy::new_without_default`, which this file only
+/// started seeing once `hosttest/mfsk-app-shared` pulled it into the
+/// workspace (2026-09-20). Cannot replace [`UiState::new`]: that one
+/// is `const` because the boards build a `static` from it, and
+/// `Default::default` cannot be.
+impl Default for UiState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UiState {
     pub const fn new() -> Self {
         Self {
