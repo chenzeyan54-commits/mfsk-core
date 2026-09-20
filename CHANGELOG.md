@@ -546,6 +546,121 @@ reported the grid healthy while the band said otherwise.
   After all of it: 102 slots over 29 minutes on 40 m, mean 8.2 decodes,
   no empty slot, `cut > 0` on 2 slots, no acquisition and no trim.
 
+- **A decoded row's message column went blank above 18 characters.**
+  `ui::decoded_list` built each row in a `String<32>` while computing
+  the message's room from `ROW_CHARS`, which is 40 — so with the
+  14-character `dB DT Freq ` prefix it offered 25 characters into a
+  buffer with 18 left. `heapless::String::push_str` is all-or-nothing,
+  and the `Err` was discarded, so **every message of 19 characters or
+  more drew its SNR, DT and frequency and then nothing at all**. On
+  7041 kHz this morning that was 71 of 380 decodes (19 %), and always
+  the portable stations: `JG3AGB/P JE1NGI PM95` is exactly 20. The
+  formatter is now split out as `row_text` and tested in
+  `hosttest/mfsk-app-shared`, which is what had been out of reach while
+  it needed a `DrawTarget`. Confirmed fixed on the panel.
+
+- **Callsign hashes never resolved, because nothing ever filled the
+  table.** `unpack77_with_hash` has always been able to turn a hashed
+  callsign field into a name; outside three unit tests there was no
+  `CallsignHashTable::insert` call anywhere in the crate or its
+  consumers, and the only plumbing that carries a table —
+  `DecodeContext::callsign_hash_table` — is an
+  `Arc<dyn Any + Send + Sync>`, which cannot be written through. So
+  every receiver rendered `<...>` forever: 69 of 380 on-air decodes
+  carried one.
+
+  `msg::wsjt77::unpack77_learn` resolves first and registers second —
+  a message must not resolve its own hash against a call it is itself
+  introducing, which is the ordering WSJT-X's `save_hash_call` has.
+  Registration walks the *fields*, never the rendered text: a token
+  scan cannot separate `PM95` from a callsign, and `insert` rejects
+  only `CQ…` and strings under two characters, so `RRR`, `DX` and `TU`
+  would all be registered — and a polluted entry resolves a later hash
+  to the **wrong** station, which is worse than a placeholder.
+  `register_callsigns` is public for callers that cannot hold a `&mut`
+  where they resolve: the FT4 receiver decodes candidates on two cores
+  at once, so `Ft4Decode` now carries the raw payload and the app
+  resolves and learns single-threaded after the workers join.
+
+  Verified on the air, one exchange end to end: `CQ JA6GVF PM53` at
+  12:09:46 on 891 Hz, then at 12:18:01 on 1194 Hz
+  `JL1IBJ/3 <JA6GVF> 73` — the 12-bit hash resolved from a table
+  entry learned eight and a half minutes and thirty-four slots
+  earlier.
+
+- **The reply deadline is the slot boundary, and `dec` was counting
+  two things at once.** WSJT-X opens its transmit window *at* the
+  boundary: the message is taken from the auto-sequencer and PTT
+  asserted in the same pass (`mainwindow.cpp:4552-4711`), `txDelay`
+  runs from the rig's PTT confirmation and is spent *inside* the
+  0.5 s, and `Modulator::start` pads silence so audio still lands at
+  `delay_ms` (500 for FT8, 300 for FT4). So a decode finishing inside
+  that 0.5 s is already too late to answer, even though stage 3 is
+  allowed to claim there. The whole schedule, with citations, is in
+  `EMBEDDED.md` / `.ja.md`.
+
+  The slot log now carries `intime=` — decodes completed before the
+  boundary — measured exactly by running the early first-attempt batch
+  as two `stage3_split` calls split there, which covers the same
+  candidates in the same order for the same cost. On a radio,
+  **8.4 % of decodes were arriving too late to be answered**, on 41 %
+  of slots. `ref=` (candidates the early half handed to stage 3) joins
+  it, so cost per candidate is derivable.
+
+- **`MFSK_FT8_SPEC_EMIT_PAIR` makes the emit point a build knob**, and
+  an A-B-A on the air says what moving it buys. At the shipped pair 87
+  the early path wants 1 143 ms of stage 3 and only 818 ms lands before
+  the boundary — about 4 of 15 candidates decided too late. Pair 85
+  adds 320 ms:
+
+  | arm | dec | intime | late | post_slotend |
+  |---|---:|---:|---:|---:|
+  | 87 (A, n=44) | 8.64 | 7.91 | 0.73 | 282 ms |
+  | 85 (B, n=53) | 8.36 | **8.32** | **0.04** | **92 ms** |
+  | 87 (C, n=50) | 8.54 | 7.86 | 0.68 | 261 ms |
+
+  The two 87 arms agree to 0.1-0.2 σ on every figure, so the middle one
+  is the flag and not the band. Late decodes essentially vanish
+  (6.3 σ); the decode total moves −0.23 and `intime` +0.44, neither
+  significant at this sample size. **Not adopted yet**: the −0.23 has
+  not been separated into the lag ceiling and the shorter prefix
+  (`defer` goes 1.4 → 3.9, and the late path has no budget without
+  `share_cand_budget`). Default stays 87.
+
+- **`stage1_inc::max_lag_s` is one authority for the emit/lag bound**,
+  which three comments used to state independently and two of them a
+  row apart. Emit pair `P` fills rows `0 ..= 2P-1`, block 2's last
+  Costas sits at 162, so `lag ≤ (2P - 163) × 0.08` — 0.88 s at the
+  shipped 87, against a configured 1.00 s. The boot line reports the
+  pair and says `OVER` when it is.
+
+  The explanation that bound used to carry was wrong and is corrected
+  here: exceeding it does **not** make the search correlate against
+  zeros in any way that matters. `tests/ft8_coarse_partial_blocks.rs`
+  measures a zeroed tail scoring **bit-identically** to the same
+  symbols skipped — the score's numerator and denominator are sums
+  over the same symbols, and a zero adds nothing to either. What a lag
+  past the bound really loses is *evidence*: the candidate is scored on
+  two Costas blocks instead of three, with a ratio that is not
+  penalised for it, so a two-block coincidence competes with a
+  three-block station. That is the ±1.75 s widen's failure, and the
+  shipped ±1.0 s is the same thing two rows over — two such candidates
+  in the pass-1 list on `qso3_busy`, one at rank 8, inside the refined
+  top-`max_cand`.
+
+- **`MFSK_FT8_BLOCK2_GATE` refuses to score a lag whose block 2 is
+  incomplete** — off by default, and a deliberate divergence from
+  WSJT-X, which scores the truncated block and takes the result
+  (`sync8.f90` guards the read and skips). Upstream never needs it:
+  upstream's spectrogram ends where its slot ends, and this one is
+  emitted early and declares the full `n_time` because that is what
+  sets the allsum's stride. One rule covers both scores, since both
+  contain block 2; negative lag moves block 2 *earlier* and is never
+  the truncated one, so the asymmetry the measurement asked for — 0 %
+  of 1 382 on-air decodes past +0.88 s against 0.26-1.35 % below
+  −0.88 s — falls out with no special case. Opt-in through a
+  `valid_rows` parameter, so the host path is bit-identical.
+
 - **CoreS3: every acquisition trial now has a slot to cut.** The entry
   above reported the unreachable trials; this removes them, and the gap
   was wider than that report said. `acquire_slot_phases` returns centres
