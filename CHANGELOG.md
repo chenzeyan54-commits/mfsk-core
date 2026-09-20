@@ -193,6 +193,36 @@ reported the grid healthy while the band said otherwise.
 
 ### Added
 
+- **`DecodeRequest::also_accept(f)` / `.message_filter(f)` — a
+  caller-supplied message-acceptance policy (#383).** `MessageCodec`
+  gained `is_plausible`, the codec's own verdict on a decoded message's
+  text (default `true`; `Wsjt77Message` overrides it with
+  `is_plausible_message`), and a request now says what to do with that
+  verdict: keep it, widen it with `also_accept`, or replace it with
+  `message_filter`. The filter is mfsk-core's own — `ft8b.f90` gates on
+  `nbadcrc` and `nharderrors` alone — so it is a judgement call, and
+  the judgement belongs to whoever knows the band. `LIBRARY.md` §2.6
+  (and its `.ja.md` twin) is the writeup.
+
+  **A type parameter, not the `&'a dyn Fn` shape `.on_result()` and
+  `.budget()` use.** Those fire once per decode; this fires once per
+  candidate that reaches the text stage, so the default has to cost
+  nothing: `DecodeRequest<'_, P>` still means
+  `DecodeRequest<'_, P, DefaultPolicy>`, whose policy field is
+  zero-sized (asserted at compile time) and whose verdict inlines to
+  the bare codec call the ladder already made. `ft8_message_policy`
+  decodes the reference recording with and without a no-op policy and
+  compares whole result rows.
+
+  **FT8 only**, gated on `SupportsMessageFilter` — a compile error on
+  the others rather than a silent no-op. Not a statement about the
+  codec (FT4 and every FST4 sub-mode share `Wsjt77Message`) but about
+  the pipeline: FT8's bespoke engine forms the message string inside
+  the per-candidate ladder, where a rejection lets the ladder keep
+  going, while the generic engine FT4 and FST4 share returns
+  information bits and never forms a string, because `engine` does not
+  depend on `msg`.
+
 - **`unpack77` decodes every message type `packjt77.f90` defines
   (#383).** Three were missing and returned `None`, which is a dropped
   decode rather than a rejected one: telemetry (`i3=0, n3=5`), the
