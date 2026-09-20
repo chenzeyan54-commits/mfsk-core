@@ -141,15 +141,31 @@ const _: () = assert!(SPEC_EMIT_PAIR <= N_PAIRS, "SPEC_EMIT_PAIR > N_PAIRS");
 ///   `162 + j <= 2P - 1`, i.e. `j <= 2P - 163`
 /// - a row is `NSTEP / SAMPLE_RATE_HZ` = 0.08 s
 ///
-/// **Exceeding it is not an error, and that is the danger.** The
-/// spectrogram is declared `N_TIME` rows long whatever the emit point
-/// is (`emit_spec_bundle`), so a lag past this bound reads rows that
-/// are *zero* rather than absent, and a correlation against zeros does
-/// not come out small — it comes out whatever the score's
-/// normalisation makes of it. That is what the ±1.75 s widen
-/// experiment hit on a radio (candidates at −1.64 / +1.72 / +1.08 with
-/// scores of 20-30 and nothing decoded, 2026-09-19); the shipped
-/// ±1.0 s is a smaller instance of the same thing, two rows over.
+/// **Exceeding it costs evidence, not correctness — and the
+/// difference matters.** An earlier version of this comment, and the
+/// reverted-widen note it was taken from, said a lag past the bound
+/// "correlates against zeros, and that does not come out small". That
+/// is wrong, and it was measured wrong:
+/// `tests/ft8_coarse_partial_blocks.rs` shows a zeroed tail scoring
+/// **bit-identically** to the same spectrogram with those symbols
+/// skipped. The score accumulates `t_blocks[2] += power` and
+/// `t0_blocks[2] += allsum` as plain sums, and a zero adds nothing to
+/// either.
+///
+/// What a lag past the bound really does is leave the candidate
+/// scored on **two Costas blocks instead of three**, with a ratio that
+/// is not penalised for the missing evidence — so a two-block
+/// coincidence competes with a three-block station. That is WSJT-X's
+/// own behaviour (`sync8.f90` guards `m + nssy*72 <= NHSYM` and
+/// skips), and it is why the ±1.75 s widen filled the shortlist with
+/// candidates at −1.64 / +1.72 / +1.08 and decoded nothing
+/// (2026-09-19).
+///
+/// The shipped ±1.0 s is the same thing two rows over instead of
+/// twenty, and it is cheap but not free: on `qso3_busy` it puts two
+/// two-block candidates in the pass-1 list, **one of them at rank 8**
+/// — inside the refined top-`max_cand`, so it spends a stage-3 slot
+/// (~72 ms on this board) on something that cannot decode.
 pub const fn max_lag_s(emit_pair: usize) -> f32 {
     // `2P - 163` as above, floored at zero.
     let steps = (2 * emit_pair) as i32 - 163;
