@@ -907,6 +907,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             n_deferred,
             n_early_refined,
             n_in_time,
+            pass2_us,
             n_gate2_p1,
             gate2_best_rank,
             // Not read any more: the ±0.2 s/slot nudge it fed was a
@@ -1059,7 +1060,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         );
         log::info!(
             "SLOT[{wav_idx}] t2: tail_use={}ms post_slotend={}ms slot_wait={}ms late={}ms \
-             audio={}sa",
+             audio={}sa p2={}/{}/{}us",
             tail_use / 1_000,
             post_slotend / 1_000,
             (t_slot_recv - t_early_done) / 1_000,
@@ -1068,6 +1069,14 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             // shortens it, and a short slot is why a healthy-looking
             // `p1` decodes nothing.
             slot.audio().len(),
+            // Pass 2's fixed head/tail split: main's own half, main
+            // blocked on the worker, the worker's own half. See
+            // `dual_core::PASS2_MAIN_US` — `stage3_split` work-steals
+            // and this one does not, so whichever core draws the
+            // cheaper half idles for the difference.
+            pass2_us.0,
+            pass2_us.1,
+            pass2_us.2,
         );
         // **What the coarse search saw, when nothing decoded.**
         //

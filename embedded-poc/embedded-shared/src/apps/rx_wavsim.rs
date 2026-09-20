@@ -126,6 +126,7 @@ pub fn run_sweep(wavs: &'static [&'static [u8]], cfgs: &'static [RxSweepCfg]) ->
             n_in_time: _,
             // Observation-only counters; this bench predates them and
             // the number that matters is the one a live band produces.
+            pass2_us: _,
             n_gate2_p1: _,
             gate2_best_rank: _,
             n_cut: _,

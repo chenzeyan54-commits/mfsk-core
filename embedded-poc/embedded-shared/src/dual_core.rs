@@ -29,7 +29,7 @@
 
 use core::cell::UnsafeCell;
 use core::ptr;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 use esp_idf_svc::sys::{
     uxQueueMessagesWaiting, xQueueGenericCreate, xQueueGenericSend, xQueuePeek, xQueueReceive,
@@ -172,6 +172,17 @@ pub struct SpeculativeOut {
     /// so `results.len() - n_in_time` is decoded for the screen and
     /// for the period after next, not for this exchange.
     pub n_in_time: usize,
+    /// Pass 2's fixed head/tail split, in microseconds for the whole
+    /// slot: `(main's own half, main blocked on the worker, the
+    /// worker's own half)`. See [`PASS2_MAIN_US`].
+    ///
+    /// `wait` is the idle the main core paid; `main - worker` is the
+    /// imbalance, and its sign says which core drew the cheaper half.
+    /// A large `wait` with a large `worker` means the split is simply
+    /// uneven; a large `wait` with a small `worker` means the worker
+    /// was late to start, which is a scheduling question rather than a
+    /// partitioning one.
+    pub pass2_us: (i64, i64, i64),
     /// Pass-1 candidates whose `|dt_sec|` is past
     /// [`crate::stage1_inc::SPEC_EMIT_MAX_LAG_S`], i.e. scored on two
     /// Costas blocks instead of three because the emitted spectrogram
@@ -593,6 +604,7 @@ pub fn run_speculative_slot(
                 t_early_done: t_post_recv,
                 t_slot_recv,
                 t_done: unsafe { esp_timer_get_time() },
+                pass2_us: (0, 0, 0),
                 n_gate2_p1: 0,
                 gate2_best_rank: u16::MAX,
                 skipped: true,
@@ -601,6 +613,7 @@ pub fn run_speculative_slot(
             };
         }
     }
+    pass2_timing_reset();
     let pass1: Vec<SyncCandidate> = coarse_sync_split_with_allsum(
         &spec.spec,
         cfg.freq_min,
@@ -1007,6 +1020,7 @@ pub fn run_speculative_slot(
         n_ready,
         n_deferred,
         n_early_refined,
+        pass2_us: pass2_timing(),
         n_gate2_p1,
         gate2_best_rank,
         n_in_time,
@@ -1227,7 +1241,9 @@ extern "C" fn worker_main(_arg: *mut core::ffi::c_void) {
                 max_cand,
             } => {
                 let audio_slice = unsafe { core::slice::from_raw_parts(audio, audio_len) };
+                let t0 = now_us();
                 let result = refine_candidates_into(audio_slice, cands, max_cand);
+                PASS2_WORKER_US.fetch_add((now_us() - t0) as i32, Ordering::Relaxed);
                 let raw = Box::into_raw(Box::new(result));
                 unsafe { queue_send_ptr(PASS2_RESULT_Q.get(), raw) };
             }
@@ -1436,6 +1452,41 @@ pub fn coarse_sync_split_with_allsum(
 }
 
 /// Pass 2 split across main + worker; merged top-`max_cand` returned.
+/// Per-slot totals for [`pass2_split`], in microseconds: how long the
+/// main core spent on its own half, how long it then sat blocked on
+/// the worker, and how long the worker's half actually took.
+///
+/// **`pass2_split` is the one stage that is still a fixed head/tail
+/// split.** `stage3_split` moved to work stealing because per-candidate
+/// BP wall-clock varies a lot; pass 2 did not, so it hands the worker
+/// `pass1[mid..]` and blocks. Whichever core draws the cheaper half
+/// idles for the difference, and until these counters existed nobody
+/// had measured it in either direction — `main_wait` sees only the
+/// case where the worker is slower.
+// `AtomicI32`, not `I64`: Xtensa has no 64-bit atomics, and a stage
+// that ran for 35 minutes would have bigger problems than a wrapped
+// counter.
+static PASS2_MAIN_US: AtomicI32 = AtomicI32::new(0);
+static PASS2_WAIT_US: AtomicI32 = AtomicI32::new(0);
+static PASS2_WORKER_US: AtomicI32 = AtomicI32::new(0);
+
+/// Zero the [`PASS2_MAIN_US`] family; `run_speculative_slot` calls this
+/// once a slot so the totals cover that slot's two pass-2 batches.
+fn pass2_timing_reset() {
+    PASS2_MAIN_US.store(0, Ordering::Relaxed);
+    PASS2_WAIT_US.store(0, Ordering::Relaxed);
+    PASS2_WORKER_US.store(0, Ordering::Relaxed);
+}
+
+/// `(main, wait, worker)` microseconds since the last reset.
+fn pass2_timing() -> (i64, i64, i64) {
+    (
+        PASS2_MAIN_US.load(Ordering::Relaxed) as i64,
+        PASS2_WAIT_US.load(Ordering::Relaxed) as i64,
+        PASS2_WORKER_US.load(Ordering::Relaxed) as i64,
+    )
+}
+
 pub fn pass2_split(
     audio: &[i16],
     pass1: Vec<SyncCandidate>,
@@ -1453,9 +1504,14 @@ pub fn pass2_split(
     });
     unsafe { queue_send_ptr(JOB_Q.get(), Box::into_raw(job)) };
 
+    let t0 = now_us();
     let mut local = refine_candidates_into(audio, head, max_cand);
+    let t_local = now_us();
 
     let worker_ptr = unsafe { queue_recv_ptr::<Vec<RefinedCandidate>>(PASS2_RESULT_Q.get()) };
+    let t_join = now_us();
+    PASS2_MAIN_US.fetch_add((t_local - t0) as i32, Ordering::Relaxed);
+    PASS2_WAIT_US.fetch_add((t_join - t_local) as i32, Ordering::Relaxed);
     let worker = unsafe { *Box::from_raw(worker_ptr) };
 
     local.extend(worker);
