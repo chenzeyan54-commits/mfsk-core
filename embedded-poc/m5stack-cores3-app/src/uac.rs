@@ -1574,6 +1574,107 @@ const TX_PROBE_WRITES: u32 = 20;
 const TX_PROBE_CHUNK_BYTES: usize = 1920; // 10 ms @ 48k stereo 16b
 const TX_PROBE_WRITE_TIMEOUT_MS: u32 = 100;
 
+/// **Amplitude for a real FT8 frame, and why it is not the default.**
+///
+/// `MFSK_CORES3_TX_AMPLITUDE=<0..32767>` at build time. **Unset means
+/// zero, which means the whole transmit chain runs and the radio hears
+/// nothing.** That is the point: `GfskStream`, the 12 k → 48 k
+/// upsample, the chunked writes and their timing are all exercised
+/// identically at amplitude 0, so the path can be proven before
+/// anything can reach the air.
+///
+/// A nonzero value puts a real signal into the IC-705's USB MOD input,
+/// and if the radio's `PTT SOURCE` is `VOX` **that keys the
+/// transmitter with no further action from this board**. Software here
+/// cannot read that menu. Before setting this:
+///
+/// - `PTT SOURCE` is not `VOX`, or PTT is under deliberate control
+/// - the radio is on a dummy load, or on a band and power the operator
+///   intends to transmit on
+/// - the frequency is one this station is licensed and willing to
+///   transmit on, at the moment the board decides to
+///
+/// 20 000 of 32 767 is what `m5stack-s3-app`'s `tx.rs` uses (≈ −4 dBFS,
+/// headroom for the GFSK envelope while staying above the noise an ALC
+/// needs).
+const TX_AMPLITUDE: i16 = match option_env!("MFSK_CORES3_TX_AMPLITUDE") {
+    Some(s) => crate::decode_pipeline::parse_u32(s) as i16,
+    None => 0,
+};
+
+/// One 20 ms chunk at 12 kHz — what `GfskStream` is filled with and
+/// what `m5stack-s3-app`'s `tx::play` sends, chosen there for DMA
+/// underrun headroom against ringbuffer overhead.
+const TX_CHUNK_12K: usize = 240;
+/// The same chunk as the radio wants it: 4x zero-order hold to 48 kHz,
+/// duplicated L = R, 16-bit. `240 * 4 * 2 * 2`.
+const TX_CHUNK_BYTES: usize = TX_CHUNK_12K * 4 * 2 * 2;
+
+/// Send one FT8 frame to the radio's USB audio input, synthesising it
+/// a chunk at a time.
+///
+/// Returns `(chunks_written, worst_chunk_us, total_us)`.
+///
+/// **The waveform never exists as a buffer.** `GfskStream` produces
+/// 20 ms at a time straight into the upsample scratch — measured on
+/// this board at 439 us per chunk against the 20 ms the chunk
+/// represents, a 2.2 % duty. The batch synthesiser it replaces cost
+/// 472 ms up front and 1.2 MB of PSRAM temporaries, which put the
+/// decoder's deadline before the end of the slot it was decoding
+/// (`docs/notes/CORES3_FT8_SLOT_BUDGET.md` §10).
+fn write_ft8_frame(
+    handle: sys::uac::uac_host_device_handle_t,
+    msg77: &[u8; 77],
+    df_hz: f32,
+    amplitude: i16,
+) -> (u32, i64, i64) {
+    let tones = mfsk_core::ft8::wave_gen::message_to_tones(msg77);
+    let mut stream = mfsk_core::engine::dsp::gfsk::GfskStream::new(
+        &tones,
+        df_hz,
+        &mfsk_core::ft8::wave_gen::FT8_GFSK,
+    );
+    let mut mono = [0i16; TX_CHUNK_12K];
+    let mut out = [0u8; TX_CHUNK_BYTES];
+    let now_us = || unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+    let (mut chunks, mut worst, t_start) = (0u32, 0i64, now_us());
+    while stream.remaining() > 0 {
+        let t0 = now_us();
+        let n = stream.fill_i16(&mut mono, amplitude);
+        // 4x zero-order hold, L = R. The receive side's
+        // `LinearResamplerI16To12k` run backwards; ZOH rather than
+        // interpolation because the radio's own input filter is what
+        // shapes the image, and `m5stack-s3-app` has driven an IC-705
+        // this way since Phase 1.6.
+        let mut o = 0usize;
+        for &sm in mono.iter().take(n) {
+            let [lo, hi] = sm.to_le_bytes();
+            for _ in 0..4 {
+                out[o] = lo;
+                out[o + 1] = hi;
+                out[o + 2] = lo;
+                out[o + 3] = hi;
+                o += 4;
+            }
+        }
+        let err = unsafe {
+            sys::uac::uac_host_device_write(
+                handle,
+                out.as_mut_ptr(),
+                o as u32,
+                TX_PROBE_WRITE_TIMEOUT_MS,
+            )
+        };
+        if err != sys::ESP_OK as sys::esp_err_t {
+            log::warn!("uac: tx write failed at chunk {chunks} err={err:#x}");
+            break;
+        }
+        chunks += 1;
+        worst = worst.max(now_us() - t0);
+    }
+    (chunks, worst, now_us() - t_start)
+}
+
 fn handle_tx_connected(addr: u8, iface_num: u8) {
     log::info!("uac: TX_CONNECTED addr={addr} iface={iface_num} — probe start (silence only)");
     let dev_config = sys::uac::uac_host_device_config_t {
@@ -1642,6 +1743,49 @@ fn handle_tx_connected(addr: u8, iface_num: u8) {
         esp_idf_svc::hal::delay::FreeRtos::delay_ms(10);
     }
     log::info!("uac: tx probe wrote {wrote_ok}/{TX_PROBE_WRITES} silent chunks OK");
+
+    // **The whole transmit chain, at whatever amplitude is configured
+    // — which is zero unless someone set it.**
+    //
+    // Twenty 10 ms writes prove the endpoint accepts data. They do not
+    // prove a transmission: a frame is 632 consecutive chunks over
+    // 12.64 s, paced by the ring's own backpressure, with `GfskStream`
+    // producing each one 439 us before it is needed. Whether that
+    // holds for twelve seconds is a different question from whether
+    // twenty writes succeed, and it is the question a QSO depends on.
+    //
+    // At `TX_AMPLITUDE = 0` every part of that runs and the radio
+    // hears silence — see that constant for what a nonzero value
+    // means and what has to be true first.
+    if wrote_ok > 0 {
+        let msg77 = match mfsk_core::msg::wsjt77::pack77(
+            "CQ",
+            crate::decode_pipeline::MY_CALL,
+            crate::decode_pipeline::MY_GRID,
+        ) {
+            Some(m) => m,
+            None => {
+                log::warn!(
+                    "uac: tx frame skipped — pack77 failed for CQ {} {}",
+                    crate::decode_pipeline::MY_CALL,
+                    crate::decode_pipeline::MY_GRID
+                );
+                [0u8; 77]
+            }
+        };
+        let (chunks, worst_us, total_us) = write_ft8_frame(handle, &msg77, 1_500.0, TX_AMPLITUDE);
+        log::warn!(
+            "uac: tx frame {} — {chunks} chunks of 20 ms, worst {worst_us} us, total {} ms \
+             (audio is 12 640 ms; a shortfall is the ring not pacing, an excess is this board \
+             not keeping up)",
+            if TX_AMPLITUDE == 0 {
+                "SILENT (amplitude 0, nothing reaches the air)"
+            } else {
+                "AT FULL AMPLITUDE — the radio may be transmitting"
+            },
+            total_us / 1_000,
+        );
+    }
 
     let stop_err = unsafe { sys::uac::uac_host_device_stop(handle) };
     let close_err = unsafe { sys::uac::uac_host_device_close(handle) };

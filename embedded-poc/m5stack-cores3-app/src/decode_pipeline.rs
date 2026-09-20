@@ -27,8 +27,8 @@ use mfsk_app_shared::ui::state::{DecodedRow, UI};
 ///
 /// Empty is a valid value and leaves the QSO FSM idle, which is the
 /// right behaviour for a receiver with no operator configured.
-const MY_CALL: &str = env!("MY_CALL");
-const MY_GRID: &str = env!("MY_GRID");
+pub(crate) const MY_CALL: &str = env!("MY_CALL");
+pub(crate) const MY_GRID: &str = env!("MY_GRID");
 
 /// The baked FT8 slot. `pub` so the `MFSK_CORES3_SIM` harness can feed
 /// it through `Ft8ChunkSink` (the real UAC sink) instead of the direct
@@ -292,7 +292,7 @@ const FT8_SHARE_CAND: bool = match option_env!("MFSK_FT8_SHARE_CAND") {
 /// only; anything else is a build-time panic, which is what you want
 /// for a typo in a sweep env var that would otherwise silently fall
 /// back to the default.
-const fn parse_u32(s: &str) -> u32 {
+pub(crate) const fn parse_u32(s: &str) -> u32 {
     let b = s.as_bytes();
     let mut i = 0;
     let mut v: u32 = 0;
