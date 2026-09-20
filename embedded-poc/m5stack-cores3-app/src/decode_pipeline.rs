@@ -12,7 +12,6 @@ use core::fmt::Write as _;
 use mfsk_core::ft8::decode::DecodeDepth;
 use mfsk_core::ft8::decode_block::{DEFAULT_Q_THRESH, NFFT_SPEC};
 
-use mfsk_core::msg::wsjt77::unpack77;
 
 use embedded_shared::{dual_core, esp_dsp_fft, pipeline, stage1_inc, wav_sim};
 use esp_idf_svc::sys::QueueHandle_t;
@@ -347,6 +346,19 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
     log::info!("decode pipeline ready (q_thresh={DEFAULT_Q_THRESH}, band 200..3000 Hz, cores3-app phase 0)");
 
     let mut qso = QsoManager::new(MY_CALL, MY_GRID);
+    // **The callsign hash table, and the fact that it has to live
+    // here.** A 28-bit callsign field can carry a 22-bit hash instead
+    // of a call, and that only resolves against stations heard
+    // earlier — so the table has to outlive the slot, which means it
+    // belongs to this loop rather than to a decode. Without one,
+    // `unpack77` renders `<...>` forever: 69 of 380 decodes on 7041
+    // kHz carried one (2026-09-20), 13 of them the same station.
+    //
+    // PSRAM by way of the global allocator, and bounded by
+    // construction: the 10- and 12-bit tables cannot exceed 1 024 and
+    // 4 096 entries, and the 22-bit one is an LRU capped at
+    // `MAX_HASH22`.
+    let mut calls = mfsk_core::msg::CallsignHashTable::new();
     let initial = qso.call_cq(None);
     push_tx_line(&qso, Some(&initial));
 
@@ -1521,7 +1533,11 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             // because a slot with no decode adds none.
             ui.latest_slot_seq = slot_seq;
             for r in results.iter() {
-                if let Some(text) = unpack77(r.message77()) {
+                // Resolve against what earlier slots taught us, then
+                // learn this message's own callsigns for the next.
+                if let Some(text) =
+                    mfsk_core::msg::wsjt77::unpack77_learn(r.message77(), &mut calls)
+                {
                     let mut msg: heapless::String<22> = heapless::String::new();
                     let take = text.len().min(msg.capacity());
                     let _ = msg.push_str(&text[..take]);

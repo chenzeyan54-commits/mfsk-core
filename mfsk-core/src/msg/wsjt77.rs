@@ -430,6 +430,110 @@ pub fn unpack77(msg: &[u8]) -> Option<String> {
 ///
 /// Behaves identically to [`unpack77`] but replaces `<...>` placeholders with
 /// actual callsigns when they are found in the hash table.
+/// Unpack, resolving hashed callsigns, **and register the callsigns
+/// this message carries** so later messages can resolve *their*
+/// hashes against them.
+///
+/// This is the flow WSJT-X runs: `save_hash_call` is invoked with the
+/// callsign fields as they are unpacked, and the table it fills is
+/// what turns a later `<...>` into a name. Without the registering
+/// half a table stays empty and [`unpack77_with_hash`] can only ever
+/// return placeholders — which is exactly what shipped until
+/// 2026-09-20, when a CoreS3 on 7041 kHz rendered `<...>` in 69 of 380
+/// decodes with no code anywhere in this crate or its consumers
+/// calling [`CallsignHashTable::insert`] outside a test.
+///
+/// **Registration is by field, never by parsing the rendered text.**
+/// A token scan cannot tell `PM95` from a callsign without duplicating
+/// this walker's knowledge, and [`CallsignHashTable::insert`] rejects
+/// only `CQ…` and strings under two characters — so `RRR`, `DX` and
+/// `TU` would all be registered as callsigns. The failure that causes
+/// is worse than a placeholder: a polluted entry resolves a later hash
+/// to the *wrong* callsign, silently.
+///
+/// [`unpack77_with_hash`] keeps its shared borrow and stays
+/// resolve-only, because `DecodeContext::callsign_hash_table` is an
+/// `Arc<dyn Any + Send + Sync>` shared across the parallel decode path
+/// and cannot hand out `&mut` without a mutex in a `no_std`,
+/// `Send + Sync` context. Callers that own their table use this one.
+pub fn unpack77_learn(msg: &[u8], ht: &mut CallsignHashTable) -> Option<String> {
+    // Resolve first, learn second: a message must not be allowed to
+    // resolve its own hash field against a call it is itself
+    // introducing. WSJT-X has the same ordering for the same reason.
+    let text = unpack77_with_hash(msg, ht);
+    register_callsigns(msg, ht);
+    text
+}
+
+/// Register the callsign fields of a 77-bit message into `ht`.
+///
+/// Walks the same `i3`/`n3` layout [`unpack77_with_hash`] does, but
+/// only the callsign fields — the 28-bit standard-call tokens and, for
+/// `i3 = 4`, the 58-bit nonstandard call, which is the field whose
+/// hash other stations will be transmitting.
+///
+/// `unpack28` also yields `CQ`, `DE`, `QRZ`, `CQ DX` and `CQ 001` for
+/// low tokens, so every candidate is filtered through
+/// [`is_standard_callsign`]; the nonstandard call is registered as-is,
+/// which is the whole point of it.
+fn register_callsigns(msg: &[u8], ht: &mut CallsignHashTable) {
+    if msg.len() != 77 {
+        return;
+    }
+    let n3 = read_bits(msg, 71, 3);
+    let i3 = read_bits(msg, 74, 3);
+
+    let learn_std = |n28: u32, ht: &mut CallsignHashTable| {
+        let call = unpack28(n28);
+        if is_standard_callsign(&call) {
+            ht.insert(&call);
+        }
+    };
+
+    match i3 {
+        0 => match n3 {
+            // DXpedition and Field Day both carry two 28-bit calls at
+            // the same offsets; free text (n3 = 0) carries none.
+            1 | 3 | 4 => {
+                learn_std(read_bits(msg, 0, 28), ht);
+                learn_std(read_bits(msg, 28, 28), ht);
+            }
+            _ => {}
+        },
+        1 | 2 => {
+            learn_std(read_bits(msg, 0, 28), ht);
+            learn_std(read_bits(msg, 29, 28), ht);
+        }
+        // ARRL RTTY Roundup: one bit of ITU flag first, so the fields
+        // sit at 1 and 29 rather than 0 and 28.
+        3 => {
+            learn_std(read_bits(msg, 1, 28), ht);
+            learn_std(read_bits(msg, 29, 28), ht);
+        }
+        // Nonstandard call. The 12-bit field is a *hash* of the other
+        // station and carries no callsign to learn; the 58-bit field
+        // is the call itself.
+        4 => {
+            let n58 = read_bits_u64(msg, 12, 58);
+            let mut n = n58;
+            let mut buf = [b' '; 11];
+            for i in (0..11).rev() {
+                buf[i] = C38[(n % 38) as usize];
+                n /= 38;
+            }
+            if let Ok(s) = core::str::from_utf8(&buf) {
+                let call = s.trim();
+                // Two characters is `insert`'s own floor; below it
+                // there is nothing a hash could usefully name.
+                if call.len() >= 2 {
+                    ht.insert(call);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn unpack77_with_hash(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
     let n3 = read_bits(msg, 71, 3);
     let i3 = read_bits(msg, 74, 3);
