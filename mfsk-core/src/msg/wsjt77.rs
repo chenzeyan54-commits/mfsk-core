@@ -262,168 +262,15 @@ fn unpack_free_text(msg: &[u8]) -> String {
 /// - `2`    Standard with `/P`
 /// - `4`    One non-standard callsign + 12-bit hashed counterpart
 pub fn unpack77(msg: &[u8]) -> Option<String> {
-    let n3 = read_bits(msg, 71, 3);
-    let i3 = read_bits(msg, 74, 3);
-
-    match i3 {
-        // ── Type 0: various sub-types ────────────────────────────────────
-        0 => match n3 {
-            0 => {
-                let text = unpack_free_text(msg);
-                if text.is_empty() { None } else { Some(text) }
-            }
-            1 => {
-                // DXpedition: CALL1 RR73; CALL2 <hash> REPORT
-                // Format: b28 b28 b10 b5
-                let n28a = read_bits(msg, 0, 28);
-                let n28b = read_bits(msg, 28, 28);
-                let n5 = read_bits(msg, 66, 5);
-                let irpt = 2 * n5 as i32 - 30;
-                let crpt = if irpt >= 0 {
-                    format!("+{:02}", irpt)
-                } else {
-                    format!("{:03}", irpt)
-                };
-                let c1 = unpack28(n28a);
-                let c2 = unpack28(n28b);
-                Some(format!("{} RR73; {} <...> {}", c1, c2, crpt))
-            }
-            3 | 4 => {
-                // ARRL Field Day — show callsigns + tag
-                let c1 = unpack28(read_bits(msg, 0, 28));
-                let c2 = unpack28(read_bits(msg, 28, 28));
-                Some(format!("{} {} [FD]", c1, c2))
-            }
-            _ => None,
-        },
-
-        // ── Type 1 / 2: standard or /P message ───────────────────────────
-        1 | 2 => {
-            // Format: b28 b1 b28 b1 b1 b15 b3
-            let n28a = read_bits(msg, 0, 28);
-            let ipa = msg[28] & 1;
-            let n28b = read_bits(msg, 29, 28);
-            let ipb = msg[57] & 1;
-            let ir = msg[58] & 1;
-            let igrid = read_bits(msg, 59, 15);
-
-            let mut c1 = unpack28(n28a);
-            let mut c2 = unpack28(n28b);
-
-            // Append /R or /P if the flag bit is set (but not for CQ-type tokens)
-            if ipa == 1 && !c1.starts_with('<') && !c1.starts_with("CQ") {
-                c1.push_str(if i3 == 1 { "/R" } else { "/P" });
-            }
-            if ipb == 1 && !c2.starts_with('<') {
-                c2.push_str(if i3 == 1 { "/R" } else { "/P" });
-            }
-
-            let report = if igrid <= MAX_GRID4 {
-                let grid = to_grid4(igrid)?;
-                if ir == 0 { grid } else { format!("R {}", grid) }
-            } else {
-                let irpt = igrid - MAX_GRID4;
-                match irpt {
-                    1 => String::new(),
-                    2 => "RRR".to_string(),
-                    3 => "RR73".to_string(),
-                    4 => "73".to_string(),
-                    n => {
-                        let mut isnr = n as i32 - 35;
-                        if isnr > 50 {
-                            isnr -= 101;
-                        }
-                        fmt_report(isnr, ir)
-                    }
-                }
-            };
-
-            if report.is_empty() {
-                Some(format!("{} {}", c1, c2))
-            } else {
-                Some(format!("{} {} {}", c1, c2, report))
-            }
-        }
-
-        // ── Type 3: ARRL RTTY Contest ─────────────────────────────────────
-        3 => {
-            // Format (WSJT-X `packjt77.f90:514` `b1,2b28.28,b1,b3.3,b13.13,b3.3`):
-            //   b1: itu (0 = US/Can, 1 = TU; prefix)
-            //   b28: call1
-            //   b28: call2
-            //   b1: ir (0 = no prefix, 1 = "R " prefix on RST)
-            //   b3: irpt → RST = 5{irpt+2}9 (e.g. irpt=6 → "589")
-            //   b13: nexch → if `> 8000`, `imult = nexch-8000` indexes RTTY_STATES;
-            //        else `nserial = nexch`, formatted as 4-digit serial
-            //   b3: i3 (= 3, type marker)
-            let itu = msg[0] & 1;
-            let n28a = read_bits(msg, 1, 28);
-            let n28b = read_bits(msg, 29, 28);
-            let ir = msg[57] & 1;
-            let irpt = read_bits(msg, 58, 3) as u8;
-            let nexch = read_bits(msg, 61, 13);
-            let c1 = unpack28(n28a);
-            let c2 = unpack28(n28b);
-
-            let rst = format!("5{}9", irpt + 2);
-            let exch = if nexch > 8000 && (nexch as usize - 8000) <= RTTY_STATES.len() {
-                RTTY_STATES[(nexch as usize - 8000) - 1].to_string()
-            } else if (1..=7999).contains(&nexch) {
-                format!("{:04}", nexch)
-            } else {
-                // Out-of-range exchange: keep the [RTTY] placeholder so callers
-                // can still see the callsign pair without misleading state codes.
-                return Some(format!("{} {} [RTTY]", c1, c2));
-            };
-            let prefix = if itu == 1 { "TU; " } else { "" };
-            let r_prefix = if ir == 1 { "R " } else { "" };
-            Some(format!(
-                "{}{} {} {}{} {}",
-                prefix, c1, c2, r_prefix, rst, exch
-            ))
-        }
-
-        // ── Type 4: one non-standard call + 12-bit hash ───────────────────
-        4 => {
-            // Format: b12 b58 b1 b2 b1 (b3 = i3)
-            let n58 = read_bits_u64(msg, 12, 58);
-            let iflip = msg[70] & 1;
-            let nrpt = read_bits(msg, 71, 2);
-            let icq = msg[73] & 1;
-
-            // Decode 11-char non-standard callsign from 58-bit base-38 number
-            let mut n = n58;
-            let mut buf = [b' '; 11];
-            for i in (0..11).rev() {
-                buf[i] = C38[(n % 38) as usize];
-                n /= 38;
-            }
-            let nonstd = String::from_utf8(buf.to_vec())
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-
-            if icq == 1 {
-                return Some(format!("CQ {}", nonstd));
-            }
-
-            let (c1, c2) = if iflip == 0 {
-                ("<...>".to_string(), nonstd)
-            } else {
-                (nonstd, "<...>".to_string())
-            };
-
-            match nrpt {
-                0 => Some(format!("{} {}", c1, c2)),
-                1 => Some(format!("{} {} RRR", c1, c2)),
-                2 => Some(format!("{} {} RR73", c1, c2)),
-                3 => Some(format!("{} {} 73", c1, c2)),
-                _ => None,
-            }
-        }
-
-        _ => None,
-    }
+    // One implementation, not two. This used to carry a full copy of
+    // the branch table that `unpack77_with_hash` also carries, the
+    // two differing only in `unpack28` vs `unpack28_h` and the 10-bit
+    // hash lookup — so every per-type validity check had to be written
+    // twice or the two would disagree about what a valid message is.
+    // An empty table makes `unpack28_h` identical to `unpack28` (its
+    // only divergence is a `lookup22` hit, which an empty table cannot
+    // produce), and `CallsignHashTable::new()` allocates nothing.
+    unpack77_with_hash(msg, &CallsignHashTable::new())
 }
 
 /// Decode a 77-bit FT8 message, resolving hashed callsigns via a lookup table.
@@ -544,6 +391,20 @@ pub fn register_callsigns(msg: &[u8], ht: &mut CallsignHashTable) {
 }
 
 pub fn unpack77_with_hash(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
+    let text = unpack77_body(msg, ht)?;
+    // `packjt77.f90:616` — the last thing upstream's `unpack77` does,
+    // for every type: `if(msg(1:4).eq.'CQ <') unpk77_success=.false.`
+    // A CQ is addressed to nobody, so the second field cannot be a
+    // hash: nothing can have introduced it. A 28-bit field landing in
+    // the 22-bit hash range renders as `<...>` and produced exactly
+    // that shape here.
+    if text.starts_with("CQ <") {
+        return None;
+    }
+    Some(text)
+}
+
+fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
     let n3 = read_bits(msg, 71, 3);
     let i3 = read_bits(msg, 74, 3);
 
@@ -565,6 +426,15 @@ pub fn unpack77_with_hash(msg: &[u8], ht: &CallsignHashTable) -> Option<String> 
                 } else {
                     format!("{:03}", irpt)
                 };
+                // `packjt77.f90:318,320` — both callsign fields are
+                // checked against the token range. `n28 <= 2` is
+                // `DE` / `QRZ` / `CQ`, which `unpack28` renders as a
+                // word: a DXpedition participant cannot be one, so a
+                // field that lands there is a CRC-14 survivor rather
+                // than a message.
+                if n28a <= 2 || n28b <= 2 {
+                    return None;
+                }
                 let c1 = unpack28_h(n28a, ht);
                 let c2 = unpack28_h(n28b, ht);
                 let c3 = if let Some(call) = ht.lookup10(n10) {
@@ -575,8 +445,14 @@ pub fn unpack77_with_hash(msg: &[u8], ht: &CallsignHashTable) -> Option<String> 
                 Some(format!("{} RR73; {} {} {}", c1, c2, c3, crpt))
             }
             3 | 4 => {
-                let c1 = unpack28_h(read_bits(msg, 0, 28), ht);
-                let c2 = unpack28_h(read_bits(msg, 28, 28), ht);
+                // `packjt77.f90:343,345` — the same token-range check
+                // upstream applies to Field Day's two callsign fields.
+                let (n28a, n28b) = (read_bits(msg, 0, 28), read_bits(msg, 28, 28));
+                if n28a <= 2 || n28b <= 2 {
+                    return None;
+                }
+                let c1 = unpack28_h(n28a, ht);
+                let c2 = unpack28_h(n28b, ht);
                 Some(format!("{} {} [FD]", c1, c2))
             }
             _ => None,
@@ -600,11 +476,27 @@ pub fn unpack77_with_hash(msg: &[u8], ht: &CallsignHashTable) -> Option<String> 
                 c2.push_str(if i3 == 1 { "/R" } else { "/P" });
             }
 
+            // `packjt77.f90:494,509` — a CQ is a call to no one in
+            // particular, so it cannot acknowledge (`R`) and it cannot
+            // carry a report. Upstream tests the assembled message's
+            // first three characters; `c1` is what those come from, and
+            // every CQ token `unpack28` produces (`CQ`, `CQ 123`,
+            // `CQ DX`) starts the message with `CQ `.
+            let is_cq = c1 == "CQ" || c1.starts_with("CQ ");
             let report = if igrid <= MAX_GRID4 {
+                if is_cq && ir == 1 {
+                    return None;
+                }
                 let grid = to_grid4(igrid)?;
                 if ir == 0 { grid } else { format!("R {}", grid) }
             } else {
                 let irpt = igrid - MAX_GRID4;
+                // `irpt == 1` is the bare `CQ CALL` form and is the only
+                // one a CQ may take; 2..4 are RRR / RR73 / 73 and 5+ is
+                // a signal report.
+                if is_cq && irpt >= 2 {
+                    return None;
+                }
                 match irpt {
                     1 => String::new(),
                     2 => "RRR".to_string(),
@@ -1796,5 +1688,122 @@ mod tests {
         // Empty report
         let msg = pack77("JA1ABC", "3Y0Z", "").unwrap();
         assert_eq!(unpack77(&msg).unwrap(), "JA1ABC 3Y0Z");
+    }
+    /// One bit per byte, MSB first — the layout `read_bits` reads.
+    fn bits77(spec: &[(usize, usize, u32)]) -> [u8; 77] {
+        let mut m = [0u8; 77];
+        for &(start, len, v) in spec {
+            for i in 0..len {
+                m[start + i] = ((v >> (len - 1 - i)) & 1) as u8;
+            }
+        }
+        m
+    }
+
+    /// A real callsign token, safely past the hash range.
+    fn call28() -> u32 {
+        pack28("JA1ABC").expect("JA1ABC packs")
+    }
+
+    /// `packjt77.f90:318,320` — a DXpedition callsign field in the
+    /// `DE`/`QRZ`/`CQ` token range is not a message.
+    ///
+    /// These pin that the port *fires*. Tier B proves it costs no
+    /// golden decode; without these, a check that silently never ran
+    /// would look exactly the same.
+    #[test]
+    fn dxpedition_rejects_a_token_in_a_callsign_field() {
+        let good = bits77(&[
+            (0, 28, call28()),
+            (28, 28, call28()),
+            (66, 5, 20),
+            (71, 3, 1),
+        ]);
+        assert!(unpack77(&good).is_some(), "control must decode");
+        for (name, a, b) in [
+            ("DE", 0, call28()),
+            ("QRZ", 1, call28()),
+            ("CQ", 2, call28()),
+        ] {
+            let m = bits77(&[(0, 28, a), (28, 28, b), (66, 5, 20), (71, 3, 1)]);
+            assert!(
+                unpack77(&m).is_none(),
+                "DXpedition call1 = {name} must be refused"
+            );
+        }
+        let m = bits77(&[(0, 28, call28()), (28, 28, 2), (66, 5, 20), (71, 3, 1)]);
+        assert!(
+            unpack77(&m).is_none(),
+            "DXpedition call2 = CQ must be refused"
+        );
+    }
+
+    /// `packjt77.f90:343,345` — the same two checks for ARRL Field Day.
+    #[test]
+    fn field_day_rejects_a_token_in_a_callsign_field() {
+        for n3 in [3u32, 4] {
+            let good = bits77(&[(0, 28, call28()), (28, 28, call28()), (71, 3, n3)]);
+            assert!(unpack77(&good).is_some(), "control must decode (n3={n3})");
+            let m = bits77(&[(0, 28, 0), (28, 28, call28()), (71, 3, n3)]);
+            assert!(
+                unpack77(&m).is_none(),
+                "Field Day call1 = DE must be refused"
+            );
+        }
+    }
+
+    /// `packjt77.f90:494,509` — a CQ cannot acknowledge and cannot
+    /// carry a report.
+    #[test]
+    fn cq_rejects_r_and_any_report() {
+        const CQ: u32 = 2;
+        let grid = pack_grid4("PM95").expect("PM95 packs");
+        // Control: plain `CQ JA1ABC PM95`.
+        let ok = bits77(&[(0, 28, CQ), (29, 28, call28()), (59, 15, grid), (74, 3, 1)]);
+        assert_eq!(unpack77(&ok).as_deref(), Some("CQ JA1ABC PM95"));
+        // `CQ ... R PM95` — ir = 1 on the grid path.
+        let r = bits77(&[
+            (0, 28, CQ),
+            (29, 28, call28()),
+            (58, 1, 1),
+            (59, 15, grid),
+            (74, 3, 1),
+        ]);
+        assert!(unpack77(&r).is_none(), "CQ with R must be refused");
+        // Reports: irpt 2..4 are RRR / RR73 / 73, 5+ is a signal report.
+        // irpt 1 (the bare form) stays legal.
+        let bare = bits77(&[
+            (0, 28, CQ),
+            (29, 28, call28()),
+            (59, 15, MAX_GRID4 + 1),
+            (74, 3, 1),
+        ]);
+        assert_eq!(unpack77(&bare).as_deref(), Some("CQ JA1ABC"));
+        for irpt in [2u32, 3, 4, 40] {
+            let m = bits77(&[
+                (0, 28, CQ),
+                (29, 28, call28()),
+                (59, 15, MAX_GRID4 + irpt),
+                (74, 3, 1),
+            ]);
+            assert!(
+                unpack77(&m).is_none(),
+                "CQ with irpt={irpt} must be refused"
+            );
+        }
+    }
+
+    /// `packjt77.f90:616` — nothing can have introduced the hash a
+    /// `CQ <...>` would need, so the shape is never a message.
+    #[test]
+    fn cq_rejects_a_hashed_second_call() {
+        let hashed = NTOKENS + 7;
+        let grid = pack_grid4("PM95").expect("PM95 packs");
+        let m = bits77(&[(0, 28, 2), (29, 28, hashed), (59, 15, grid), (74, 3, 1)]);
+        assert!(
+            unpack77(&m).is_none(),
+            "CQ <...> must be refused; got {:?}",
+            unpack77(&m)
+        );
     }
 }
