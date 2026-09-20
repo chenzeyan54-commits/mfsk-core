@@ -36,6 +36,162 @@ use super::ap::ApHint;
 #[cfg(feature = "ft8")]
 use super::ap::WsjtApCompatible;
 
+// ──────────────────────────────────────────────────────────────────────────
+// Message-acceptance policy
+// ──────────────────────────────────────────────────────────────────────────
+
+/// How a request decides whether a decoded message's *text* is
+/// acceptable, on top of the FEC and CRC layers that got it that far.
+///
+/// A CRC-14 false positive is a codeword the decoder converged on that
+/// is not the transmitted one, so its information bits are effectively
+/// uniform. With `max_cand = 200` × 4 LLR variants × OSD, 1/16384
+/// produces one or two such strings per FT8 slot, and every one of them
+/// unpacks to *something*. [`MessageCodec::is_plausible`] is what
+/// refuses them; this trait is what lets a caller adjust that verdict
+/// without the crate guessing at their band.
+///
+/// **Three implementors, and the default is zero-sized.**
+/// [`DefaultPolicy`] carries nothing, so a request that never calls
+/// [`DecodeRequest::also_accept`] or [`DecodeRequest::message_filter`]
+/// monomorphises to exactly the code that existed before this trait —
+/// `base(text)` inlined, no indirect call, no field. That is the reason
+/// this is a type parameter rather than the `&'a dyn Fn` shape
+/// [`DecodeRequest::on_result`] and [`DecodeRequest::budget`] use: those
+/// fire once per *decode*, this fires once per candidate that reaches
+/// the text stage, and the default has to cost nothing at all.
+///
+/// [`MessageCodec::is_plausible`]: crate::engine::protocol::MessageCodec::is_plausible
+pub trait MessagePolicy: Sync {
+    /// `base` is the protocol's own codec verdict
+    /// ([`MessageCodec::is_plausible`]), passed as a function item so
+    /// it inlines. `base_applies` is whether this call site runs that
+    /// verdict by default — `true` on FT8's, which has filtered since
+    /// the filter existed.
+    ///
+    /// [`MessageCodec::is_plausible`]: crate::engine::protocol::MessageCodec::is_plausible
+    fn accepts(&self, base: fn(&str) -> bool, base_applies: bool, text: &str) -> bool;
+}
+
+/// The codec's own verdict and nothing else — what every request starts
+/// with, and a zero-sized type so that costs nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DefaultPolicy;
+
+impl MessagePolicy for DefaultPolicy {
+    #[inline]
+    fn accepts(&self, base: fn(&str) -> bool, base_applies: bool, text: &str) -> bool {
+        !base_applies || base(text)
+    }
+}
+
+/// The claim [`MessagePolicy`]'s doc comment makes about the default
+/// costing nothing, held down at compile time rather than asserted in
+/// prose: a [`DecodeRequest`] that never names a policy stores a field
+/// of size zero.
+const _: () = assert!(core::mem::size_of::<DefaultPolicy>() == 0);
+
+/// Widen the codec's verdict: accept what it accepts, **plus** whatever
+/// the caller's predicate accepts.
+///
+/// For messages the shipped filter is too strict about — a callsign
+/// whose prefix the ITU allowlist does not carry, a local contest
+/// exchange — without giving up the filter for everything else. Set by
+/// [`DecodeRequest::also_accept`].
+///
+/// Note what this implies for a protocol whose call site does *not*
+/// apply the base by default: the widening still runs against the
+/// codec's verdict, so opting in turns the codec's filter on. That is
+/// deliberate — a caller asking for "the usual filter, plus this" gets
+/// the usual filter.
+#[derive(Clone, Copy, Debug)]
+pub struct AlsoAccept<F>(pub F);
+
+impl<F: Fn(&str) -> bool + Sync> MessagePolicy for AlsoAccept<F> {
+    #[inline]
+    fn accepts(&self, base: fn(&str) -> bool, _base_applies: bool, text: &str) -> bool {
+        base(text) || (self.0)(text)
+    }
+}
+
+/// Replace the codec's verdict entirely with the caller's predicate.
+///
+/// The escape hatch for a caller who knows their band better than the
+/// crate does — a closed network, a test harness that wants every
+/// CRC-passing string, a mode whose traffic the ITU allowlist has no
+/// opinion about. Set by [`DecodeRequest::message_filter`].
+///
+/// This can *lose* nothing and *gain* phantoms: the filter it replaces
+/// removes roughly two thirds of the CRC survivors that reach it
+/// (`msg::wsjt77`'s `phantom_survival_rates`). Prefer [`AlsoAccept`]
+/// unless the whole verdict is wrong for the deployment.
+#[derive(Clone, Copy, Debug)]
+pub struct Only<F>(pub F);
+
+impl<F: Fn(&str) -> bool + Sync> MessagePolicy for Only<F> {
+    #[inline]
+    fn accepts(&self, _base: fn(&str) -> bool, _base_applies: bool, text: &str) -> bool {
+        (self.0)(text)
+    }
+}
+
+/// Protocols whose decode path has a message-*text* stage a
+/// [`MessagePolicy`] can be applied at, so
+/// [`DecodeRequest::also_accept`] / [`DecodeRequest::message_filter`]
+/// are callable. **FT8 only, for now.**
+///
+/// Not a statement about the message codec: `Ft8`, `Ft4` and every FST4
+/// sub-mode share `Wsjt77Message`, so the verdict would mean the same
+/// thing for all of them. It is a statement about the *pipeline*. FT8
+/// has its own bespoke engine (`ft8::decode_block`) which unpacks to
+/// text inside the per-candidate ladder and already filters there; the
+/// generic engine FT4 and FST4 share (`engine::pipeline`) returns
+/// information bits and never forms a string, because `engine` does not
+/// depend on `msg` and so cannot call `unpack77` at all. Giving those
+/// two a text stage is its own change with its own measurement — the
+/// candidate ladder gets to continue past a rejection, which is a
+/// recall question, not just a filtering one.
+///
+/// Gating it means a caller who tries gets a compile error naming the
+/// missing capability, rather than a builder method that silently does
+/// nothing — the same reason [`SupportsSicEarly`] and [`SupportsSniper`]
+/// are traits rather than runtime checks.
+pub trait SupportsMessageFilter: FrameDecodable {
+    /// Re-select this protocol's strategy dispatch for a new policy
+    /// type.
+    ///
+    /// [`DecodeRequest`] stashes its strategy as a function pointer so
+    /// that `decode()` can call a capability-gated entry point
+    /// (`__flat_sic`, `__staged_sic`) without naming the capability —
+    /// see the module comment. That pointer's type mentions the policy,
+    /// so changing the policy invalidates it, and the tag is how it is
+    /// rebuilt: a protocol that implements this trait implements all of
+    /// its own strategies, so it can hand back the right pointer for
+    /// any of them.
+    ///
+    /// Without this the builder would be order-dependent —
+    /// `.also_accept()` would have to precede `.sic_early()` or
+    /// silently reset it — which is exactly the kind of reachable
+    /// runtime state this module exists to make unrepresentable.
+    #[doc(hidden)]
+    fn __strategy_for<Pol: MessagePolicy>(
+        tag: StrategyTag,
+    ) -> fn(&DecodeRequest<'_, Self, Pol>) -> DecodeOutcome<Self>
+    where
+        Self: Sized;
+}
+
+/// Which strategy a [`DecodeRequest`] is carrying, kept beside the
+/// function pointer so [`SupportsMessageFilter::__strategy_for`] can
+/// rebuild it for a different policy type.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrategyTag {
+    SinglePass,
+    FlatSic,
+    StagedSic,
+}
+
 /// Protocols with a `decode_frame`-family entry point via [`DecodeRequest`]
 /// / [`SniperRequest`]. Implemented for `Ft8`, `Ft4`, and each FST4
 /// sub-mode; intentionally not implemented for protocols with their own
@@ -58,7 +214,7 @@ pub trait FrameDecodable: Protocol {
     type DecodeResult;
 
     #[doc(hidden)]
-    fn __single_pass(req: &DecodeRequest<'_, Self>) -> DecodeOutcome<Self>
+    fn __single_pass<Pol: MessagePolicy>(req: &DecodeRequest<'_, Self, Pol>) -> DecodeOutcome<Self>
     where
         Self: Sized;
 }
@@ -100,7 +256,7 @@ pub trait FrameDecodable: Protocol {
 #[cfg(feature = "ft8")]
 pub trait SupportsSniper: FrameDecodable {
     #[doc(hidden)]
-    fn __sniper(req: &SniperRequest<'_, Self>) -> DecodeOutcome<Self>
+    fn __sniper<Pol: MessagePolicy>(req: &SniperRequest<'_, Self, Pol>) -> DecodeOutcome<Self>
     where
         Self: Sized;
 }
@@ -123,7 +279,7 @@ pub trait SupportsSniper: FrameDecodable {
 /// real fading (EME libration, ionospheric variation) needs.
 pub trait SupportsSicRounds: FrameDecodable {
     #[doc(hidden)]
-    fn __flat_sic(req: &DecodeRequest<'_, Self>) -> DecodeOutcome<Self>
+    fn __flat_sic<Pol: MessagePolicy>(req: &DecodeRequest<'_, Self, Pol>) -> DecodeOutcome<Self>
     where
         Self: Sized;
 }
@@ -136,7 +292,7 @@ pub trait SupportsSicRounds: FrameDecodable {
 /// `impl` here, no trait redesign needed (see issue #192).
 pub trait SupportsSicEarly: FrameDecodable {
     #[doc(hidden)]
-    fn __staged_sic(req: &DecodeRequest<'_, Self>) -> DecodeOutcome<Self>
+    fn __staged_sic<Pol: MessagePolicy>(req: &DecodeRequest<'_, Self, Pol>) -> DecodeOutcome<Self>
     where
         Self: Sized;
 }
@@ -186,7 +342,7 @@ pub struct DecodeOutcome<P: FrameDecodable> {
 /// the FT4/FST4 `decode_frame`/`_with_options`/`_with_cache`/
 /// `_with_cache_and_options`/`decode_frame_subtract`/`_with_options`
 /// family (issue #191).
-pub struct DecodeRequest<'a, P: FrameDecodable> {
+pub struct DecodeRequest<'a, P: FrameDecodable, Pol: MessagePolicy = DefaultPolicy> {
     pub(crate) audio: &'a [i16],
     pub(crate) freq_min: f32,
     pub(crate) freq_max: f32,
@@ -210,10 +366,24 @@ pub struct DecodeRequest<'a, P: FrameDecodable> {
     pub(crate) on_result: Option<OnResultCallback<'a, P>>,
     /// Set via [`DecodeRequest::budget`].
     pub(crate) budget: Option<BudgetCheck<'a>>,
-    strategy: fn(&DecodeRequest<'a, P>) -> DecodeOutcome<P>,
+    /// Set via [`DecodeRequest::also_accept`] /
+    /// [`DecodeRequest::message_filter`]; [`DefaultPolicy`] otherwise,
+    /// which is zero-sized and inlines to the codec's own verdict.
+    ///
+    /// FT8 is its only reader, because [`SupportsMessageFilter`] is
+    /// implemented for FT8 alone — so in a build without that feature
+    /// the field really is dead, and the allow is scoped to exactly
+    /// that configuration rather than blanket. Step 5 (issue #383)
+    /// gives FT4 a text stage, at which point this comes off.
+    #[cfg_attr(not(feature = "ft8"), allow(dead_code))]
+    pub(crate) policy: Pol,
+    /// Which of the three `strategy` below is, so a policy change can
+    /// rebuild the pointer — see [`SupportsMessageFilter::__strategy_for`].
+    tag: StrategyTag,
+    strategy: fn(&DecodeRequest<'a, P, Pol>) -> DecodeOutcome<P>,
 }
 
-impl<'a, P: FrameDecodable> DecodeRequest<'a, P> {
+impl<'a, P: FrameDecodable> DecodeRequest<'a, P, DefaultPolicy> {
     /// `sync_min` — minimum coarse-sync score (typical: 1.0-2.0).
     /// `max_cand` — maximum number of sync candidates to evaluate.
     pub fn new(
@@ -239,10 +409,14 @@ impl<'a, P: FrameDecodable> DecodeRequest<'a, P> {
             sic_rounds: 3,
             on_result: None,
             budget: None,
+            policy: DefaultPolicy,
+            tag: StrategyTag::SinglePass,
             strategy: P::__single_pass,
         }
     }
+}
 
+impl<'a, P: FrameDecodable, Pol: MessagePolicy> DecodeRequest<'a, P, Pol> {
     /// Preferred frequency; matching candidates are tried first.
     pub fn freq_hint(mut self, f: f32) -> Self {
         self.freq_hint = Some(f);
@@ -431,7 +605,77 @@ impl<'a, P: FrameDecodable> DecodeRequest<'a, P> {
     }
 }
 
-impl<'a, P: SupportsWideBandAp> DecodeRequest<'a, P> {
+impl<'a, P: SupportsMessageFilter, Pol: MessagePolicy> DecodeRequest<'a, P, Pol> {
+    /// Accept what the protocol's message codec accepts, **plus**
+    /// whatever `f` accepts. **FT8 only** — see [`SupportsMessageFilter`]
+    /// for why the others cannot take one yet.
+    ///
+    /// For traffic the shipped filter is too strict about. It refuses a
+    /// callsign whose prefix the ITU allowlist does not carry, which is
+    /// the right default against CRC survivors and the wrong one on a
+    /// band carrying special-event or experimental calls the list has
+    /// no entry for:
+    ///
+    /// ```ignore
+    /// DecodeRequest::<Ft8>::new(&audio, 200.0, 3000.0, 1.5, 200)
+    ///     .also_accept(|text| text.split_whitespace().all(is_cb_callsign))
+    ///     .decode()
+    /// ```
+    ///
+    /// Widening only — it cannot lose a decode the default would have
+    /// made. Use [`Self::message_filter`] to replace the verdict
+    /// instead of adding to it.
+    ///
+    /// The closure is stored by value in a [`AlsoAccept`], not behind a
+    /// `&dyn`, so the whole predicate monomorphises into the decode.
+    /// A request that never calls this carries [`DefaultPolicy`], which
+    /// is zero-sized.
+    pub fn also_accept<F: Fn(&str) -> bool + Sync>(
+        self,
+        f: F,
+    ) -> DecodeRequest<'a, P, AlsoAccept<F>> {
+        self.with_policy(AlsoAccept(f))
+    }
+
+    /// Replace the protocol's message-codec verdict with `f` entirely.
+    /// **FT8 only** — see [`SupportsMessageFilter`].
+    ///
+    /// The escape hatch, and a sharp one: the filter it replaces removes
+    /// about two thirds of the CRC survivors that reach it, so a
+    /// permissive `f` will surface phantom decodes the default hides.
+    /// Prefer [`Self::also_accept`] unless the whole verdict is wrong
+    /// for the deployment.
+    pub fn message_filter<F: Fn(&str) -> bool + Sync>(self, f: F) -> DecodeRequest<'a, P, Only<F>> {
+        self.with_policy(Only(f))
+    }
+
+    /// Rebuild with a different policy type, re-selecting the strategy
+    /// pointer for it — see [`SupportsMessageFilter::__strategy_for`].
+    fn with_policy<Q: MessagePolicy>(self, policy: Q) -> DecodeRequest<'a, P, Q> {
+        DecodeRequest {
+            audio: self.audio,
+            freq_min: self.freq_min,
+            freq_max: self.freq_max,
+            sync_min: self.sync_min,
+            freq_hint: self.freq_hint,
+            depth: self.depth,
+            max_cand: self.max_cand,
+            strictness: self.strictness,
+            eq_mode: self.eq_mode,
+            ap_hint: self.ap_hint,
+            known: self.known,
+            fft_cache: self.fft_cache,
+            sic_rounds: self.sic_rounds,
+            on_result: self.on_result,
+            budget: self.budget,
+            policy,
+            tag: self.tag,
+            strategy: P::__strategy_for::<Q>(self.tag),
+        }
+    }
+}
+
+impl<'a, P: SupportsWideBandAp, Pol: MessagePolicy> DecodeRequest<'a, P, Pol> {
     /// A-priori callsign/grid/report hint applied to every candidate.
     ///
     /// Available for **`Ft8`, `Ft4` and every FST4 sub-mode** — every
@@ -470,7 +714,7 @@ impl<'a, P: SupportsWideBandAp> DecodeRequest<'a, P> {
     }
 }
 
-impl<'a, P: SupportsSicRounds> DecodeRequest<'a, P> {
+impl<'a, P: SupportsSicRounds, Pol: MessagePolicy> DecodeRequest<'a, P, Pol> {
     /// One round = coarse-sync + per-candidate decode + subtract, over the
     /// (shrinking) residual buffer. `n` is clamped to 1..=3 — WSJT-X's own
     /// `npass`/`nsp` never exceeds 3.
@@ -526,13 +770,14 @@ impl<'a, P: SupportsSicRounds> DecodeRequest<'a, P> {
     /// Pinned by `tests/ft4_wsjtx_samples.rs::
     /// ft4_wsjtx_sample_reaches_jt9_parity_with_sic`.
     pub fn sic_rounds(mut self, n: usize) -> Self {
+        self.tag = StrategyTag::FlatSic;
         self.strategy = P::__flat_sic;
         self.sic_rounds = n.clamp(1, 3);
         self
     }
 }
 
-impl<'a, P: SupportsSicEarly> DecodeRequest<'a, P> {
+impl<'a, P: SupportsSicEarly, Pol: MessagePolicy> DecodeRequest<'a, P, Pol> {
     /// WSJT-X's early decode (`ft8_decode.f90`'s `ndec_early`/`MAX_EARLY`,
     /// checkpointed at `nzhsym` = 41/47/50 out of 79 symbols): decodes
     /// progressively larger audio prefixes, subtracting earlier
@@ -547,6 +792,7 @@ impl<'a, P: SupportsSicEarly> DecodeRequest<'a, P> {
     /// same underlying idea (flat multi-pass SIC) without the checkpoint
     /// structure.
     pub fn sic_early(mut self) -> Self {
+        self.tag = StrategyTag::StagedSic;
         self.strategy = P::__staged_sic;
         self
     }
@@ -598,7 +844,7 @@ impl<'a, P: SupportsSicEarly> DecodeRequest<'a, P> {
 /// relaxed-threshold pass) is dropped rather than ported — it had zero
 /// callers anywhere in the crate.
 #[cfg(feature = "ft8")]
-pub struct SniperRequest<'a, P: FrameDecodable> {
+pub struct SniperRequest<'a, P: FrameDecodable, Pol: MessagePolicy = DefaultPolicy> {
     pub(crate) audio: &'a [i16],
     pub(crate) target_freq: f32,
     pub(crate) sync_min: f32,
@@ -616,11 +862,13 @@ pub struct SniperRequest<'a, P: FrameDecodable> {
     /// Half-width of the search window, Hz. Set via
     /// [`SniperRequest::search_hz`].
     pub(crate) search_hz: f32,
+    /// See [`DecodeRequest`]'s field of the same name.
+    pub(crate) policy: Pol,
     _protocol: core::marker::PhantomData<P>,
 }
 
 #[cfg(feature = "ft8")]
-impl<'a, P: SupportsSniper> DecodeRequest<'a, P> {
+impl<'a, P: SupportsSniper> DecodeRequest<'a, P, DefaultPolicy> {
     /// Narrow-band, single-target preset. **FT8 only** — see
     /// [`SupportsSniper`] for why this is not a gap in the others.
     pub fn sniper(audio: &'a [i16], target_freq: f32, max_cand: usize) -> SniperRequest<'a, P> {
@@ -629,7 +877,7 @@ impl<'a, P: SupportsSniper> DecodeRequest<'a, P> {
 }
 
 #[cfg(feature = "ft8")]
-impl<'a, P: SupportsSniper> SniperRequest<'a, P> {
+impl<'a, P: SupportsSniper> SniperRequest<'a, P, DefaultPolicy> {
     pub fn new(audio: &'a [i16], target_freq: f32, max_cand: usize) -> Self {
         Self {
             audio,
@@ -643,10 +891,18 @@ impl<'a, P: SupportsSniper> SniperRequest<'a, P> {
             on_result: None,
             budget: None,
             search_hz: 250.0,
+            policy: DefaultPolicy,
             _protocol: core::marker::PhantomData,
         }
     }
+}
 
+// Same gate as the block above: `SupportsSniper` and `SniperRequest`
+// are both `ft8`-only, so without that feature this block names two
+// types that do not exist. Caught by the `alloc ft4 fft-extern` leg of
+// `scripts/pre-push-check.sh`'s feature matrix, not by `full`.
+#[cfg(feature = "ft8")]
+impl<'a, P: SupportsSniper, Pol: MessagePolicy> SniperRequest<'a, P, Pol> {
     /// Half-width of the search window in Hz, centred on the target.
     /// Default 250.0, i.e. the 500 Hz span both callers have always
     /// hardcoded.
@@ -730,6 +986,46 @@ impl<'a, P: SupportsSniper> SniperRequest<'a, P> {
     pub fn budget(mut self, check: BudgetCheck<'a>) -> Self {
         self.budget = Some(check);
         self
+    }
+
+    /// See [`DecodeRequest::also_accept`] — same contract. A sniper
+    /// search reaches the same per-candidate text stage.
+    pub fn also_accept<F: Fn(&str) -> bool + Sync>(
+        self,
+        f: F,
+    ) -> SniperRequest<'a, P, AlsoAccept<F>>
+    where
+        P: SupportsMessageFilter,
+    {
+        self.with_policy(AlsoAccept(f))
+    }
+
+    /// See [`DecodeRequest::message_filter`] — same contract.
+    pub fn message_filter<F: Fn(&str) -> bool + Sync>(self, f: F) -> SniperRequest<'a, P, Only<F>>
+    where
+        P: SupportsMessageFilter,
+    {
+        self.with_policy(Only(f))
+    }
+
+    /// No strategy pointer to rebuild here — [`Self::decode`] calls
+    /// [`SupportsSniper::__sniper`] directly, since there is only one.
+    fn with_policy<Q: MessagePolicy>(self, policy: Q) -> SniperRequest<'a, P, Q> {
+        SniperRequest {
+            audio: self.audio,
+            target_freq: self.target_freq,
+            sync_min: self.sync_min,
+            depth: self.depth,
+            max_cand: self.max_cand,
+            strictness: self.strictness,
+            eq_mode: self.eq_mode,
+            ap_hint: self.ap_hint,
+            on_result: self.on_result,
+            budget: self.budget,
+            search_hz: self.search_hz,
+            policy,
+            _protocol: core::marker::PhantomData,
+        }
     }
 
     pub fn decode(&self) -> DecodeOutcome<P> {

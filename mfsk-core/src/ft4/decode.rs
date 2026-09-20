@@ -14,7 +14,9 @@ use crate::engine::pipeline;
 
 pub use crate::engine::pipeline::{DecodeDepth, DecodeResult, DecodeStrictness, FftCache};
 pub use crate::msg::ApHint;
-use crate::msg::decode_request::{DecodeOutcome, DecodeRequest, FrameDecodable, SupportsSicRounds};
+use crate::msg::decode_request::{
+    DecodeOutcome, DecodeRequest, FrameDecodable, MessagePolicy, SupportsSicRounds,
+};
 
 /// FT4 downsample configuration: 12 kHz → ~666.7 Hz baseband, covering four
 /// tones spaced 20.833 Hz apart plus headroom.
@@ -63,7 +65,9 @@ impl pipeline::GenericPipelineProtocol for Ft4 {
 impl FrameDecodable for Ft4 {
     type DecodeResult = DecodeResult;
 
-    fn __single_pass(req: &DecodeRequest<'_, Self>) -> DecodeOutcome<Self> {
+    fn __single_pass<Pol: MessagePolicy>(
+        req: &DecodeRequest<'_, Self, Pol>,
+    ) -> DecodeOutcome<Self> {
         // See `pipeline::known_filtered_on_result`'s doc comment: without
         // this, `on_result` could fire for a candidate `pipeline::dedup_known`
         // below then silently drops from the returned `Vec`.
@@ -132,7 +136,7 @@ impl FrameDecodable for Ft4 {
 impl crate::msg::decode_request::SupportsWideBandAp for Ft4 {}
 
 impl SupportsSicRounds for Ft4 {
-    fn __flat_sic(req: &DecodeRequest<'_, Self>) -> DecodeOutcome<Self> {
+    fn __flat_sic<Pol: MessagePolicy>(req: &DecodeRequest<'_, Self, Pol>) -> DecodeOutcome<Self> {
         // Same rationale as `__single_pass` above — this strategy is
         // held to `on_result`'s *exact-match* contract (sequential
         // SIC), so this gap was a genuine violation, not just an

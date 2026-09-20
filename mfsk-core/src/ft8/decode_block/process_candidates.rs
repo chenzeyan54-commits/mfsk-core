@@ -40,6 +40,7 @@ use crate::engine::sync::SyncCandidate;
 use crate::fec::ldpc::bp::check_crc14;
 #[cfg(feature = "fft-rustfft")]
 use crate::fec::ldpc::osd::osd_decode_deep;
+use crate::msg::decode_request::{DefaultPolicy, MessagePolicy};
 use num_complex::Complex;
 
 // ── Stage-timing trace (host diagnostic only) ───────────────────────────────
@@ -1771,6 +1772,7 @@ where
             ap_hint,
             strictness,
             0.0,
+            &DefaultPolicy,
         ) {
             if let Some(cb) = on_result.as_mut() {
                 cb(&r);
@@ -1824,6 +1826,15 @@ where
 #[cfg(feature = "fft-rustfft")]
 const BLIND_CQ_MIN_NSYNC: u32 = 12;
 
+/// FT8's message codec verdict, as a function item so the policy layer
+/// can inline it. `<Ft8 as Protocol>::Msg` is `Wsjt77Message`, whose
+/// `is_plausible` is `msg::wsjt77::is_plausible_message` — named through
+/// the trait rather than directly so that a protocol swapping its codec
+/// cannot leave this pointing at the old one.
+fn codec_is_plausible(text: &str) -> bool {
+    <<crate::ft8::Ft8 as crate::engine::protocol::Protocol>::Msg as crate::engine::protocol::MessageCodec>::is_plausible(text)
+}
+
 /// Per-candidate decode core — runs the LLR-staircase, OSD fallback,
 /// and AP iaptype loop on a *fully-filled* `cs_scratch`. Shared
 /// between the embedded `process_candidates_with` driver (above) and
@@ -1848,7 +1859,7 @@ const BLIND_CQ_MIN_NSYNC: u32 = 12;
 #[allow(clippy::too_many_arguments)]
 #[allow(unused_variables)] // ap_hint only used under #[cfg(feature = "fft-rustfft")]
 #[allow(unused_assignments)] // llrb_arr/llrc_arr only read back under #[cfg(feature = "fft-rustfft")]
-pub(in crate::ft8) fn process_one_candidate_inner(
+pub(in crate::ft8) fn process_one_candidate_inner<Pol: MessagePolicy>(
     cs_scratch: &[[Cmplx<f32>; 8]; 79],
     cand: &SyncCandidate,
     refined_dt: f32,
@@ -1863,6 +1874,11 @@ pub(in crate::ft8) fn process_one_candidate_inner(
     ap_hint: Option<&ApHint>,
     strictness: DecodeStrictness,
     sync_cv: f32,
+    // Whether a decoded message's *text* is acceptable. `&DefaultPolicy`
+    // for every caller that has no opinion — it is zero-sized and
+    // inlines to `codec_is_plausible` alone, which is what this
+    // function did unconditionally before the hook existed.
+    policy: &Pol,
 ) -> Option<DecodeResult> {
     // ── Staircase: cheap → deeper → OSD ─────────────────────────
     //
@@ -2170,7 +2186,7 @@ pub(in crate::ft8) fn process_one_candidate_inner(
                     let Some(text) = unpack77(&msg77) else {
                         return false;
                     };
-                    if !crate::msg::wsjt77::is_plausible_message(&text) {
+                    if !policy.accepts(codec_is_plausible, true, &text) {
                         return false;
                     }
                     let upper = text.to_uppercase();
@@ -2229,7 +2245,7 @@ pub(in crate::ft8) fn process_one_candidate_inner(
     // CRC-14's 1/16384 false-positive rate produces ~1-2 random
     // strings per slot. Same filter the host wide-band path
     // uses (`decode_frame::process_candidate`).
-    if !crate::msg::wsjt77::is_plausible_message(&text) {
+    if !policy.accepts(codec_is_plausible, true, &text) {
         return None;
     }
     if known.iter().any(|r| r.message77() == bp.message77) {

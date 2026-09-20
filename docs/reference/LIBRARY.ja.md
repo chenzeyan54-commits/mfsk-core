@@ -29,6 +29,7 @@ type である。配線済みの全プロトコルが同じ受信フロー
   - [2.3 計算予算](#23-計算予算)
   - [2.4 ストリーミング配信](#24-ストリーミング配信)
   - [2.5 独自エントリポイントを持つプロトコル](#25-独自エントリポイントを持つプロトコル)
+  - [2.6 メッセージの受理](#26-メッセージの受理)
 - [3. プロトコル](#3-プロトコル)
   - [3.1 プロトコル毎の汎用 vs 専用](#31-プロトコル毎の汎用-vs-専用)
   - [3.2 諸元](#32-諸元)
@@ -132,6 +133,8 @@ DecodeRequest::<P>::new(audio, freq_min, freq_max, sync_min, max_cand)
 | `.ap_hint(&ApHint)` | `&ApHint` | 無し | `SupportsWideBandAp` — **FT8・FT4・FST4 全サブモード** | 事前仮説からメッセージビットを固定 |
 | `.sic_rounds(n)` | `usize`、`1..=3` にクランプ | 無し | `SupportsSicRounds` — **FT8, FT4** | 平坦な逐次干渉除去 |
 | `.sic_early()` | — | 無し | `SupportsSicEarly` — **FT8** | チェックポイント模倣の早期デコード（3 チェックポイント固定構造） |
+| `.also_accept(f)` | `Fn(&str) -> bool` | 無し | `SupportsMessageFilter` — **FT8** | codec が通すもの **＋** `f` が通すもの — [§2.5](#26-メッセージの受理) |
+| `.message_filter(f)` | `Fn(&str) -> bool` | 無し | `SupportsMessageFilter` — **FT8** | codec の判定を `f` で置き換える — [§2.5](#26-メッセージの受理) |
 | `.on_result(cb)` | `FnMut(&Row)` | 無し | 全部 | 見つかった順に行を配信 — [§2.4](#24-ストリーミング配信) |
 | `.budget(check)` | `FnMut() -> bool` | 無し | 全部 | 呼び出し側の締切述語 — [§2.3](#23-計算予算) |
 | `.sniper(...)` | `(audio, target_hz, max_cand)` | — | `SupportsSniper` — **FT8** | 代わりに `SniperRequest` を作る |
@@ -183,6 +186,8 @@ for r in &results {
 | `.strictness(s)` | `Normal` | 同上 |
 | `.eq_mode(m)` | `Off` | 同上 |
 | `.ap_hint(&h)` | 無し | 同上 |
+| `.also_accept(f)` | 無し | 同上 |
+| `.message_filter(f)` | 無し | 同上 |
 | `.on_result(cb)` | 無し | 同上 |
 | `.budget(check)` | 無し | 同上 |
 | `.decode()` | — | 同じ `DecodeOutcome<P>` |
@@ -355,6 +360,73 @@ JT9 の多段 AGC/IFFT/コヒーレント加算パイプラインは単純な帯
 還元できないため、相対値専用である（JT9 のデコード同士で比べること。
 他プロトコルの `snr_db` と比べないこと）。WSPR のそれは `wsprd` 較正の
 候補 SNR で、`wsprd` 自身がスポットの隣に表示するのと同じ数値である。
+
+### 2.6 メッセージの受理
+
+この層より下は全て誤り*検出*である — LDPC のパリティ検査、そして CRC。
+どちらも、出てきた文字列が誰かが実際に送ったメッセージかどうかについては
+何も言わない。CRC-14 の偽陽性とは、デコーダが収束した符号語が送信された
+ものではなかった場合であり、その 77 情報ビットは実質的に一様である。
+`max_cand = 200` × LLR 4 変種 × OSD という探索では、1/16384 が FT8 の
+1スロットあたり 1〜2 個を生む。その半分以上が構文的に妥当なメッセージに
+展開される。
+
+`MessageCodec::is_plausible` がそれを拒否する。`Wsjt77Message` の場合は
+コールサイントークンに対する ITU プレフィクス許可リストに加え、交換内容が
+コールサインでないメッセージ型（ARRL Field Day、EU VHF contest）に対する
+構造検査である。**本家に対応物は無い** — `ft8b.f90` は `nbadcrc` と
+`nharderrors` だけで判定している。これが存在するのは、本クレートの既定探索が
+本家より深く、本家がそもそもスコアリングしない候補にまで到達するためである。
+
+つまりこれは移植ではなく判断であり、判断は呼び出し側のものである。
+2つのビルダーメソッドがこれを調整する:
+
+```rust
+use mfsk_core::ft8::Ft8;
+use mfsk_core::msg::decode_request::DecodeRequest;
+
+/// 配備先が知っていて ITU 許可リストが知らないもの。
+fn is_special_event_call(token: &str) -> bool {
+    token.starts_with("8J")
+}
+
+let audio = vec![0i16; 180_000]; // 15 s @ 12 kHz
+
+// 既定のフィルタ ＋ それが知らないコールサイン。
+let widened = DecodeRequest::<Ft8>::new(&audio, 200.0, 3000.0, 1.5, 20)
+    .also_accept(|text| text.split_whitespace().all(is_special_event_call))
+    .decode();
+
+// 一切の判断をしない — CRC を通った文字列は全部、ファントム込みで。
+let unfiltered = DecodeRequest::<Ft8>::new(&audio, 200.0, 3000.0, 1.5, 20)
+    .message_filter(|_| true)
+    .decode();
+
+// 無音には実信号も CRC 生存者も無いので、フィルタ無しの方も空で返る。
+assert!(widened.results.is_empty());
+assert!(unfiltered.results.is_empty());
+```
+
+`.also_accept(f)` は広げることしかできない — 既定が拾えたデコードを失うことは
+ない。`.message_filter(f)` は判定を丸ごと置き換える。置き換えられる側は、
+そこに到達した CRC 生存者のおよそ 2/3 を落としているので、緩い `f` は既定が
+隠しているファントム行を表に出す。配備先にとって判定全体が間違っている場合を
+除き、前者を選ぶこと。
+
+**未使用時のコストはゼロ。** ポリシーは `.on_result()` / `.budget()` のような
+`&dyn Fn` ではなく型パラメータである。どちらのメソッドも呼ばない request は
+`DefaultPolicy` を持ち、これはゼロサイズ型で、その判定は codec の呼び出しそのものに
+インライン展開される。前者2つのフックは*デコード*ごとに1回発火するが、こちらは
+テキスト段に到達した候補ごとに発火する — 型パラメータにする価値があるのはそのため。
+
+**FT8 のみ**、`SupportsMessageFilter` でゲートしている。これは codec についての
+主張ではない（FT4 も FST4 全サブモードも `Wsjt77Message` を共有している）。
+パイプラインについての主張である。FT8 の専用エンジンは候補ごとのラダーの内部で
+メッセージ文字列を組み立てるので、そこで拒否すればラダーは続行できる。一方
+FT4/FST4 が共有する汎用エンジンは情報ビットを返すだけで文字列を一切作らない —
+`engine` が `msg` に依存しないためである。これらのプロトコルで上記メソッドを
+呼ぶと、欠けている能力を名指しするコンパイルエラーになる（黙って何もしない
+no-op ではない）。
 
 ---
 

@@ -22,8 +22,8 @@ use super::{
     sync::SyncCandidate,
 };
 use crate::msg::decode_request::{
-    BudgetReport, DecodeOutcome, DecodeRequest, FrameDecodable, SniperRequest, SupportsSicEarly,
-    SupportsSicRounds, SupportsWideBandAp,
+    BudgetReport, DecodeOutcome, DecodeRequest, FrameDecodable, MessagePolicy, SniperRequest,
+    StrategyTag, SupportsMessageFilter, SupportsSicEarly, SupportsSicRounds, SupportsWideBandAp,
 };
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -131,7 +131,7 @@ type LlrT = f32;
 ///
 /// Returns `Some(DecodeResult)` on the first successful decode, `None` if the
 /// candidate yields no valid message.
-fn process_candidate(
+fn process_candidate<Pol: MessagePolicy>(
     cand: &SyncCandidate,
     audio: &[i16],
     fft_cache: &[num_complex::Complex<f32>],
@@ -140,6 +140,7 @@ fn process_candidate(
     known: &[DecodeResult],
     eq_mode: EqMode,
     ap_hint: Option<&ApHint>,
+    policy: &Pol,
 ) -> Option<DecodeResult> {
     let mut bp_scratch =
         crate::fec::ldpc::bp::BpScratch::<crate::fec::ldpc::params::Ldpc174_91Params, LlrT>::new();
@@ -153,6 +154,7 @@ fn process_candidate(
         eq_mode,
         ap_hint,
         &mut bp_scratch,
+        policy,
     )
 }
 
@@ -169,7 +171,7 @@ fn process_candidate(
 /// ordering). Composed here rather than duplicated there, so the
 /// unbudgeted path cannot drift from the budgeted one.
 #[allow(clippy::too_many_arguments)]
-fn process_candidate_with_scratch(
+fn process_candidate_with_scratch<Pol: MessagePolicy>(
     cand: &SyncCandidate,
     audio: &[i16],
     fft_cache: &[num_complex::Complex<f32>],
@@ -182,10 +184,11 @@ fn process_candidate_with_scratch(
         crate::fec::ldpc::params::Ldpc174_91Params,
         LlrT,
     >,
+    policy: &Pol,
 ) -> Option<DecodeResult> {
     let state = triage_candidate(cand, audio, fft_cache)?;
     run_candidate_ladder(
-        state, audio, fft_cache, depth, strictness, known, eq_mode, ap_hint, bp_scratch,
+        state, audio, fft_cache, depth, strictness, known, eq_mode, ap_hint, bp_scratch, policy,
     )
 }
 
@@ -371,7 +374,7 @@ impl<'a> BudgetState<'a> {
 /// `accept` is the shared SNR-gate/`on_result` tail; see its definition
 /// in [`decode_frame_inner`].
 #[allow(clippy::too_many_arguments)]
-fn decode_all_candidates(
+fn decode_all_candidates<Pol: MessagePolicy>(
     candidates: &[SyncCandidate],
     audio: &[i16],
     fft_cache: &[num_complex::Complex<f32>],
@@ -381,10 +384,11 @@ fn decode_all_candidates(
     eq_mode: EqMode,
     ap_hint: Option<&ApHint>,
     accept: &(dyn Fn(DecodeResult) -> Option<DecodeResult> + Sync),
+    policy: &Pol,
 ) -> Vec<DecodeResult> {
     let decode_one = |cand: &SyncCandidate| -> Option<DecodeResult> {
         let r = process_candidate(
-            cand, audio, fft_cache, depth, strictness, known, eq_mode, ap_hint,
+            cand, audio, fft_cache, depth, strictness, known, eq_mode, ap_hint, policy,
         )?;
         accept(r)
     };
@@ -423,7 +427,7 @@ fn decode_all_candidates(
 /// [`decode_all_candidates`] — a silent difference in the reported
 /// freq/dt/SNR of a decode, which reads as a sensitivity regression.
 #[allow(clippy::too_many_arguments)]
-fn decode_scheduled_candidates(
+fn decode_scheduled_candidates<Pol: MessagePolicy>(
     candidates: &[SyncCandidate],
     audio: &[i16],
     fft_cache: &[num_complex::Complex<f32>],
@@ -434,6 +438,7 @@ fn decode_scheduled_candidates(
     ap_hint: Option<&ApHint>,
     check: crate::msg::decode_request::BudgetCheck<'_>,
     accept: &(dyn Fn(DecodeResult) -> Option<DecodeResult> + Sync),
+    policy: &Pol,
 ) -> (Vec<DecodeResult>, BudgetReport) {
     let triage_one = |(i, cand): (usize, &SyncCandidate)| -> Option<(usize, CandidateTriage)> {
         triage_candidate(cand, audio, fft_cache).map(|t| (i, t))
@@ -506,6 +511,7 @@ fn decode_scheduled_candidates(
             eq_mode,
             ap_hint,
             &mut bp_scratch,
+            policy,
         ) && let Some(r) = accept(r)
         {
             out.push((idx, r));
@@ -520,7 +526,7 @@ fn decode_scheduled_candidates(
 /// Expensive half: the 58 data-symbol DFTs, then the LLR/BP/OSD/AP
 /// staircase. Everything a budget would want to stop before.
 #[allow(clippy::too_many_arguments)]
-fn run_candidate_ladder(
+fn run_candidate_ladder<Pol: MessagePolicy>(
     triage: CandidateTriage,
     audio: &[i16],
     fft_cache: &[num_complex::Complex<f32>],
@@ -533,6 +539,7 @@ fn run_candidate_ladder(
         crate::fec::ldpc::params::Ldpc174_91Params,
         LlrT,
     >,
+    policy: &Pol,
 ) -> Option<DecodeResult> {
     let CandidateTriage {
         refined,
@@ -571,6 +578,7 @@ fn run_candidate_ladder(
             ap_hint,
             strictness,
             sync_cv,
+            policy,
         )
     };
 
@@ -602,7 +610,7 @@ fn run_candidate_ladder(
 /// Returns `(decoded_results, fft_cache)`.  Callers that don't need the cache
 /// can simply ignore the second element.
 #[allow(clippy::too_many_arguments)]
-fn decode_frame_inner(
+fn decode_frame_inner<Pol: MessagePolicy>(
     audio: &[i16],
     freq_min: f32,
     freq_max: f32,
@@ -617,6 +625,7 @@ fn decode_frame_inner(
     ap_hint: Option<&ApHint>,
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
     budget: Option<crate::msg::decode_request::BudgetCheck<'_>>,
+    policy: &Pol,
 ) -> (
     Vec<DecodeResult>,
     Vec<num_complex::Complex<f32>>,
@@ -717,6 +726,7 @@ fn decode_frame_inner(
             eq_mode,
             ap_hint,
             &accept,
+            policy,
         ),
         Some(check) => {
             let (v, rep) = decode_scheduled_candidates(
@@ -730,6 +740,7 @@ fn decode_frame_inner(
                 ap_hint,
                 check,
                 &accept,
+                policy,
             );
             budget_report = rep;
             v
@@ -788,7 +799,7 @@ fn decode_frame_inner(
 /// Round termination matches WSJT-X: round 2 skips when round 1 returned
 /// 0 decodes; round 3 skips when round 2 returned no NEW decodes.
 #[allow(clippy::too_many_arguments)]
-fn flat_sic_inner(
+fn flat_sic_inner<Pol: MessagePolicy>(
     audio: &[i16],
     freq_min: f32,
     freq_max: f32,
@@ -803,6 +814,7 @@ fn flat_sic_inner(
     n_rounds: usize,
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
     budget: &mut BudgetState<'_>,
+    policy: &Pol,
 ) -> (Vec<DecodeResult>, FftCache) {
     let mut residual = audio.to_vec();
     sic_inner_passes_with_cache(
@@ -820,6 +832,7 @@ fn flat_sic_inner(
         n_rounds,
         on_result,
         budget,
+        policy,
     )
 }
 
@@ -839,7 +852,7 @@ fn flat_sic_inner(
 /// messages are skipped if re-found and are not re-emitted in the
 /// returned `Vec`.
 #[allow(clippy::too_many_arguments)]
-fn sic_inner_passes(
+fn sic_inner_passes<Pol: MessagePolicy>(
     residual: &mut [i16],
     freq_min: f32,
     freq_max: f32,
@@ -853,10 +866,11 @@ fn sic_inner_passes(
     n_rounds: usize,
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
     budget: &mut BudgetState<'_>,
+    policy: &Pol,
 ) -> Vec<DecodeResult> {
     sic_inner_passes_with_cache(
         residual, freq_min, freq_max, sync_min, depth, max_cand, strictness, known, eq_mode,
-        ap_hint, None, n_rounds, on_result, budget,
+        ap_hint, None, n_rounds, on_result, budget, policy,
     )
     .0
 }
@@ -877,7 +891,7 @@ fn sic_inner_passes(
 /// (`DecodeRequest::sic_rounds` already clamps to this range for the
 /// `.sic_rounds()` path; checkpoint callers always pass `3`).
 #[allow(clippy::too_many_arguments)]
-fn sic_inner_passes_with_cache(
+fn sic_inner_passes_with_cache<Pol: MessagePolicy>(
     residual: &mut [i16],
     freq_min: f32,
     freq_max: f32,
@@ -892,6 +906,7 @@ fn sic_inner_passes_with_cache(
     n_rounds: usize,
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
     budget: &mut BudgetState<'_>,
+    policy: &Pol,
 ) -> (Vec<DecodeResult>, FftCache) {
     let mut all_results: Vec<DecodeResult> = Vec::new();
     let mut pass0_cache: Option<FftCache> = None;
@@ -973,6 +988,7 @@ fn sic_inner_passes_with_cache(
                 eq_mode,
                 ap_hint,
                 &mut bp_scratch,
+                policy,
             ) {
                 Some(r) => r,
                 None => continue,
@@ -1137,6 +1153,9 @@ pub(crate) fn decode_frame_subtract_staged_with_ap_debug_residual(
         &[],
         None,
         &mut BudgetState::new(None),
+        // Debug-only residual dump; it has no caller with an opinion
+        // about message text, so it takes the codec's own verdict.
+        &crate::msg::decode_request::DefaultPolicy,
     )
 }
 
@@ -1147,7 +1166,7 @@ pub(crate) fn decode_frame_subtract_staged_with_ap_debug_residual(
 const CHECKPOINT_SIC_ROUNDS: usize = 3;
 
 #[allow(clippy::too_many_arguments)]
-fn decode_frame_subtract_staged_with_ap_inner(
+fn decode_frame_subtract_staged_with_ap_inner<Pol: MessagePolicy>(
     audio: &[i16],
     freq_min: f32,
     freq_max: f32,
@@ -1177,6 +1196,7 @@ fn decode_frame_subtract_staged_with_ap_inner(
     outer_known: &[DecodeResult],
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
     budget: &mut BudgetState<'_>,
+    policy: &Pol,
 ) -> (Vec<DecodeResult>, Vec<i16>) {
     use staged_checkpoint::{A_SAMPLES, B_SAMPLES, C_SAMPLES};
 
@@ -1230,6 +1250,7 @@ fn decode_frame_subtract_staged_with_ap_inner(
             CHECKPOINT_SIC_ROUNDS,
             on_result,
             budget,
+            policy,
         );
         return (r, audio_clean);
     }
@@ -1267,6 +1288,7 @@ fn decode_frame_subtract_staged_with_ap_inner(
         CHECKPOINT_SIC_ROUNDS,
         on_result,
         budget,
+        policy,
     );
     // Checkpoint A's own residual is not carried forward — only its
     // decoded results are (ft8_decode.f90 reloads `dd=iwave` fresh at
@@ -1300,6 +1322,7 @@ fn decode_frame_subtract_staged_with_ap_inner(
             CHECKPOINT_SIC_ROUNDS,
             on_result,
             budget,
+            policy,
         );
         return (r, audio_clean);
     }
@@ -1377,6 +1400,7 @@ fn decode_frame_subtract_staged_with_ap_inner(
         CHECKPOINT_SIC_ROUNDS,
         on_result,
         budget,
+        policy,
     );
 
     let mut all_results = early_results;
@@ -1391,7 +1415,7 @@ fn decode_frame_subtract_staged_with_ap_inner(
 /// [`FrameDecodable::__sniper`]'s `Ft8` impl; also the shared inner for
 /// [`SniperRequest`]'s single-pass search.
 #[allow(clippy::too_many_arguments)]
-fn decode_sniper_inner(
+fn decode_sniper_inner<Pol: MessagePolicy>(
     audio: &[i16],
     target_freq: f32,
     depth: DecodeDepth,
@@ -1403,6 +1427,7 @@ fn decode_sniper_inner(
     search_hz: f32,
     on_result: Option<&(dyn Fn(&DecodeResult) + Sync)>,
     budget: &mut BudgetState<'_>,
+    policy: &Pol,
 ) -> (Vec<DecodeResult>, FftCache) {
     let freq_min = (target_freq - search_hz).max(100.0);
     let freq_max = (target_freq + search_hz).min(5900.0);
@@ -1457,6 +1482,7 @@ fn decode_sniper_inner(
                 &[],
                 eq_mode,
                 ap_hint,
+                policy,
             ) else {
                 continue;
             };
@@ -1502,6 +1528,7 @@ fn decode_sniper_inner(
                 &[],
                 eq_mode,
                 ap_hint,
+                policy,
             )?;
             #[cfg(all(feature = "fft-rustfft", feature = "std", not(feature = "fixed-point")))]
             {
@@ -1537,6 +1564,7 @@ fn decode_sniper_inner(
                 &[],
                 eq_mode,
                 ap_hint,
+                policy,
             )?;
             #[cfg(all(feature = "fft-rustfft", feature = "std", not(feature = "fixed-point")))]
             {
@@ -1571,7 +1599,9 @@ fn decode_sniper_inner(
 impl FrameDecodable for Ft8 {
     type DecodeResult = DecodeResult;
 
-    fn __single_pass(req: &DecodeRequest<'_, Self>) -> DecodeOutcome<Self> {
+    fn __single_pass<Pol: MessagePolicy>(
+        req: &DecodeRequest<'_, Self, Pol>,
+    ) -> DecodeOutcome<Self> {
         let (results, fft_cache, budget) = decode_frame_inner(
             req.audio,
             req.freq_min,
@@ -1587,6 +1617,7 @@ impl FrameDecodable for Ft8 {
             req.ap_hint,
             req.on_result,
             req.budget,
+            &req.policy,
         );
         DecodeOutcome {
             results,
@@ -1597,7 +1628,7 @@ impl FrameDecodable for Ft8 {
 }
 
 impl SupportsSicRounds for Ft8 {
-    fn __flat_sic(req: &DecodeRequest<'_, Self>) -> DecodeOutcome<Self> {
+    fn __flat_sic<Pol: MessagePolicy>(req: &DecodeRequest<'_, Self, Pol>) -> DecodeOutcome<Self> {
         let mut budget = BudgetState::new(req.budget);
         // Subtract caller-supplied `known` before round 0, same rationale
         // as `SupportsSicEarly::__staged_sic` below: without this, a
@@ -1624,6 +1655,7 @@ impl SupportsSicRounds for Ft8 {
                 req.sic_rounds,
                 req.on_result,
                 &mut budget,
+                &req.policy,
             );
             DecodeOutcome {
                 results,
@@ -1650,6 +1682,7 @@ impl SupportsSicRounds for Ft8 {
                 req.sic_rounds,
                 req.on_result,
                 &mut budget,
+                &req.policy,
             );
             DecodeOutcome {
                 results,
@@ -1676,7 +1709,7 @@ impl SupportsSicEarly for Ft8 {
     /// would silently mismatch. (It *is* reused by [`SupportsSicRounds`]'s
     /// impl above, whose single full-buffer round 0 has the matching
     /// shape.) Recomputing here is always correct, just not free.
-    fn __staged_sic(req: &DecodeRequest<'_, Self>) -> DecodeOutcome<Self> {
+    fn __staged_sic<Pol: MessagePolicy>(req: &DecodeRequest<'_, Self, Pol>) -> DecodeOutcome<Self> {
         // `req.known`'s pre-subtraction now happens *inside*
         // `decode_frame_subtract_staged_with_ap_inner` (2026-08-10,
         // issue #253) — scoped away from checkpoint A specifically, see
@@ -1720,6 +1753,7 @@ impl SupportsSicEarly for Ft8 {
             req.known,
             req.on_result,
             &mut budget,
+            &req.policy,
         );
         let fft_cache = FftCache(build_fft_cache(&residual));
         DecodeOutcome {
@@ -1811,8 +1845,25 @@ impl<'a> DecodeRequest<'a, Ft8> {
     }
 }
 
+/// FT8 is the one protocol whose decode path forms a message string
+/// inside the per-candidate ladder, which is where a policy has to be
+/// applied for a rejection to let the ladder keep going — see
+/// [`SupportsMessageFilter`]'s own doc comment for why FT4 and FST4
+/// cannot take one yet.
+impl SupportsMessageFilter for Ft8 {
+    fn __strategy_for<Pol: MessagePolicy>(
+        tag: StrategyTag,
+    ) -> fn(&DecodeRequest<'_, Self, Pol>) -> DecodeOutcome<Self> {
+        match tag {
+            StrategyTag::SinglePass => Self::__single_pass::<Pol>,
+            StrategyTag::FlatSic => Self::__flat_sic::<Pol>,
+            StrategyTag::StagedSic => Self::__staged_sic::<Pol>,
+        }
+    }
+}
+
 impl crate::msg::decode_request::SupportsSniper for Ft8 {
-    fn __sniper(req: &SniperRequest<'_, Self>) -> DecodeOutcome<Self> {
+    fn __sniper<Pol: MessagePolicy>(req: &SniperRequest<'_, Self, Pol>) -> DecodeOutcome<Self> {
         let mut budget = BudgetState::new(req.budget);
         let (results, fft_cache) = decode_sniper_inner(
             req.audio,
@@ -1826,6 +1877,7 @@ impl crate::msg::decode_request::SupportsSniper for Ft8 {
             req.search_hz,
             req.on_result,
             &mut budget,
+            &req.policy,
         );
         DecodeOutcome {
             results,
@@ -2429,6 +2481,7 @@ mod tests {
                     &[],
                     EqMode::Off,
                     None,
+                    &crate::msg::decode_request::DefaultPolicy,
                 );
                 eprintln!("  -> process_candidate result: {:?}", r.map(|d| d.pass));
             }

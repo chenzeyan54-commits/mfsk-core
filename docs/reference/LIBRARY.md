@@ -29,6 +29,7 @@ This document is the Rust host API. Other audiences:
   - [2.3 Compute budget](#23-compute-budget)
   - [2.4 Streaming delivery](#24-streaming-delivery)
   - [2.5 Protocols with their own entry point](#25-protocols-with-their-own-entry-point)
+  - [2.6 Message acceptance](#26-message-acceptance)
 - [3. Protocols](#3-protocols)
   - [3.1 Generic vs bespoke, per protocol](#31-generic-vs-bespoke-per-protocol)
   - [3.2 Geometry](#32-geometry)
@@ -130,6 +131,8 @@ DecodeRequest::<P>::new(audio, freq_min, freq_max, sync_min, max_cand)
 | `.ap_hint(&ApHint)` | `&ApHint` | none | `SupportsWideBandAp` — **FT8, FT4, every FST4 sub-mode** | lock message bits from an a-priori hypothesis |
 | `.sic_rounds(n)` | `usize`, clamped `1..=3` | none | `SupportsSicRounds` — **FT8, FT4** | flat successive-interference cancellation |
 | `.sic_early()` | — | none | `SupportsSicEarly` — **FT8** | checkpoint-emulation early decode, fixed 3-checkpoint structure |
+| `.also_accept(f)` | `Fn(&str) -> bool` | none | `SupportsMessageFilter` — **FT8** | accept what the codec accepts **plus** what `f` accepts — [§2.5](#26-message-acceptance) |
+| `.message_filter(f)` | `Fn(&str) -> bool` | none | `SupportsMessageFilter` — **FT8** | replace the codec's verdict with `f` — [§2.5](#26-message-acceptance) |
 | `.on_result(cb)` | `FnMut(&Row)` | none | all | deliver rows as they are found — [§2.4](#24-streaming-delivery) |
 | `.budget(check)` | `FnMut() -> bool` | none | all | caller-supplied deadline predicate — [§2.3](#23-compute-budget) |
 | `.sniper(...)` | `(audio, target_hz, max_cand)` | — | `SupportsSniper` — **FT8** | build a `SniperRequest` instead |
@@ -181,6 +184,8 @@ for r in &results {
 | `.strictness(s)` | `Normal` | as `DecodeRequest` |
 | `.eq_mode(m)` | `Off` | as `DecodeRequest` |
 | `.ap_hint(&h)` | none | as `DecodeRequest` |
+| `.also_accept(f)` | none | as `DecodeRequest` |
+| `.message_filter(f)` | none | as `DecodeRequest` |
 | `.on_result(cb)` | none | as `DecodeRequest` |
 | `.budget(check)` | none | as `DecodeRequest` |
 | `.decode()` | — | same `DecodeOutcome<P>` shape |
@@ -328,6 +333,78 @@ reduce to a simple bandwidth offset, so it is relative-only: compare
 JT9 decodes against each other, not against other protocols.
 `Wspr`'s is a `wsprd`-calibrated candidate SNR, the same figure
 `wsprd` itself prints next to a spot.
+
+### 2.6 Message acceptance
+
+Everything below this point in the stack is error *detection*: the
+LDPC parity check, then the CRC. Neither says anything about whether
+the string that comes out is a message someone sent. A CRC-14 false
+positive is a codeword the decoder converged on that is not the
+transmitted one, so its 77 information bits are effectively uniform —
+and with `max_cand = 200` × 4 LLR variants × OSD, 1/16384 produces one
+or two of them per FT8 slot. Better than half of those unpack to a
+syntactically valid message.
+
+`MessageCodec::is_plausible` is what refuses them: for
+`Wsjt77Message`, an ITU prefix allowlist over the callsign tokens plus
+structural checks for the message types whose exchange fields are not
+callsigns. **It has no WSJT-X counterpart** — `ft8b.f90` gates on
+`nbadcrc` and `nharderrors` alone. It exists because this crate's
+default search is deeper than upstream's and reaches candidates
+upstream never scores.
+
+That makes it a judgement call rather than a port, and judgement calls
+belong to the caller. Two builder methods adjust it:
+
+```rust
+use mfsk_core::ft8::Ft8;
+use mfsk_core::msg::decode_request::DecodeRequest;
+
+/// Whatever the deployment knows and the ITU allowlist does not.
+fn is_special_event_call(token: &str) -> bool {
+    token.starts_with("8J")
+}
+
+let audio = vec![0i16; 180_000]; // 15 s @ 12 kHz
+
+// The default filter, plus callsigns it does not know about.
+let widened = DecodeRequest::<Ft8>::new(&audio, 200.0, 3000.0, 1.5, 20)
+    .also_accept(|text| text.split_whitespace().all(is_special_event_call))
+    .decode();
+
+// No opinion at all — every CRC-passing string, phantoms included.
+let unfiltered = DecodeRequest::<Ft8>::new(&audio, 200.0, 3000.0, 1.5, 20)
+    .message_filter(|_| true)
+    .decode();
+
+// Silence carries neither real signals nor CRC survivors, so even the
+// filterless run comes back empty.
+assert!(widened.results.is_empty());
+assert!(unfiltered.results.is_empty());
+```
+
+`.also_accept(f)` can only widen: it cannot lose a decode the default
+would have made. `.message_filter(f)` replaces the verdict outright,
+and the thing it replaces removes roughly two thirds of the CRC
+survivors that reach it — a permissive `f` will surface phantom rows
+the default hides. Prefer the first unless the whole verdict is wrong
+for the deployment.
+
+**Zero-cost when unused.** The policy is a type parameter, not a
+`&dyn Fn` like `.on_result()` and `.budget()`: a request that names
+neither method carries `DefaultPolicy`, which is a zero-sized type
+whose verdict inlines to the bare codec call. The two hooks fire once
+per *decode*; this one fires once per candidate that reaches the text
+stage, which is why it is worth the type parameter.
+
+**FT8 only**, gated on `SupportsMessageFilter`. Not a statement about
+the codec — FT4 and every FST4 sub-mode share `Wsjt77Message` — but
+about the pipeline. FT8's bespoke engine forms the message string
+inside the per-candidate ladder, where rejecting one lets the ladder
+keep going; the generic engine FT4 and FST4 share returns information
+bits and never forms a string at all, because `engine` does not depend
+on `msg`. Calling either method on those protocols is a compile error
+naming the missing capability, not a silent no-op.
 
 ---
 
