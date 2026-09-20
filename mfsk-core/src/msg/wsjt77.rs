@@ -224,6 +224,16 @@ fn resolve_hash12(n12: u32, ht: &CallsignHashTable) -> String {
     }
 }
 
+/// [`resolve_hash12`] for the 22-bit hash the Type-5 message carries in
+/// its second callsign field (`packjt77.f90:605` `hash22`).
+///
+/// Note the asymmetry with [`CallsignHashTable::lookup12`]:
+/// `lookup22` already returns the callsign wrapped in `<>`, so this
+/// must not wrap it again. [`unpack28_h`] relies on the same thing.
+fn resolve_hash22(n22: u32, ht: &CallsignHashTable) -> String {
+    ht.lookup22(n22).unwrap_or_else(|| "<...>".to_string())
+}
+
 /// Decode a 15-bit Maidenhead grid square index.
 /// The 5-bit power field of a WSPR-type message, in dBm.
 ///
@@ -296,7 +306,11 @@ fn wspr_prefix_suffix(npfx: u32, call: &str) -> Option<String> {
 /// is range-checked, and `j5 == j6 == 24` is the sentinel for a
 /// four-character grid, which upstream renders by leaving characters
 /// 5-6 blank.
-fn to_grid6(n: u32) -> Option<String> {
+///
+/// **Not** upstream's `to_grid6`, which is a different function on a
+/// different base — see [`to_grid6`]. This was named `to_grid6` until
+/// the type-5 port needed the real one and the collision surfaced.
+fn to_grid(n: u32) -> Option<String> {
     let mut n = n;
     let j1 = n / (18 * 10 * 10 * 25 * 25);
     if j1 > 17 {
@@ -332,6 +346,52 @@ fn to_grid6(n: u32) -> Option<String> {
         g.push((b'A' + j5 as u8) as char);
         g.push((b'A' + j6 as u8) as char);
     }
+    Some(g)
+}
+
+/// Ported from `packjt77.f90`'s `to_grid6` — the strictly
+/// six-character form used by the Type-5 (EU VHF contest) message.
+///
+/// Distinct from [`to_grid`] in both base and range: the subsquare
+/// digits run `0..=23` (`A`..`X`) against a base of 24 rather than
+/// `0..=24` against 25, and there is no four-character sentinel. The
+/// consequence is a tight bound — `18*18*10*10*24*24 = 18_662_400`
+/// valid codes in a 25-bit field, so 44 % of the field names no grid
+/// at all and is refused, which `packjt77.f90:599` checks up front.
+fn to_grid6(n: u32) -> Option<String> {
+    let mut n = n;
+    let j1 = n / (18 * 10 * 10 * 24 * 24);
+    if j1 > 17 {
+        return None;
+    }
+    n -= j1 * (18 * 10 * 10 * 24 * 24);
+    let j2 = n / (10 * 10 * 24 * 24);
+    if j2 > 17 {
+        return None;
+    }
+    n -= j2 * (10 * 10 * 24 * 24);
+    let j3 = n / (10 * 24 * 24);
+    if j3 > 9 {
+        return None;
+    }
+    n -= j3 * (10 * 24 * 24);
+    let j4 = n / (24 * 24);
+    if j4 > 9 {
+        return None;
+    }
+    n -= j4 * (24 * 24);
+    let j5 = n / 24;
+    let j6 = n - j5 * 24;
+    if j5 > 23 || j6 > 23 {
+        return None;
+    }
+    let mut g = String::with_capacity(6);
+    g.push((b'A' + j1 as u8) as char);
+    g.push((b'A' + j2 as u8) as char);
+    g.push((b'0' + j3 as u8) as char);
+    g.push((b'0' + j4 as u8) as char);
+    g.push((b'A' + j5 as u8) as char);
+    g.push((b'A' + j6 as u8) as char);
     Some(g)
 }
 
@@ -381,13 +441,19 @@ fn unpack_free_text(msg: &[u8]) -> String {
 /// Returns `None` if the message type is unsupported or the bits are
 /// inconsistent (e.g. unused type codes, bad grid index).
 ///
-/// Supported types:
+/// Supported types — every one `packjt77.f90` defines, since the
+/// Type-5 port (issue #383); `0/2` and `i3 >= 6` are the codes
+/// upstream itself marks unused and refuses.
 /// - `0/0`  Free text
 /// - `0/1`  DXpedition RR73
 /// - `0/3`, `0/4`  ARRL Field Day: `CALL1 CALL2 [R] <ntx><class> SEC`
+/// - `0/5`  Telemetry, 71 bits as up to 18 hex digits
+/// - `0/6`  WSPR types 1/2/3
 /// - `1`    Standard: `CALL1 CALL2 GRID` or `CALL1 CALL2 REPORT`
 /// - `2`    Standard with `/P`
+/// - `3`    ARRL RTTY Roundup
 /// - `4`    One non-standard callsign + 12-bit hashed counterpart
+/// - `5`    EU VHF contest: `<CALL> <CALL> [R] <rst><serial> GRID6`
 pub fn unpack77(msg: &[u8]) -> Option<String> {
     // One implementation, not two. This used to carry a full copy of
     // the branch table that `unpack77_with_hash` also carries, the
@@ -619,7 +685,7 @@ fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
                     _ => {
                         let n22 = read_bits(msg, 0, 22);
                         let igrid6 = read_bits(msg, 22, 25);
-                        let grid = to_grid6(igrid6)?;
+                        let grid = to_grid(igrid6)?;
                         Some(format!("{} {}", unpack28_h(n22 + NTOKENS, ht), grid))
                     }
                 }
@@ -762,6 +828,38 @@ fn unpack77_body(msg: &[u8], ht: &CallsignHashTable) -> Option<String> {
             Some(format!(
                 "{}{} {} {}{} {}",
                 prefix, c1, c2, r_prefix, rst, exch
+            ))
+        }
+
+        5 => {
+            // `packjt77.f90:593-610` — EU VHF contest, laid out
+            // `b12,b22,b1,b3,b11,b25` over the 74 payload bits: two
+            // *always-hashed* callsigns (`pack77_5` refuses the type
+            // unless both are written `<CALL>`), the `R` flag, the
+            // RS(T) report, a serial and a six-character grid.
+            //
+            // Unimplemented until now — the outer `match` fell through
+            // to `_ => None`, so an EU VHF contest frame was a dropped
+            // decode rather than a rejected one, the same gap the
+            // telemetry and WSPR types had.
+            let n12 = read_bits(msg, 0, 12);
+            let n22 = read_bits(msg, 12, 22);
+            let ir = msg[34] & 1;
+            let irpt = read_bits(msg, 35, 3);
+            let iserial = read_bits(msg, 38, 11);
+            let igrid6 = read_bits(msg, 49, 25);
+            // `packjt77.f90:599` guards this before unpacking anything
+            // else; [`to_grid6`]'s own bounds are the same test, so
+            // running it first is equivalent and keeps one copy.
+            let grid = to_grid6(igrid6)?;
+            let c1 = resolve_hash12(n12, ht);
+            let c2 = resolve_hash22(n22, ht);
+            // `packjt77.f90:607` — `write(cexch,'(i2,i4.4)') nrs,iserial`.
+            let nrs = 52 + irpt;
+            let r = if ir == 1 { "R " } else { "" };
+            Some(format!(
+                "{} {} {}{:02}{:04} {}",
+                c1, c2, r, nrs, iserial, grid
             ))
         }
 
@@ -1102,6 +1200,63 @@ fn plausible_call_token(w: &str) -> bool {
     (w.starts_with('<') && w.ends_with('>')) || is_plausible_callsign(w)
 }
 
+/// Recognise the Type-5 (EU VHF contest) message and judge it, or
+/// return `None` when the words are not that shape.
+///
+/// `packjt77.f90:609-610` renders it as
+/// `<CALL> <CALL> [R] <nrs><serial> GRID6`, where `nrs` is 52..=59, the
+/// serial is four digits and the grid is strictly six characters.
+///
+/// **Both callsigns are always hashes** — `pack77_5` refuses to build
+/// the type unless the operator wrote them `<CALL>` — so unlike every
+/// other type here there is no callsign to check, and the exchange
+/// fields span their encodable ranges almost completely. Accepting the
+/// shape alone would make this a 100 %-survival type: 138 700 of 2 M
+/// uniform payloads reach it, a 44 % increase in the surviving phantom
+/// population on its own (`phantom_survival_rates`).
+///
+/// What distinguishes a real one is that its hashes *resolve*. A
+/// station running this exchange has already put both callsigns in the
+/// table; a CRC survivor's 12- and 22-bit hashes land on an entry with
+/// probability ~`n/2^12` and ~`n/2^22`. So require at least one side to
+/// have come back as a callsign rather than as `<...>`.
+fn eu_vhf_contest_plausible(words: &[&str]) -> Option<bool> {
+    let tail: &[&str] = match (words.len(), words.get(2)) {
+        (4, _) => &words[2..],
+        (5, Some(&"R")) => &words[3..],
+        _ => return None,
+    };
+    let (exch, grid) = (tail[0], tail[1]);
+    if !is_grid6(grid) {
+        return None;
+    }
+    if exch.len() != 6 || !exch.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if !matches!(exch[..2].parse::<u32>(), Ok(52..=59)) {
+        return None;
+    }
+    let hashed = |w: &str| w.starts_with('<') && w.ends_with('>');
+    if !hashed(words[0]) || !hashed(words[1]) {
+        return None;
+    }
+    Some(words[0] != "<...>" || words[1] != "<...>")
+}
+
+/// The six-character grid `packjt77.f90`'s `is_grid6` statement
+/// function accepts: field letters `A`..=`R`, square digits, subsquare
+/// letters `A`..=`X`.
+fn is_grid6(g: &str) -> bool {
+    let b = g.as_bytes();
+    b.len() == 6
+        && (b'A'..=b'R').contains(&b[0])
+        && (b'A'..=b'R').contains(&b[1])
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit()
+        && (b'A'..=b'X').contains(&b[4])
+        && (b'A'..=b'X').contains(&b[5])
+}
+
 /// Recognise the ARRL Field Day exchange and judge it, or return `None`
 /// when the words are not that shape and the caller should fall through
 /// to its generic per-token loop.
@@ -1145,6 +1300,9 @@ pub fn is_plausible_message(text: &str) -> bool {
     // measured that as a 100 % survival rate for the type: not because
     // the messages were plausible, but because nothing looked at them.
     if let Some(ok) = field_day_plausible(&words) {
+        return ok;
+    }
+    if let Some(ok) = eu_vhf_contest_plausible(&words) {
         return ok;
     }
 
@@ -2057,6 +2215,93 @@ mod tests {
             (71, 3, 4),
         ]);
         assert_eq!(unpack77(&m).as_deref(), Some("JA1ABC 3Y0Z R 32H DX"));
+    }
+
+    /// Inverse of [`to_grid6`] for the tests above.
+    fn grid6_index(g: &str) -> u32 {
+        let b = g.as_bytes();
+        let j = |i: usize, base: u8| (b[i] - base) as u32;
+        j(0, b'A') * 18 * 10 * 10 * 24 * 24
+            + j(1, b'A') * 10 * 10 * 24 * 24
+            + j(2, b'0') * 10 * 24 * 24
+            + j(3, b'0') * 24 * 24
+            + j(4, b'A') * 24
+            + j(5, b'A')
+    }
+
+    /// `packjt77.f90:593-610` — the EU VHF contest message, which the
+    /// outer `match` used to drop through `_ => None`.
+    #[test]
+    fn eu_vhf_contest_decodes_the_exchange() {
+        // irpt=7 => nrs 59, iserial=3, grid "IO91NP", R set.
+        let igrid6 = grid6_index("IO91NP");
+        let m = bits77(&[
+            (0, 12, 0x123),
+            (12, 22, 0x2_3456),
+            (34, 1, 1),
+            (35, 3, 7),
+            (38, 11, 3),
+            (49, 25, igrid6),
+            (74, 3, 5),
+        ]);
+        assert_eq!(unpack77(&m).as_deref(), Some("<...> <...> R 590003 IO91NP"));
+
+        // `ir = 0` drops the acknowledgement; irpt=0 is RS(T) 52.
+        let m = bits77(&[(35, 3, 0), (38, 11, 2047), (49, 25, igrid6), (74, 3, 5)]);
+        assert_eq!(unpack77(&m).as_deref(), Some("<...> <...> 522047 IO91NP"));
+    }
+
+    /// End-to-end: a Type-5 frame whose hashes are in the table
+    /// resolves to real callsigns and survives the phantom filter,
+    /// which is the whole basis on which the type is accepted.
+    #[test]
+    fn eu_vhf_contest_resolves_hashes_from_the_table() {
+        use crate::msg::hash_table::ihashcall;
+        let mut ht = CallsignHashTable::new();
+        ht.insert("PA3XYZ");
+        let m = bits77(&[
+            (0, 12, ihashcall("PA3XYZ", 12)),
+            (12, 22, 0x2_3456),
+            (34, 1, 1),
+            (35, 3, 7),
+            (38, 11, 3),
+            (49, 25, grid6_index("IO91NP")),
+            (74, 3, 5),
+        ]);
+        let text = unpack77_with_hash(&m, &ht).expect("type 5 unpacks");
+        assert_eq!(text, "<PA3XYZ> <...> R 590003 IO91NP");
+        assert!(
+            is_plausible_message(&text),
+            "a resolved hash is what makes it plausible: {text}"
+        );
+        // Without the table the same bits are indistinguishable from a
+        // CRC survivor.
+        let blind = unpack77(&m).expect("type 5 unpacks");
+        assert_eq!(blind, "<...> <...> R 590003 IO91NP");
+        assert!(!is_plausible_message(&blind));
+    }
+
+    /// `packjt77.f90:599` — the 25-bit grid field has 18_662_400 valid
+    /// codes, so 44 % of it names no square and is refused.
+    #[test]
+    fn eu_vhf_contest_rejects_an_out_of_range_grid() {
+        let g = |igrid6: u32| bits77(&[(49, 25, igrid6), (74, 3, 5)]);
+        assert!(unpack77(&g(18_662_399)).is_some(), "last valid code");
+        assert!(unpack77(&g(18_662_400)).is_none(), "one past the table");
+        assert!(unpack77(&g(33_554_431)).is_none(), "top of the field");
+    }
+
+    /// Both of this type's callsigns are hashes, so the only evidence a
+    /// message carries is whether they resolve. An unresolved pair is
+    /// indistinguishable from a CRC survivor and must not pass.
+    #[test]
+    fn eu_vhf_contest_needs_a_resolved_hash() {
+        assert!(!is_plausible_message("<...> <...> R 590003 IO91NP"));
+        assert!(is_plausible_message("<PA3XYZ> <...> R 590003 IO91NP"));
+        assert!(is_plausible_message("<...> <G4ABC/P> 590003 IO91NP"));
+        // Right shape, impossible RS(T) / grid.
+        assert!(!is_plausible_message("<PA3XYZ> <...> R 510003 IO91NP"));
+        assert!(!is_plausible_message("<PA3XYZ> <...> R 590003 IO91NZ"));
     }
 
     /// The DXpedition body was already ported; what was missing was
