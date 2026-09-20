@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 
 pub use crate::engine::pipeline::{DecodeDepth, DecodeResult, DecodeStrictness, FftCache};
 pub use crate::msg::ApHint;
-use crate::msg::decode_request::{DecodeOutcome, DecodeRequest, FrameDecodable};
+use crate::msg::decode_request::{DecodeOutcome, DecodeRequest, FrameDecodable, MessagePolicy};
 
 /// FST4-15 downsample configuration: 12 kHz → 666.7 Hz baseband
 /// (NDOWN = 18, matching WSJT-X `fst4_decode.f90`'s `ndown` for
@@ -167,7 +167,9 @@ macro_rules! impl_frame_decodable {
         impl FrameDecodable for $proto {
             type DecodeResult = DecodeResult;
 
-            fn __single_pass(req: &DecodeRequest<'_, Self>) -> DecodeOutcome<Self> {
+            fn __single_pass<Pol: MessagePolicy>(
+                req: &DecodeRequest<'_, Self, Pol>,
+            ) -> DecodeOutcome<Self> {
                 // See `pipeline::known_filtered_on_result`'s doc comment
                 // (same rationale as `ft4::decode`'s copy of this fix):
                 // without this, `on_result` could fire for a candidate

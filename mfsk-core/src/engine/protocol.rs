@@ -666,6 +666,37 @@ pub trait MessageCodec: Default + 'static {
         let _ = info;
         true
     }
+
+    /// Judge a message this codec already unpacked, as *text*.
+    ///
+    /// The layer below this one is the CRC, and a CRC false positive is
+    /// a codeword the decoder converged on that is not the transmitted
+    /// one — so its information bits are uniform, and it unpacks to a
+    /// syntactically valid message roughly half the time. Returning
+    /// `false` here is how a codec refuses one on grounds the bits
+    /// cannot express: a callsign whose prefix the ITU never allocated,
+    /// an exchange field outside the range its contest defines.
+    ///
+    /// Default: accept unconditionally. Appropriate for codecs whose
+    /// own field checks are the whole story, and for any codec whose
+    /// messages carry no redundant structure to check.
+    /// [`crate::msg::Wsjt77Message`] overrides it.
+    ///
+    /// **This has no upstream counterpart.** WSJT-X's `ft8b.f90` gates
+    /// on `nbadcrc` and `nharderrors` alone; the text filter is
+    /// mfsk-core's own, added because this crate's default search is
+    /// deeper than upstream's and reaches candidates upstream never
+    /// scores. Callers who disagree with the verdict override it per
+    /// request — see [`crate::msg::decode_request::MessagePolicy`].
+    ///
+    /// Associated-function shape (no `&self`) for the same reason
+    /// [`Self::verify_info`] has it: the verdict is a property of the
+    /// codec, and a function item passes into the policy layer without
+    /// an indirection.
+    fn is_plausible(text: &str) -> bool {
+        let _ = text;
+        true
+    }
 }
 
 /// Generic input to `MessageCodec::pack` — protocol-specific codecs accept

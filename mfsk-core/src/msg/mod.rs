@@ -138,4 +138,12 @@ impl MessageCodec for Wsjt77Message {
             _ => false,
         }
     }
+
+    /// [`wsjt77::is_plausible_message`] — the ITU-prefix callsign
+    /// allowlist plus the structural checks for the message types whose
+    /// exchange fields are not callsigns (ARRL Field Day, EU VHF
+    /// contest). See its own doc comment for what each part costs.
+    fn is_plausible(text: &str) -> bool {
+        wsjt77::is_plausible_message(text)
+    }
 }
