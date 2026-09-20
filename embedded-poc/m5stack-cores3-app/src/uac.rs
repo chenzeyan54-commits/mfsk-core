@@ -2038,8 +2038,22 @@ fn reader_thread(handle: DeviceHandle, addr: u8, iface_num: u8) {
             // buffer each, and the decode pipeline allocates on top of
             // that, so "how much was left when it died" is the first
             // thing worth knowing. Refs #163.
-            let free_internal = unsafe {
-                sys::heap_caps_get_free_size(sys::MALLOC_CAP_INTERNAL | sys::MALLOC_CAP_8BIT)
+            //
+            // **The largest block goes beside it, because the free
+            // total has been the misleading number.** Measured over
+            // 363 samples of a 44-minute run (2026-09-20), the
+            // largest contiguous block is a median of 51 % of the
+            // free total and a quarter of samples are under 43 %; at
+            // the run's low points it was 448-512 B while `int` still
+            // read 1.4 kB. A DMA buffer has to fit in one block, so
+            // reading `int` alone overstates the headroom by about
+            // 2x.
+            let (free_internal, largest_internal) = unsafe {
+                let caps = sys::MALLOC_CAP_INTERNAL | sys::MALLOC_CAP_8BIT;
+                (
+                    sys::heap_caps_get_free_size(caps),
+                    sys::heap_caps_get_largest_free_block(caps),
+                )
             };
             // `bps` is bytes in this interval, and the interval is
             // only *at least* a second — so it is printed, or a slow
@@ -2052,7 +2066,8 @@ fn reader_thread(handle: DeviceHandle, addr: u8, iface_num: u8) {
             log::info!(
                 "uac: rx tick: {bps} B/{int_ms}ms ({packets} pkt / {errors} err) \
                  | audio {out_samples} sa/s, rms {dbfs:.1} dBFS, peak {peak}, clip {clipped} \
-                 | blk {blk_max}/{blk_sum}us gap {gap_max}us to {to} | int={free_internal}",
+                 | blk {blk_max}/{blk_sum}us gap {gap_max}us to {to} \
+                 | int={free_internal} lrg={largest_internal}",
             );
             let _ = bytes;
             UAC_SA_PER_S.store(out_samples, Ordering::Release);
