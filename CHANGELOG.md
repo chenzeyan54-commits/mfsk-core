@@ -546,6 +546,34 @@ reported the grid healthy while the band said otherwise.
   After all of it: 102 slots over 29 minutes on 40 m, mean 8.2 decodes,
   no empty slot, `cut > 0` on 2 slots, no acquisition and no trim.
 
+- **CoreS3: every acquisition trial now has a slot to cut.** The entry
+  above reported the unreachable trials; this removes them, and the gap
+  was wider than that report said. `acquire_slot_phases` returns centres
+  in (−7.5, +7.5], `rem_euclid` turns a negative one into a capture
+  offset in (7.5, 15] s, and a whole slot only fits behind an offset up
+  to 10 s of a 25 s capture — so **every centre in (−5, 0)**, a third of
+  the period, had nothing behind it. Measured at 30 capture starts per
+  recording: 50 of 150 centres on each of `qso1`, `qso2` and
+  `qso3_busy` — the geometry, not the band — and on `qso3_busy` six of
+  thirty starts acquired *nothing at all*, the whole shortlist being
+  centres with no slot behind them, for which the board's only answer is
+  another 25 s capture.
+
+  The room was in the trial's own window rather than in the buffer.
+  `decode_block_tuned` searches ±2.5 s about wherever the slot is cut,
+  and the reachable band's complement is 5 s wide and wraps at both
+  ends, so no centre is further than 2.5 s from it: clamping the offset
+  circularly into the band always lands inside the search. What makes it
+  correct rather than merely closer is that the applied phase is now
+  measured from the offset actually cut at instead of from the centre —
+  the median DT that corrects it is relative to the cut, and the two
+  agreed only while nothing moved. Decodes at the grid that results:
+  `qso3_busy` 4.70 → 6.07, `qso1` 3.32 → 3.86, `qso2` 3.48 → 4.38; one
+  start of thirty lost a decode, six gained a grid where there had been
+  none. `mirror_acquisition_unreachable_phases` is the measurement.
+  `ACQUIRE_CAPTURE_SAMPLES` is now load-bearing for the 2.5 s bound,
+  which is `(SLOT − (CAPTURE − SLOT)) / 2`, and says so.
+
 - **CoreS3: the panel is BGR, and every colour has been swapped since
   the first screen.** `CSS_ORANGE` (255, 165, 0) reached the panel as
   (0, 165, 255) — sky blue. mipidsi defaults to RGB; the CoreS3's
