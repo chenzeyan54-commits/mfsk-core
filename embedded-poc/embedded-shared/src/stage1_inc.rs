@@ -481,7 +481,11 @@ pub fn spawn_with_wf(
         SPEC_EMIT_MAX_LAG_S,
         lag,
         if lag > SPEC_EMIT_MAX_LAG_S {
-            " — OVER: the outermost lags score against zero rows"
+            // Not "scores against zeros" — that explanation was
+            // measured false (`tests/ft8_coarse_partial_blocks.rs`).
+            // What the outermost lags lose is block 2, and a score
+            // over fewer Costas symbols is noisier, not larger.
+            " — OVER: the outermost lags are scored without all of block 2"
         } else {
             ""
         }
