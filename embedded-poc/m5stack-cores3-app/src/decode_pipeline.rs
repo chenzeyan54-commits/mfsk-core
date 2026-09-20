@@ -280,6 +280,34 @@ const FT8_KEY_UP_GUARD_MS: i64 = 0;
 /// same breath without a skip that has to be right about the future.
 const FT8_SLOT_FLOOR_MS: i64 = 0;
 
+/// The ±lag coarse sync searches, in seconds, **before** the emit
+/// point's coverage ceiling is applied to it.
+///
+/// Swept on the host mirror over every distinct width the row grid
+/// allows (fixed-point, 51 capture phases per recording,
+/// `mirror_partial_block2_policies`, 2026-09-20) — decodes:
+///
+/// ```text
+///   window   lags   qso3_busy   qso1   qso2
+///   ±0.80     21        331       88     87
+///   ±0.88     23        337      118    115
+///   ±0.96     25        335      116    112
+///   ±1.04     27        335      112    112
+/// ```
+///
+/// A maximum on all three with no distinct station lost, and 23 lag
+/// steps instead of 27 — 15 % off coarse sync, which on this board is
+/// 100-180 ms a slot. It replaced `1.0`, which `jz = round(lag /
+/// 0.08)` had been turning into 13 rows, i.e. ±1.04 s.
+///
+/// Confirmed on a radio the same day (40 m, IC-705): `dec` 8.90 ± 1.70
+/// over the first slots against 8.54 ± 1.93 over 63 baseline slots —
+/// a difference this sample cannot resolve, but no regression, and
+/// `defer` went from 1.27 a slot to 0 because the candidates that
+/// needed the whole slot were the ones at the extremes of the old
+/// window.
+const FT8_SEARCH_LAG_S: f32 = 0.88;
+
 /// `dual_core::DecodeConfig::share_cand_budget` — off pending a board
 /// measurement; the host mirror's gain is on `qso1`/`qso2`, which the
 /// SIM harness cannot play.
@@ -287,6 +315,86 @@ const FT8_SHARE_CAND: bool = match option_env!("MFSK_FT8_SHARE_CAND") {
     Some(s) => parse_u32(s) != 0,
     None => false,
 };
+
+/// Alternate `share_cand_budget` in blocks of this many slots, so one
+/// image measures both arms against the same band.
+///
+/// **Blocks, not alternate slots, and the block must be even.** Which
+/// stations are audible changes with the TX period, so odd/even
+/// alternation would compare arm A against one set of stations and arm
+/// B against another and call the difference an effect. An even block
+/// holds equally many slots of each period, so neither arm inherits a
+/// period.
+///
+/// **Smaller blocks do not cost resolution — they buy balance.** What
+/// resolves a difference is slots per arm, not block length: at the
+/// `dec` spread measured here (sd 1.94) one arm needs ~45 slots to
+/// resolve 1.2 decodes, ~20 for 1.9, ~12 for 2.4. Block length only
+/// decides how a drift across the session (band opening, battery sag)
+/// distributes over the two arms, and short blocks distribute it
+/// evenly. So on a run bounded by the battery rather than by patience,
+/// shorten the block and read the A/B as indicative.
+///
+/// `0` (the default) means no experiment: `FT8_SHARE_CAND` holds for
+/// every slot, which is what a shipped build does. Set it only for a
+/// measurement run — `MFSK_FT8_SHARE_CAND_AB=20` — and the boot line
+/// and every `SLOT[...]` line say which arm produced them, because two
+/// builds that differ only in an `option_env!` are otherwise
+/// indistinguishable in a log.
+const FT8_SHARE_CAND_AB: u32 = match option_env!("MFSK_FT8_SHARE_CAND_AB") {
+    Some(s) => parse_u32(s),
+    None => 0,
+};
+
+/// Alternate the coarse search window in blocks of this many slots,
+/// so one image measures the narrowed window against the old one on
+/// the same band.
+///
+/// `0` (the default) means no experiment. Set it for a measurement
+/// run — `MFSK_FT8_LAG_AB=2` — and each `SLOT` line says which arm
+/// produced it: `W` for the old ±1.04 s, `N` for [`FT8_SEARCH_LAG_S`].
+///
+/// **Must be even, and 2 is the right value.** Block length does not
+/// set the resolution — slots per arm does — so the only thing it
+/// buys is how evenly a drift in the band spreads across the two
+/// arms, and short is better. The floor is 2 rather than 1 because
+/// the TX period alternates every slot and each period carries a
+/// different set of stations: a 1-slot alternation gives one arm
+/// every odd slot and the other every even one, and the station mix
+/// becomes the arm. An even block holds one of each.
+///
+/// **Why this exists at all.** The narrowed window was first checked
+/// before-and-after in time (63 baseline slots, then 30), which gave
+/// `dec` +1.43 at 3.49σ — six times what the host sweep predicted,
+/// on a 40 m evening where the band itself was opening. A sequential
+/// comparison cannot separate the two. Blocks put the drift on both
+/// arms.
+const FT8_LAG_AB: u32 = match option_env!("MFSK_FT8_LAG_AB") {
+    Some(s) => parse_u32(s),
+    None => 0,
+};
+
+/// The window this crate shipped before the sweep, kept only as the
+/// control arm of [`FT8_LAG_AB`]. `jz = round(1.0 / 0.08)` makes it
+/// 13 rows, so it is really ±1.04 s.
+const FT8_SEARCH_LAG_WIDE_S: f32 = 1.0;
+
+// **Two block experiments on one counter would be confounded.** They
+// alternate on the same `SLOT_SEEN` with the same phase, so arm A of
+// one is always arm A of the other and neither result means anything.
+const _: () = assert!(
+    FT8_LAG_AB.is_multiple_of(2),
+    "MFSK_FT8_LAG_AB must be even — an odd block gives each arm one TX period"
+);
+const _: () = assert!(
+    FT8_LAG_AB == 0 || FT8_SHARE_CAND_AB == 0,
+    "MFSK_FT8_LAG_AB and MFSK_FT8_SHARE_CAND_AB alternate on the same slot counter — run one"
+);
+
+/// Slots seen since boot — the A/B block index comes off this rather
+/// than off `wav_idx`, which is the sink's own numbering and need not
+/// start at zero or stay dense across a re-anchor.
+static SLOT_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// `const`-context unsigned parse — `str::parse` is not `const`. Digits
 /// only; anything else is a build-time panic, which is what you want
@@ -343,6 +451,27 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
     .expect("spawn wf drainer");
 
     log::info!("decode pipeline ready (q_thresh={DEFAULT_Q_THRESH}, band 200..3000 Hz, cores3-app phase 0)");
+    // **The arm belongs in the boot line**, same reason `stage1_inc`
+    // puts the emit point in its own: a measurement build and a
+    // shipped build differ by one `option_env!` and a log that does
+    // not say which is which cannot be re-read later.
+    if FT8_LAG_AB != 0 {
+        log::warn!(
+            "decode pipeline: SEARCH LAG A/B in blocks of {FT8_LAG_AB} slots — arm W = \
+             {FT8_SEARCH_LAG_WIDE_S:.2} s (old), arm N = {FT8_SEARCH_LAG_S:.2} s"
+        );
+    }
+    log::info!(
+        "decode pipeline: share_cand {}",
+        if FT8_SHARE_CAND_AB == 0 {
+            format!("fixed {FT8_SHARE_CAND} (no A/B)")
+        } else {
+            format!(
+                "A/B in blocks of {FT8_SHARE_CAND_AB} slots — arm A = off, arm B = on; \
+                 `arm=` on each SLOT line"
+            )
+        }
+    );
 
     // **What the transmit side costs, measured before it exists.**
     //
@@ -626,7 +755,95 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         // An error past ±1.0 s is acquisition's job — it searches the
         // whole period on a full slot, which is the only place a wide
         // search is sound.
-        dual_core::set_sync_lag_s(1.0);
+        // **0.88, and the number is the coverage ceiling, not a round
+        // one.** `stage1_inc` emits at pair 87, which fills rows
+        // 0..173; block 2's last Costas symbol sits at row 162, so a
+        // lag of 11 rows still lands it inside real data and a lag of
+        // 12 does not. Eleven rows is 0.88 s.
+        //
+        // Swept on the host mirror over every distinct width the row
+        // grid allows (fixed-point, 51 capture phases per recording,
+        // `mirror_partial_block2_policies`, 2026-09-20). Decodes:
+        //
+        // ```text
+        //   window   lags   qso3_busy   qso1   qso2
+        //   ±0.80     21        331       88     87
+        //   ±0.88     23        337      118    115
+        //   ±0.96     25        335      116    112
+        //   ±1.04     27        335      112    112
+        // ```
+        //
+        // A maximum on all three, with no distinct station lost
+        // anywhere, and 23 lag steps instead of 27 — 15 % off coarse
+        // sync, which on this board is 100-180 ms a slot.
+        //
+        // **This used to read `1.0`, and that was never 1.0**: `jz =
+        // round(lag / 0.08)` makes it 13 rows, i.e. ±1.04 s. The
+        // sweep's `±1.04` row reproduces the shipped count exactly,
+        // which is how that was noticed.
+        //
+        // Narrowing also retires `FT8_BLOCK2_GATE`: inside ±0.88 no
+        // lag truncates block 2, so there is nothing for the gate to
+        // refuse. The gate was the cleanup for lags this window should
+        // not have visited — and it only ever removed the positive
+        // half, which is why it *lost* decodes on `qso1`/`qso2` (91
+        // and 92 against 118 and 115): the junk it left on the
+        // negative side was promoted into the refine budget it freed.
+        //
+        // **And it is not a free constant — it is a dependent one.**
+        // The ceiling moves with the emit point, so a build that
+        // emits earlier silently re-opens everything above: `87` is
+        // the only pair for which `0.88` happens to be right. Clamped
+        // rather than documented, because the version of this that
+        // was only documented is the one being fixed.
+        let slot_n = SLOT_SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let (share_cand, arm) = if FT8_SHARE_CAND_AB == 0 {
+            (FT8_SHARE_CAND, '-')
+        } else if (slot_n / FT8_SHARE_CAND_AB).is_multiple_of(2) {
+            (false, 'A')
+        } else {
+            (true, 'B')
+        };
+        // The window arm, when that is the experiment running. Decided
+        // from the same counter, which is why the const assert above
+        // refuses to have both.
+        //
+        // **Arithmetic, not a select between two f32 constants.**
+        // `if wide { 1.0 } else { 0.88 }` makes LLVM materialise a
+        // `[2 x float]` constant pool and the Xtensa backend cannot
+        // select it: `rustc-LLVM ERROR: Cannot select:
+        // XtensaISD::PCREL_WRAPPER TargetConstantPool`. Same family as
+        // the regression `release.opt-level = 1` exists for, and the
+        // same workaround `engine::pipeline` already carries.
+        let wide_arm = FT8_LAG_AB != 0 && (slot_n / FT8_LAG_AB.max(1)).is_multiple_of(2);
+        let arm = if FT8_LAG_AB == 0 {
+            arm
+        } else if wide_arm {
+            'W'
+        } else {
+            'N'
+        };
+        // The control arm is deliberately *above* the ceiling — that
+        // is the condition being measured — so it bypasses the clamp.
+        // `FT8_LAG_AB` is a constant, so only one side of this
+        // survives in a given build.
+        let want = FT8_SEARCH_LAG_S
+            + (FT8_SEARCH_LAG_WIDE_S - FT8_SEARCH_LAG_S) * (wide_arm as u32 as f32);
+        let lag_s = if FT8_LAG_AB == 0 {
+            want.min(embedded_shared::stage1_inc::SPEC_EMIT_MAX_LAG_S)
+        } else {
+            want
+        };
+        if lag_s < want {
+            log::warn!(
+                "FT8 search lag clamped {want:.2} -> {lag_s:.2} s by the emit \
+                 point's coverage ceiling — re-sweep the window for this emit pair"
+            );
+        }
+        dual_core::set_sync_lag_s(lag_s);
+
+        // Arm for this slot. Read once and used for both the config and
+        // the log line, so the label can never disagree with what ran.
 
         let cfg = dual_core::DecodeConfig {
             freq_min: 100.0,
@@ -641,7 +858,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             fine_sync: FT8_FINE_SYNC,
             key_up_guard_ms: FT8_KEY_UP_GUARD_MS,
             fine_sync_min_slack_ms: FT8_FINE_SYNC_MIN_SLACK_MS,
-            share_cand_budget: FT8_SHARE_CAND,
+            share_cand_budget: share_cand,
             slot_floor_ms: FT8_SLOT_FLOOR_MS,
             slot_end_hint: Some(slot_end_hint),
         };
@@ -657,6 +874,8 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             n_deferred,
             n_early_refined,
             n_in_time,
+            n_gate2_p1,
+            gate2_best_rank,
             // Not read any more: the ±0.2 s/slot nudge it fed was a
             // random walk, not an acquisition (see the lock-and-hold
             // comment below). Acquisition is cold acquisition's job.
@@ -769,13 +988,22 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         // for a longer buffer would cost internal DRAM in 44 staged
         // copies; two lines cost nothing.
         log::info!(
-            "SLOT[{wav_idx}] src={source} grid={} p1={n_pass1} ready={n_ready} defer={n_deferred} \
-             ref={n_early_refined} cut={n_cut} fb={n_fallback} dec={} intime={n_in_time}",
+            "SLOT[{wav_idx}] src={source} arm={arm} grid={} p1={n_pass1} ready={n_ready} \
+             defer={n_deferred} ref={n_early_refined} cut={n_cut} fb={n_fallback} dec={} \
+             intime={n_in_time} gate2={n_gate2_p1}@{}",
             mfsk_app_shared::grid_src::grid_label(
                 crate::grid_source(),
                 mfsk_app_shared::time_sync::grid_lock(),
             ),
             results.len(),
+            // Rank of the best two-block candidate, or `-` for none.
+            // The count alone cannot say whether gating would save
+            // anything: 12 of them below rank 25 cost nothing.
+            if gate2_best_rank == u16::MAX {
+                String::from("-")
+            } else {
+                format!("{gate2_best_rank}")
+            },
         );
         // **In ms, and still two lines.** Even split, the µs form
         // clipped at `slot_wait` on a radio — six seven-digit numbers

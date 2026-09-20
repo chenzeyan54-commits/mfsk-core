@@ -104,6 +104,13 @@ const EMBEDDED_SYNC_LAG_S: f32 = 1.0;
 ///
 /// Off by default until an on-air A-B says what it costs in
 /// *decodes*; candidate counts are not the quantity that decides it.
+/// **No-op at the shipped search window since 2026-09-20, retained on
+/// purpose.** `decode_pipeline` now searches the coverage ceiling
+/// itself, so no lag it visits has an incomplete block 2 and there is
+/// nothing here to refuse. Kept as the other half of an experiment
+/// that is still open — emit earlier and gate, rather than emit at 87
+/// and search narrower — which deleting it would close. See
+/// `mfsk_core::ft8::decode_block::PartialBlock2::Gate`.
 pub const FT8_BLOCK2_GATE: bool = option_env!("MFSK_FT8_BLOCK2_GATE").is_some();
 
 /// The lag the next coarse search will use, in milliseconds.
@@ -165,6 +172,28 @@ pub struct SpeculativeOut {
     /// so `results.len() - n_in_time` is decoded for the screen and
     /// for the period after next, not for this exchange.
     pub n_in_time: usize,
+    /// Pass-1 candidates whose `|dt_sec|` is past
+    /// [`crate::stage1_inc::SPEC_EMIT_MAX_LAG_S`], i.e. scored on two
+    /// Costas blocks instead of three because the emitted spectrogram
+    /// does not reach block 2 at that lag.
+    ///
+    /// **Observation only — nothing here acts on it.** The gate that
+    /// would (`FT8_BLOCK2_GATE`) stays off; this counts how often it
+    /// would have anything to do. The last knob wired on the strength
+    /// of a comment's reasoning rather than a measurement turned out
+    /// to be a no-op after it had been threaded through three boards
+    /// (`valid_rows`, 2026-09-20), so the count comes first.
+    pub n_gate2_p1: usize,
+    /// The best (lowest) pass-1 rank held by such a candidate, or
+    /// `u16::MAX` if there is none.
+    ///
+    /// This is the number that decides whether the gate is worth
+    /// anything: pass 1 is score-ordered and stage 3 takes from the
+    /// top, so a two-block candidate at rank 25 of 30 costs nothing
+    /// and one at rank 8 costs a stage-3 slot (~72 ms on this board).
+    /// `max_lag_s`'s own doc reports rank 8 on `qso3_busy`; whether a
+    /// live band does the same has never been measured.
+    pub gate2_best_rank: u16,
     /// Stage-3 candidates the [`DecodeConfig::budget_ms`] deadline
     /// stopped from being tried (speculative + deferred, first attempts
     /// and coarse-position retries alike). `0` when the budget is
@@ -564,6 +593,8 @@ pub fn run_speculative_slot(
                 t_early_done: t_post_recv,
                 t_slot_recv,
                 t_done: unsafe { esp_timer_get_time() },
+                n_gate2_p1: 0,
+                gate2_best_rank: u16::MAX,
                 skipped: true,
                 top3: [(0.0, 0.0, 0.0); 3],
                 slot_end_hint_us: slot_end_hint,
@@ -581,6 +612,29 @@ pub fn run_speculative_slot(
         FT8_BLOCK2_GATE.then_some(spec.valid_rows),
     );
     let t_coarse_done = unsafe { esp_timer_get_time() };
+
+    // Two-block candidates, counted and not acted on. See
+    // `SpeculativeOut::n_gate2_p1`.
+    let mut n_gate2_p1 = 0usize;
+    let mut gate2_best_rank = u16::MAX;
+    for (i, c) in pass1.iter().enumerate() {
+        // **Positive lag only.** Block 2 runs late in the slot, so only
+        // a positive lag pushes it past the filled rows; a negative
+        // lag moves it earlier, where it is always covered. What a
+        // negative lag truncates is block 0, which `sync_tail` does
+        // not include, so the `max()` of the two scores is untouched.
+        //
+        // Counted as `|dt|` on 2026-09-20 and the number was roughly
+        // double what it should have been — which then made the gated
+        // arm of the host comparison look as though it had left
+        // candidates behind that it had in fact removed.
+        if c.dt_sec > crate::stage1_inc::SPEC_EMIT_MAX_LAG_S {
+            n_gate2_p1 += 1;
+            if gate2_best_rank == u16::MAX {
+                gate2_best_rank = i as u16;
+            }
+        }
+    }
 
     let n_pass1 = pass1.len();
     let mut top3 = [(0.0f32, 0.0f32, 0.0f32); 3];
@@ -953,6 +1007,8 @@ pub fn run_speculative_slot(
         n_ready,
         n_deferred,
         n_early_refined,
+        n_gate2_p1,
+        gate2_best_rank,
         n_in_time,
         n_cut,
         n_fallback,
