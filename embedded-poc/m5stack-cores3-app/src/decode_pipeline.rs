@@ -1194,25 +1194,74 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                                 ui.set_acq_line(line.as_str());
                             }
                         }
-                        let off = ((centre * 12_000.0).round() as i64)
+                        // **Cut at the nearest offset a slot fits
+                        // behind, not at the centre itself.**
+                        //
+                        // `acquire_slot_phases` returns centres in
+                        // (−7.5, +7.5]; `rem_euclid` turns a negative
+                        // one into an offset in (7.5, 15] s, and a
+                        // whole slot only fits behind an offset up to
+                        // `max_off` = 10 s of a 25 s capture. So every
+                        // centre in (−5, 0) — **a third of the phase
+                        // space** — had no slot behind it, and its
+                        // trial was skipped (silently until
+                        // `c47a78fb`). On the host mirror
+                        // (`mirror_acquisition_unreachable_phases`)
+                        // that is 50 of 150 centres on each of the
+                        // three recordings, and on `qso3_busy` six of
+                        // thirty capture starts acquired *nothing at
+                        // all*: every centre that would have decoded
+                        // was one of the skipped ones.
+                        //
+                        // Capturing two slots would remove the limit
+                        // and needs ~1.44 MB transiently — the board
+                        // died of `rust_oom` trying, see
+                        // `uac::ACQUIRE_CAPTURE_SAMPLES`. The trial's
+                        // own window has the room instead.
+                        // `decode_block_tuned` searches ±2.5 s about
+                        // wherever the slot is cut; the reachable band
+                        // `[0, max_off]`'s complement is 5 s wide and
+                        // wraps at both ends, so no centre is further
+                        // than 2.5 s from it and the clamp always
+                        // lands inside the search.
+                        //
+                        // What makes it correct is the line below
+                        // measuring the applied phase from the offset
+                        // actually cut at rather than from the centre:
+                        // the median DT is relative to the cut. The
+                        // two agree only while nothing moves.
+                        //
+                        // Measured, skip → clamp, decodes at the grid
+                        // that results: qso3 4.70 → 6.07, qso1
+                        // 3.32 → 3.86, qso2 3.48 → 4.38.
+                        let max_off = audio.len().saturating_sub(SLOT_TRIAL_SAMPLES);
+                        let want = ((centre * 12_000.0).round() as i64)
                             .rem_euclid(SLOT_TRIAL_SAMPLES as i64)
                             as usize;
+                        let off = if want <= max_off {
+                            want
+                        } else if want - max_off < SLOT_TRIAL_SAMPLES - want {
+                            max_off
+                        } else {
+                            0
+                        };
+                        if off != want {
+                            log::info!(
+                                "    acq trial {}/{}: centre={centre:+.3} has no slot behind \
+                                 it — cutting at {:+.3} s",
+                                trial + 1,
+                                phases.len(),
+                                off as f32 / 12_000.0,
+                            );
+                        }
                         if audio.len() < off + SLOT_TRIAL_SAMPLES {
-                            // **Say so.** This used to `continue` in
-                            // silence, and so did the zero-decode case
-                            // below, so "none of 5 candidate phases
-                            // decoded" covered both "tried and failed"
-                            // and "never tried" — which want opposite
-                            // fixes. The second is real: a whole slot
-                            // cut at an offset past 10 s runs off the
-                            // end of a 25 s capture, so a third of the
-                            // phase space cannot be tried at all. See
-                            // `uac::ACQUIRE_CAPTURE_SAMPLES` for why
-                            // the obvious fix (capture two slots) is
-                            // not available.
+                            // Only reachable if the capture is shorter
+                            // than one slot, which `acquire_slot_phases`
+                            // refuses before returning any centre at
+                            // all. Kept so that a short buffer cannot
+                            // panic the decode task.
                             log::warn!(
-                                "    acq trial {}/{}: centre={centre:+.3} SKIPPED — needs \
-                                 {} samples, capture has {}",
+                                "    acq trial {}/{}: SKIPPED — needs {} samples, capture has {}",
                                 trial + 1,
                                 phases.len(),
                                 off + SLOT_TRIAL_SAMPLES,
@@ -1248,7 +1297,11 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                         }
                         dts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
                         let med = dts[dts.len() / 2];
-                        let mut dt = centre + med + start_s;
+                        // From the cut, not from the centre — see the
+                        // clamp above. `off` is in [0, 15) s where
+                        // `centre` was in (−7.5, +7.5]; the wrap below
+                        // normalises either.
+                        let mut dt = off as f32 / 12_000.0 + med + start_s;
                         while dt > 7.5 {
                             dt -= 15.0;
                         }

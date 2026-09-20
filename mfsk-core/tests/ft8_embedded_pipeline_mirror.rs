@@ -2434,3 +2434,196 @@ fn mirror_emit_earlier() {
         }
     }
 }
+
+/// **The phases a 25 s capture cannot cut a slot at, and what
+/// clamping the trial to the nearest reachable offset recovers.**
+///
+/// `acquire_slot_phases` returns centres in `(−7.5, +7.5]`; the board
+/// turns one into a capture offset with `rem_euclid(SLOT)`, so a
+/// negative centre becomes an offset in `(7.5, 15]` s. The capture is
+/// [`REQUIRED_SAMPLES`] = 25 s, so a whole slot can only be cut at an
+/// offset up to 10 s: **centres below −5 s have no slot behind them**
+/// and the trial loop skips them (`c47a78fb` made the skip visible;
+/// before that it was silent). Capturing two slots would fix it and
+/// costs ~1.44 MB transiently — the board died of `rust_oom` trying,
+/// see `uac::ACQUIRE_CAPTURE_SAMPLES`.
+///
+/// The fix has to come from the trial's own window, and the trial
+/// already has the room: `decode_block_tuned` searches ±2.5 s about
+/// wherever the slot is cut, and the phase applied is not the cut
+/// position but that position corrected by the median DT of what the
+/// trial decoded. The farthest any centre sits from the reachable
+/// band `[0, 10]` s is 2.5 s (the band's complement is 5 s wide and
+/// wraps at both ends), which is exactly the search half-width. So
+/// clamping the offset circularly into the band — and measuring the
+/// applied phase from the offset actually used rather than from the
+/// centre — makes every centre reachable, with the decode's own
+/// window absorbing the difference.
+///
+/// This scores both rules the way `mirror_acquisition_early_stop`
+/// does: run the trials, apply the best, and decode a steady slot at
+/// the grid that results.
+#[test]
+#[ignore = "diagnostic — unreachable acquisition trials, skipped vs clamped"]
+fn mirror_acquisition_unreachable_phases() {
+    use mfsk_core::ft8::acquire::{REQUIRED_SAMPLES, acquire_slot_phases};
+    use mfsk_core::ft8::decode_block::decode_block_tuned;
+
+    const ACQ_MAX_CAND: usize = 200;
+    const ACQ_MAX_TRIALS: usize = 5;
+    /// `grid_state::LOCK_MIN_DECODES` — the board stops trialling here.
+    const STOP_AT: usize = 3;
+    /// The last offset a whole slot fits behind.
+    const MAX_OFF: usize = REQUIRED_SAMPLES - SLOT;
+
+    let slot = load_slot();
+    let mut loopbuf = Vec::with_capacity(SLOT * 3);
+    for _ in 0..3 {
+        loopbuf.extend_from_slice(&slot);
+    }
+    let wrap = |mut dt: f32| {
+        while dt > 7.5 {
+            dt -= 15.0;
+        }
+        while dt <= -7.5 {
+            dt += 15.0;
+        }
+        dt
+    };
+    let unique = |rs: &[DecodeResult]| -> usize {
+        let mut m: Vec<String> = rs.iter().filter_map(|r| unpack77(r.message77())).collect();
+        m.sort();
+        m.dedup();
+        m.len()
+    };
+    // The nearest offset in `[0, MAX_OFF]` going round the 15 s
+    // period, and how far it had to move.
+    let reachable = |off: usize| -> (usize, i64) {
+        if off <= MAX_OFF {
+            (off, 0)
+        } else if off - MAX_OFF < SLOT - off {
+            (MAX_OFF, (off - MAX_OFF) as i64)
+        } else {
+            (0, -((SLOT - off) as i64))
+        }
+    };
+    let mut cache: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+
+    println!(
+        "  start | centres (* = no slot behind it)            | skip: land  dec | clamp: land  dec"
+    );
+    println!("  {:-<100}", "");
+    let (mut sum_skip, mut sum_clamp, mut n_starts) = (0usize, 0usize, 0usize);
+    let (mut n_unreach, mut n_cent) = (0usize, 0usize);
+    let mut differed = 0usize;
+    for step in 0..30 {
+        let start = step as f32 * 0.5;
+        let cap_k = (start * 12_000.0) as usize;
+        let audio = &loopbuf[cap_k..cap_k + REQUIRED_SAMPLES];
+        let phases = acquire_slot_phases(
+            audio,
+            FREQ_MIN,
+            FREQ_MAX,
+            SYNC_MIN,
+            ACQ_MAX_CAND,
+            ACQ_MAX_TRIALS,
+        );
+
+        // Every trial once, under both rules. `skip` is what the board
+        // does today: an unreachable centre contributes nothing.
+        // `clamp` cuts at the nearest reachable offset instead and
+        // measures the applied phase from there.
+        let mut marks = String::new();
+        let mut got_skip: Vec<(usize, f32)> = Vec::new();
+        let mut got_clamp: Vec<(usize, f32)> = Vec::new();
+        for &(centre, _) in phases.iter() {
+            let off = ((centre * 12_000.0).round() as i64).rem_euclid(SLOT as i64) as usize;
+            let (used, moved) = reachable(off);
+            n_cent += 1;
+            marks.push_str(&format!(
+                "{centre:+5.2}{} ",
+                if moved == 0 { ' ' } else { '*' }
+            ));
+            if moved != 0 {
+                n_unreach += 1;
+                got_skip.push((0, 0.0));
+            }
+            let rs = decode_block_tuned(
+                &audio[used..used + SLOT],
+                FREQ_MIN,
+                FREQ_MAX,
+                SYNC_MIN,
+                DecodeDepth::EMBEDDED,
+                MAX_CAND_TRIAL,
+                DEFAULT_BP_MAX_ITER,
+            );
+            if rs.is_empty() {
+                if moved == 0 {
+                    got_skip.push((0, 0.0));
+                }
+                got_clamp.push((0, 0.0));
+                continue;
+            }
+            let mut dts: Vec<f32> = rs.iter().map(|r| r.dt_sec).collect();
+            dts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+            // Measured from the offset actually cut at, not from the
+            // centre — the two are the same only when nothing moved.
+            let dt = wrap(used as f32 / 12_000.0 + dts[dts.len() / 2]);
+            if moved == 0 {
+                got_skip.push((rs.len(), dt));
+            }
+            got_clamp.push((rs.len(), dt));
+        }
+
+        // Best-of-N with the board's early stop, over what each rule ran.
+        let best_of = |got: &[(usize, f32)]| -> Option<(usize, f32)> {
+            let mut best: Option<(usize, f32)> = None;
+            for &(n, dt) in got.iter() {
+                if n > 0 && best.is_none_or(|(bn, _)| n > bn) {
+                    best = Some((n, dt));
+                }
+                if n >= STOP_AT {
+                    break;
+                }
+            }
+            best
+        };
+        let mut dec_at = |dt: f32| -> (f32, usize) {
+            let land = (start + dt).rem_euclid(15.0);
+            let key = (land * 1000.0).round() as i32;
+            let dec = *cache
+                .entry(key)
+                .or_insert_with(|| unique(&at_phase(&slot, land).results));
+            (if land > 7.5 { land - 15.0 } else { land }, dec)
+        };
+        let skip = best_of(&got_skip).map(|(_, dt)| dec_at(dt));
+        let clamp = best_of(&got_clamp).map(|(_, dt)| dec_at(dt));
+        if skip.is_none() && clamp.is_none() {
+            println!("  {start:5.1} | {marks:42} | (nothing decoded either way)");
+            continue;
+        }
+        n_starts += 1;
+        sum_skip += skip.map_or(0, |(_, d)| d);
+        sum_clamp += clamp.map_or(0, |(_, d)| d);
+        if skip.map(|(_, d)| d) != clamp.map(|(_, d)| d) {
+            differed += 1;
+        }
+        let show = |o: Option<(f32, usize)>| match o {
+            Some((land, dec)) => format!("{land:+6.2} {dec:3}"),
+            None => "  none   -".to_string(),
+        };
+        println!(
+            "  {start:5.1} | {marks:42} | {} | {}",
+            show(skip),
+            show(clamp)
+        );
+    }
+
+    println!(
+        "\n  {n_unreach} of {n_cent} centres had no slot behind them\n  \
+         over {n_starts} starts that decoded at all:\n    \
+         skip  (today): dec {:.2}\n    clamp        : dec {:.2}   ({differed} starts differed)",
+        sum_skip as f32 / n_starts as f32,
+        sum_clamp as f32 / n_starts as f32,
+    );
+}
