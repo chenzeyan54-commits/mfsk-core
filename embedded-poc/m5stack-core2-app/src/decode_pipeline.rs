@@ -113,6 +113,8 @@ pub fn run() -> ! {
             n_fallback: _,
             n_ready,
             n_deferred,
+            n_early_refined: _,
+            n_in_time: _,
             bootstrap_dt_med: _,
             t_post_recv,
             t_coarse_done,

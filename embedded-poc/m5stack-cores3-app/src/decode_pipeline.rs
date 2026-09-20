@@ -521,6 +521,8 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             n_fallback,
             n_ready,
             n_deferred,
+            n_early_refined,
+            n_in_time,
             // Not read any more: the ±0.2 s/slot nudge it fed was a
             // random walk, not an acquisition (see the lock-and-hold
             // comment below). Acquisition is cold acquisition's job.
@@ -634,7 +636,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         // copies; two lines cost nothing.
         log::info!(
             "SLOT[{wav_idx}] src={source} grid={} p1={n_pass1} ready={n_ready} defer={n_deferred} \
-             cut={n_cut} fb={n_fallback} dec={}",
+             ref={n_early_refined} cut={n_cut} fb={n_fallback} dec={} intime={n_in_time}",
             mfsk_app_shared::grid_src::grid_label(
                 crate::grid_source(),
                 mfsk_app_shared::time_sync::grid_lock(),

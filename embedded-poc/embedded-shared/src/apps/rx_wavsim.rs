@@ -122,6 +122,8 @@ pub fn run_sweep(wavs: &'static [&'static [u8]], cfgs: &'static [RxSweepCfg]) ->
             n_pass1,
             n_ready,
             n_deferred,
+            n_early_refined: _,
+            n_in_time: _,
             n_cut: _,
             n_fallback: _,
             bootstrap_dt_med: _,

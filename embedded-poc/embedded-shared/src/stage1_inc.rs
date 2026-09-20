@@ -94,8 +94,55 @@ const TARGET_PEAK: i32 = (NFFT_SPEC * 2) as i32;
 // Pairs 87..91 (m=174..183) still get computed when `wf_q.is_some()`
 // to keep the WF flowing through the slot tail; `wf_q = None`
 // (bench) skips them via the `pair_limit` branch in advance_pairs.
-const SPEC_EMIT_PAIR: usize = 87; // emit when next_pair == 87 (= pairs 0..86 done, m=0..173 valid)
+// **`MFSK_FT8_SPEC_EMIT_PAIR` moves it, and what that buys is the
+// reply deadline** (2026-09-20). Each pair earlier is 160 ms of wall
+// clock handed to the decode task before the slot boundary — and the
+// boundary, not `slot end + 0.5 s`, is when a reply has to be chosen:
+// WSJT-X takes the message from the auto-sequencer and asserts PTT in
+// the same pass at t = 0 (see
+// `dual_core::FT8_KEY_UP_AFTER_SLOT_END_US` for the whole upstream
+// schedule). Measured on a radio 2026-09-19 (118 slots,
+// `m5stack-cores3-app/logs/udp_ts_2026-09-19.log`): the early path
+// wants 1 143 ms of stage 3 and only 818 ms of it lands before the
+// boundary — `tail_win` 921 ms less `coarse` 103 ms — so **29 % of it,
+// roughly the last 4 of 15 candidates at ~75 ms each, is decided too
+// late to answer**. Pair 85 adds 320 ms and brings the whole
+// `max_cand` budget inside the deadline.
+//
+// The cost is the truncation this constant's own comment describes,
+// measured on the host mirror at `mirror_emit_earlier` (81 phases,
+// fixed-point, value allocation on): `qso3_busy` 6.52 -> 6.31 decodes
+// at pair 85, `qso1` 2.75 -> 2.74, `qso2` 2.86 -> 2.86. Those are
+// *totals* from a mirror with no deadline in it; what the move buys is
+// on the other side of a boundary the mirror does not model, which is
+// why the decision waits on a radio run rather than on those numbers.
+const SPEC_EMIT_PAIR: usize = match option_env!("MFSK_FT8_SPEC_EMIT_PAIR") {
+    Some(s) => parse_usize(s),
+    None => 87, // emit when next_pair == 87 (= pairs 0..86 done, m=0..173 valid)
+};
 const _: () = assert!(SPEC_EMIT_PAIR <= N_PAIRS, "SPEC_EMIT_PAIR > N_PAIRS");
+// Below this the emitted spectrogram stops covering block 2 at all
+// (last Costas at m=162 => pair 81), and coarse sync would be scoring
+// one sync block out of three without saying so.
+const _: () = assert!(SPEC_EMIT_PAIR >= 82, "SPEC_EMIT_PAIR drops block 2");
+
+/// `const`-context unsigned parse — `str::parse` is not `const`.
+/// Digits only; anything else is a build-time panic, which is what a
+/// typo in a sweep env var deserves rather than a silent fallback.
+const fn parse_usize(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut v = 0usize;
+    while i < b.len() {
+        assert!(
+            b[i] >= b'0' && b[i] <= b'9',
+            "MFSK_FT8_SPEC_EMIT_PAIR: digits only"
+        );
+        v = v * 10 + (b[i] - b'0') as usize;
+        i += 1;
+    }
+    v
+}
 
 // Phase-E2 per-half allsum parameters (matches dual_core
 // coarse_sync_split_with_allsum band 100..3000 split at 1550).

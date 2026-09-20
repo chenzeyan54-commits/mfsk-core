@@ -120,6 +120,22 @@ pub struct SpeculativeOut {
     pub n_pass1: usize,
     pub n_ready: usize,
     pub n_deferred: usize,
+    /// Candidates the early (prefix) half actually handed to stage 3.
+    /// With `results.len()` and the `early` timing it gives the cost
+    /// per candidate, which is what shows whether an allocation change
+    /// moved work or merely moved it around: a BP that converges exits
+    /// on the iteration it converges (`fec::ldpc::bp`), a hopeless one
+    /// leaves via the stall detector at ~10-15, and a marginal one
+    /// burns all `bp_max_iter`. Selecting better candidates is
+    /// therefore also selecting cheaper ones.
+    pub n_early_refined: usize,
+    /// Of `results`, how many were decoded **before the slot
+    /// boundary** — in time to be answered in the next period. See
+    /// [`FT8_KEY_UP_AFTER_SLOT_END_US`]: the reply is committed at the
+    /// boundary, while stage 3 is allowed to claim for another 0.5 s,
+    /// so `results.len() - n_in_time` is decoded for the screen and
+    /// for the period after next, not for this exchange.
+    pub n_in_time: usize,
     /// Stage-3 candidates the [`DecodeConfig::budget_ms`] deadline
     /// stopped from being tried (speculative + deferred, first attempts
     /// and coarse-position retries alike). `0` when the budget is
@@ -508,6 +524,8 @@ pub fn run_speculative_slot(
                 n_pass1: 0,
                 n_ready: 0,
                 n_deferred: 0,
+                n_early_refined: 0,
+                n_in_time: 0,
                 n_cut: 0,
                 n_fallback: 0,
                 bootstrap_dt_med: None,
@@ -586,11 +604,17 @@ pub fn run_speculative_slot(
     // different thing — that is a backlogged pipeline, it is true, and
     // it is meant to bite.
     const HINT_SANE_US: i64 = 7_500_000;
-    let key_up_us = cfg
-        .slot_end_hint
-        .and_then(|f| f())
-        .map(|slotend| key_up_deadline(slotend, cfg.key_up_guard_ms.max(0) * 1_000))
-        .filter(|k| (*k - t_post_recv).abs() <= HINT_SANE_US);
+    let guard_us_cfg = cfg.key_up_guard_ms.max(0) * 1_000;
+    // The boundary itself, kept separate from the key-up deadline
+    // derived from it. They are 0.5 s apart and answer different
+    // questions: the deadline is when stage 3 stops claiming, the
+    // boundary is when a reply has to have been chosen. Same sanity
+    // filter, applied through the same derived value so the two cannot
+    // disagree about which slots have a usable hint.
+    let boundary_us = cfg.slot_end_hint.and_then(|f| f()).filter(|slotend| {
+        (key_up_deadline(*slotend, guard_us_cfg) - t_post_recv).abs() <= HINT_SANE_US
+    });
+    let key_up_us = boundary_us.map(|slotend| key_up_deadline(slotend, guard_us_cfg));
     let slack_ms = key_up_us
         .map(|d| (d - t_post_recv) / 1_000)
         .unwrap_or(i64::MAX);
@@ -682,6 +706,12 @@ pub fn run_speculative_slot(
     let n_deferred = deferred.len();
 
     let mut n_early_refined = 0usize;
+    // Decodes completed before the slot boundary — the ones in time to
+    // be answered in the next period. Exact for the early first-attempt
+    // batch below, which is the only one that straddles the boundary in
+    // steady state; every later batch starts after it, and is counted
+    // in time only when it also *finishes* before it.
+    let mut n_in_time = 0usize;
     // Early-path retries that the slot's arrival stopped; they join the
     // late path's retries on the full slot below.
     let mut retry_leftover: Vec<RefinedCandidate> = Vec::new();
@@ -689,14 +719,64 @@ pub fn run_speculative_slot(
         let partial_audio: &[i16] = spec.audio_prefix();
         let p2 = pass2_split(partial_audio, ready, early_budget);
         n_early_refined = p2.len();
-        let first = stage3_split(
-            partial_audio,
-            p2,
-            cfg.depth,
-            cfg.q_thresh,
-            cfg.bp_max_iter,
-            early_stop(false),
-        );
+        // **Run the batch in two halves split at the slot boundary, so
+        // the count of decodes that were in time to be answered comes
+        // out exactly.**
+        //
+        // The work is identical either way: `stage3_split` claims one
+        // candidate at a time and hands back what it did not claim, so
+        // stopping at the boundary and resuming on `unclaimed` covers
+        // the same candidates in the same order for the same cost. What
+        // it adds is the split itself, and on a radio that split is the
+        // number that matters — measured 2026-09-19, 29 % of this batch
+        // runs past the boundary, which is past the moment WSJT-X
+        // commits the reply (`FT8_KEY_UP_AFTER_SLOT_END_US`). `dec`
+        // alone cannot see it.
+        //
+        // Skipped when the boundary is already behind us or past the
+        // deadline anyway; then the batch runs as one and everything it
+        // produces is late by definition.
+        let first = match boundary_us.filter(|b| *b > now_us() && *b < deadline_us) {
+            Some(b) => {
+                let in_time = stage3_split(
+                    partial_audio,
+                    p2,
+                    cfg.depth,
+                    cfg.q_thresh,
+                    cfg.bp_max_iter,
+                    Stage3Stop {
+                        deadline_us: b,
+                        ..early_stop(false)
+                    },
+                );
+                n_in_time = in_time.results.len();
+                let mut rest = stage3_split(
+                    partial_audio,
+                    in_time.unclaimed,
+                    cfg.depth,
+                    cfg.q_thresh,
+                    cfg.bp_max_iter,
+                    early_stop(false),
+                );
+                let mut merged = in_time.results;
+                merged.append(&mut rest.results);
+                let mut failed = in_time.failed;
+                failed.append(&mut rest.failed);
+                Stage3Split {
+                    results: merged,
+                    failed,
+                    unclaimed: rest.unclaimed,
+                }
+            }
+            None => stage3_split(
+                partial_audio,
+                p2,
+                cfg.depth,
+                cfg.q_thresh,
+                cfg.bp_max_iter,
+                early_stop(false),
+            ),
+        };
         n_cut += first.unclaimed.len();
         let mut r = first.results;
         // **Retries run only on time no first attempt can use.** Before
@@ -775,6 +855,11 @@ pub fn run_speculative_slot(
                 late_stop,
             );
             n_cut += late.unclaimed.len();
+            // In time only if the whole batch landed before the
+            // boundary, which needs the early path to have left room.
+            if boundary_us.is_some_and(|b| now_us() <= b) {
+                n_in_time += late.results.len();
+            }
             results.extend(late.results);
             late_retry = coarse_retry_candidates(&late.failed, &refined, &coarse);
         } else if max_cand_late > 0 {
@@ -809,6 +894,9 @@ pub fn run_speculative_slot(
         );
         n_fallback += n - fb.unclaimed.len();
         n_cut += fb.unclaimed.len();
+        if boundary_us.is_some_and(|b| now_us() <= b) {
+            n_in_time += fb.results.len();
+        }
         results.extend(fb.results);
     }
     // One row per message. Duplicates were possible before — two
@@ -820,6 +908,11 @@ pub fn run_speculative_slot(
     // QSO state machine did not. The first row is kept, which is the
     // higher pass-2 rank within whichever path produced it first.
     dedup_by_message(&mut results);
+    // Dedup can drop a row the in-time count already claimed, so cap
+    // rather than let `n_in_time > results.len()` reach a log line.
+    // Which of a duplicate pair survives is the first produced, so the
+    // cap loses at most the difference and never the wrong side.
+    n_in_time = n_in_time.min(results.len());
     let t_done = unsafe { esp_timer_get_time() };
 
     SpeculativeOut {
@@ -829,6 +922,8 @@ pub fn run_speculative_slot(
         n_pass1,
         n_ready,
         n_deferred,
+        n_early_refined,
+        n_in_time,
         n_cut,
         n_fallback,
         bootstrap_dt_med,
