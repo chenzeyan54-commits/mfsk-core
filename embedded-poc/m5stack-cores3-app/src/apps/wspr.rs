@@ -499,7 +499,15 @@ pub fn run(peripherals: Peripherals, nvs_part: EspDefaultNvsPartition) -> ! {
     // and everything downstream of a successful connect (UDP log
     // sink, NTP, HTTP config server).
     let sysloop = EspSystemEventLoop::take().expect("sysloop");
-    let wifi_driver = if crate::WIFI_SSID.is_empty() {
+    let wifi_driver = if !crate::wifi_pref().enabled() {
+        // The CONFIG page's choice — see `mfsk_app_shared::wifi_pref`.
+        // For WSPR it also means no wsprnet upload, which is most of
+        // what a WSPR receiver is for, so it is said plainly (#381).
+        log::warn!(
+            "wspr_app: WIFI: OFF (CONFIG page) — NTP/HTTP config/wsprnet all unavailable"
+        );
+        None
+    } else if crate::WIFI_SSID.is_empty() {
         log::warn!(
             "wspr_app: WIFI_SSID empty (no cfg.toml) — NTP/HTTP config/wsprnet all unavailable"
         );

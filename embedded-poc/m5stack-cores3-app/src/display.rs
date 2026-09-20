@@ -556,7 +556,9 @@ pub fn run_log_panel(
         ) {
             apply_commit(&nvs, commit);
         }
-        picker.render(&mut display, mode, crate::grid_source()).ok();
+        picker
+            .render(&mut display, mode, crate::grid_source(), crate::wifi_pref())
+            .ok();
         if picker.take_just_closed() {
             // The overlay covered the panel; force everything back.
             last_usb_panel.clear();
@@ -690,7 +692,9 @@ pub fn run_log_panel(
         // over it stays painted over it — which is why the picker
         // vanished a moment after opening.
         if picker.is_open() {
-            picker.render(&mut display, mode, crate::grid_source()).ok();
+            picker
+            .render(&mut display, mode, crate::grid_source(), crate::wifi_pref())
+            .ok();
             // The overlay is the one screen that is nothing but input;
             // spend its idle time sampling rather than sleeping.
             if let Some(commit) = pump_touch(
@@ -1058,6 +1062,13 @@ fn apply_commit(nvs: &EspNvs<NvsDefault>, commit: mode_picker::Commit) {
             log::warn!("grid source -> {} (touch), restarting", src.label());
             if let Err(e) = mfsk_app_shared::grid_src::write(nvs, src) {
                 log::error!("grid source write failed: {e} — not restarting");
+                return;
+            }
+        }
+        mode_picker::Commit::Wifi(pref) => {
+            log::warn!("wifi -> {} (touch), restarting", pref.label());
+            if let Err(e) = mfsk_app_shared::wifi_pref::write(nvs, pref) {
+                log::error!("wifi pref write failed: {e} — not restarting");
                 return;
             }
         }

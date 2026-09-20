@@ -1,6 +1,39 @@
 # Changelog
 
-## 0.11.1 — the message-policy docs catch up with the code
+## 0.11.1 — WiFi becomes a CoreS3 setting of its own (#381), the message-policy docs catch up with the code
+
+- **CoreS3: `WIFI: ON` / `WIFI: OFF` on the CONFIG page, and every
+  receiver honours it (#381).** `main.rs` decided from the boot mode
+  alone, so a board set to `TIME: AIR DT` — which means "no
+  infrastructure here, take the phase off the band" — still ran a full
+  association campaign at boot. That campaign is four attempts three
+  seconds apart, and while the driver hunts for an AP that is not there
+  it runs at FreeRTOS priority 23, above anything this app creates:
+  ~40 % of decoder throughput when it was measured (`fst4_sync_search`
+  711 → 1 395 ms per candidate, 2026-08-22). It lands on the first
+  slots after boot, which are exactly the ones a cold `AIR DT`
+  acquisition needs.
+
+  **Not derived from the grid source**, which was the obvious shape and
+  the wrong one: the time source says where the *phase* comes from,
+  this says whether there is a *console*. A hilltop with a phone
+  hotspot wants `AIR DT` and a log both.
+
+  The setting is read and published **before** `main` dispatches into
+  WSPR, FST4 or FT4 — three of the four receivers never return from
+  that dispatch and each brings up its own WiFi, so a setting read
+  after it would have been a switch that does nothing in three of the
+  four places the operator can see it. `wifi_pref` defaults to `On`, so
+  a board that has never been set behaves exactly as before.
+
+  What `WIFI: OFF` takes with it is said in the manual and in the
+  module docs: in FT8 (UAC) mode WiFi is the only console, since the
+  USB host driver has taken USB-Serial-JTAG; it also takes NTP, and in
+  WSPR mode the wsprnet upload. The way back is the panel, which still
+  works.
+
+  Also folded: `main.rs` carried the same `WIFI_SSID empty` warning
+  twice, so it printed twice.
 
 - **The message-acceptance policy reaches `Ft4` and every FST4
   sub-mode, and five places said `Ft8` alone (#383).** No code changed:

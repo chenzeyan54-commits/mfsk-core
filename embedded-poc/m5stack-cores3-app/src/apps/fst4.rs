@@ -402,6 +402,12 @@ pub fn run(peripherals: Peripherals, nvs_part: EspDefaultNvsPartition) -> ! {
     let wifi_driver = if NO_WIFI {
         log::warn!("fst4_app: MFSK_FST4_APP_NO_WIFI=1 — no radio this boot (diagnostic build)");
         None
+    } else if !crate::wifi_pref().enabled() {
+        // What `NO_WIFI` is for the bench, this is for the operator:
+        // same outcome, chosen from the CONFIG page instead of a build
+        // flag (#381).
+        log::warn!("fst4_app: WIFI: OFF (CONFIG page) — NTP and HTTP config unavailable");
+        None
     } else if crate::WIFI_SSID.is_empty() {
         log::warn!("fst4_app: WIFI_SSID empty (no cfg.toml) — NTP and HTTP config unavailable");
         None

@@ -46,7 +46,8 @@
 //! ## Two levels, because there are two kinds of setting
 //!
 //! The root names the two: **MODE** (which receiver boots) and
-//! **CONFIG** (how the slot grid finds its phase — NTP, or the air).
+//! **CONFIG** (the two settings that are not a receiver — where the
+//! slot grid's phase comes from, and whether WiFi comes up at all).
 //! A tap on either opens that page; the commit bar then works exactly
 //! as it did, on whichever kind of thing the page holds. Both commits
 //! restart the board, so both are worth a confirmation, and neither is
@@ -69,6 +70,7 @@ use embedded_graphics::{
 
 use crate::boot_mode::BootMode;
 use crate::grid_src::GridSource;
+use crate::wifi_pref::WifiPref;
 
 /// Which page the overlay is showing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -92,10 +94,46 @@ const ROOT: [(Page, &str); 3] = [
 pub enum Commit {
     Mode(BootMode),
     Grid(GridSource),
+    Wifi(WifiPref),
 }
 
-/// The CONFIG page's rows.
-pub const GRID_SOURCES: [GridSource; 2] = [GridSource::Ntp, GridSource::AirDt];
+/// One row on the CONFIG page.
+///
+/// The page carries two settings that have nothing to do with each
+/// other — where the slot grid's phase comes from (`grid_src`) and
+/// whether the radio associates (`wifi_pref`) — so a row names a
+/// *value*, not a setting. Tapping `WIFI: OFF` arms that value and the
+/// commit bar applies it, exactly as `TIME: AIR DT` does, and the `*`
+/// marks the standing value of **each** setting rather than one row.
+///
+/// Keeping them on one page rather than giving WiFi its own was the
+/// cheaper of the two: a third level would put two taps between the
+/// operator and a setting that is changed at the moment the board is
+/// somewhere awkward, and four rows is exactly what the widget already
+/// draws for `MODES`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfigRow {
+    Grid(GridSource),
+    Wifi(WifiPref),
+}
+
+impl ConfigRow {
+    fn label(self) -> &'static str {
+        match self {
+            ConfigRow::Grid(src) => src.label(),
+            ConfigRow::Wifi(pref) => pref.label(),
+        }
+    }
+}
+
+/// The CONFIG page's rows, in draw order: the grid sources, then the
+/// WiFi choices.
+pub const CONFIG_ROWS: [ConfigRow; 4] = [
+    ConfigRow::Grid(GridSource::Ntp),
+    ConfigRow::Grid(GridSource::AirDt),
+    ConfigRow::Wifi(WifiPref::On),
+    ConfigRow::Wifi(WifiPref::Off),
+];
 
 /// The receivers this binary can boot into, in draw order.
 ///
@@ -167,7 +205,7 @@ pub const COMMIT_H: u32 = 40;
 /// it undrawable.
 pub const ROWS: usize = MODES.len();
 const _: () = assert!(ROWS >= ROOT.len(), "the root has more rows than the widget draws");
-const _: () = assert!(ROWS >= GRID_SOURCES.len(), "CONFIG has more rows than the widget draws");
+const _: () = assert!(ROWS >= CONFIG_ROWS.len(), "CONFIG has more rows than the widget draws");
 const _: () = assert!(ROWS >= DEMOS.len(), "DEMO has more rows than the widget draws");
 
 pub const fn height() -> u32 {
@@ -313,7 +351,7 @@ impl ModePicker {
         match self.page {
             Page::Root => ROOT.len(),
             Page::Mode => MODES.len(),
-            Page::Config => GRID_SOURCES.len(),
+            Page::Config => CONFIG_ROWS.len(),
             Page::Demo => DEMOS.len(),
         }
     }
@@ -323,7 +361,7 @@ impl ModePicker {
         match self.page {
             Page::Root => ROOT[i].1,
             Page::Mode => MODES[i].1,
-            Page::Config => GRID_SOURCES[i].label(),
+            Page::Config => CONFIG_ROWS[i].label(),
             Page::Demo => DEMOS[i].1,
         }
     }
@@ -388,7 +426,10 @@ impl ModePicker {
                             return Some(match self.page {
                                 Page::Mode => Commit::Mode(MODES[idx].0),
                                 Page::Demo => Commit::Mode(DEMOS[idx].0),
-                                Page::Config => Commit::Grid(GRID_SOURCES[idx]),
+                                Page::Config => match CONFIG_ROWS[idx] {
+                                    ConfigRow::Grid(src) => Commit::Grid(src),
+                                    ConfigRow::Wifi(pref) => Commit::Wifi(pref),
+                                },
                                 Page::Root => unreachable!("handled above"),
                             });
                         } else {
@@ -448,14 +489,16 @@ impl ModePicker {
     }
 
     /// Draw, but only while open and only when something changed.
-    /// `current` / `current_grid` are what this boot is running, marked
-    /// with a `*` on their pages so the operator can see the setting
-    /// before changing it.
+    /// `current` / `current_grid` / `current_wifi` are what this boot
+    /// is running, marked with a `*` on their pages so the operator can
+    /// see the setting before changing it. CONFIG carries two settings,
+    /// so it marks two rows.
     pub fn render<D>(
         &mut self,
         display: &mut D,
         current: BootMode,
         current_grid: GridSource,
+        current_wifi: WifiPref,
     ) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = Rgb565>,
@@ -512,7 +555,10 @@ impl ModePicker {
                 Page::Root => false,
                 Page::Mode => MODES[i].0 == current,
                 Page::Demo => DEMOS[i].0 == current,
-                Page::Config => GRID_SOURCES[i] == current_grid,
+                Page::Config => match CONFIG_ROWS[i] {
+                    ConfigRow::Grid(src) => src == current_grid,
+                    ConfigRow::Wifi(pref) => pref == current_wifi,
+                },
             };
             let selected = armed_idx == Some(i);
             // Palette borrowed whole from `decoded_list`, which is
@@ -586,7 +632,7 @@ impl ModePicker {
                 let _ = line.push_str("pick a mode above");
             }
             (Page::Config, None) => {
-                let _ = line.push_str("pick a time source");
+                let _ = line.push_str("pick a setting above");
             }
         }
         Text::with_baseline(

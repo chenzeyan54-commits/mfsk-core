@@ -219,7 +219,11 @@ fn poll_touch(
         }
         Some(mode_picker::Commit::Grid(src)) => {
             log::warn!("grid source -> {} (touch), restarting", src.label());
-            crate::commit_grid_src_and_restart(nvs.clone(), src);
+            crate::commit_config_and_restart(nvs.clone(), crate::ConfigChoice::Grid(src));
+        }
+        Some(mode_picker::Commit::Wifi(pref)) => {
+            log::warn!("wifi -> {} (touch), restarting", pref.label());
+            crate::commit_config_and_restart(nvs.clone(), crate::ConfigChoice::Wifi(pref));
         }
         None => {}
     }
@@ -408,7 +412,9 @@ pub fn run<P: SpotPanel>(ctx: DisplayCtx) -> ! {
         // on change, so a repaint underneath erases it and it never
         // comes back.
         if picker.is_open() {
-            picker.render(&mut display, P::MODE, crate::grid_source()).ok();
+            picker
+                .render(&mut display, P::MODE, crate::grid_source(), crate::wifi_pref())
+                .ok();
             FreeRtos::delay_ms(50);
             poll_touch(
                 &mut picker,
@@ -544,7 +550,9 @@ pub fn run<P: SpotPanel>(ctx: DisplayCtx) -> ! {
                     &mut last_contact,
                     &ctx.nvs,
                 );
-                picker.render(&mut display, P::MODE, crate::grid_source()).ok();
+                picker
+                .render(&mut display, P::MODE, crate::grid_source(), crate::wifi_pref())
+                .ok();
                 if picker.take_just_closed() {
                     last_dirty = u32::MAX;
                 }

@@ -223,7 +223,12 @@ pub fn run(peripherals: Peripherals, nvs_part: EspDefaultNvsPartition) -> ! {
     // after: which of the two loses is a fact worth having on the log,
     // not a race worth hiding.
     let modem = peripherals.modem;
-    if crate::WIFI_SSID.is_empty() {
+    if !crate::wifi_pref().enabled() {
+        // The CONFIG page's choice, and it reaches here the same way it
+        // reaches the FT8 controller — `main` publishes it before
+        // handing this receiver the singletons (#381).
+        log::warn!("ft4_app: WIFI: OFF (CONFIG page) — no NTP, no UDP log, no config page");
+    } else if crate::WIFI_SSID.is_empty() {
         log::warn!("ft4_app: WIFI_SSID empty (no cfg.toml) — no NTP, no UDP log, no config page");
     } else {
         let sysloop = EspSystemEventLoop::take().expect("sysloop");

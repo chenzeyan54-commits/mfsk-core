@@ -15,9 +15,9 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use mfsk_app_shared::{boot_mode, udp_log, wifi};
 
 use mfsk_core_m5stack_cores3_app::{
-    apps, board, coredump, decode_pipeline, display, log_free_internal, set_grid_source, uac,
-    BOOT_MODE_DEFAULT, FANOUT, LOGGER, NTP_SERVER, NTP_SYNC_TIMEOUT_MS, UDP_LOG_PORT,
-    UDP_LOG_TARGET, WIFI_ENABLED, WIFI_PSK, WIFI_SSID,
+    apps, board, coredump, decode_pipeline, display, log_free_internal, set_grid_source,
+    set_wifi_pref, uac, BOOT_MODE_DEFAULT, FANOUT, LOGGER, NTP_SERVER, NTP_SYNC_TIMEOUT_MS,
+    UDP_LOG_PORT, UDP_LOG_TARGET, WIFI_ENABLED, WIFI_PSK, WIFI_SSID,
 };
 
 fn main() -> ! {
@@ -81,6 +81,15 @@ fn main() -> ! {
         None => boot_mode::determine_no_override(&nvs),
     };
     log::info!("boot_mode: {} (NVS-only on CoreS3)", mode.label());
+
+    // Read and published **before** the dispatch below, because three
+    // of the four receivers never come back from it and each brings up
+    // its own WiFi. A setting that only reached the FT8 controller
+    // would be a switch that does nothing in three of the four places
+    // the operator can see it (#381).
+    let wifi_pref = mfsk_app_shared::wifi_pref::read(&nvs);
+    set_wifi_pref(wifi_pref);
+    log::info!("wifi: {} (CONFIG page)", wifi_pref.label());
 
     // WSPR and FST4 are whole receivers, not modes of the FT8
     // controller — their own tasks, screens, slot grids and stacks.
@@ -190,31 +199,41 @@ fn main() -> ! {
     // for the FT8 → FT4 reboot, where the alternative is no phase at
     // all.
 
-    let needs_wifi = matches!(mode, boot_mode::BootMode::Wifi | boot_mode::BootMode::Uac);
+    // **Three separate questions, and they used to be one.** The boot
+    // mode says whether this receiver has any use for WiFi; the CONFIG
+    // page says whether the operator wants it this time; `cfg.toml`
+    // says whether there is an SSID to try at all.
+    //
+    // Only the first was asked (issue #381), so a board set to
+    // `TIME: AIR DT` — which means "the phase comes from the band,
+    // there is no infrastructure here" — still ran a full association
+    // campaign over the first slots, which are the ones a cold
+    // acquisition needs. The WiFi task runs at FreeRTOS priority 23,
+    // above anything this app creates, and a campaign against an AP
+    // that is not there cost ~40 % of decoder throughput when it was
+    // measured (`wifi_pref`'s module docs carry the numbers).
+    //
+    // The setting is deliberately *not* derived from the grid source.
+    // See `mfsk_app_shared::wifi_pref`: a hilltop with a phone hotspot
+    // wants `AIR DT` and a log both.
+    let mode_wants_wifi = matches!(mode, boot_mode::BootMode::Wifi | boot_mode::BootMode::Uac);
+    let needs_wifi = mode_wants_wifi && wifi_pref.enabled();
     WIFI_ENABLED.store(needs_wifi, std::sync::atomic::Ordering::Release);
+    if mode_wants_wifi && !wifi_pref.enabled() {
+        log::warn!(
+            "{} (CONFIG page) — no WiFi this boot{}",
+            wifi_pref.label(),
+            console_note(mode)
+        );
+    }
     if needs_wifi && WIFI_SSID.is_empty() {
         log::warn!(
             "boot_mode={} but WIFI_SSID empty (no cfg.toml) — UDP log unavailable{}",
             mode.label(),
-            if mode == boot_mode::BootMode::Uac {
-                "; serial console also gone in UAC mode (USB-Serial-JTAG detached on usb_host_install)"
-            } else {
-                ""
-            }
+            console_note(mode)
         );
     }
     let wifi_should_start = needs_wifi && !WIFI_SSID.is_empty();
-    if needs_wifi && WIFI_SSID.is_empty() {
-        log::warn!(
-            "boot_mode={} but WIFI_SSID empty (no cfg.toml) — UDP log unavailable{}",
-            mode.label(),
-            if mode == boot_mode::BootMode::Uac {
-                "; serial console also gone in UAC mode (USB-Serial-JTAG detached on usb_host_install)"
-            } else {
-                ""
-            }
-        );
-    }
     if wifi_should_start {
         // **Backgrounded.** This used to run inline, and association
         // took ~30 s — during which the LCD showed nothing and the USB
@@ -507,4 +526,21 @@ fn main() -> ! {
         nvs,
         mode,
     )
+}
+
+/// What losing WiFi costs in this boot mode, appended to whichever
+/// warning is saying that it is gone.
+///
+/// In `BootMode::Uac` the USB host driver detaches USB-Serial-JTAG, so
+/// the UDP log is the *only* channel off this board and a silent
+/// failure on a hilltop is invisible except for what the panel shows.
+/// Worth saying every time, which is why it is one function and not
+/// two copies — the two warnings below it used to be the same literal
+/// twice, printed twice, by a paste that was never noticed (#381).
+fn console_note(mode: boot_mode::BootMode) -> &'static str {
+    if mode == boot_mode::BootMode::Uac {
+        "; serial console also gone in UAC mode (USB-Serial-JTAG detached on usb_host_install)"
+    } else {
+        ""
+    }
 }

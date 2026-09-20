@@ -69,31 +69,85 @@ pub fn grid_source() -> mfsk_app_shared::grid_src::GridSource {
     }
 }
 
+/// Whether this boot was *asked* to bring WiFi up — the CONFIG page's
+/// other setting, published the same way and for the same two readers
+/// (the picker marks it, `main` acts on it).
+///
+/// Not the same question as [`wifi_enabled_for_this_boot`], which
+/// answers "is a log sink coming": a boot mode with no use for WiFi,
+/// or a build with an empty `WIFI_SSID`, leaves that false while this
+/// still says `On`. Issue #381.
+static WIFI_PREF: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_wifi_pref(pref: mfsk_app_shared::wifi_pref::WifiPref) {
+    WIFI_PREF.store(
+        match pref {
+            mfsk_app_shared::wifi_pref::WifiPref::On => 0,
+            mfsk_app_shared::wifi_pref::WifiPref::Off => 1,
+        },
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+pub fn wifi_pref() -> mfsk_app_shared::wifi_pref::WifiPref {
+    match WIFI_PREF.load(std::sync::atomic::Ordering::Acquire) {
+        1 => mfsk_app_shared::wifi_pref::WifiPref::Off,
+        _ => mfsk_app_shared::wifi_pref::WifiPref::On,
+    }
+}
+
+/// One of the CONFIG page's settings, as handed to
+/// [`commit_config_and_restart`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfigChoice {
+    Grid(mfsk_app_shared::grid_src::GridSource),
+    Wifi(mfsk_app_shared::wifi_pref::WifiPref),
+}
+
+impl ConfigChoice {
+    fn label(self) -> &'static str {
+        match self {
+            ConfigChoice::Grid(src) => src.label(),
+            ConfigChoice::Wifi(pref) => pref.label(),
+        }
+    }
+
+    fn write(
+        self,
+        nvs: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
+    ) -> Result<(), esp_idf_svc::sys::EspError> {
+        match self {
+            ConfigChoice::Grid(src) => mfsk_app_shared::grid_src::write(nvs, src),
+            ConfigChoice::Wifi(pref) => mfsk_app_shared::wifi_pref::write(nvs, pref),
+        }
+    }
+}
+
 /// Persist a CONFIG-page choice and restart into it.
 ///
 /// Same shape as `boot_mode::commit_and_restart`, and for the same
 /// reason: the panel tasks run on PSRAM stacks and an NVS write
 /// disables the flash cache, which a PSRAM stack must not be holding.
-pub fn commit_grid_src_and_restart(
+pub fn commit_config_and_restart(
     nvs: std::sync::Arc<std::sync::Mutex<esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>>>,
-    src: mfsk_app_shared::grid_src::GridSource,
+    choice: ConfigChoice,
 ) {
     struct Req {
         nvs: std::sync::Arc<
             std::sync::Mutex<esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>>,
         >,
-        src: mfsk_app_shared::grid_src::GridSource,
+        choice: ConfigChoice,
     }
 
     extern "C" fn entry(arg: *mut core::ffi::c_void) {
-        // SAFETY: `commit_grid_src_and_restart` leaked exactly this pointer.
+        // SAFETY: `commit_config_and_restart` leaked exactly this pointer.
         let req = unsafe { Box::from_raw(arg as *mut Req) };
         match req.nvs.lock() {
-            Ok(nvs) => match mfsk_app_shared::grid_src::write(&nvs, req.src) {
-                Ok(()) => log::warn!("grid source: committed {} — restarting", req.src.label()),
-                Err(e) => log::error!("grid source write failed: {e} — not restarting"),
+            Ok(nvs) => match req.choice.write(&nvs) {
+                Ok(()) => log::warn!("config: committed {} — restarting", req.choice.label()),
+                Err(e) => log::error!("config write failed: {e} — not restarting"),
             },
-            Err(e) => log::error!("grid source: NVS lock poisoned: {e} — not restarting"),
+            Err(e) => log::error!("config: NVS lock poisoned: {e} — not restarting"),
         }
         drop(req);
         // Let the line reach the log sink; in UAC mode that is the only
@@ -103,11 +157,11 @@ pub fn commit_grid_src_and_restart(
         unsafe { esp_idf_svc::sys::esp_restart() };
     }
 
-    let ptr = Box::into_raw(Box::new(Req { nvs, src })) as *mut core::ffi::c_void;
+    let ptr = Box::into_raw(Box::new(Req { nvs, choice })) as *mut core::ffi::c_void;
     let created = unsafe {
         esp_idf_svc::sys::xTaskCreatePinnedToCore(
             Some(entry),
-            c"grid_src_save".as_ptr(),
+            c"config_save".as_ptr(),
             4096,
             ptr,
             5,
@@ -116,7 +170,7 @@ pub fn commit_grid_src_and_restart(
         )
     };
     if created != 1 {
-        log::error!("could not spawn the grid-source save task");
+        log::error!("could not spawn the config save task");
         drop(unsafe { Box::from_raw(ptr as *mut Req) });
     }
 }

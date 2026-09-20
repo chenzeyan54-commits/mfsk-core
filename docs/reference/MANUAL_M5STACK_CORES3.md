@@ -244,7 +244,7 @@ The overlay opens on a three-row **root**:
 | Row | What it holds |
 |---|---|
 | `MODE` | which receiver boots (FT8, FT4, WSPR, FST4) |
-| `CONFIG` | how the slot phase is kept (NTP, or the air's DT) |
+| `CONFIG` | how the slot phase is kept (NTP, or the air's DT), and whether WiFi comes up |
 | `DEMO` | running without a radio (`WAV REPLAY` — a recording, decoded on a loop) |
 
 Pages have different numbers of rows. **Pressing an unused band does
@@ -265,7 +265,13 @@ overlay that reappears on a page nobody chose is how a stray tap lands
 on a setting. There is 14 px of slop around the edges, so a press that
 is nearly right commits rather than dismissing.
 
-### CONFIG — how the slot phase is kept
+### CONFIG — the slot phase, and the radio
+
+Two settings, four rows. They are unrelated to each other, so each
+carries its own `*`: one marks the time source this boot is using, the
+other marks whether WiFi was brought up.
+
+#### The slot phase
 
 **This does not choose a time source.** The clock belongs to the log:
 QSO logging needs the minute right, that comes from NTP beforehand, and
@@ -297,6 +303,38 @@ holdover) or weaker than 0.55 is not used, and the board acquires
 instead. If the seed is wrong anyway, three slots with nothing decoded
 re-acquire from the air — that search covers the whole 15 s period, so
 it recovers **whole seconds of error** as well as the fraction.
+
+#### WiFi
+
+| Row | Meaning |
+|---|---|
+| `WIFI: ON` | associate at boot, as every build did before this setting. The default |
+| `WIFI: OFF` | leave the radio down for this boot |
+
+**Why this is its own setting and not a consequence of `TIME: AIR DT`.**
+The two answer different questions: the time source says where the
+*phase* comes from, this says whether there is a *console*. A hilltop
+with a phone hotspot wants `AIR DT` and a log both, so one setting
+cannot stand for the other.
+
+What `WIFI: OFF` buys, on a hilltop where the configured AP is not
+there: the association campaign is four attempts three seconds apart,
+and while the driver hunts for an AP it cannot find it runs at FreeRTOS
+priority 23 — above anything this app creates. Measured at ~40 % of
+decoder throughput (`fst4_sync_search` 711 → 1 395 ms per candidate),
+and it lands on the first slots after boot, which are exactly the ones
+a cold `AIR DT` acquisition needs.
+
+What it costs. In FT8 (UAC) mode the USB host driver has taken
+USB-Serial-JTAG, so **WiFi is the only console**: the UDP log and the
+HTTP config page both go with it, and a board that fails on a hilltop
+shows nothing but its panel. It also takes NTP (so `TIME: NTP` has
+nothing to sync from and the grid falls back to the RTC), and in WSPR
+mode it takes the wsprnet upload, which is most of what a WSPR receiver
+is for.
+
+The way back is the panel: `WIFI: OFF` does not disable the mode
+picker, so the same three presses turn it on again.
 
 To change mode without the panel: erase NVS, and set `boot_mode` in
 `cfg.toml`.
