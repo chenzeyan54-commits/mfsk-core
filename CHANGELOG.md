@@ -193,6 +193,37 @@ reported the grid healthy while the band said otherwise.
 
 ### Added
 
+- **`unpack77` decodes every message type `packjt77.f90` defines
+  (#383).** Three were missing and returned `None`, which is a dropped
+  decode rather than a rejected one: telemetry (`i3=0, n3=5`), the
+  WSPR types (`i3=0, n3=6`) and the EU VHF contest exchange (`i3=5`).
+  ARRL Field Day (`i3=0, n3=3|4`) decoded only its two callsigns and
+  rendered the exchange as a literal `[FD]`; it now reads
+  `CALL CALL [R] <ntx><class> SEC` against the 86-entry ARRL section
+  table. Only `0/2` and `i3 >= 6` are still refused, which is what
+  upstream does with them.
+
+  Type 5 needed a second grid unpacker. What this crate called
+  `to_grid6` is a port of upstream's `to_grid` (base 25, with
+  `j5 == j6 == 24` as the four-character sentinel); type 5 uses
+  upstream's actual `to_grid6` (base 24, no sentinel, 18 662 400 valid
+  codes in a 25-bit field). The old function is renamed `to_grid` and
+  the real `to_grid6` added beside it.
+
+- **The per-type validity checks `unpack77` was missing, and a
+  measurement of what each stage actually removes (#383).** A CRC
+  false positive's information bits are uniform, so `#[ignore]`d
+  `phantom_survival_rates` runs 2 M uniform 77-bit payloads through
+  `unpack77` and `is_plausible_message` and prints the survival rate
+  per `(i3, n3)` cell, plus what each mode's own pre-gate would remove
+  on top — `msk144decodeframe.f90:103`, `ft8b.f90:510-511`, and the
+  nothing that `ft4_decode.f90` and `fst4_decode.f90` apply.
+
+  It showed that `ft8b.f90`'s gate removes **zero** survivors: all
+  three of its conditions are already refused inside `unpack77`
+  itself (`packjt77.f90:330`, `:457`, `:613`). MSK144's removes 28 %,
+  and is already ported.
+
 - **CoreS3 FT8: the coarse search window is now the emit point's
   coverage ceiling, and clamped to it.** `stage1_inc` emits at pair 87,
   filling rows 0..173; block 2's last Costas symbol is at row 162, so
@@ -426,6 +457,30 @@ reported the grid healthy while the band said otherwise.
   of where the decode happened to finish.
 
 ### Fixed
+
+- **Three message types were surviving the phantom filter at 100 %
+  because a marker string short-circuited it (#383).**
+  `is_plausible_message` returned `true` on finding `[FD]`, `[RTTY]`
+  or `RR73;` anywhere in the text, which skipped the ITU-prefix
+  callsign check for the whole message. They were not surviving
+  because they were plausible; nothing was looking at them. Field Day
+  and DXpedition are now judged on the callsigns they carry, and
+  `[RTTY]` — which upstream never produces, its 22 out-of-range
+  exchange codes leaving the message blank — is refused.
+
+  With the missing `isec` range check (`packjt77.f90:338`: a 1-based
+  index into 86 sections carried in a 7-bit field, so 42 of 128 codes
+  name nothing), the surviving phantom population over 2 M uniform
+  payloads falls **374 277 → 318 572, −14.9 %**, and every structured
+  type now survives at the ~52 % rate two callsigns and nothing else
+  should give, instead of at 100 %.
+
+  The EU VHF contest type is the exception that proves the rule: both
+  its callsigns are hashes, so it carries no callsign to check and
+  138 700 of the 2 M payloads reach it. It is accepted only when at
+  least one hash *resolves* against the table — a real exchange has
+  both callsigns registered, a CRC survivor hits an entry with
+  probability ~n/2¹² and ~n/2²².
 
 - **CoreS3: USB audio transmit works in one format only, and it is not
   the one the radio advertises first.** `uac_host_device_start` refused
