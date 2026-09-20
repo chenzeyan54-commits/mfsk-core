@@ -1262,6 +1262,11 @@ writeup on the issue itself:
   facade impls), `…/osd_strategy.rs` (OSD dispatch, #63 hook).
   Host `decode_frame*` family + `refine_fine` gate:
   `mfsk-core/src/ft8/decode.rs`.
+- **CoreS3 FT8 slot budget — read before proposing a decode
+  experiment**: `docs/notes/CORES3_FT8_SLOT_BUDGET.md`. What the slot
+  spends, what binds it (selection, not time: 44 % of the refine
+  budget produces nothing while the deadline stops 2 slots in 278),
+  and the table of effect sizes an on-air arm can actually resolve.
 - Probe templates: `mfsk-core/src/jt9/decode.rs::gate_diag::probe_missing_goldens`.
 - Protocol-specific: `mfsk-core/src/fst4/decode.rs` ⇔
   `WSJT-X/lib/fst4_decode.f90`; `mfsk-core/src/jt65/{mod,rx,decode}.rs`
