@@ -230,6 +230,11 @@ jobs:
   verify-tag:
     name: Verify tag
     runs-on: ubuntu-latest
+    outputs:
+      # The version without its `v`, for the steps that ask crates.io
+      # and docs.rs about it after the publish. Taken from the same
+      # check that proves it matches the tag, so the two cannot drift.
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -249,6 +254,7 @@ jobs:
       # publishable crate (mfsk-core) and both binary-tarball crates
       # at once.
       - name: Check tag matches Cargo.toml version
+        id: version
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/v}"
@@ -257,6 +263,7 @@ jobs:
             echo "::error::Tag v$TAG does not match workspace version $V (Cargo.toml [workspace.package])"
             exit 1
           fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
 
   # ── Gate 3a-d ──────────────────────────────────────────────────────
   # Build every FFI binary BEFORE crates.io publish so a
@@ -344,6 +351,70 @@ jobs:
         # via the GitHub release tarball attached below. Keeps the
         # crates.io index focused on the library consumers depend on.
         run: cargo publish -p mfsk-core --features full
+
+      # ── Confirm the publish actually landed ──────────────────────
+      # `cargo publish` returns when crates.io has accepted the upload,
+      # not when the registry serves it, and not at all with respect to
+      # what docs.rs then does with it. v0.11.0 is the case that
+      # motivated these two steps: the publish succeeded, every gate in
+      # the repository was green, and the documentation build failed on
+      # docs.rs — `all-features = true` against a `compile_error!`d
+      # mutually exclusive feature pair — with nothing anywhere saying
+      # so. A release that ends without looking is a release that can
+      # ship a crate nobody can read the docs for.
+      - name: Wait for crates.io to serve this version
+        env:
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          url="https://crates.io/api/v1/crates/mfsk-core/${VERSION}"
+          for attempt in $(seq 1 30); do
+            code=$(curl -sS -o /tmp/crate.json -w '%{http_code}' \
+              -H 'User-Agent: mfsk-core release workflow (github actions)' "$url" || echo 000)
+            if [ "$code" = "200" ]; then
+              echo "crates.io is serving mfsk-core ${VERSION}"
+              exit 0
+            fi
+            echo "attempt ${attempt}: crates.io returned ${code}, waiting"
+            sleep 10
+          done
+          echo "::error::crates.io never served mfsk-core ${VERSION} (5 min). Check ${url}"
+          exit 1
+
+      - name: Require the docs.rs build to succeed
+        env:
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          url="https://docs.rs/crate/mfsk-core/${VERSION}/status.json"
+          page="https://docs.rs/crate/mfsk-core/${VERSION}"
+          # `status.json`, not `builds.json`: the latter serves HTML
+          # today (checked 2026-09-21 against 0.11.0, with and without
+          # an `Accept: application/json` header). `status.json` answers
+          # 404 until docs.rs has a result for the version and 200 with
+          # `doc_status` once it does, so a 200 is an outcome and
+          # `false` means the build failed rather than "not yet".
+          #
+          # docs.rs queues rather than builds on demand, so this polls
+          # for half an hour. A queue that slow is itself worth a red
+          # release: the alternative is a green one that proves nothing,
+          # which is what 0.10.0, 0.10.1 and 0.11.0 each had.
+          for attempt in $(seq 1 90); do
+            code=$(curl -sS -o /tmp/status.json -w '%{http_code}' \
+              -H 'User-Agent: mfsk-core release workflow (github actions)' "$url" || echo 000)
+            if [ "$code" = "200" ]; then
+              if [ "$(jq -r '.doc_status' /tmp/status.json)" = "true" ]; then
+                echo "docs.rs built mfsk-core ${VERSION}"
+                exit 0
+              fi
+              echo "::error::docs.rs FAILED to build mfsk-core ${VERSION} — see ${page}"
+              exit 1
+            fi
+            echo "attempt ${attempt}: docs.rs returned ${code}, waiting"
+            sleep 20
+          done
+          echo "::error::docs.rs did not report on mfsk-core ${VERSION} within 30 min — see ${page}"
+          exit 1
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
