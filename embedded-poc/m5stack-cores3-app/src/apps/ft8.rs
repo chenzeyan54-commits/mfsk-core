@@ -87,6 +87,10 @@ impl Receiver for Ft8Controller {
                 "no UDP log, no NTP, no config page"
             },
             bringup: crate::net::Bringup::Connect,
+            // Off: measured 2026-09-22 (SIM, `logs/storage_ft8sim*`), a
+            // resident httpd costs ~4.3 KB of internal DRAM for a page
+            // needed once per activation. The logs are fetched from a
+            // server started on demand, not one left listening.
             http: false,
             on_ntp: |synced| log::info!("ft8_app: NTP synced = {synced}"),
         })

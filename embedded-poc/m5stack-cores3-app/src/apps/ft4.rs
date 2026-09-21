@@ -536,6 +536,15 @@ fn slot_loop() -> ! {
                 text: &d.msg,
                 hard_errors: d.hard_errors,
             }));
+            crate::storage::record_slot(
+                crate::storage::decoded_slot_unix(7_500),
+                7_500,
+                None,
+                "FT4",
+                o.decodes
+                    .iter()
+                    .map(|d| (d.snr_db, d.dt_sec, d.freq_hz, d.msg.as_str())),
+            );
             for d in &o.decodes {
                 log::info!(
                     "    {:>6.1} Hz  {:>+5.2} s  {:>3.0} dB  {}",

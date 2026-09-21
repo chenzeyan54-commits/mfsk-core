@@ -83,7 +83,33 @@ const HTTP_SERVER_TASK_CAPS: u32 =
 /// Returned server must be kept alive by the caller (dropping it
 /// stops listening, same as every other `Esp*` service in this
 /// crate).
-pub fn start(nvs: Arc<Mutex<EspNvs<NvsDefault>>>) -> anyhow::Result<EspHttpServer<'static>> {
+/// Files the board serves for download (`GET /<name>`), and how to read
+/// them.
+///
+/// `read` is the board's, not a `std::fs` call here, because this
+/// server's task runs on a PSRAM stack ([`HTTP_SERVER_TASK_CAPS`]) and
+/// a flash read from a PSRAM stack aborts the board
+/// (`esp_task_stack_is_sane_cache_disabled`). The CoreS3 passes its
+/// storage task's `read_chunk`, which does the read on an internal
+/// stack and hands the bytes back.
+#[derive(Clone, Copy)]
+pub struct FileSource {
+    pub names: &'static [&'static str],
+    /// Up to `len` bytes of `name` from `offset`; `Some(empty)` at the
+    /// end, `None` if absent.
+    pub read: fn(name: &str, offset: u64, len: usize) -> Option<Vec<u8>>,
+}
+
+/// Bytes per read while streaming a download: one request to the
+/// storage task per chunk, so large enough to keep a 2 MB `all.txt`
+/// to a few hundred round trips, small enough to stay one PSRAM
+/// allocation.
+const DOWNLOAD_CHUNK: usize = 8192;
+
+pub fn start(
+    nvs: Arc<Mutex<EspNvs<NvsDefault>>>,
+    files: Option<FileSource>,
+) -> anyhow::Result<EspHttpServer<'static>> {
     let mut server = EspHttpServer::new(&HttpConfiguration {
         stack_size: HTTP_SERVER_STACK_SIZE,
         task_caps: HTTP_SERVER_TASK_CAPS,
@@ -96,10 +122,41 @@ pub fn start(nvs: Arc<Mutex<EspNvs<NvsDefault>>>) -> anyhow::Result<EspHttpServe
             let guard = nvs_get.lock().expect("settings NVS mutex poisoned");
             settings::load(&guard)
         };
-        let page = render_form(&current, None);
+        let page = render_form(&current, None, files);
         req.into_ok_response()?.write_all(page.as_bytes())?;
         Ok(())
     })?;
+
+    for &name in files.map_or(&[][..], |f| f.names) {
+        let read = files.map(|f| f.read).expect("names imply a source");
+        server.fn_handler::<anyhow::Error, _>(&format!("/{name}"), Method::Get, move |req| {
+            let Some(first) = read(name, 0, DOWNLOAD_CHUNK) else {
+                req.into_status_response(404)?
+                    .write_all(b"no such file yet")?;
+                return Ok(());
+            };
+            let disposition = format!("attachment; filename=\"{name}\"");
+            let mut resp = req.into_response(
+                200,
+                None,
+                &[
+                    ("Content-Type", "text/plain; charset=utf-8"),
+                    ("Content-Disposition", disposition.as_str()),
+                ],
+            )?;
+            let mut offset = first.len() as u64;
+            let mut chunk = first;
+            while !chunk.is_empty() {
+                resp.write_all(&chunk)?;
+                chunk = match read(name, offset, DOWNLOAD_CHUNK) {
+                    Some(c) => c,
+                    None => break,
+                };
+                offset += chunk.len() as u64;
+            }
+            Ok(())
+        })?;
+    }
 
     server.fn_handler::<anyhow::Error, _>("/save", Method::Post, move |mut req| {
         let len = req.content_len().unwrap_or(0) as usize;
@@ -126,12 +183,12 @@ pub fn start(nvs: Arc<Mutex<EspNvs<NvsDefault>>>) -> anyhow::Result<EspHttpServe
                     settings::save(&guard, &new_settings)?;
                 }
                 log::info!("http_config: settings saved (call='{}')", new_settings.call);
-                let page = render_form(&new_settings, Some("Saved."));
+                let page = render_form(&new_settings, Some("Saved."), files);
                 req.into_ok_response()?.write_all(page.as_bytes())?;
             }
             Err(msg) => {
                 log::warn!("http_config: rejected save — {msg}");
-                let page = render_form(&current, Some(&format!("Rejected: {msg}")));
+                let page = render_form(&current, Some(&format!("Rejected: {msg}")), files);
                 req.into_status_response(400)?.write_all(page.as_bytes())?;
             }
         }
@@ -157,7 +214,7 @@ fn html_escape(s: &str) -> String {
     out
 }
 
-fn render_form(s: &Settings, banner: Option<&str>) -> String {
+fn render_form(s: &Settings, banner: Option<&str>, files: Option<FileSource>) -> String {
     let mut html = String::with_capacity(2048);
     let _ = write!(
         html,
@@ -226,6 +283,13 @@ fn render_form(s: &Settings, banner: Option<&str>) -> String {
     );
 
     let _ = write!(html, "<p><button type=\"submit\">Save</button></p></form>");
+    if let Some(f) = files {
+        let _ = write!(html, "<h2>Logs</h2><ul>");
+        for name in f.names {
+            let _ = write!(html, "<li><a href=\"/{name}\">{name}</a></li>");
+        }
+        let _ = write!(html, "</ul>");
+    }
     let _ = write!(html, "</body></html>");
     html
 }

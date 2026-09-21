@@ -187,6 +187,17 @@ pub fn run<R: Receiver>(
         ctx.nvs.clone(),
         R::net_config(&ctx),
     );
+    // After WiFi has taken its contiguous internal DRAM: the storage
+    // task's stack is internal by necessity (a flash op from a PSRAM
+    // stack aborts), and 5 KB of it is better taken from what is left
+    // than carved out of the block WiFi needs.
+    // `MFSK_STORAGE_OFF=1`: the A/B knob for whether the flash writes
+    // cost the decoder anything — compile-time, bench only.
+    if option_env!("MFSK_STORAGE_OFF").is_none() {
+        crate::storage::enable();
+    } else {
+        log::warn!("storage: MFSK_STORAGE_OFF — no logs this boot");
+    }
     R::start(&ctx);
     R::run_forever(ctx, panel)
 }

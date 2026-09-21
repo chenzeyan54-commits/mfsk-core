@@ -15,7 +15,9 @@
 nvs,        data, nvs,     0x9000,  0x6000
 phy_init,   data, phy,     0xf000,  0x1000
 factory,    app,  factory, 0x10000, 0x900000
-littlefs,   data, spiffs,  0x910000, 0xC0000
+# 0x910000-0x9D0000 held the old 768 KB `littlefs`, which no
+# component ever mounted. Left free rather than renumbered, so the
+# coredump below keeps its offset.
 # Coredump, added 2026-08-23 (#163). In host mode the USB driver owns
 # the USB-Serial-JTAG, so the console the ESP-IDF panic handler writes
 # to does not exist — a crash is a spontaneous reboot and nothing else,
@@ -23,3 +25,9 @@ littlefs,   data, spiffs,  0x910000, 0xC0000
 # boot read the exception cause, faulting PC and task back out and put
 # them on the log path that does work (UDP / LCD).
 coredump,   data, coredump, 0x9D0000, 0x10000
+# LittleFS for the activator's `qso.adi` and `ALL.TXT` (2026-09-22,
+# `src/storage.rs`): everything from here to the end of the 16 MB
+# flash, 6.125 MiB. ALL.TXT runs ~120 KB/h against a busy JA evening
+# band — the old 768 KB would have filled in six hours; this holds
+# `all.txt` + `all.1.txt` at 2 MiB each with `qso.adi` never rotated.
+littlefs,   data, littlefs, 0x9E0000, 0x620000

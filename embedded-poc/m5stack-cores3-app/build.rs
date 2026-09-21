@@ -4,6 +4,25 @@ use std::path::PathBuf;
 fn main() {
     embuild::espidf::sysenv::output();
 
+    // `MFSK_STORAGE_TRACE=1` (bench only): route the three flash calls
+    // LittleFS makes through counting wrappers in `storage::trace`, so
+    // an append's cost splits into reads, programs and erases.
+    println!("cargo:rustc-check-cfg=cfg(storage_trace)");
+    println!("cargo:rerun-if-env-changed=MFSK_STORAGE_TRACE");
+    if env::var_os("MFSK_STORAGE_TRACE").is_some() {
+        println!("cargo:rustc-cfg=storage_trace");
+        for f in [
+            "esp_partition_read",
+            "esp_partition_write",
+            "esp_partition_erase_range",
+        ] {
+            println!("cargo:rustc-link-arg=-Wl,--wrap={f}");
+            // The wrappers live in this crate's rlib and nothing in Rust
+            // calls them; without `-u` the linker never pulls them in.
+            println!("cargo:rustc-link-arg=-Wl,-u,__wrap_{f}");
+        }
+    }
+
     // Anchor CONFIG_PARTITION_TABLE_CUSTOM_FILENAME to this checkout's
     // absolute path — same rationale as the sibling s3-app build.rs.
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());

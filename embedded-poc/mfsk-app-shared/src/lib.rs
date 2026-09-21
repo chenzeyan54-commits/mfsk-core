@@ -8,6 +8,7 @@
 
 pub mod activator;
 pub mod adif;
+pub mod all_txt;
 pub mod boot_mode;
 pub mod grid_src;
 pub mod capture_window;

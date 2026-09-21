@@ -688,6 +688,9 @@ fn scan_loop() -> ! {
             }
             FreeRtos::delay_ms(200);
         };
+        // Named now, not at publish: the candidate loop below runs
+        // ~33 s into the next slot and can run past its end.
+        let slot_unix = crate::storage::decoded_slot_unix(60_000);
 
         let t_post0 = now_us();
         let (candidates, fill_us, rank_us) = fst4_monitor::coarse_search(&slot);
@@ -796,6 +799,20 @@ fn scan_loop() -> ! {
                 hard_errors: 0,
             }));
         }
+        crate::storage::record_slot(
+            slot_unix,
+            60_000,
+            None,
+            "FST4",
+            decoded.iter().map(|h| {
+                (
+                    h.snr_db,
+                    h.dt_sec,
+                    h.refined_hz,
+                    h.msg.as_deref().unwrap_or(""),
+                )
+            }),
+        );
         log_heap("post-slot");
         slot_num = slot_num.wrapping_add(1);
     }

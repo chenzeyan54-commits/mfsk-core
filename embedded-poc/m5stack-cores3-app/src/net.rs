@@ -156,10 +156,11 @@ pub struct Config {
     ///
     /// False for the FT8 controller, which has never had one: its
     /// network sequence was hand-rolled in `main.rs` and stopped at
-    /// NTP. Unifying the sequence would have handed it an httpd task
-    /// as a side effect, and a refactor that adds a listening socket to
-    /// a shipped receiver is not a refactor. One line, when it is
-    /// wanted on purpose and with the memory measured.
+    /// NTP. Turning it on was measured on 2026-09-22 (SIM build):
+    /// ~4.3 KB less internal DRAM with the server resident
+    /// (65 091 -> 60 775 B free), for a page — the activator's log
+    /// download — needed once per activation. It stays off; the logs
+    /// are to come from a server started on demand.
     pub http: bool,
     /// Called with whether NTP synced.
     pub on_ntp: fn(bool),
@@ -439,7 +440,7 @@ fn run(mut ctx: Ctx) -> ! {
     let _http_server = if !ctx.cfg.http {
         None
     } else {
-        match http_config::start(ctx.nvs.clone()) {
+        match http_config::start(ctx.nvs.clone(), Some(crate::storage::HTTP_FILES)) {
             Ok(s) => {
                 log::info!("{tag}: HTTP config server up");
                 Some(s)

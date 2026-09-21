@@ -382,3 +382,11 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 #
 # Do not reintroduce it as a first move. Check `stack_hw` in the alive
 # tick first — it costs nothing and it answered this in one flash.
+
+# LittleFS (`src/storage.rs`): its caches in PSRAM, not internal DRAM.
+# Internal DRAM's floor is ~16 KB with WiFi up (memory
+# project_cores3_coarse_sync_internal_dram_cliff); these buffers are a
+# few hundred bytes each per open file and are touched only by the
+# storage task, whose flash calls go through esp_flash's internal bounce
+# buffer for an external source/destination.
+CONFIG_LITTLEFS_MALLOC_STRATEGY_SPIRAM=y

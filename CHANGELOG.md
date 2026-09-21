@@ -18,6 +18,52 @@
   as WSJT-X, whose `pack77` never had the gap. `pack77_type1` routes
   through `pack77`, so it gains the same.
 
+- **CoreS3: `qso.adi` and `all.txt` on flash.** The activator's
+  contacts and every decode now have somewhere to go that survives a
+  power cut. `littlefs` moves to the unused tail of the 16 MB flash
+  (6.125 MiB at `0x9E0000`; the old 768 KB partition had no component
+  mounting it, so nothing is lost) and is mounted through
+  `joltwallet/littlefs`, formatted on first boot. `all.txt` is
+  WSJT-X's `ALL.TXT` line for line (`MainWindow::write_all`), written
+  for every mode from each receiver's `publish_slot` site and rotated
+  to `all.1.txt` at 2 MiB; `qso.adi` follows `LogBook::QSOToADIF`
+  field for field, plus `MY_SOTA_REF` / `MY_POTA_REF`, and is
+  `fsync`ed per record. Both formatters are pure and tested against
+  the WSJT-X layout in `hosttest/mfsk-app-shared`. `http_config` can
+  serve the files (`FileSource`; verified, 9 KB in 85 ms), but no
+  receiver keeps a server up for it — see below.
+
+  **All flash I/O goes through one task with an internal-DRAM stack**
+  (`storage.rs`): the HTTP server and the panel tasks run on PSRAM
+  stacks, and a flash operation from one aborts the board
+  (`cache_utils.c:127`). Three things about it were measured on the
+  FT8 SIM build before it was right, 18 slots per run:
+
+  - **It is spawned by the first request, not at boot.** Spawned at
+    boot, its 5 KB stack came out of the block the decoder allocates
+    next — largest free internal block before the decode loop 40 960 →
+    32 768 B — and FT8 went from 0 to 9-14 slots of 18 finishing past
+    key-up, losing the weakest station (K1JT, −15 dB) from the slot
+    list. Lazily spawned: 0 of 18, 7 decodes every slot. A resident
+    httpd costs the same way (~4.3 KB), which is why the FT8
+    controller still has none; the logs are to be fetched from a
+    server started on demand, or over Web Serial.
+  - **`all.txt` is written 4 KB at a time.** LittleFS cannot program
+    into a block after `sync` committed it, so each synced append
+    copied the tail block to a fresh one: a 448 B slot cost one erase
+    and 512-4 096 B of programming, and about one sync in ten also
+    compacted the metadata log (538 reads, 69 KB, 147 ms) — traced
+    with counting `--wrap`pers on the three `esp_partition_*` calls
+    (`MFSK_STORAGE_TRACE=1`). Batched, one 4 480 B write programs
+    7 168 B in 72 ms every ~10 FT8 slots. A power cut loses the
+    unwritten ~2 minutes of `all.txt`; `qso.adi` is unaffected.
+  - **The write waits for mid-slot**, the point furthest from every
+    deadline.
+
+  **Not yet measured**: whether a flush's cache-off time drops audio
+  on a live UAC capture (48 ms of queued isochronous audio); the SIM
+  build feeds from a WAV and cannot show it.
+
 - **CoreS3: the CQ-side QSO state machine for portable activations
   (`mfsk-app-shared::activator`), host-tested, not yet wired.** SOTA /
   POTA operation wants the board to call CQ, answer whoever calls, log

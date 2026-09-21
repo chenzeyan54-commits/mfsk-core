@@ -69,6 +69,14 @@ pub mod grid_state;
 #[path = "../../../embedded-poc/mfsk-app-shared/src/activator.rs"]
 pub mod activator;
 
+/// ADIF records and `ALL.TXT` lines — pure formatting; what they are
+/// checked against is WSJT-X's own writers, since a log that does not
+/// merge into WSJT-X's is a log someone has to retype.
+#[path = "../../../embedded-poc/mfsk-app-shared/src/adif.rs"]
+pub mod adif;
+#[path = "../../../embedded-poc/mfsk-app-shared/src/all_txt.rs"]
+pub mod all_txt;
+
 /// The FT8/FT4 decoded-row list. Pulled in as a `ui` module tree so
 /// the file's own `crate::ui::state::...` paths resolve unchanged.
 ///
@@ -184,5 +192,122 @@ mod activator_pack_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod log_format_tests {
+    use super::adif::{self, Qso};
+    use super::all_txt::{rx_line, tx_line};
+
+    /// 2026-09-22 10:15:00 UTC.
+    const T0: i64 = 1_790_072_100;
+
+    #[test]
+    fn all_txt_lines_match_wsjtx_layout() {
+        assert_eq!(
+            rx_line(
+                T0,
+                Some(14_074_000),
+                "FT8",
+                -12,
+                0.3,
+                1234,
+                "CQ JA1ABC PM95"
+            ),
+            "260922_101500    14.074 Rx FT8    -12  0.3 1234 CQ JA1ABC PM95\n"
+        );
+        assert_eq!(
+            rx_line(
+                T0,
+                Some(7_047_500),
+                "FT4",
+                5,
+                -1.25,
+                987,
+                "W1AW JA1ABC R-03"
+            ),
+            "260922_101500     7.048 Rx FT4      5 -1.2  987 W1AW JA1ABC R-03\n"
+        );
+        assert_eq!(
+            tx_line(
+                T0 + 15,
+                Some(14_074_000),
+                "FT8",
+                1500,
+                "JA1ABC JL1NIE/P -12"
+            ),
+            "260922_101515    14.074 Tx FT8      0  0.0 1500 JA1ABC JL1NIE/P -12\n"
+        );
+        // No CAT link: 0.000, not a guess.
+        assert!(
+            rx_line(T0, None, "FT8", 0, 0.0, 1000, "X").starts_with("260922_101500     0.000 Rx")
+        );
+    }
+
+    fn qso() -> Qso<'static> {
+        Qso {
+            call: "W1AW",
+            grid: "FN31",
+            mode: "FT8",
+            rst_sent: -7,
+            rst_rcvd: Some(-12),
+            on_unix: T0,
+            off_unix: T0 + 45,
+            dial_hz: Some(14_074_000),
+            my_call: "JL1NIE/P",
+            my_grid: "PM95",
+            my_sota_ref: Some("JA/KN-006"),
+            my_pota_ref: None,
+        }
+    }
+
+    /// Field for field what `LogBook::QSOToADIF` writes for the same
+    /// contact, plus the SOTA reference WSJT-X has no field for.
+    #[test]
+    fn adif_record_matches_wsjtx() {
+        assert_eq!(
+            adif::record(&qso()),
+            "<call:4>W1AW <gridsquare:4>FN31 <mode:3>FT8 <rst_sent:3>-07 \
+             <rst_rcvd:3>-12 <qso_date:8>20260922 <time_on:6>101500 \
+             <qso_date_off:8>20260922 <time_off:6>101545 <band:3>20m \
+             <freq:9>14.074000 <station_callsign:8>JL1NIE/P \
+             <my_gridsquare:4>PM95 <my_sota_ref:9>JA/KN-006 <eor>\n"
+        );
+    }
+
+    #[test]
+    fn adif_ft4_is_an_mfsk_submode_and_unknowns_are_left_out() {
+        let mut q = qso();
+        q.mode = "FT4";
+        q.rst_rcvd = None;
+        q.dial_hz = None;
+        q.grid = "";
+        q.my_sota_ref = None;
+        q.my_pota_ref = Some("JA-1234");
+        let r = adif::record(&q);
+        assert!(r.contains("<mode:4>MFSK <submode:3>FT4"), "{r}");
+        assert!(r.contains("<gridsquare:0> "), "{r}");
+        for absent in ["rst_rcvd", "<band", "<freq", "my_sota_ref"] {
+            assert!(!r.contains(absent), "{absent} in {r}");
+        }
+        assert!(r.contains("<my_pota_ref:7>JA-1234"), "{r}");
+    }
+
+    #[test]
+    fn bands() {
+        assert_eq!(adif::band_for_hz(7_074_000), Some("40m"));
+        assert_eq!(adif::band_for_hz(50_313_000), Some("6m"));
+        assert_eq!(adif::band_for_hz(144_460_000), Some("2m"));
+        assert_eq!(adif::band_for_hz(9_000_000), None);
+    }
+
+    #[test]
+    fn adif_header_ends_in_eoh() {
+        let h = adif::header(T0);
+        assert!(h.starts_with(
+            "ADIF Export\n<adif_ver:5>3.1.4\n<created_timestamp:15>20260922 101500\n"
+        ));
+        assert!(h.ends_with("<eoh>\n"));
     }
 }

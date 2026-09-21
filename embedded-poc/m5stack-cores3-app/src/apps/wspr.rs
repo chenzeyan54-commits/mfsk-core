@@ -680,6 +680,17 @@ fn run_one_slot(
             hard_errors: 0,
         }));
     }
+    let texts: Vec<String> = results.iter().map(|r| r.message.to_string()).collect();
+    crate::storage::record_slot(
+        slot_start_unix_s,
+        120_000,
+        Some((band.dial_mhz * 1e6).round() as u64),
+        "WSPR",
+        results
+            .iter()
+            .zip(&texts)
+            .map(|(r, text)| (r.snr_db, r.dt_sec, r.freq_hz, text.as_str())),
+    );
 
     let ntp_synced = NTP_SYNCED.load(Ordering::Acquire);
     if is_synthetic_source {

@@ -300,3 +300,12 @@ bindings_module = "esp_dsp"
 remote_component = { name = "espressif/usb_host_uac", version = "^1.4" }
 bindings_header = "../bindings_uac.h"
 bindings_module = "uac"
+
+# The activator's contact log and ALL.TXT (`src/storage.rs`). LittleFS
+# rather than NVS, which is a 24 KB key-value store, and rather than
+# FAT, whose allocation table is one power cut from losing the file
+# on a battery-powered summit board. `esp_idf_svc::fs::littlefs` is
+# compiled only when this component is present — hence here, and not
+# in `mfsk-app-shared`, which the StickS3 and Core2 also build.
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "joltwallet/littlefs", version = "^1.14" }

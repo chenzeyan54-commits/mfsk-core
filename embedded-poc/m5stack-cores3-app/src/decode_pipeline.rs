@@ -2039,6 +2039,18 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                     hard_errors: *hard,
                 }
             }));
+            // ALL.TXT beside the panel, from the same rows. Dial
+            // frequency unknown (no CAT) until the activator's settings
+            // carry one.
+            crate::storage::record_slot(
+                crate::storage::decoded_slot_unix(15_000),
+                15_000,
+                None,
+                "FT8",
+                published
+                    .iter()
+                    .map(|(text, f, snr, dt, _)| (*snr, *dt, *f, text.as_str())),
+            );
         }
 
         // **This period's transmission is decided here** — before
