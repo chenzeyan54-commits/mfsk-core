@@ -634,25 +634,68 @@ pub fn take_acquisition_audio(min_samples: usize) -> Option<Vec<i16>> {
 /// samples so the sink's slot grid starts `lead_silence / 12` ms
 /// mis-aligned from the signal — the condition the grid code exists
 /// to recover from.
-pub fn spawn_sim_feed(wav: &'static [u8], lead_silence: usize) {
+/// Where a sim feed's samples come from.
+///
+/// Two shapes because the two baked assets are two shapes: FT8's
+/// recordings are `.wav` files with a 44-byte header, and the FT4
+/// golden is the raw `i16` slot `ft4_bench` already links
+/// (`assets/ft4_golden_audio.bin`). Neither is worth converting to the
+/// other at build time just to share one loop.
+#[derive(Clone, Copy)]
+pub enum SimSource {
+    /// A `.wav` file; the 44-byte header is skipped.
+    Wav(&'static [u8]),
+    /// Raw little-endian `i16` at 12 kHz, no header.
+    Pcm(&'static [u8]),
+}
+
+/// True once a sim feed is running, so a sink can say *sim* where it
+/// would otherwise say *real UAC audio*.
+///
+/// That line is not decoration: "has FT4 ever decoded off the air on
+/// this board" was answered by grepping the logs for it, and a replay
+/// that claims to be a radio makes that question unanswerable.
+static SIM_FEEDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn sim_feeding() -> bool {
+    SIM_FEEDING.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Feed baked audio to whatever sink is registered, at 12 kHz, forever.
+///
+/// `slot_samples` is the receiver's own slot at 12 kHz — 180 000 for
+/// FT8, 90 000 for FT4 — and the loop is truncated to a whole number
+/// of them; see the note inside for what a partial slot did to the
+/// measurement it was supposed to make.
+pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) {
     struct Cfg {
-        wav: &'static [u8],
+        src: SimSource,
+        slot: usize,
         lead: usize,
     }
-    let cfg = Box::into_raw(Box::new(Cfg { wav, lead: lead_silence })) as *mut core::ffi::c_void;
+    let cfg = Box::into_raw(Box::new(Cfg {
+        src,
+        slot: slot_samples,
+        lead: lead_silence,
+    })) as *mut core::ffi::c_void;
 
     extern "C" fn entry(arg: *mut core::ffi::c_void) {
         // SAFETY: `spawn_sim_feed` leaked exactly this box. Drop it once
-        // its two fields are copied into locals — the task never
-        // returns, so nothing else needs it.
-        let (wav, lead) = {
+        // its fields are copied into locals — the task never returns,
+        // so nothing else needs it.
+        let (src, slot_samples, lead) = {
             let cfg = unsafe { Box::from_raw(arg as *mut Cfg) };
-            (cfg.wav, cfg.lead)
+            (cfg.src, cfg.slot, cfg.lead)
         };
-        let pcm: Vec<i16> = wav[44..]
+        let bytes = match src {
+            SimSource::Wav(w) => &w[44..],
+            SimSource::Pcm(p) => p,
+        };
+        let pcm: Vec<i16> = bytes
             .chunks_exact(2)
             .map(|b| i16::from_le_bytes([b[0], b[1]]))
             .collect();
+        SIM_FEEDING.store(true, core::sync::atomic::Ordering::Release);
         // Loop a *whole number of slots*, not the raw file length.
         // `qso3_busy.wav` is 180 101 samples — 101 past one 15 s slot —
         // so wrapping at `pcm.len()` slid the content 101 samples
@@ -666,15 +709,15 @@ pub fn spawn_sim_feed(wav: &'static [u8], lead_silence: usize) {
         // the window crossed the seam. Truncating to whole slots makes
         // the loop phase-continuous, so identical audio really does
         // reach the decoder identically every slot.
-        let loop_len = if pcm.len() >= SLOT_SAMPLES_12K {
-            pcm.len() / SLOT_SAMPLES_12K * SLOT_SAMPLES_12K
+        let loop_len = if pcm.len() >= slot_samples {
+            pcm.len() / slot_samples * slot_samples
         } else {
             pcm.len()
         };
         log::warn!(
             "uac SIM: feeding {loop_len} of {} baked samples on loop ({} slot(s), {} trimmed for phase continuity), {} ms lead silence — no radio",
             pcm.len(),
-            loop_len / SLOT_SAMPLES_12K.max(1),
+            loop_len / slot_samples.max(1),
             pcm.len() - loop_len,
             lead / 12
         );
@@ -743,6 +786,68 @@ pub fn set_grid_fix_nvs(part: esp_idf_svc::nvs::EspDefaultNvsPartition) {
     if let Ok(mut slot) = GRID_FIX_NVS.lock() {
         *slot = Some(part);
     }
+}
+
+/// How many slots between live-phase writes while the air owns the
+/// grid. 20 slots is 5 minutes, and the phase moves ~1.2 ms a slot
+/// (measured on a radio 2026-09-21, `logs/airdt_2026-09-21.log`), so a
+/// fix read at the worst moment is ~24 ms stale — against FT4's ±1.0 s
+/// search and its 0.3 s lock bar.
+const LIVE_PHASE_EVERY_SLOTS: u32 = 20;
+
+/// Last slot index a live phase was written at, and what it said.
+static LIVE_PHASE_LAST: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// **Keep the sub-second phase where a reboot can find it.**
+///
+/// `persist_grid_fix` used to be reached from exactly one place: the
+/// cold-acquisition success arm. So a receiver that never ran an
+/// acquisition — which is the *normal* case, since the RTC places the
+/// grid and one DT trim centres it — persisted nothing, and the reboot
+/// into FT4 found either no fix or one from a previous day. Measured
+/// 2026-09-21: `ft4_app: persisted grid fix present but stale/weak
+/// (R 1.00, 88394 s old) — ignoring`.
+///
+/// That matters because **FT4 cannot place its own grid**: cold
+/// acquisition is FT8-only, and FT4's band is too thin to derive a
+/// phase from anyway. Its phase has to come from NTP or from whatever
+/// FT8 left behind. This is what leaves something behind.
+///
+/// `err_ms` is this boundary's distance from the clock's own slot
+/// grid, which is exactly what `GridFix::correction_for` hands back to
+/// a reader: positive means the band's boundary falls later than the
+/// clock's, and a reader adds it to its own `samples_to_next_slot`.
+///
+/// Written only while [`GridLock::Air`] stands — the air is then the
+/// phase authority, which is the one case a reader cannot reconstruct
+/// for itself. Under NTP the reader has NTP; under `Rtc` the phase is
+/// the clock's own and unproven.
+///
+/// [`GridLock::Air`]: mfsk_app_shared::time_sync::GridLock::Air
+fn persist_live_phase_if_air_owns_it(err_ms: i64, slot_idx: u32) {
+    use core::sync::atomic::Ordering as O;
+    if mfsk_app_shared::time_sync::grid_lock() != mfsk_app_shared::time_sync::GridLock::Air {
+        return;
+    }
+    let last = LIVE_PHASE_LAST.load(O::Acquire);
+    if last != u32::MAX && slot_idx.wrapping_sub(last) < LIVE_PHASE_EVERY_SLOTS {
+        return;
+    }
+    let Some(now_ms) = mfsk_app_shared::time_sync::utc_now_ms() else {
+        return;
+    };
+    LIVE_PHASE_LAST.store(slot_idx, O::Release);
+    persist_grid_fix(mfsk_app_shared::grid_fix::GridFix {
+        offset_us: (err_ms * 1000) as i32,
+        period_s: SLOT_SECS as f32,
+        epoch_at_fix: (now_ms / 1000) as i64,
+        // The air raised this lock, which needs `LOCK_MIN_DECODES`
+        // decodes *and* a median DT inside `LOCK_MAX_PHASE_S`. A grid
+        // that has held that and is still producing slots is as
+        // confident as the acquisition path's own saturated 1.0.
+        confidence: 1.0,
+    });
 }
 
 /// Persist a cold-acquisition grid fix, from a short-lived
@@ -1086,6 +1191,7 @@ impl AudioSink for Ft8ChunkSink {
                             self.wav_idx,
                             self.slot_target,
                         );
+                        persist_live_phase_if_air_owns_it(err, self.wav_idx as u32);
                     }
 
                     // One phase authority per boundary, never both.
@@ -1293,7 +1399,7 @@ pub fn seed_grid_fix_us(offset_us: i32) {
 /// Without NTP there is no phase source and the boundary falls back to
 /// stream-relative — the sink says which of the two it is doing rather
 /// than leaving a reader to guess.
-const SLOT_SAMPLES_12K: usize = 180_000;
+pub const SLOT_SAMPLES_12K: usize = 180_000;
 /// The same slot, in seconds — what the UTC grid is computed from.
 const SLOT_SECS: u64 = 15;
 /// Phase error that is worth a log line. The correction itself runs

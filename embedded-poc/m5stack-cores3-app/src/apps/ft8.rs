@@ -165,5 +165,9 @@ fn sim_feed_if_asked() {
     let offset_ms: usize = option_env!("MFSK_SIM_OFFSET_MS")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    crate::uac::spawn_sim_feed(crate::decode_pipeline::QSO_WAVS[0], offset_ms * 12);
+    crate::uac::spawn_sim_feed(
+        crate::uac::SimSource::Wav(crate::decode_pipeline::QSO_WAVS[0]),
+        crate::uac::SLOT_SAMPLES_12K,
+        offset_ms * 12,
+    );
 }

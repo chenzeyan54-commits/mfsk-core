@@ -204,6 +204,7 @@ impl Receiver for Ft4Rx {
     fn start(_ctx: &BootCtx) {
         spawn_slot_task();
         crate::uac::set_audio_sink(Ft4Sink);
+        sim_feed_if_asked();
     }
 
     fn run_forever(ctx: BootCtx, panel: Panel) -> ! {
@@ -255,7 +256,11 @@ struct Ft4Sink;
 impl crate::uac::AudioSink for Ft4Sink {
     fn push_samples(&mut self, samples_12k_mono: &[i16]) {
         if !AUDIO_LIVE.swap(true, Ordering::AcqRel) {
-            log::info!("ft4_app: real UAC audio active");
+            if crate::uac::sim_feeding() {
+                log::info!("ft4_app: SIM audio active — baked slot through the real sink");
+            } else {
+                log::info!("ft4_app: real UAC audio active");
+            }
         }
         let Ok(mut staging) = STAGING.lock() else {
             return;
@@ -573,4 +578,48 @@ fn port_tick_ms() -> u32 {
 fn free_heap_kb() -> u32 {
     const CAPS: u32 = (1 << 11) | (1 << 2);
     (unsafe { esp_idf_svc::sys::heap_caps_get_free_size(CAPS) } / 1024) as u32
+}
+
+/// `MFSK_CORES3_SIM`: feed the baked FT4 slot through **`Ft4Sink`**,
+/// the same path a radio's audio takes.
+///
+/// The replay inside `slot_loop` is not this. It pushes samples
+/// straight into the staging buffer, so it exercises the decoder and
+/// nothing above it: no sink, no `SlotAccum` anchor, no slot grid —
+/// which is precisely the machinery #354 and #356 are about, and the
+/// reason FT4's grid wiring has never been tested on hardware. It also
+/// declines to anchor at all (`live_prev` stays false, because "the
+/// replay source is not real-time"), so a replay run cannot tell a
+/// working grid from a broken one.
+///
+/// This is the FT8 harness's shape (`MFSK_CORES3_SIM`, `ebc4e42`)
+/// applied to FT4: real-time pacing into the registered sink, the
+/// phase set by `MFSK_SIM_OFFSET_MS` so a deliberate grid error can be
+/// aimed, and `MFSK_SIM_NO_CLOCK` to take the RTC away and make the
+/// receiver find the phase without one.
+///
+/// The audio is `assets/ft4_golden_audio.bin` — the WSJT-X FT4 sample
+/// `000000_000002.wav`, a real off-air recording of six stations, not
+/// a synthesised frame. Needs `--features ft4-replay`, which is what
+/// links it.
+fn sim_feed_if_asked() {
+    if option_env!("MFSK_CORES3_SIM").is_none() {
+        return;
+    }
+    if GOLDEN_AUDIO.is_empty() {
+        log::error!("ft4_app: MFSK_CORES3_SIM set but no golden linked — build with ft4-replay");
+        return;
+    }
+    if option_env!("MFSK_SIM_NO_CLOCK").is_some() {
+        mfsk_app_shared::time_sync::suppress_clock(true);
+        log::warn!("ft4_app SIM: clock suppressed — the grid has to come from the air or the fix");
+    }
+    let offset_ms: usize = option_env!("MFSK_SIM_OFFSET_MS")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    crate::uac::spawn_sim_feed(
+        crate::uac::SimSource::Pcm(GOLDEN_AUDIO),
+        rx::SLOT_SAMPLES,
+        offset_ms * 12,
+    );
 }
