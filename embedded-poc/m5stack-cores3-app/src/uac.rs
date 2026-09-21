@@ -721,6 +721,44 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
             pcm.len() - loop_len,
             lead / 12
         );
+        // **Put the recording on the grid before feeding it.**
+        //
+        // A sim feed that just starts at boot places its slot
+        // boundaries wherever the boot fell, which is uniform over the
+        // period — and a receiver whose phase comes from the clock then
+        // decodes nothing, with no way to tell that from a decoder
+        // fault. Measured 2026-09-21: with FT4's DT servo removed the
+        // harness read `0 decodes` on every slot at a −906 ms offset,
+        // and the only thing wrong was the harness.
+        //
+        // So the first real sample lands on a clock slot boundary, and
+        // `lead` — `MFSK_SIM_OFFSET_MS` — is a *deliberate* error
+        // measured from there rather than an unknown one added to it.
+        // With no clock (`MFSK_SIM_NO_CLOCK`) there is no boundary to
+        // aim at, which is its own experiment: the receiver has to find
+        // the phase without one.
+        let align = mfsk_app_shared::time_sync::samples_to_next_slot_12k_ms(
+            (slot_samples / 12) as u64,
+        );
+        let lead = match align {
+            Some(to_boundary) => {
+                log::warn!(
+                    "uac SIM: aligning to the clock — {} ms of silence to the next {} ms \
+                     boundary, then {} ms of deliberate offset",
+                    to_boundary / 12,
+                    slot_samples / 12,
+                    lead / 12,
+                );
+                to_boundary + lead
+            }
+            None => {
+                log::warn!(
+                    "uac SIM: no clock — feeding from now, {} ms of deliberate offset",
+                    lead / 12
+                );
+                lead
+            }
+        };
         const BLK: usize = 256;
         let t0 = unsafe { sys::esp_timer_get_time() };
         let mut fed: u64 = 0;

@@ -90,12 +90,29 @@ const REPLAY_BLOCK: usize = 256;
 /// whole-second `samples_to_next_slot_12k` could not be reused here.
 const FT4_SLOT_MS: u64 = 7_500;
 
-/// Smallest DT-median correction worth applying to the grid.
+/// Smallest DT median worth a log line. ~24 ms, half an FT4 symbol.
 ///
-/// ~24 ms — half an FT4 symbol. Below this it is jitter, and the UTC
-/// anchor has the grid within ~100 ms already; chasing it every slot
-/// would only add noise.
-const FT4_DT_TRIM_MIN_SAMPLES: u32 = 288;
+/// **It used to be the smallest correction worth *applying***, and the
+/// grid was steered by it every slot. Measured on the board through the
+/// real sink (2026-09-21, `logs/ft4sim_2026-09-21.log`), that steering
+/// fought the clock re-anchor and neither won: the DT median alternated
+/// −0.45 s / −0.25 s and `slot grid +45x ms off the clock — trimmed`
+/// fired on all 15 slots, for as long as the run lasted.
+///
+/// Two mechanisms, pulling opposite ways once a slot. The trim moved
+/// the window toward the audio; the re-anchor put it back on the
+/// clock's grid; the next slot measured the same offset again. It was
+/// invisible until the replay went through `Ft4Sink` instead of around
+/// it, because nothing else anchored at all.
+///
+/// FT8 removed its own per-slot DT servo on 2026-09-05 for a different
+/// reason with the same conclusion — a decode's DT is *that station's*
+/// clock error, not ours. FT4 cannot even take the other side of that
+/// trade: its band does not carry enough stations for a median to mean
+/// anything. So the phase comes from NTP or from the fix FT8 persisted,
+/// and this number only decides whether the measurement is worth
+/// printing.
+const FT4_DT_REPORT_MIN_SAMPLES: u32 = 288;
 
 /// Spectrogram rows per waterfall row.
 ///
@@ -411,10 +428,24 @@ fn slot_loop() -> ! {
                 // backlog, in the same direction, every slot.
                 remain += block.len();
                 let was_aligned = accum.is_aligned();
-                // Fold in the persisted FT8 acquisition fix (#356b) on
-                // the first anchor only — after that the DT-median trim
-                // owns the fine correction.
-                if !was_aligned && seeded_from_air {
+                // **Every anchor, not just the first.**
+                //
+                // This used to fold the persisted FT8 fix in once, on
+                // the reasoning that "after that the DT-median trim
+                // owns the fine correction". It does not, and cannot:
+                // FT4's band carries too few stations for a DT median
+                // to be a phase reference, which is the whole reason
+                // the trim below is gone. With nothing owning the
+                // correction, a re-anchor would drop the sub-second
+                // part and put the grid back on the RTC's raw phase —
+                // whole seconds, since `read_into_system_clock` commits
+                // `tv_usec: 0`.
+                //
+                // So the clock supplies the seconds and the fix
+                // supplies the remainder, on every anchor, for as long
+                // as the fix is fresh. That is what "FT8 locks, FT4
+                // runs off it" means in code.
+                if seeded_from_air {
                     let fix_us = ACQUIRED_GRID_FIX_US.load(Ordering::Acquire);
                     let period = (FT4_SLOT_MS * 12) as i64;
                     let shifted = remain as i64 + (fix_us as i64 * 12 / 1000);
@@ -557,12 +588,13 @@ fn slot_loop() -> ! {
                 last_finalised = finalised;
                 if let Some(off_sec) = mfsk_app_shared::time_sync::slot_dt_offset() {
                     // Cross-slot phase filter (#356b) — 7.5 s period.
+                    // A **readout**, and nothing steers on it.
                     mfsk_app_shared::time_sync::observe_slot_phase(off_sec, 7.5);
                     let delta = (off_sec * 12_000.0).round() as i32;
-                    if delta.unsigned_abs() >= FT4_DT_TRIM_MIN_SAMPLES {
-                        accum.shift_next_window(delta);
+                    if delta.unsigned_abs() >= FT4_DT_REPORT_MIN_SAMPLES {
                         log::info!(
-                            "ft4_app: DT median {off_sec:+.3} s ({finalised} slots) — grid {delta:+} samples"
+                            "ft4_app: DT median {off_sec:+.3} s ({finalised} slots, {delta:+} \
+                             samples) — not applied"
                         );
                     }
                 }
