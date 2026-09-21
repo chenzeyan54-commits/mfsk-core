@@ -72,18 +72,16 @@
 #![allow(dead_code)] // board.rs/pmic.rs/uac.rs carry items this bin doesn't use (no touch, no TX).
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use esp_idf_hal::delay::FreeRtos;
-use esp_idf_hal::peripherals::Peripherals;
 
-use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
 
 use embedded_shared::fst4_dual_core;
+
+use crate::boot::{BootCtx, Display, Panel, Receiver};
 use embedded_shared::fst4_monitor::{self, CapturedSlot, MonitorConfig, MonitorHit, SlotCapture};
 use mfsk_app_shared::boot_mode::BootMode;
-use mfsk_app_shared::settings;
 use mfsk_app_shared::ui::slot_list::{self, SlotSpotRow, SlotUiState};
 
 /// The same baked golden slot `fst4-ddc-bench` runs — raw `i16` little
@@ -242,10 +240,6 @@ const CFG: MonitorConfig = MonitorConfig {
 
 const MALLOC_CAP_SPIRAM: u32 = 1 << 10;
 
-/// Same bound `wspr_app` uses — one attempt at boot, then the app runs
-/// regardless.
-const NTP_SYNC_TIMEOUT_MS: u32 = 20_000;
-
 static SCAN_GO: AtomicBool = AtomicBool::new(false);
 /// Flips true on the first real sample from a UAC device, after which
 /// the capture task stops replaying the golden slot.
@@ -326,144 +320,109 @@ fn log_heap(tag: &str) {
 /// Everything below is unchanged from when it was `main`, including
 /// the ordering constraints: the worker-stack reservation and the scan
 /// task's stack both have to land before WiFi starts.
-pub fn run(peripherals: Peripherals, nvs_part: EspDefaultNvsPartition) -> ! {
-    log::info!("=== mfsk-core-m5stack-cores3-app fst4-app boot ===");
-    log::info!("mfsk-core {}", mfsk_core::VERSION);
+/// FST4 through the shared boot sequence — see `crate::boot`.
+///
+/// This receiver carries the bench flags the others do not
+/// (`MFSK_FST4_APP_NO_WIFI`, `_NO_CONNECT`, `_WIFI_STOP`, `_HOG_KB`),
+/// and they survive the move intact: the first two are now shapes of
+/// [`crate::net::Config`] rather than branches in a boot sequence, so
+/// the thing they measure — the driver's memory against the driver's
+/// CPU — is expressed where the driver is built.
+pub struct Fst4Rx;
 
-    // The candidate loop is compute-bound for tens of seconds with no
-    // yield point on either core; IDLE0/IDLE1 starve and the task
-    // watchdog fires. Same call, same reason, as every bench here.
-    let r = unsafe { esp_idf_svc::sys::esp_task_wdt_deinit() };
-    log::info!("task watchdog deinit -> {r}");
+impl Receiver for Fst4Rx {
+    const TAG: &'static str = "fst4_app";
 
-    // Take FST4's worker stack before WiFi, while the heap is still
-    // whole — after WiFi and the USB host the largest free internal
-    // block is 31,744 B, and this needs far more. See
-    // `embedded_shared::worker_arena` for the measurements.
-    if !fst4_dual_core::reserve_arena() {
-        log::error!("worker stack reservation failed — decoding will run single-core");
-    }
-    fst4_dual_core::init();
-
-    // Both lints fire on the *default* value of a build-time knob:
-    // with `MFSK_FST4_APP_HOG_KB` unset `HOG_KB` is 0, so the guard is
-    // trivially false and the range trivially empty — which is the
-    // intended shape of an off-by-default diagnostic, not a mistake.
-    // The code exists for the builds that pass the env var.
-    #[allow(clippy::absurd_extreme_comparisons, clippy::reversed_empty_ranges)]
-    if HOG_KB > 0 {
-        const MALLOC_CAP_INTERNAL_8BIT: u32 = (1 << 11) | (1 << 2);
-        // 4 KiB blocks, matching what `SPIRAM_MALLOC_ALWAYSINTERNAL`
-        // treats as "small enough to want internal DRAM" — the same
-        // shape the allocations this is meant to crowd out have.
-        let mut got = 0usize;
-        for _ in 0..HOG_KB / 4 {
-            let p = unsafe { esp_idf_svc::sys::heap_caps_malloc(4096, MALLOC_CAP_INTERNAL_8BIT) };
-            if p.is_null() {
-                break;
-            }
-            got += 4;
+    fn prepare(_ctx: &BootCtx) {
+        if !fst4_dual_core::reserve_arena() {
+            log::error!("worker stack reservation failed — decoding will run single-core");
         }
-        log::warn!("fst4_app: MFSK_FST4_APP_HOG_KB={HOG_KB} — reserved {got} KB of internal DRAM");
+        fst4_dual_core::init();
+        hog_internal_dram();
     }
 
-    let nvs = settings::open_nvs(nvs_part.clone()).expect("settings NVS open");
-    let nvs = Arc::new(Mutex::new(nvs));
+    fn spawn_workers(_ctx: &BootCtx) {
+        log_heap("pre-scan-spawn");
+        spawn_scan_task();
+        spawn_capture_task();
+        log_heap("post-scan-spawn");
+        crate::uac::set_audio_sink(Fst4Sink);
+    }
 
-    // Scan task's 96 KiB stack first, before anything else can
-    // fragment internal DRAM — `wspr_app`'s own comment explains what
-    // this ordering is worth on real hardware (a display task's
-    // concurrent SPI-driver allocations beat it to the block once).
-    log_heap("pre-scan-spawn");
-    spawn_scan_task();
-    spawn_capture_task();
-    log_heap("post-scan-spawn");
+    fn attach_panel(ctx: &BootCtx, display: Display) -> Panel {
+        crate::spot_panel::spawn::<Fst4Panel>(crate::spot_panel::DisplayCtx {
+            i2c0: display.i2c0,
+            spi2: display.spi2,
+            pins: display.pins,
+            nvs: ctx.nvs.clone(),
+        });
+        log_heap("post-display-spawn");
+        Panel::Spawned
+    }
 
-    // Register the sink before the display task, whose body installs
-    // the USB host driver — same "wire the consumer before installing
-    // the driver" ordering `wspr_app` relies on.
-    crate::uac::set_audio_sink(Fst4Sink);
-
-    crate::spot_panel::spawn::<Fst4Panel>(crate::spot_panel::DisplayCtx {
-        i2c0: peripherals.i2c0,
-        spi2: peripherals.spi2,
-        pins: peripherals.pins,
-        nvs: nvs.clone(),
-    });
-    log_heap("post-display-spawn");
-
-    // WiFi *driver construction* is synchronous and stays here, before
-    // `SCAN_GO`: `peripherals.modem` is consumed by value and is not
-    // returned on `Err`, so a failure is permanent for this boot, and
-    // the internal-DRAM it needs has to be claimed in the same quiet
-    // window the task stacks were. The slow, unbounded half
-    // (associate/DHCP retry) is what the network task backgrounds.
-    let sysloop = EspSystemEventLoop::take().expect("sysloop");
-    let wifi_driver = if NO_WIFI {
-        log::warn!("fst4_app: MFSK_FST4_APP_NO_WIFI=1 — no radio this boot (diagnostic build)");
-        None
-    } else if !crate::wifi_pref().enabled() {
-        // What `NO_WIFI` is for the bench, this is for the operator:
-        // same outcome, chosen from the CONFIG page instead of a build
-        // flag (#381).
-        log::warn!("fst4_app: WIFI: OFF (CONFIG page) — NTP and HTTP config unavailable");
-        None
-    } else if crate::WIFI_SSID.is_empty() {
-        log::warn!("fst4_app: WIFI_SSID empty (no cfg.toml) — NTP and HTTP config unavailable");
-        None
-    } else {
-        match mfsk_app_shared::wifi::wifi_driver_init(peripherals.modem, sysloop, Some(nvs_part)) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                log::error!("fst4_app: WiFi driver init failed (unrecoverable this boot): {e:#}");
-                None
-            }
+    fn net_config(_ctx: &BootCtx) -> Option<crate::net::Config> {
+        if NO_WIFI {
+            log::warn!("fst4_app: MFSK_FST4_APP_NO_WIFI=1 — no radio this boot (diagnostic build)");
+            return None;
         }
-    };
-    log_heap("post-wifi-driver-init");
+        Some(crate::net::Config {
+            name: "fst4_app::net",
+            // Bounded campaigns and modem power save, both for the same
+            // measured reason: an associating or fully-awake radio
+            // preempts this decoder at FreeRTOS priority 23.
+            // `crate::net` carries the numbers.
+            policy: crate::net::DECODE_FIRST,
+            power_save: true,
+            ntp: true,
+            without: "NTP and HTTP config unavailable",
+            bringup: if NO_CONNECT {
+                crate::net::Bringup::DriverOnly {
+                    stop_radio: WIFI_STOP,
+                }
+            } else {
+                crate::net::Bringup::Connect
+            },
+            http: true,
+            on_ntp: |synced| {
+                FST4_UI.lock().expect("FST4_UI poisoned").ntp_synced = synced;
+            },
+        })
+    }
 
-    if let Some(wifi_driver) = wifi_driver {
-        if NO_CONNECT {
-            log::warn!("fst4_app: MFSK_FST4_APP_NO_CONNECT=1 — driver up, no association");
-            if WIFI_STOP {
-                // Separates "the radio is on" from "the radio's memory
-                // is spoken for": `esp_wifi_stop` silences the receiver
-                // while every buffer the driver allocated stays
-                // allocated.
-                let r = unsafe { esp_idf_svc::sys::esp_wifi_stop() };
-                log::warn!("fst4_app: esp_wifi_stop() -> {r} (radio silenced, memory retained)");
-            }
-            core::mem::forget(wifi_driver);
-        } else {
-            crate::net::spawn(
-                wifi_driver,
-                nvs,
-                crate::net::Config {
-                    name: "fst4_app::net",
-                    // Bounded campaigns and modem power save, both for
-                    // the same measured reason: an associating or
-                    // fully-awake radio preempts this decoder at
-                    // FreeRTOS priority 23. `crate::net` carries the
-                    // numbers.
-                    policy: crate::net::DECODE_FIRST,
-                    power_save: true,
-                    on_ntp: |synced| {
-                        FST4_UI.lock().expect("FST4_UI poisoned").ntp_synced = synced;
-                    },
-                },
-            );
+    fn start(_ctx: &BootCtx) {
+        log_heap("post-network-spawn");
+        // Decode start does not wait on WiFi — same conclusion
+        // `wspr_app` reached the hard way: this app's test AP needs
+        // unbounded retry, so gating boot on it means an unbounded
+        // hang, not a delay.
+        SCAN_GO.store(true, Ordering::Release);
+    }
+
+    fn run_forever(_ctx: BootCtx, _panel: Panel) -> ! {
+        loop {
+            FreeRtos::delay_ms(1000);
         }
     }
-    log_heap("post-network-spawn");
+}
 
-    // Decode start does not wait on WiFi — same conclusion `wspr_app`
-    // reached the hard way: this app's test AP needs unbounded retry,
-    // so gating boot on it means an unbounded hang, not a delay.
-    SCAN_GO.store(true, Ordering::Release);
-
-    loop {
-        FreeRtos::delay_ms(1000);
+/// `MFSK_FST4_APP_HOG_KB`: take internal DRAM away from the decoder on
+/// purpose, to find where it starts to hurt. Zero in every shipped
+/// build, which is why the guard reads as an absurd comparison.
+#[allow(clippy::absurd_extreme_comparisons, clippy::reversed_empty_ranges)]
+fn hog_internal_dram() {
+    if HOG_KB == 0 {
+        return;
     }
+    const MALLOC_CAP_INTERNAL_8BIT: u32 = (1 << 11) | (1 << 2);
+    let mut got = 0usize;
+    for _ in 0..HOG_KB / 4 {
+        let p = unsafe { esp_idf_svc::sys::heap_caps_malloc(4096, MALLOC_CAP_INTERNAL_8BIT) };
+        if p.is_null() {
+            break;
+        }
+        got += 4;
+    }
+    log::warn!("fst4_app: MFSK_FST4_APP_HOG_KB={HOG_KB} — reserved {got} KB of internal DRAM");
 }
 
 // ── Capture task ─────────────────────────────────────────────────────

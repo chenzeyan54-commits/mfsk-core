@@ -14,6 +14,7 @@
 pub mod apps;
 pub mod audio_out;
 pub mod board;
+pub mod boot;
 pub mod coredump;
 pub mod decode_pipeline;
 pub mod display;
@@ -175,6 +176,28 @@ pub fn commit_config_and_restart(
     }
 }
 
+/// Whether this boot's receiver holds the USB host install until the
+/// UDP log sink exists.
+///
+/// Only the FT8 controller does, and it is the reason the flag exists:
+/// in host mode the serial console goes away the moment
+/// `usb_host_install` returns, so everything interesting about
+/// enumeration would land in the staging ring and be overwritten. The
+/// other three receivers never waited — they dispatched before the
+/// flag that used to gate it was even set — and a 45 s pause before
+/// audio is not something a refactor should hand them. Published by
+/// `boot::run` from `Receiver::WAIT_FOR_LOG_SINK`.
+static WAIT_LOG_SINK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_wait_for_log_sink(wait: bool) {
+    WAIT_LOG_SINK.store(wait, std::sync::atomic::Ordering::Release);
+}
+
+pub fn wait_for_log_sink() -> bool {
+    WAIT_LOG_SINK.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub fn wifi_enabled_for_this_boot() -> bool {
     WIFI_ENABLED.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -186,10 +209,9 @@ pub const UDP_LOG_TARGET: &str = env!("UDP_LOG_TARGET");
 pub const UDP_LOG_PORT: &str = env!("UDP_LOG_PORT");
 pub const BOOT_MODE_DEFAULT: &str = env!("BOOT_MODE_DEFAULT");
 
-/// SNTP server for the FT8 controller. WSPR and FST4 take theirs from
-/// NVS settings, which this app has no page for; `pool.ntp.org` is what
-/// their own default is.
-pub const NTP_SERVER: &str = "pool.ntp.org";
-/// Long enough for a first sync over WiFi, short enough that a boot
-/// with no route still reaches the decode loop.
-pub const NTP_SYNC_TIMEOUT_MS: u32 = 20_000;
+// `NTP_SERVER` and `NTP_SYNC_TIMEOUT_MS` used to live here, for the FT8
+// controller's own NTP wait. That wait is `net::run`'s now, for every
+// receiver, and it reads the server from the settings page rather than
+// from a constant — the same page the FT8 controller's own network task
+// serves. The default behind it is `pool.ntp.org`, which is what the
+// constant said, so nothing moved for a board nobody has configured.

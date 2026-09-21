@@ -1,6 +1,53 @@
 # Changelog
 
-## 0.11.1 — WiFi becomes a CoreS3 setting of its own (#381), the message-policy docs catch up with the code
+## 0.11.1 — one boot sequence for the CoreS3's four receivers, WiFi becomes a setting of its own (#381), the message-policy docs catch up with the code
+
+- **CoreS3: the four receivers share one boot sequence
+  (`boot::Receiver`).** This crate carried four `main`s: one per app,
+  plus the FT8 controller's, inline in `main.rs`. Each opened with its
+  own copy of the same seven steps in its own order, so the receiver
+  with the most behaviour was the one with no name, and the copies had
+  drifted — the WiFi decision existed four times over (#381), the
+  sequence *after* the association existed twice (`net.rs` for three
+  receivers, a hand-rolled thread in `main.rs` for the FT8 controller),
+  and two receivers opened the `"mfsk"` NVS namespace a second time for
+  a handle the first one already held.
+
+  `boot::run` is now that sequence —
+  `prepare → spawn_workers → attach_panel → net::bring_up → start →
+  run_forever` — and a receiver implements only its differences. The
+  order is the part worth writing once: arenas while the heap is whole
+  (155 648 B largest free internal block before WiFi and the USB host
+  take theirs, 31 744 B after), then the WiFi driver's synchronous
+  internal-DRAM claim, then anything that takes a stack. `main.rs` goes
+  from 546 lines to 166, and the FT8 controller becomes
+  `apps::ft8::Ft8Controller` beside the other three.
+
+  **Behaviour preserved on purpose, where it differed for a reason.**
+  The FT8 controller keeps its watchdog (its `task_wdt(IDLE0)` lines
+  during a cold acquisition are a watched symptom), keeps
+  `WIFI_PS_NONE` (`MIN_MODEM` has never been measured there — the A/B
+  is on #381), keeps giving up after four association attempts rather
+  than re-campaigning (`net::Policy::Once`), and keeps *not* serving
+  the HTTP config page: unifying the sequence would have handed it a
+  listening socket as a side effect, which is not a refactor.
+  Waiting for the UDP log sink before `usb_host_install` stays FT8's
+  alone, now as `Receiver::WAIT_FOR_LOG_SINK` rather than as a flag
+  three receivers happened never to reach.
+
+  **What did change**, all of it in the FT8 controller's favour and all
+  of it wanting a board to confirm: its network task moves from a
+  24 KiB pthread stack in internal DRAM to `net`'s PSRAM-backed task at
+  priority 2 pinned to core 1 (never core 0, which carries capture); it
+  gains the UDP-sink bind retry the shared path did not have and the
+  30-attempt retry it did; its NTP server comes from the settings page
+  rather than a constant (same default, `pool.ntp.org`); and
+  `WIFI_ENABLED` is now false when there is no SSID to try, so UAC no
+  longer waits 45 s for a sink that cannot arrive. The FT4, WSPR and
+  FST4 panels also show the operator's real grid source instead of
+  always `ntp`, because the setting is published before the dispatch
+  now.
+
 
 - **CoreS3: `WIFI: ON` / `WIFI: OFF` on the CONFIG page, and every
   receiver honours it (#381).** `main.rs` decided from the boot mode

@@ -10,14 +10,11 @@
 #![allow(dead_code)]
 
 use esp_idf_hal::peripherals::Peripherals;
-use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use mfsk_app_shared::{boot_mode, udp_log, wifi};
+use mfsk_app_shared::boot_mode;
 
 use mfsk_core_m5stack_cores3_app::{
-    apps, board, coredump, decode_pipeline, display, log_free_internal, set_grid_source,
-    set_wifi_pref, uac, BOOT_MODE_DEFAULT, FANOUT, LOGGER, NTP_SERVER, NTP_SYNC_TIMEOUT_MS,
-    UDP_LOG_PORT, UDP_LOG_TARGET, WIFI_ENABLED, WIFI_PSK, WIFI_SSID,
+    apps, boot, coredump, set_grid_source, set_wifi_pref, BOOT_MODE_DEFAULT, LOGGER,
 };
 
 fn main() -> ! {
@@ -82,35 +79,71 @@ fn main() -> ! {
     };
     log::info!("boot_mode: {} (NVS-only on CoreS3)", mode.label());
 
-    // Read and published **before** the dispatch below, because three
-    // of the four receivers never come back from it and each brings up
-    // its own WiFi. A setting that only reached the FT8 controller
-    // would be a switch that does nothing in three of the four places
-    // the operator can see it (#381).
+    // **Whether WiFi comes up at all** — one of the CONFIG page's two
+    // settings, read here because it belongs to every receiver. It used
+    // to be decided from the boot mode alone, three steps further down
+    // and only for the FT8 controller, so a board told to take its
+    // phase off the air still ran an association campaign over the
+    // slots a cold acquisition needs (#381). What the campaign costs,
+    // and the three ways to end up without a radio, are
+    // `net::bring_up`'s to say now.
     let wifi_pref = mfsk_app_shared::wifi_pref::read(&nvs);
     set_wifi_pref(wifi_pref);
     log::info!("wifi: {} (CONFIG page)", wifi_pref.label());
+    // **How the slot grid's phase is kept** — the CONFIG page's other
+    // setting, read once here and published for whoever boots.
+    //
+    // It does *not* choose a time source. The clock is the log's, and
+    // it comes from NTP when there is a network and from the RTC when
+    // there is not; FT8 logging wants the minute right, which the RTC
+    // holds for weeks. What drifts into trouble is the *slot phase*:
+    // seconds of it after days off the network, against a mode whose
+    // coarse search is ±1 s. `AirDt` says to correct that from the air
+    // rather than by waiting on a time server that is not there —
+    // which is why it also skips NTP (`net::Config::ntp`), and why it
+    // leaves the clock alone.
+    let grid_src = mfsk_app_shared::grid_src::read(&nvs);
+    set_grid_source(grid_src);
+    log::info!("grid source: {}", grid_src.label());
 
-    // WSPR and FST4 are whole receivers, not modes of the FT8
-    // controller — their own tasks, screens, slot grids and stacks.
-    // They get the singletons and never come back.
+    // **No seeding from a stored fix.** `AIR DT` is a cold start by
+    // definition now: the air places the phase every boot, because a
+    // phase inherited from the RTC or from yesterday's acquisition is
+    // one nothing has checked, and starting from an unchecked phase is
+    // how this receiver spent minutes discovering it was 1.65 s out.
+    // The `grid_fix` record is still written — `apps/ft4.rs` reads it
+    // for the FT8 → FT4 reboot, where the alternative is no phase at
+    // all.
+
+    // **Everything above this line is every receiver's, and everything
+    // below is one receiver's.** That split is the whole of `main` now.
     //
-    // This is why they are here at all rather than in their own
-    // binaries: changing mode used to mean re-flashing, and on this
-    // board that means unplugging the radio, because `usb_host_install`
-    // takes the port the flasher would use. Refs #163.
+    // It carries four receivers rather than four binaries because
+    // changing mode used to mean re-flashing, and on this board that
+    // means unplugging the radio: `usb_host_install` takes the port the
+    // flasher would use. Refs #163.
     //
-    // `Wspr` and `Fst4` are behind default-off features. The NVS
-    // setting outlives a reflash, so a board can ask for a mode this
-    // image does not carry; say which and carry on into the FT8 path
-    // rather than appearing to ignore the setting.
+    // Each of them used to open with its own copy of the same seven
+    // steps, in its own order, and the FT8 controller's copy was this
+    // function's own body — so the receiver with the most behaviour was
+    // the one with no name. `boot::run` is that sequence, written once;
+    // `apps::*` are the differences. `Wspr` and `Fst4` are behind
+    // default-off features, so say which mode a board asked for and
+    // carry on as an FT8 controller rather than appearing to ignore the
+    // NVS setting.
     match mode {
         #[cfg(feature = "wspr")]
-        boot_mode::BootMode::Wspr => apps::wspr::run(peripherals, nvs_part),
+        boot_mode::BootMode::Wspr => {
+            boot::run::<apps::wspr::WsprRx>(mode, peripherals, nvs_part, nvs)
+        }
         #[cfg(feature = "fst4")]
-        boot_mode::BootMode::Fst4 => apps::fst4::run(peripherals, nvs_part),
+        boot_mode::BootMode::Fst4 => {
+            boot::run::<apps::fst4::Fst4Rx>(mode, peripherals, nvs_part, nvs)
+        }
         #[cfg(feature = "ft4")]
-        boot_mode::BootMode::Ft4 => apps::ft4::run(peripherals, nvs_part),
+        boot_mode::BootMode::Ft4 => {
+            boot::run::<apps::ft4::Ft4Rx>(mode, peripherals, nvs_part, nvs)
+        }
         #[cfg(not(feature = "ft4"))]
         boot_mode::BootMode::Ft4 => log::error!(
             "boot_mode=ft4 but this image was built without --features ft4 — \
@@ -129,418 +162,5 @@ fn main() -> ! {
         _ => {}
     }
 
-    // Take the decode scratch now, while the heap is still whole.
-    //
-    // Ordering, not size, is what makes this work: after WiFi and the
-    // USB host have taken their share the largest free internal block
-    // is 31,744 B, and before they start it is 155,648 B (both
-    // measured on this board, #163). Reserving here also means a
-    // binary that carries several modes only ever allocates the one it
-    // booted into — see `embedded_shared::worker_arena`.
-    if matches!(mode, boot_mode::BootMode::Decode | boot_mode::BootMode::Uac)
-        && !embedded_shared::internal_pool::reserve_arena()
-    {
-        log::error!("decode scratch reservation failed — the pipeline will abort on first use");
-    }
-
-    // The mixed-radix FFT wrappers' shared workspace, on the same
-    // ordering argument and for every mode: FT8's `NFFT_SPEC = 3840`
-    // and FT4's coarse `NFFT1 = 2304` both run through them, and in
-    // PSRAM the 3840 transform is 2.44x slower and FT4's coarse stage
-    // 1.7x (`docs/notes/FT4_BENCHMARK.md` §26, §28). Unlike the block
-    // above this is not mode-gated — whichever mode boots, if it plans
-    // a non-power-of-two transform it wants this, and if it never does
-    // the 30 KB is the price of not having to know which modes will.
-    //
-    // A failure here is slow, not fatal, so it logs at warn from
-    // inside and is not repeated as an error out here.
-    let _ = embedded_shared::esp_dsp_fft::reserve_mixed_scratch();
-
-    // WiFi is not a debug channel. It carries NTP, the HTTP config
-    // UI and QSO log upload, and an FST4/WSPR beacon needs all three
-    // while the radio is attached — so "host mode" and "networked"
-    // are not alternatives.
-    //
-    // They were treated as alternatives for one night. Bringing WiFi
-    // up costs ~105 KB of internal DRAM, the USB host stack another
-    // 14 KB, and with a display loop quietly overflowing its stack
-    // into the heap on top of that, the board aborted in whichever
-    // subsystem allocated next. Turning WiFi off made the crashes
-    // stop, which looked like a diagnosis and was not: the overflow
-    // was the bug (see `display::run_log_panel`), and once it was
-    // fixed the budget was never the problem. Measured 2026-08-23
-    // with a radio streaming and WiFi associated: 73 KB of internal
-    // DRAM still free, no allocation failures, audio at full rate.
-    //
-    // WiFi buffers were also sized down for this workload — see
-    // `sdkconfig.defaults`. Refs #163.
-    // **How the slot grid's phase is kept** — the CONFIG page's
-    // setting, read once here.
-    //
-    // It does *not* choose a time source. The clock is the log's, and
-    // it comes from NTP when there is a network and from the RTC when
-    // there is not; FT8 logging wants the minute right, which the RTC
-    // holds for weeks. What drifts into trouble is the *slot phase*:
-    // seconds of it after days off the network, against a mode whose
-    // coarse search is ±1 s. `AirDt` says to correct that from the air
-    // rather than by waiting on a time server that is not there —
-    // which is why it also skips NTP, and why it leaves the clock
-    // alone.
-    let grid_src = mfsk_app_shared::grid_src::read(&nvs);
-    set_grid_source(grid_src);
-    log::info!("grid source: {}", grid_src.label());
-
-    // **No seeding from a stored fix.** `AIR DT` is a cold start by
-    // definition now: the air places the phase every boot, because a
-    // phase inherited from the RTC or from yesterday's acquisition is
-    // one nothing has checked, and starting from an unchecked phase is
-    // how this receiver spent minutes discovering it was 1.65 s out.
-    // The `grid_fix` record is still written — `apps/ft4.rs` reads it
-    // for the FT8 → FT4 reboot, where the alternative is no phase at
-    // all.
-
-    // **Three separate questions, and they used to be one.** The boot
-    // mode says whether this receiver has any use for WiFi; the CONFIG
-    // page says whether the operator wants it this time; `cfg.toml`
-    // says whether there is an SSID to try at all.
-    //
-    // Only the first was asked (issue #381), so a board set to
-    // `TIME: AIR DT` — which means "the phase comes from the band,
-    // there is no infrastructure here" — still ran a full association
-    // campaign over the first slots, which are the ones a cold
-    // acquisition needs. The WiFi task runs at FreeRTOS priority 23,
-    // above anything this app creates, and a campaign against an AP
-    // that is not there cost ~40 % of decoder throughput when it was
-    // measured (`wifi_pref`'s module docs carry the numbers).
-    //
-    // The setting is deliberately *not* derived from the grid source.
-    // See `mfsk_app_shared::wifi_pref`: a hilltop with a phone hotspot
-    // wants `AIR DT` and a log both.
-    let mode_wants_wifi = matches!(mode, boot_mode::BootMode::Wifi | boot_mode::BootMode::Uac);
-    let needs_wifi = mode_wants_wifi && wifi_pref.enabled();
-    WIFI_ENABLED.store(needs_wifi, std::sync::atomic::Ordering::Release);
-    if mode_wants_wifi && !wifi_pref.enabled() {
-        log::warn!(
-            "{} (CONFIG page) — no WiFi this boot{}",
-            wifi_pref.label(),
-            console_note(mode)
-        );
-    }
-    if needs_wifi && WIFI_SSID.is_empty() {
-        log::warn!(
-            "boot_mode={} but WIFI_SSID empty (no cfg.toml) — UDP log unavailable{}",
-            mode.label(),
-            console_note(mode)
-        );
-    }
-    let wifi_should_start = needs_wifi && !WIFI_SSID.is_empty();
-    if wifi_should_start {
-        // **Backgrounded.** This used to run inline, and association
-        // took ~30 s — during which the LCD showed nothing and the USB
-        // host was not yet installed, so plugging a radio in did
-        // nothing and the board was indistinguishable from a crashed
-        // one. A receiver has to be up when it is powered on; WiFi
-        // buys it a log sink and a clock, and both can arrive late.
-        //
-        // Same conclusion `wspr_app`/`fst4_app` reached and for the
-        // same reason. The handle has to outlive the association, so
-        // the thread keeps it and never returns.
-        let modem = peripherals.modem;
-        let nvs_for_wifi = nvs_part.clone();
-        let spawned = crate::board::spawn_named(c"wifi", 24 * 1024, move || {
-            let sysloop = match EspSystemEventLoop::take() {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("sysloop take failed: {e:#} — no WiFi this boot");
-                    return;
-                }
-            };
-            match wifi::connect_sta(modem, sysloop, Some(nvs_for_wifi), WIFI_SSID, WIFI_PSK) {
-                Ok(handle) => {
-                    let target_ip: std::net::IpAddr =
-                        if UDP_LOG_TARGET.is_empty() || UDP_LOG_TARGET == "auto" {
-                            std::net::IpAddr::V4(handle.subnet_broadcast)
-                        } else {
-                            match UDP_LOG_TARGET.parse() {
-                                Ok(ip) => ip,
-                                Err(e) => {
-                                    log::warn!(
-                                        "UDP_LOG_TARGET '{UDP_LOG_TARGET}' parse failed ({e}); \
-                                             using subnet bcast"
-                                    );
-                                    std::net::IpAddr::V4(handle.subnet_broadcast)
-                                }
-                            }
-                        };
-                    let port: u16 = UDP_LOG_PORT.parse().unwrap_or(9999);
-                    let addr = std::net::SocketAddr::new(target_ip, port);
-                    // Install the sink, and keep trying.
-                    //
-                    // `FANOUT.udp` is an `embassy_sync` mutex with
-                    // only `try_lock`, and every log line anywhere
-                    // in the process takes it. Inline in `main`
-                    // that was safe — nothing else was running
-                    // yet. From a background thread it is not: a
-                    // single missed `try_lock` used to drop the
-                    // sink on the floor and leave the board
-                    // reachable by ping and silent on the log,
-                    // which is exactly what happened the first
-                    // time this moved off the boot path.
-                    //
-                    // The retry also covers a bind that fails
-                    // because the interface is not quite ready.
-                    let mut installed = false;
-                    for attempt in 0..30u32 {
-                        if !installed {
-                            match udp_log::UdpLogSink::new(addr) {
-                                Ok(sink) => match FANOUT.udp.try_lock() {
-                                    Ok(mut slot) => {
-                                        *slot = Some(sink);
-                                        installed = true;
-                                    }
-                                    Err(_) => {
-                                        // Sink dropped here; rebuilt next round.
-                                    }
-                                },
-                                Err(e) => {
-                                    if attempt == 0 {
-                                        log::warn!("UDP socket bind failed: {e} — retrying");
-                                    }
-                                }
-                            }
-                        }
-                        if installed {
-                            FANOUT.drain_staging_to_udp();
-                            log::info!("UDP log sink up → {addr} (attempt {})", attempt + 1);
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                    }
-                    if !installed {
-                        log::error!("UDP log sink never installed — board will be silent");
-                    }
-
-                    // NTP, which the FT8 controller has never
-                    // started and cannot decode reliably without.
-                    //
-                    // `Ft8ChunkSink` anchors its 15 s slot grid
-                    // with `time_sync::samples_to_next_slot_12k`,
-                    // and that returns `None` until the system
-                    // clock is plausible — which only NTP makes it.
-                    // Unanchored, the grid free-runs from whenever
-                    // the first USB sample arrived, at a phase
-                    // uniform over 15 s, against a mode that
-                    // tolerates ±2.5 s: about a one-in-three chance
-                    // of decoding anything at all, per boot.
-                    //
-                    // Measured 2026-08-23 against a real antenna:
-                    // audio at -26 dBFS, thirty candidates a slot,
-                    // `dec=0` every slot. `slot grid anchored to
-                    // UTC` appears exactly once in an evening of
-                    // logs — on the one boot that followed a soft
-                    // restart out of FST4, which runs NTP, and
-                    // whose clock survives `esp_restart` but not
-                    // the power-on reset the button performs.
-                    //
-                    // WSPR and FST4 have done this since they were
-                    // written. `time_sync`'s own doc comment says
-                    // "NTP is already in every app that has WiFi";
-                    // this was the app where that was not true.
-                    // The CONFIG page's choice. `AirDt` means the
-                    // operator has said the phase comes from the band,
-                    // so there is nothing to wait for here — and
-                    // starting NTP anyway would spend the timeout and
-                    // then discipline a clock `suppress_clock` makes
-                    // invisible, which is cost without effect.
-                    let (_sntp, ntp_synced) =
-                        if grid_src == mfsk_app_shared::grid_src::GridSource::AirDt {
-                            log::info!("NTP not started — grid source is the air (CONFIG page)");
-                            (None, false)
-                        } else {
-                            match mfsk_app_shared::ntp::start(NTP_SERVER) {
-                                Ok(sntp) => {
-                                    let ok = mfsk_app_shared::ntp::wait_synced(
-                                        &sntp,
-                                        NTP_SYNC_TIMEOUT_MS,
-                                    );
-                                    if ok {
-                                        log::info!("NTP synced — FT8 slot grid can anchor to UTC");
-                                    } else {
-                                        log::warn!(
-                                            "NTP never synced in {NTP_SYNC_TIMEOUT_MS} ms — the \
-                                             slot grid stays free-running and decodes are unlikely"
-                                        );
-                                    }
-                                    (Some(sntp), ok)
-                                }
-                                Err(e) => {
-                                    log::warn!("NTP start failed: {e:#} — slot grid free-running");
-                                    (None, false)
-                                }
-                            }
-                        };
-
-                    // **The 20 s window ends a wait, not the sync.**
-                    //
-                    // `wait_synced` counts its own delays, so a timeout
-                    // means the exchange had not arrived yet, not that
-                    // the poll was starved — and the handle above keeps
-                    // retrying underneath either way. Reading it once
-                    // and never again decided the clock source for the
-                    // whole session: measured on a radio 2026-09-19,
-                    // two consecutive host-mode boots timed out here
-                    // and ran the rest of the session as `grid=rtc`,
-                    // which turns off the sink's UTC phase tracking
-                    // entirely, from a board whose RTC had been set
-                    // from NTP minutes earlier and which then synced in
-                    // 2.4 s and 4.2 s on the boots either side.
-                    //
-                    // (`net.rs` carries the same watch for the FT4 /
-                    // WSPR / FST4 receivers. It was fixed there first,
-                    // in c66af4c9, on the mistaken reading that the
-                    // failure had come from that module — the log line
-                    // above is this one's. Both paths need it.)
-                    //
-                    // In `AirDt` there is no handle and no watch, which
-                    // is the point: the operator said the phase comes
-                    // from the band, and a late sync must not take it
-                    // back.
-                    let mut watching_ntp = !ntp_synced && _sntp.is_some();
-                    if watching_ntp {
-                        log::info!("NTP still retrying underneath — watching for it");
-                    }
-
-                    // `handle`'s `Drop` tears the association down
-                    // and `_sntp`'s stops the periodic re-sync, so
-                    // this thread has to hold both forever.
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_secs(
-                            if watching_ntp { 5 } else { 60 },
-                        ));
-                        if !watching_ntp {
-                            continue;
-                        }
-                        match _sntp.as_ref() {
-                            Some(sntp) if mfsk_app_shared::ntp::note_sync_completed(sntp) => {
-                                watching_ntp = false;
-                                log::info!(
-                                    "NTP synced on a later attempt — UTC now owns the slot phase"
-                                );
-                            }
-                            Some(_) => {}
-                            None => watching_ntp = false,
-                        }
-                    }
-                }
-                Err(e) => log::warn!("WiFi STA failed: {e:#} — UDP log disabled"),
-            }
-        });
-        if let Err(e) = spawned {
-            log::error!("wifi thread spawn failed ({e}) — continuing without WiFi");
-        }
-    }
-
-    match mode {
-        boot_mode::BootMode::Decode => {
-            log_free_internal("pre-thread-spawn");
-            // **Pinned to PRO_CPU.** The two-core decode split is this
-            // thread on one core and `dsp_worker` on the other, and
-            // `dsp_worker` is pinned to APP_CPU: left unpinned this
-            // thread can be scheduled there too, and the half-and-half
-            // of coarse sync and stage 3 becomes serial. It has in
-            // practice always run on core 0 (every watchdog dump during
-            // acquisition reads `CPU 0: decode`, `CPU 1: IDLE1`), so
-            // this pins where it already sits rather than moving it —
-            // it is the guarantee that is new, not the placement.
-            let pipeline_spawn = crate::board::spawn_named_tuned(
-                c"decode",
-                32 * 1024,
-                None,
-                Some(esp_idf_svc::hal::cpu::Core::Core0),
-                || decode_pipeline::run(),
-            );
-            if let Err(e) = pipeline_spawn {
-                log::error!("decode_pipeline spawn failed ({e})");
-            }
-        }
-        boot_mode::BootMode::Uac => {
-            // Spawn the decode pipeline first so the chunk_q is live before
-            // uac::start_host() installs the UAC driver. The reader thread
-            // (spawned on first RxConnected) calls set_chunk_q once the
-            // queue handle is registered, dropping samples until then.
-            // Note: uac::start_host() itself is called in display::run_log_panel
-            // after pmic::init() drives BUS_OUT_EN HIGH.
-            log_free_internal("pre-thread-spawn");
-            // So the pipeline can persist a cold-acquisition grid fix
-            // across the reboot into FT4 mode (#356b).
-            uac::set_grid_fix_nvs(nvs_part.clone());
-
-            // `MFSK_CORES3_SIM` — feed a baked slot through the real
-            // `Ft8ChunkSink` instead of a radio, to exercise the grid
-            // alignment without an IC-705. The board (flashed over USB)
-            // stays a peripheral so `start_host` no-ops and the console
-            // survives. `MFSK_SIM_OFFSET_MS` mis-aligns the feed;
-            // `MFSK_SIM_NO_CLOCK` reproduces the clockless hilltop.
-            let sim = option_env!("MFSK_CORES3_SIM").is_some();
-            if sim {
-                if option_env!("MFSK_SIM_NO_CLOCK").is_some() {
-                    mfsk_app_shared::time_sync::suppress_clock(true);
-                    log::warn!("SIM: clock suppressed — grid must recover from the air");
-                }
-                let offset_ms: usize = option_env!("MFSK_SIM_OFFSET_MS")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                uac::spawn_sim_feed(decode_pipeline::QSO_WAVS[0], offset_ms * 12);
-            }
-
-            // **Pinned to PRO_CPU.** The two-core decode split is this
-            // thread on one core and `dsp_worker` on the other, and
-            // `dsp_worker` is pinned to APP_CPU: left unpinned this
-            // thread can be scheduled there too, and the half-and-half
-            // of coarse sync and stage 3 becomes serial. It has in
-            // practice always run on core 0 (every watchdog dump during
-            // acquisition reads `CPU 0: decode`, `CPU 1: IDLE1`), so
-            // this pins where it already sits rather than moving it —
-            // it is the guarantee that is new, not the placement.
-            let pipeline_spawn = crate::board::spawn_named_tuned(
-                c"decode",
-                32 * 1024,
-                None,
-                Some(esp_idf_svc::hal::cpu::Core::Core0),
-                || decode_pipeline::run_with_source("uac", |q| uac::set_chunk_q(q)),
-            );
-            if let Err(e) = pipeline_spawn {
-                log::error!("decode_pipeline (Uac) spawn failed ({e})");
-            }
-        }
-        _ => {
-            log::info!("decode_pipeline skipped ({})", mode.label());
-        }
-    }
-
-    display::run_log_panel(
-        peripherals.i2c0,
-        peripherals.spi2,
-        peripherals.pins,
-        &FANOUT,
-        nvs,
-        mode,
-    )
-}
-
-/// What losing WiFi costs in this boot mode, appended to whichever
-/// warning is saying that it is gone.
-///
-/// In `BootMode::Uac` the USB host driver detaches USB-Serial-JTAG, so
-/// the UDP log is the *only* channel off this board and a silent
-/// failure on a hilltop is invisible except for what the panel shows.
-/// Worth saying every time, which is why it is one function and not
-/// two copies — the two warnings below it used to be the same literal
-/// twice, printed twice, by a paste that was never noticed (#381).
-fn console_note(mode: boot_mode::BootMode) -> &'static str {
-    if mode == boot_mode::BootMode::Uac {
-        "; serial console also gone in UAC mode (USB-Serial-JTAG detached on usb_host_install)"
-    } else {
-        ""
-    }
+    boot::run::<apps::ft8::Ft8Controller>(mode, peripherals, nvs_part, nvs)
 }

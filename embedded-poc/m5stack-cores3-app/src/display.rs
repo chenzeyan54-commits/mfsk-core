@@ -35,6 +35,7 @@ use mipidsi::{
     Builder,
 };
 
+use std::sync::{Arc, Mutex};
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
 use mfsk_app_shared::boot_mode::{self, BootMode};
@@ -126,7 +127,7 @@ pub fn run_log_panel(
     spi2: SPI2<'static>,
     pins: Pins,
     fanout: &'static LogFanout,
-    nvs: EspNvs<NvsDefault>,
+    nvs: Arc<Mutex<EspNvs<NvsDefault>>>,
     mode: BootMode,
 ) -> ! {
     // Set false when the board finds itself on external power — see
@@ -1049,7 +1050,15 @@ fn pump_touch(
 }
 
 /// Persist what the picker committed and restart into it.
-fn apply_commit(nvs: &EspNvs<NvsDefault>, commit: mode_picker::Commit) {
+/// The panel owns the only handle on the `"mfsk"` namespace now — one
+/// per boot, shared through `boot::BootCtx`, where two receivers used
+/// to open a second one for the same keys.
+fn apply_commit(nvs: &Arc<Mutex<EspNvs<NvsDefault>>>, commit: mode_picker::Commit) {
+    let Ok(nvs) = nvs.lock() else {
+        log::error!("NVS mutex poisoned — not committing, not restarting");
+        return;
+    };
+    let nvs = &*nvs;
     match commit {
         mode_picker::Commit::Mode(target) => {
             log::warn!("boot_mode -> {} (touch), restarting", target.label());

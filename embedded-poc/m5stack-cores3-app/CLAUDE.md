@@ -8,22 +8,36 @@ live there and all apply to this crate. The user-facing manual is
 
 ## One binary, four receivers
 
-`main` reads NVS `boot_mode` and dispatches. Only the mode that booted
-allocates its decode scratch (`worker_arena`), which is why the image
-carries 86 KB of static DRAM rather than the ~173 KB a naive merge
-would cost.
+`main` reads NVS `boot_mode`, publishes the two CONFIG-page settings
+(`grid_src`, `wifi_pref`), and hands one `boot::Receiver` to
+`boot::run`. Only the mode that booted allocates its decode scratch
+(`worker_arena`), which is why the image carries 86 KB of static DRAM
+rather than the ~173 KB a naive merge would cost.
 
-| mode | entry | audio |
+| mode | receiver | audio |
 |---|---|---|
-| `uac` | `display::run_log_panel` → `decode_pipeline` | UAC |
-| `wspr` | `apps::wspr::run` | UAC |
-| `fst4` | `apps::fst4::run` | UAC |
-| `decode` | `decode_pipeline::decode` | baked WAV |
+| `uac` | `apps::ft8::Ft8Controller` → `decode_pipeline` | UAC |
+| `ft4` | `apps::ft4::Ft4Rx` | UAC |
+| `wspr` | `apps::wspr::WsprRx` | UAC |
+| `fst4` | `apps::fst4::Fst4Rx` | UAC |
+| `decode` | `apps::ft8::Ft8Controller` (no radio) | baked WAV |
 
-`apps::{wspr,fst4}::run` take the peripherals from `main` and never
-return. They were separate `[[bin]]`s until 2026-08-23; changing mode
-then meant re-flashing, which on this board means unplugging the radio,
-because `usb_host_install` takes the port a flasher would use.
+**One boot sequence, six hooks.** `boot::run` is
+`prepare → spawn_workers → attach_panel → net::bring_up → start →
+run_forever`, and the order is measured rather than aesthetic: arenas
+while the heap is whole (155 648 B of largest free internal block
+before WiFi and the USB host take theirs, 31 744 B after — #163), and
+the WiFi driver's synchronous claim before anything that takes a stack
+in `start`. A receiver writes only the differences.
+
+It was four `main`s until 2026-09-21 — one per app plus the FT8
+controller's inline in `main.rs` — and they had drifted: the WiFi
+decision existed four times (#381) and the post-association sequence
+twice (`net.rs`, and a hand-rolled thread for FT8 with its own UDP
+retry and no modem power save). Modes were separate `[[bin]]`s before
+2026-08-23; changing mode then meant re-flashing, which on this board
+means unplugging the radio, because `usb_host_install` takes the port
+a flasher would use.
 
 ## Things that will cost you a session if you do not know them
 

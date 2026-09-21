@@ -31,12 +31,24 @@
 //! preempting the decoder is not a slow log — it is a missed QSO.
 //! Every mode here gets [`Policy::Campaign`] and power save.
 //!
-//! ## What is *not* shared
+//! ## Everything, including the driver and the decision
 //!
-//! Driver construction. `peripherals.modem` is consumed by value and
-//! is not handed back on `Err`, so it has to happen in each app's own
-//! `run` where the peripherals are, and before the app spends the
-//! quiet window on task stacks.
+//! Driver construction used to be listed here as the one part that
+//! could not be shared — `peripherals.modem` is consumed by value and
+//! is not handed back on `Err`, so it lived in each app's own `run`.
+//! `boot` takes the modem out of `Peripherals` before it dispatches
+//! into a receiver, so [`bring_up`] now owns the whole thing: the
+//! three-way decision (the CONFIG page's `wifi_pref`, an empty
+//! `WIFI_SSID`, a receiver that asked for no radio), the driver, and
+//! the task above.
+//!
+//! That decision existed in **four** copies for one day (#381). The
+//! FT8 controller had a fifth implementation of the *sequence* as
+//! well, hand-rolled in `main.rs` on its own thread: `connect_sta`,
+//! its own UDP-sink install with a 30-attempt retry, its own NTP wait
+//! and its own late-sync watch. The retry was the one thing it had
+//! that this did not, and it is here now, so nothing was lost by
+//! deleting it.
 
 use std::sync::{Arc, Mutex};
 
@@ -67,6 +79,15 @@ pub enum Policy {
     /// Four is what `wifi.rs`'s bisection found beats the AP
     /// comeback-time coin-flip; more costs decode throughput.
     Campaign { attempts: u32, idle_ms: u32 },
+    /// `attempts` tries, then stop trying for this boot.
+    ///
+    /// What the FT8 controller did before it came here: `connect_sta`
+    /// gives up after `CONNECT_MAX_ATTEMPTS` and its caller had no
+    /// retry around it. Kept as its own variant rather than folded
+    /// into a long `idle_ms`, because the two say different things to
+    /// the next reader — this one is "there is no AP here", and the
+    /// board will not spend priority-23 time discovering that again.
+    Once { attempts: u32 },
 }
 
 /// **The radio stays up, and stopping it was tried.** An earlier
@@ -94,13 +115,50 @@ pub const DECODE_FIRST: Policy = Policy::Campaign {
     idle_ms: 180_000,
 };
 
+/// How far [`bring_up`] takes the radio. Anything but [`Bringup::Connect`]
+/// is a diagnostic build.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Bringup {
+    /// Init the driver and hand it to the network task. Every shipped
+    /// build.
+    Connect,
+    /// Init the driver and never associate — `fst4_app`'s
+    /// `MFSK_FST4_APP_NO_CONNECT`, which separates the driver's
+    /// *memory* from its *CPU*. `stop_radio` additionally calls
+    /// `esp_wifi_stop`, which silences the receiver while every buffer
+    /// the driver allocated stays allocated — that asymmetry is the
+    /// measurement.
+    DriverOnly { stop_radio: bool },
+}
+
 pub struct Config {
     /// FreeRTOS task name, and the log prefix.
     pub name: &'static str,
     pub policy: Policy,
     /// `WIFI_PS_MIN_MODEM`. Off only for a build measuring what the
-    /// association costs.
+    /// association costs, and for the FT8 controller, which has never
+    /// been measured with it (see this module's `power_save` note).
     pub power_save: bool,
+    /// Whether to sync NTP once the association is up.
+    ///
+    /// False for a receiver taking its slot phase off the air
+    /// (`GridSource::AirDt`): starting NTP there spends the timeout and
+    /// then disciplines a clock the grid is deliberately not following.
+    pub ntp: bool,
+    /// What this receiver loses when the radio stays down, named in the
+    /// one warning that says so — "no NTP, no UDP log, no config page"
+    /// for FT4, wsprnet for WSPR. One line per receiver, one place.
+    pub without: &'static str,
+    pub bringup: Bringup,
+    /// Whether to serve the HTTP config page.
+    ///
+    /// False for the FT8 controller, which has never had one: its
+    /// network sequence was hand-rolled in `main.rs` and stopped at
+    /// NTP. Unifying the sequence would have handed it an httpd task
+    /// as a side effect, and a refactor that adds a listening socket to
+    /// a shipped receiver is not a refactor. One line, when it is
+    /// wanted on purpose and with the memory measured.
+    pub http: bool,
     /// Called with whether NTP synced.
     pub on_ntp: fn(bool),
 }
@@ -116,6 +174,89 @@ extern "C" fn entry(arg: *mut core::ffi::c_void) {
     // and this is the only place that reclaims it.
     let ctx = unsafe { Box::from_raw(arg as *mut Ctx) };
     run(*ctx);
+}
+
+/// The one WiFi decision and the one bring-up, for every receiver.
+///
+/// `cfg: None` is a receiver that asked for no radio at all
+/// (`fst4_app`'s `MFSK_FST4_APP_NO_WIFI`); the other two ways to end up
+/// without one — the CONFIG page's `WIFI: OFF` and an empty
+/// `WIFI_SSID` — are decided here, so they are decided once. Each says
+/// what is lost via [`Config::without`], because "no WiFi" costs a
+/// WSPR receiver its wsprnet upload and an FT8 controller its only
+/// console, and a warning that does not say which is a warning nobody
+/// can act on.
+///
+/// Consumes the modem either way: there is no second chance at it this
+/// boot, and pretending otherwise would invite a caller to retry into
+/// a panic.
+pub fn bring_up<M>(
+    modem: M,
+    nvs_part: esp_idf_svc::nvs::EspDefaultNvsPartition,
+    nvs: Arc<Mutex<EspNvs<NvsDefault>>>,
+    cfg: Option<Config>,
+) where
+    M: esp_idf_svc::hal::modem::WifiModemPeripheral + 'static,
+{
+    let Some(cfg) = cfg else {
+        // A receiver that wants no radio has already said why, in its
+        // own words — `fst4_app`'s diagnostic flag, or a mode with no
+        // use for a network. Nothing to add.
+        return;
+    };
+    let tag = cfg.name;
+    if !crate::wifi_pref().enabled() {
+        // The CONFIG page's choice. Issue #381: this used to be four
+        // copies of the same `if`, one per receiver, and before that it
+        // was not asked at all — a board told to take its phase off the
+        // air still ran an association campaign over the slots a cold
+        // acquisition needs.
+        log::warn!("{tag}: WIFI: OFF (CONFIG page) — {}", cfg.without);
+        return;
+    }
+    if crate::WIFI_SSID.is_empty() {
+        log::warn!("{tag}: WIFI_SSID empty (no cfg.toml) — {}", cfg.without);
+        return;
+    }
+    let sysloop = match esp_idf_svc::eventloop::EspSystemEventLoop::take() {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("{tag}: sysloop take failed: {e:#} — no WiFi this boot");
+            return;
+        }
+    };
+    let driver = match wifi::wifi_driver_init(modem, sysloop, Some(nvs_part)) {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("{tag}: WiFi driver init failed (permanent this boot): {e:#}");
+            return;
+        }
+    };
+    // **Synchronous, and deliberately here.** The driver's own
+    // internal-DRAM claim is what the caller ordered its task stacks
+    // around; only the slow half (associate/DHCP/NTP) is backgrounded.
+    crate::log_free_internal("post-wifi-driver-init");
+    match cfg.bringup {
+        Bringup::Connect => {
+            // `uac` waits for a log sink only when one is coming. The
+            // flag is set here, where the last thing that could stop it
+            // has already not happened, rather than from a caller's
+            // guess about what this function will decide.
+            crate::WIFI_ENABLED.store(true, std::sync::atomic::Ordering::Release);
+            spawn(driver, nvs, cfg)
+        }
+        Bringup::DriverOnly { stop_radio } => {
+            log::warn!("{tag}: driver up, no association (diagnostic build)");
+            if stop_radio {
+                // SAFETY: no arguments; the driver above is live.
+                let r = unsafe { esp_idf_svc::sys::esp_wifi_stop() };
+                log::warn!("{tag}: esp_wifi_stop() -> {r} (radio silenced, memory retained)");
+            }
+            // The handles must outlive this function or `Drop` tears
+            // the driver down, which is the opposite of the experiment.
+            core::mem::forget(driver);
+        }
+    }
 }
 
 /// Background the whole sequence against a driver the caller already
@@ -152,7 +293,7 @@ fn run(mut ctx: Ctx) -> ! {
     let info = loop {
         let attempts = match ctx.cfg.policy {
             Policy::Unbounded => None,
-            Policy::Campaign { attempts, .. } => Some(attempts),
+            Policy::Campaign { attempts, .. } | Policy::Once { attempts } => Some(attempts),
         };
         match wifi::connect_with_retry(
             &mut ctx.driver,
@@ -178,6 +319,18 @@ fn run(mut ctx: Ctx) -> ! {
                         idle_ms / 1000,
                     );
                     FreeRtos::delay_ms(idle_ms);
+                }
+                Policy::Once { attempts } => {
+                    // No log sink, so this line only reaches a serial
+                    // console — which in UAC mode does not exist. The
+                    // panel is what is left, and it says `wifi` is down.
+                    log::warn!(
+                        "{tag}: no association after {attempts} attempts ({e:#}) — not \
+                         trying again this boot"
+                    );
+                    loop {
+                        FreeRtos::delay_ms(60_000);
+                    }
                 }
             },
         }
@@ -217,15 +370,41 @@ fn run(mut ctx: Ctx) -> ! {
         };
     let addr =
         std::net::SocketAddr::new(target_ip, crate::UDP_LOG_PORT.parse().unwrap_or(9999));
-    match udp_log::UdpLogSink::new(addr) {
-        Ok(sink) => {
-            if let Ok(mut slot) = crate::FANOUT.udp.try_lock() {
-                *slot = Some(sink);
+    // **Retried, because a single bind is not enough.** The FT8
+    // controller's own copy of this learned it: the socket can refuse
+    // the bind for a moment after DHCP returns, and `FANOUT.udp` is a
+    // `try_lock` that can lose a race with a task already logging. One
+    // attempt leaves a board with no console at all in UAC mode, where
+    // this sink *is* the console. Six seconds of 200 ms retries cost
+    // nothing on a board that has one.
+    let mut installed = false;
+    for attempt in 0..30u32 {
+        match udp_log::UdpLogSink::new(addr) {
+            Ok(sink) => match crate::FANOUT.udp.try_lock() {
+                Ok(mut slot) => {
+                    *slot = Some(sink);
+                    installed = true;
+                }
+                Err(_) => {
+                    // Someone is writing a line right now. Drop this
+                    // socket and build another on the next pass.
+                }
+            },
+            Err(e) => {
+                if attempt == 0 {
+                    log::warn!("{tag}: UDP socket bind failed: {e} — retrying");
+                }
             }
-            crate::FANOUT.drain_staging_to_udp();
-            log::info!("{tag}: UDP log sink up -> {addr}");
         }
-        Err(e) => log::warn!("{tag}: UDP socket bind failed: {e}"),
+        if installed {
+            crate::FANOUT.drain_staging_to_udp();
+            log::info!("{tag}: UDP log sink up -> {addr} (attempt {})", attempt + 1);
+            break;
+        }
+        FreeRtos::delay_ms(200);
+    }
+    if !installed {
+        log::error!("{tag}: UDP log sink never installed — this board may now be silent");
     }
 
     // NTP: one attempt, now that WiFi is confirmed up. Absolute
@@ -235,7 +414,14 @@ fn run(mut ctx: Ctx) -> ! {
         let g = ctx.nvs.lock().expect("settings NVS mutex poisoned");
         settings::load(&g)
     };
-    let (ntp_synced, _sntp_keepalive) = if initial_settings.ntp_enabled {
+    let (ntp_synced, _sntp_keepalive) = if !ctx.cfg.ntp {
+        // `GridSource::AirDt`: the phase comes from the band, so a
+        // sync would spend its timeout and then discipline a clock the
+        // grid is not following. The RTC still holds the minute for the
+        // log — see `grid_src`'s module docs.
+        log::info!("{tag}: NTP not started — grid source is the air (CONFIG page)");
+        (false, None)
+    } else if initial_settings.ntp_enabled {
         match ntp::start(&initial_settings.ntp_server) {
             Ok(sntp) => {
                 let synced = ntp::wait_synced(&sntp, NTP_SYNC_TIMEOUT_MS);
@@ -271,14 +457,18 @@ fn run(mut ctx: Ctx) -> ! {
         log::info!("{tag}: NTP still retrying underneath — watching for it");
     }
 
-    let _http_server = match http_config::start(ctx.nvs.clone()) {
-        Ok(s) => {
-            log::info!("{tag}: HTTP config server up");
-            Some(s)
-        }
-        Err(e) => {
-            log::warn!("{tag}: HTTP config server failed: {e:#}");
-            None
+    let _http_server = if !ctx.cfg.http {
+        None
+    } else {
+        match http_config::start(ctx.nvs.clone()) {
+            Ok(s) => {
+                log::info!("{tag}: HTTP config server up");
+                Some(s)
+            }
+            Err(e) => {
+                log::warn!("{tag}: HTTP config server failed: {e:#}");
+                None
+            }
         }
     };
 

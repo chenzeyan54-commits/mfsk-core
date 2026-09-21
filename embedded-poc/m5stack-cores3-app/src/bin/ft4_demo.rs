@@ -109,7 +109,11 @@ fn main() -> ! {
 
     let peripherals = Peripherals::take().expect("peripherals taken twice");
     let nvs_part = EspDefaultNvsPartition::take().expect("NVS partition take");
-    let nvs = boot_mode::open_nvs(nvs_part.clone()).expect("NVS open mfsk namespace");
+    // One handle on the `"mfsk"` namespace, shared with the panel —
+    // the shape `boot::BootCtx` hands every receiver.
+    let nvs = std::sync::Arc::new(std::sync::Mutex::new(
+        boot_mode::open_nvs(nvs_part.clone()).expect("NVS open mfsk namespace"),
+    ));
 
     // WiFi, through the same `crate::net` path the receivers use, and
     // for one measurement in particular: the candidate worker's stack
@@ -128,28 +132,23 @@ fn main() -> ! {
         log::info!("ft4-demo: no cfg.toml WiFi credentials — running without the network");
     } else {
         log::info!("ft4-demo: bringing WiFi up (measuring the worker stack against it)");
-        let sysloop = esp_idf_svc::eventloop::EspSystemEventLoop::take().expect("sysloop");
-        match mfsk_app_shared::wifi::wifi_driver_init(
+        // The same bring-up every receiver uses, so this bench measures
+        // the worker stack against the network the board actually runs.
+        app::net::bring_up(
             peripherals.modem,
-            sysloop,
-            Some(nvs_part.clone()),
-        ) {
-            Ok(driver) => {
-                let settings_nvs = mfsk_app_shared::settings::open_nvs(nvs_part.clone())
-                    .expect("settings NVS open");
-                app::net::spawn(
-                    driver,
-                    std::sync::Arc::new(std::sync::Mutex::new(settings_nvs)),
-                    app::net::Config {
-                        name: "ft4-demo::net",
-                        policy: app::net::DECODE_FIRST,
-                        power_save: true,
-                        on_ntp: |synced| log::info!("ft4-demo: NTP synced = {synced}"),
-                    },
-                );
-            }
-            Err(e) => log::error!("ft4-demo: WiFi driver init failed: {e:#}"),
-        }
+            nvs_part.clone(),
+            nvs.clone(),
+            Some(app::net::Config {
+                name: "ft4-demo::net",
+                policy: app::net::DECODE_FIRST,
+                power_save: true,
+                ntp: true,
+                without: "no NTP, no UDP log, no config page",
+                bringup: app::net::Bringup::Connect,
+                http: true,
+                on_ntp: |synced| log::info!("ft4-demo: NTP synced = {synced}"),
+            }),
+        );
     }
 
     let spawn = app::board::spawn_named(c"ft4feed", FEED_STACK, feed_loop);

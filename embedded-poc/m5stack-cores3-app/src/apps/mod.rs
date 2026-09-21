@@ -9,9 +9,13 @@
 //! `board`, `pmic`, `uac`, the log fanout and the `cfg.toml` env
 //! constants — lives at the crate root, one copy for all of them.
 
-//! Both are behind default-off cargo features — see `Cargo.toml`'s
+//! `ft8` is always built — it is what a board with no feature flags
+//! boots into, and what every mode that is not one of the other three
+//! falls back to. The rest are behind default-off cargo features — see `Cargo.toml`'s
 //! `[features]` for why an FT8 controller should not carry two
 //! receivers it cannot boot into.
+pub mod ft8;
+
 #[cfg(feature = "fst4")]
 pub mod fst4;
 #[cfg(feature = "ft4")]

@@ -38,12 +38,9 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
-use esp_idf_hal::peripherals::Peripherals;
-use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
 
 use embedded_shared::apps::ft4_rx as rx;
-use mfsk_app_shared::boot_mode::{self, BootMode};
+use crate::boot::{BootCtx, Display, Panel, Receiver};
 use mfsk_app_shared::ui::state::{DecodedRow, UI};
 
 /// The deadline the candidate loop is held to, from slot close.
@@ -160,128 +157,100 @@ const GRID_FIX_MAX_AGE_S: i64 = 2 * 3600;
 /// Minimum acquisition confidence to seed FT4's grid from.
 const GRID_FIX_MIN_R: f32 = 0.55;
 
-pub fn run(peripherals: Peripherals, nvs_part: EspDefaultNvsPartition) -> ! {
-    log::info!("=== mfsk-core-m5stack-cores3-app ft4-app boot ===");
-    log::info!("mfsk-core {}", mfsk_core::VERSION);
+/// FT4 through the shared boot sequence — see `crate::boot`.
+///
+/// **The slot task starts in `start`, not `spawn_workers`.** It takes
+/// its stack immediately, and the WiFi driver's synchronous
+/// internal-DRAM claim runs between the two steps: this receiver's own
+/// comment for the ordering used to read "runs before the slot task so
+/// that the internal DRAM WiFi wants is claimed before the decoder's
+/// own worker asks for its stack", and that is exactly what the
+/// sequence now guarantees for everyone.
+pub struct Ft4Rx;
 
-    // The candidate loop is compute-bound for hundreds of milliseconds
-    // with no yield point; IDLE starves and the watchdog fires. Same
-    // call and reason as every receiver and bench here.
-    let r = unsafe { esp_idf_svc::sys::esp_task_wdt_deinit() };
-    log::info!("ft4_app: task watchdog deinit -> {r}");
+impl Receiver for Ft4Rx {
+    const TAG: &'static str = "ft4_app";
 
-    // Before WiFi and the USB host take their share, and before the
-    // display task's SPI driver fragments what is left. The coarse
-    // stage's 2304-point workspace is 41 % faster in internal DRAM
-    // (§26.3) and this is the only moment the block is available.
-    let internal = embedded_shared::esp_dsp_fft::reserve_mixed_scratch();
-    log::info!(
-        "ft4_app: mixed-radix FFT scratch in {} DRAM",
-        if internal { "INTERNAL" } else { "PSRAM" }
-    );
-
-    let nvs = boot_mode::open_nvs(nvs_part.clone()).expect("NVS open mfsk namespace");
-
-    // A grid-phase fix a prior FT8 acquisition left behind (#356b) — the
-    // "lock on FT8, QSY to FT4" model. Only usable once the system clock
-    // is plausible (`pmic::init` seeds it from the RTC before this), and
-    // only if fresh and confident.
-    if let Some(fix) = mfsk_app_shared::grid_fix::load(&nvs) {
-        let now_epoch = mfsk_app_shared::time_sync::utc_now_ms()
-            .map(|ms| (ms / 1000) as i64)
-            .unwrap_or(0);
-        match fix.correction_for(now_epoch, 7.5, GRID_FIX_MAX_AGE_S, GRID_FIX_MIN_R) {
-            Some(p) => {
-                ACQUIRED_GRID_FIX_US.store((p * 1_000_000.0) as i32, Ordering::Release);
-                log::info!(
-                    "ft4_app: seeding grid from a persisted FT8 fix — {p:+.3} s (R {:.2})",
-                    fix.confidence
-                );
-            }
-            None => log::info!(
-                "ft4_app: persisted grid fix present but stale/weak (R {:.2}, {} s old) — ignoring",
-                fix.confidence,
-                now_epoch - fix.epoch_at_fix
-            ),
-        }
-        // Not cleared: the staleness check ages it out on its own, and
-        // leaving it lets a reboot mid-session re-seed from the same
-        // fix rather than falling back to the bare RTC.
+    fn prepare(ctx: &BootCtx) {
+        let internal = embedded_shared::esp_dsp_fft::reserve_mixed_scratch();
+        log::info!(
+            "ft4_app: mixed-radix FFT scratch in {} DRAM",
+            if internal { "INTERNAL" } else { "PSRAM" }
+        );
+        seed_grid_from_ft8(ctx);
     }
 
-    // WiFi, through the same path `fst4_app` and `wspr_app` use
-    // (`crate::net`). FT4 did not bring the network up at all until
-    // 2026-09-01, which was survivable for a receiver replaying a
-    // baked slot and is not for a QSO: the slot grid needs absolute
-    // time, and NTP is where it comes from.
-    //
-    // Driver construction is synchronous and stays here — `modem` is
-    // consumed by value and is not returned on `Err` — while the slow,
-    // flaky half is what `net::spawn` backgrounds. It runs **before**
-    // the slot task so that the internal DRAM WiFi wants is claimed
-    // before the decoder's own worker asks for its stack, rather than
-    // after: which of the two loses is a fact worth having on the log,
-    // not a race worth hiding.
-    let modem = peripherals.modem;
-    if !crate::wifi_pref().enabled() {
-        // The CONFIG page's choice, and it reaches here the same way it
-        // reaches the FT8 controller — `main` publishes it before
-        // handing this receiver the singletons (#381).
-        log::warn!("ft4_app: WIFI: OFF (CONFIG page) — no NTP, no UDP log, no config page");
-    } else if crate::WIFI_SSID.is_empty() {
-        log::warn!("ft4_app: WIFI_SSID empty (no cfg.toml) — no NTP, no UDP log, no config page");
-    } else {
-        let sysloop = EspSystemEventLoop::take().expect("sysloop");
-        match mfsk_app_shared::wifi::wifi_driver_init(modem, sysloop, Some(nvs_part.clone())) {
-            Ok(driver) => {
-                let settings_nvs = mfsk_app_shared::settings::open_nvs(nvs_part.clone())
-                    .expect("settings NVS open");
-                crate::net::spawn(
-                    driver,
-                    std::sync::Arc::new(std::sync::Mutex::new(settings_nvs)),
-                    crate::net::Config {
-                        name: "ft4_app::net",
-                        // FT4's decode budget is 1 750 ms from window
-                        // close to key-up, and the WiFi task runs at
-                        // priority 23: an association campaign in the
-                        // middle of a slot is a missed QSO, not a slow
-                        // log.
-                        policy: crate::net::DECODE_FIRST,
-                        power_save: true,
-                        // The shared `StatusInfo` has no NTP field —
-                        // the FT8 panel shows time through `utc_sod`,
-                        // which NTP sets by setting the clock. So this
-                        // only says whether it happened; putting it on
-                        // the status bar is part of moving the other
-                        // two receivers onto this panel, not of this
-                        // change.
-                        on_ntp: |synced| log::info!("ft4_app: NTP synced = {synced}"),
-                    },
-                );
-            }
-            Err(e) => log::error!("ft4_app: WiFi driver init failed (permanent this boot): {e:#}"),
-        }
+    fn attach_panel(_ctx: &BootCtx, display: Display) -> Panel {
+        Panel::DrawsLast(display)
     }
 
-    spawn_slot_task();
+    fn net_config(_ctx: &BootCtx) -> Option<crate::net::Config> {
+        Some(crate::net::Config {
+            name: "ft4_app::net",
+            // FT4's decode budget is 1 750 ms from window close to
+            // key-up, and the WiFi task runs at FreeRTOS priority 23 —
+            // an association campaign preempting the decoder is a
+            // missed QSO, not a slow log. `crate::net` carries the
+            // numbers behind both of these.
+            policy: crate::net::DECODE_FIRST,
+            power_save: true,
+            ntp: true,
+            without: "no NTP, no UDP log, no config page",
+            bringup: crate::net::Bringup::Connect,
+            http: true,
+            on_ntp: |synced| log::info!("ft4_app: NTP synced = {synced}"),
+        })
+    }
 
-    // Register the sink before the display task, whose body installs
-    // the USB host driver — the same "wire the consumer before the
-    // driver" ordering `fst4` and `wspr` rely on.
-    crate::uac::set_audio_sink(Ft4Sink);
+    fn start(_ctx: &BootCtx) {
+        spawn_slot_task();
+        crate::uac::set_audio_sink(Ft4Sink);
+    }
 
-    crate::display::run_log_panel(
-        peripherals.i2c0,
-        peripherals.spi2,
-        peripherals.pins,
-        &crate::FANOUT,
-        nvs,
-        BootMode::Ft4,
-    )
+    fn run_forever(ctx: BootCtx, panel: Panel) -> ! {
+        let Panel::DrawsLast(display) = panel else {
+            unreachable!("ft4 draws from run_forever");
+        };
+        crate::display::run_log_panel(
+            display.i2c0,
+            display.spi2,
+            display.pins,
+            &crate::FANOUT,
+            ctx.nvs,
+            ctx.mode,
+        )
+    }
 }
 
-/// Audio callback. Accumulates the slot **and** its periodogram, and
-/// hands both over when one completes.
+/// The FT8 controller writes `grid_fix` when it locks; FT4 reads it so
+/// a mode change does not cost the phase. The alternative here is no
+/// phase at all — FT4's own capture window closes at 6.775 s of the
+/// slot against a ±1.0 s search, so a grid that is a second out cuts
+/// the frame rather than shifting it.
+fn seed_grid_from_ft8(ctx: &BootCtx) {
+    let nvs = ctx.nvs.lock().expect("NVS mutex poisoned");
+    let Some(fix) = mfsk_app_shared::grid_fix::load(&nvs) else {
+        return;
+    };
+    let now_epoch = mfsk_app_shared::time_sync::utc_now_ms()
+        .map(|ms| (ms / 1000) as i64)
+        .unwrap_or(0);
+    match fix.correction_for(now_epoch, 7.5, GRID_FIX_MAX_AGE_S, GRID_FIX_MIN_R) {
+        Some(p) => {
+            ACQUIRED_GRID_FIX_US.store((p * 1_000_000.0) as i32, Ordering::Release);
+            log::info!(
+                "ft4_app: seeding grid from a persisted FT8 fix — {p:+.3} s (R {:.2})",
+                fix.confidence
+            );
+        }
+        None => log::info!(
+            "ft4_app: persisted grid fix present but stale/weak (R {:.2}, {} s old) — ignoring",
+            fix.confidence,
+            now_epoch - fix.epoch_at_fix
+        ),
+    }
+}
+
 struct Ft4Sink;
 
 impl crate::uac::AudioSink for Ft4Sink {

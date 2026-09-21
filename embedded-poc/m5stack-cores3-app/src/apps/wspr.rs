@@ -127,16 +127,16 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use esp_idf_hal::delay::FreeRtos;
-use esp_idf_hal::peripherals::Peripherals;
 
-use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
+use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
 use mfsk_core::wspr::ddc::{StreamingDdcCascade, AUDIO_RATE_HZ};
 use mfsk_core::wspr::decode::WsprResult;
 
 use embedded_shared::apps::wspr_scan::{now_us, run_scan, NBB, SLOT_US};
 use embedded_shared::wspr_dual_core;
+
+use crate::boot::{BootCtx, Display, Panel, Receiver};
 
 use mfsk_app_shared::boot_mode::BootMode;
 use mfsk_app_shared::capture_window::{CaptureWindow, Step};
@@ -157,12 +157,6 @@ const GOLDEN_BASEBAND: &[u8] = &[];
 
 /// How long to wait for the boot-time NTP attempt before giving up
 /// and running without absolute time (`ntp_synced` stays false, and
-/// wsprnet reporting stays off for the whole run — see `scan_loop`).
-/// 20 s is generous for `pool.ntp.org` over a home network; unmeasured
-/// on real hardware, same caveat as this plan's other untuned
-/// timeouts.
-const NTP_SYNC_TIMEOUT_MS: u32 = 20_000;
-
 /// Stack for the scan task.
 ///
 /// 48 KiB against a **42 536 B** peak measured 2026-08-24 through
@@ -406,183 +400,83 @@ const DDC_STACK: u32 = 12 * 1024;
 /// Everything below is unchanged from when it was `main`, including
 /// the ordering constraints: the worker-stack reservation and the scan
 /// task's stack both have to land before WiFi starts.
-pub fn run(peripherals: Peripherals, nvs_part: EspDefaultNvsPartition) -> ! {
-    log::info!("=== mfsk-core-m5stack-cores3-app wspr-app boot ===");
-    log::info!("mfsk-core {}", mfsk_core::VERSION);
+/// WSPR through the shared boot sequence — see `crate::boot`.
+///
+/// The scan and DDC tasks are spawned in `spawn_workers`, before the
+/// WiFi driver, because they allocate nothing until `start` sets
+/// `SCAN_GO`: what they take at spawn time is their own stack, and the
+/// ordering that matters is the driver's claim against the *decode*
+/// arenas, which `prepare` took first.
+pub struct WsprRx;
 
-    // The candidate loop runs compute-bound for tens of seconds at a
-    // stretch with no yield point; IDLE0 starves and the task
-    // watchdog fires. Same call `wspr-bench` makes, same reason —
-    // this app pays the identical decode cost.
-    let r = unsafe { esp_idf_svc::sys::esp_task_wdt_deinit() };
-    log::info!("task watchdog deinit -> {r}");
-    // Take WSPR's worker stack before WiFi, while the heap is still
-    // whole — after WiFi and the USB host the largest free internal
-    // block is 31,744 B, and this needs far more. See
-    // `embedded_shared::worker_arena` for the measurements.
-    if !wspr_dual_core::reserve_arena() {
-        log::error!("worker stack reservation failed — decoding will run single-core");
-    }
-    wspr_dual_core::init();
+impl Receiver for WsprRx {
+    const TAG: &'static str = "wspr_app";
 
-    let nvs = settings::open_nvs(nvs_part.clone()).expect("settings NVS open");
-    let nvs = Arc::new(Mutex::new(nvs));
-
-    // Spawn the scan task's 72 KiB stack **before anything else can
-    // fragment internal DRAM** — WiFi is the case `wspr-bench` (issue
-    // #260) measured (largest contiguous block 236 -> 184 KB *before
-    // the radio even starts*, just from linking), but the display
-    // task's own SPI-driver/mipidsi allocations are the same kind of
-    // risk if they're left free to race this claim: a first version
-    // of this fix spawned the display task first and hit exactly that
-    // — `xTaskCreatePinnedToCore` for the scan stack failed on real
-    // hardware because the display task's concurrent bring-up (on the
-    // other core, but the same heap) was contending for the same
-    // block. Scan first, unconditionally, before anything else on
-    // either core gets a chance to allocate. The task itself blocks
-    // on `SCAN_GO` until bring-up below finishes — this is "reserve
-    // the memory now, start the work once settings/WiFi/NTP are
-    // ready," not "decode before init is done."
-    log_heap("pre-scan-spawn");
-    spawn_scan_task(ScanCtx { nvs: nvs.clone() });
-    log_heap("post-scan-spawn");
-
-    // DDC producer task — small stack (12 KiB), spawned here rather
-    // than after WiFi/display for the same "claim it before anything
-    // else can fragment the heap" reasoning as the scan task, even
-    // though its own footprint is far less likely to actually collide.
-    spawn_ddc_task();
-    log_heap("post-ddc-spawn");
-
-    // Register the real-audio sink **before** the display task is
-    // spawned below, whose body eventually calls
-    // `crate::uac::start_host()` (after PMIC/VBUS bring-up — see
-    // `crate::spot_panel::run`'s own comment).
-    // Same "wire the consumer before installing the driver" ordering
-    // `main.rs` relies on for its own `set_chunk_q` call: by the time
-    // the display task's thread actually reaches `start_host()` (real
-    // I2C/PMIC work first), this synchronous call here has long since
-    // returned, so there is no race despite the two running on
-    // different tasks.
-    crate::uac::set_audio_sink(WsprDdcSink::new());
-
-    // Display task: its own LCD bring-up + render loop, pinned to
-    // core 1 — see this file's top doc comment for why inline-in-
-    // `main` starved it against the scan task on real hardware.
-    crate::spot_panel::spawn::<WsprPanel>(crate::spot_panel::DisplayCtx {
-        i2c0: peripherals.i2c0,
-        spi2: peripherals.spi2,
-        pins: peripherals.pins,
-        nvs: nvs.clone(),
-    });
-    log_heap("post-display-spawn");
-
-    // WiFi *driver construction* — still synchronous, still here,
-    // still before `SCAN_GO`. **2026-08-15, real-hardware finding**:
-    // this is the one piece of WiFi bring-up that genuinely can't be
-    // backgrounded — `peripherals.modem` is consumed by value into
-    // `EspWifi::new()`, and esp-idf-svc doesn't hand it back on `Err`,
-    // so a failure here (real hardware hit exactly this once
-    // `SCAN_GO` started firing before WiFi bring-up: the driver's own
-    // rx-buffer allocation lost the internal-DRAM race against
-    // `scan_loop`'s concurrent decode-time churn — `ESP_ERR_NO_MEM`,
-    // unrecoverable, no modem left to retry with) is permanent for the
-    // rest of this boot. Keeping it here, before `SCAN_GO`, claims
-    // WiFi's internal-DRAM needs in the same safe window the scan/DDC/
-    // display task stacks already do. See `wifi::wifi_driver_init`'s
-    // own doc comment for the full explanation.
-    //
-    // What *is* backgrounded (`spawn_network_task` below): the
-    // scan/associate/DHCP retry loop, which is the slow, potentially-
-    // unbounded part (`wifi::connect_with_retry`, itself internally
-    // safe to retry indefinitely against an already-alive driver) —
-    // and everything downstream of a successful connect (UDP log
-    // sink, NTP, HTTP config server).
-    let sysloop = EspSystemEventLoop::take().expect("sysloop");
-    let wifi_driver = if !crate::wifi_pref().enabled() {
-        // The CONFIG page's choice — see `mfsk_app_shared::wifi_pref`.
-        // For WSPR it also means no wsprnet upload, which is most of
-        // what a WSPR receiver is for, so it is said plainly (#381).
-        log::warn!(
-            "wspr_app: WIFI: OFF (CONFIG page) — NTP/HTTP config/wsprnet all unavailable"
-        );
-        None
-    } else if crate::WIFI_SSID.is_empty() {
-        log::warn!(
-            "wspr_app: WIFI_SSID empty (no cfg.toml) — NTP/HTTP config/wsprnet all unavailable"
-        );
-        None
-    } else {
-        match mfsk_app_shared::wifi::wifi_driver_init(peripherals.modem, sysloop, Some(nvs_part)) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                log::error!("wspr_app: WiFi driver init failed (unrecoverable this boot): {e:#}");
-                None
-            }
+    fn prepare(_ctx: &BootCtx) {
+        if !wspr_dual_core::reserve_arena() {
+            log::error!("worker stack reservation failed — decoding will run single-core");
         }
-    };
-    log_heap("post-wifi-driver-init");
-
-    // Network task: spawned here, **still before `SCAN_GO`**, for the
-    // same reason as the WiFi driver above — its own 24 KiB task stack
-    // needs internal DRAM too, and real hardware hit exactly this:
-    // moving this spawn *after* `SCAN_GO` (a first cut of this fix)
-    // made `xTaskCreatePinnedToCore` itself fail
-    // (`failed to create wspr_net task`) once scan_loop's own
-    // decode-time churn was already racing it for the same pool. The
-    // task's own *work* (WiFi association/DHCP retry, NTP, HTTP) still
-    // doesn't block `SCAN_GO` below — it starts running immediately
-    // once spawned, same as scan/DDC/display always have, just with
-    // its stack safely claimed first.
-    if let Some(wifi_driver) = wifi_driver {
-        crate::net::spawn(
-            wifi_driver,
-            nvs,
-            crate::net::Config {
-                name: "wspr_app",
-                // Unbounded retry and no modem power save — this app's
-                // own AP needed the former, and whether it would pay
-                // for the latter the way `fst4_app` did has never been
-                // measured here, so the shared path keeps WSPR's
-                // existing behaviour rather than changing a shipped
-                // receiver on an assumption.
-                policy: crate::net::Policy::Unbounded,
-                power_save: false,
-                on_ntp: |synced| {
-                    let mut ui = WSPR_UI.lock().expect("WSPR_UI mutex poisoned");
-                    ui.update_status(|u| u.ntp_synced = synced);
-                },
-                // WSPR reports spots to wsprnet — the association is
-            },
-        );
+        wspr_dual_core::init();
     }
-    log_heap("post-network-spawn");
 
-    // Release scan/DDC immediately — the potentially-slow/unbounded
-    // half of WiFi bring-up (association/DHCP), plus NTP/HTTP/UDP-log,
-    // now happen in their own background task and must not gate decode
-    // start. **2026-08-15**: this app's own test AP needs
-    // `wifi::connect_with_retry`'s *unbounded* retry mode to reliably
-    // connect at all (see that function's own doc comment — reproduces
-    // even against `wifikey2`, an independent, previously-working
-    // reference implementation, against this same AP), so blocking
-    // boot on WiFi the way this file used to would mean an indefinite
-    // hang on a bad day rather than a bounded delay.
-    SCAN_GO.store(true, Ordering::Release);
+    fn spawn_workers(ctx: &BootCtx) {
+        log_heap("pre-scan-spawn");
+        spawn_scan_task(ScanCtx {
+            nvs: ctx.nvs.clone(),
+        });
+        log_heap("post-scan-spawn");
+        spawn_ddc_task();
+        log_heap("post-ddc-spawn");
+        crate::uac::set_audio_sink(WsprDdcSink::new());
+    }
 
-    // `main` (pinned to core 0 by sdkconfig) has nothing left to do —
-    // the scan task owns core 0's real work, the display and network
-    // tasks run independently on core 1. An idle supervisor loop, same
-    // shape as `wspr-bench`'s own `main` tail.
-    loop {
-        FreeRtos::delay_ms(1000);
+    fn attach_panel(ctx: &BootCtx, display: Display) -> Panel {
+        crate::spot_panel::spawn::<WsprPanel>(crate::spot_panel::DisplayCtx {
+            i2c0: display.i2c0,
+            spi2: display.spi2,
+            pins: display.pins,
+            nvs: ctx.nvs.clone(),
+        });
+        log_heap("post-display-spawn");
+        Panel::Spawned
+    }
+
+    fn net_config(_ctx: &BootCtx) -> Option<crate::net::Config> {
+        Some(crate::net::Config {
+            name: "wspr_app",
+            // **Unbounded, unlike the decode-first modes.** This
+            // receiver's test AP needs it, and a WSPR slot is 110.6 s
+            // of capture against a decode that does not sit on a
+            // key-up deadline — the association's priority-23 cost
+            // lands where there is room for it.
+            policy: crate::net::Policy::Unbounded,
+            power_save: false,
+            ntp: true,
+            without: "NTP/HTTP config/wsprnet all unavailable",
+            bringup: crate::net::Bringup::Connect,
+            http: true,
+            on_ntp: |synced| {
+                let mut ui = WSPR_UI.lock().expect("WSPR_UI mutex poisoned");
+                ui.update_status(|u| u.ntp_synced = synced);
+            },
+        })
+    }
+
+    fn start(_ctx: &BootCtx) {
+        log_heap("post-network-spawn");
+        // Decode start does not wait on WiFi: this app's test AP needs
+        // unbounded retry, so gating boot on it means an unbounded
+        // hang, not a delay.
+        SCAN_GO.store(true, Ordering::Release);
+    }
+
+    fn run_forever(_ctx: BootCtx, _panel: Panel) -> ! {
+        loop {
+            FreeRtos::delay_ms(1000);
+        }
     }
 }
 
-// ── Display task ──────────────────────────────────────────────────────
-
-/// The WSPR screen's half of [`crate::spot_panel`]: which renderers to
-/// call, which state to lock, and the task's own name and priority.
 struct WsprPanel;
 
 impl crate::spot_panel::SpotPanel for WsprPanel {

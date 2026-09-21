@@ -2947,7 +2947,11 @@ pub fn start_host_when_ready() {
     // now leaves WiFi off by default, and waiting 45 s for a sink
     // that will never exist is just a receiver that takes 45 s
     // longer to start. Refs #163.
-    let sink_expected = crate::wifi_enabled_for_this_boot();
+    // Two questions, and both have to be yes: does this receiver want
+    // the wait (only the FT8 controller does), and is a sink actually
+    // coming (`net::bring_up` knows, after the last thing that could
+    // stop it has not happened).
+    let sink_expected = crate::wait_for_log_sink() && crate::wifi_enabled_for_this_boot();
     let mut waited_ms = 0u32;
     while sink_expected && waited_ms < LOG_SINK_WAIT_MS {
         if crate::FANOUT
