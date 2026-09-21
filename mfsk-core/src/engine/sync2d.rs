@@ -895,7 +895,7 @@ pub fn freq_shift_cd0(cd0: &[Complex<f32>], df_hz: f32, ds_rate: f32) -> Vec<Com
 /// ran.
 ///
 /// `out` is resized to `cd0.len()`; its previous contents are not read.
-/// Bit-identical to [`freq_shift_cd0`], which is now a wrapper.
+/// [`freq_shift_cd0`] is a wrapper over this.
 pub fn freq_shift_cd0_into(
     cd0: &[Complex<f32>],
     df_hz: f32,
@@ -908,10 +908,32 @@ pub fn freq_shift_cd0_into(
         out.extend_from_slice(cd0);
         return;
     }
-    let omega = -2.0 * PI * df_hz / ds_rate;
-    out.extend(cd0.iter().enumerate().map(|(n, &c)| {
-        let p = omega * n as f32;
-        c * Complex::new(p.cos(), p.sin())
+    // **The crate's mixer, not a third one.** This used to evaluate
+    // `cos` and `sin` per sample — 11 175 µs for FT4's 5 120-sample
+    // `cd0`, 2.18 µs a sample, measured on a CoreS3 2026-09-21. Every
+    // other place in this crate that multiplies a signal by a complex
+    // exponential had already stopped doing that: `wspr::ddc` uses a
+    // period-8 table (its centre is exactly `Fs/8`), and
+    // `engine::dsp::ddc::Mixer` is the general form, a rotating-phasor
+    // NCO renormalised every 4 096 samples. `ft4::ddc` mixes with it
+    // over 40 609 samples per candidate, and `fst4::ddc`'s refine
+    // stage uses `mix_complex` for exactly this operation.
+    //
+    // This function was the one that never adopted it, because it is
+    // the only rotation in the crate that belongs to no DSP module —
+    // it sits in the generic pipeline's refine step, which FT8 bypasses
+    // (own engine) and WSPR never reaches (own decoder), so the three
+    // optimisation campaigns that built the other mixers each stopped
+    // at their own module boundary.
+    //
+    // Same transform and the same sign convention: `Mixer::new`'s
+    // `dphi = -2π·center/Fs` is this function's own `omega`, `cur`
+    // starts at `1+0j`, and `mix_complex` emits before advancing, so
+    // sample 0 is unrotated in both.
+    let mut mixer = super::dsp::ddc::Mixer::new(df_hz, ds_rate);
+    out.extend(cd0.iter().map(|&c| {
+        let (re, im) = mixer.mix_complex(c.re, c.im);
+        Complex::new(re, im)
     }));
 }
 
@@ -970,5 +992,88 @@ mod ft4_coarse_ref_cache_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod rotator_tests {
+    use super::*;
+
+    /// Exactly what `freq_shift_cd0` used to compute, per sample.
+    fn shift_exact(cd0: &[Complex<f32>], df_hz: f32, ds_rate: f32) -> Vec<Complex<f32>> {
+        let omega = -2.0 * PI * df_hz / ds_rate;
+        cd0.iter()
+            .enumerate()
+            .map(|(n, &c)| {
+                let p = omega * n as f32;
+                c * Complex::new(p.cos(), p.sin())
+            })
+            .collect()
+    }
+
+    fn ramp(n: usize) -> Vec<Complex<f32>> {
+        (0..n)
+            .map(|k| {
+                let a = k as f32 * 0.017;
+                Complex::new(a.cos(), a.sin())
+            })
+            .collect()
+    }
+
+    /// **The rotator is not bit-identical, so this bounds it.**
+    ///
+    /// `freq_shift_cd0` advances a phasor by one complex multiply per
+    /// sample instead of evaluating `cos`/`sin`, which is what every
+    /// other mixer in this crate already did. The error that buys back
+    /// is rounding in the recurrence, renormalised in magnitude every
+    /// `RENORM_PERIOD` samples but not in phase.
+    ///
+    /// Bounded at both lengths that matter: FT4's `CD0_LEN = 5 120`,
+    /// and a 30 000-sample stand-in for FST4's long sub-modes, which
+    /// reach this through `fst4::baseline` and `fst4::rung_major`.
+    ///
+    /// Measured (the samples are unit-magnitude, so a complex
+    /// difference is a phase error in radians):
+    ///
+    /// | | df 0.37 | df −3.7 | df 11.9 |
+    /// |---|---|---|---|
+    /// | n = 5 120 | 2.7e-6 | 5.1e-5 | 8.1e-5 |
+    /// | n = 30 000 | 8.0e-6 | 7.8e-5 | 1.7e-4 |
+    ///
+    /// The worst of those is 0.0096°. As a frequency error it is the
+    /// ramp divided by the span: 1.7e-4 rad over 45 s is **5.9e-7 Hz**,
+    /// against FT4's 20.83 Hz tone spacing and the 1 Hz grid the argmax
+    /// above resolves — six orders down. `ft4::ddc` already mixes
+    /// 40 609 samples a candidate through the same `Mixer` and is swept.
+    ///
+    /// The bar is 5e-4, which fails on a 3x regression (the
+    /// renormalisation going away, say) while sitting far above the
+    /// arithmetic's own floor. It is not 1e-4: that was a number
+    /// picked before measuring, and 30 000 samples exceeded it.
+    #[test]
+    fn the_rotator_tracks_the_exact_rotation() {
+        for &n in &[5_120usize, 30_000] {
+            for &df in &[0.37f32, -3.7, 11.9] {
+                let x = ramp(n);
+                let got = freq_shift_cd0(&x, df, 666.666_7);
+                let want = shift_exact(&x, df, 666.666_7);
+                let worst = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).norm())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    worst < 5e-4,
+                    "n={n} df={df}: worst deviation {worst:e} — the recurrence has drifted"
+                );
+            }
+        }
+    }
+
+    /// A zero shift still short-circuits to a copy, exactly.
+    #[test]
+    fn a_zero_shift_is_a_copy() {
+        let x = ramp(64);
+        assert_eq!(freq_shift_cd0(&x, 0.0, 666.666_7), x);
     }
 }

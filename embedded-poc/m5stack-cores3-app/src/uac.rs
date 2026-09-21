@@ -740,11 +740,31 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
         let align = mfsk_app_shared::time_sync::samples_to_next_slot_12k_ms(
             (slot_samples / 12) as u64,
         );
-        let lead = match align {
+        // **Wait for the boundary; do not feed silence up to it.**
+        //
+        // The first cut of this pushed the lead through the sink as
+        // zero samples, which is what a radio would do. A radio also
+        // has a consumer running: here the slot task has not started
+        // draining yet, so several seconds of silence piled up in
+        // `STAGING`, and `apps::ft4`'s anchor — which adds the staged
+        // backlog to the clock's "distance to the next boundary",
+        // deliberately (`remain += block.len()`) — then corrected by
+        // that backlog. Measured 2026-09-21: 5 961 ms of lead produced
+        // `slot grid -2500 ms off the clock — trimmed`, 13 candidates
+        // and **zero decodes** from slot 4 on, while a 4 792 ms lead in
+        // the previous run trimmed 263 ms and decoded fine. A harness
+        // whose result depends on when the board happened to boot is
+        // not an instrument.
+        //
+        // Sleeping is also what the thing being simulated does: audio
+        // starts arriving at a boundary, it does not arrive as silence
+        // beforehand. `MFSK_SIM_OFFSET_MS` is served the same way, so a
+        // deliberate grid error is a late *start*, not a fed gap.
+        let wait_samples = match align {
             Some(to_boundary) => {
                 log::warn!(
-                    "uac SIM: aligning to the clock — {} ms of silence to the next {} ms \
-                     boundary, then {} ms of deliberate offset",
+                    "uac SIM: waiting {} ms for the next {} ms boundary, then {} ms of \
+                     deliberate offset — nothing is fed until then",
                     to_boundary / 12,
                     slot_samples / 12,
                     lead / 12,
@@ -753,12 +773,17 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
             }
             None => {
                 log::warn!(
-                    "uac SIM: no clock — feeding from now, {} ms of deliberate offset",
+                    "uac SIM: no clock — feeding from now, after {} ms of deliberate offset",
                     lead / 12
                 );
                 lead
             }
         };
+        if wait_samples > 0 {
+            let ms = (wait_samples / 12) as u32;
+            unsafe { sys::vTaskDelay(ms / (1_000 / sys::configTICK_RATE_HZ).max(1)) };
+        }
+        let lead = 0usize;
         const BLK: usize = 256;
         let t0 = unsafe { sys::esp_timer_get_time() };
         let mut fed: u64 = 0;

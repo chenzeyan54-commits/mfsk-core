@@ -920,12 +920,18 @@ fn llr_bp_probe(audio: &[i16], candidates: &[SyncCandidate]) {
     }
     let shift_us = (now_us() - t0) / ITERS as i64;
 
-    // **Which half of it is the allocation.** `freq_shift_cd0` returns
-    // a fresh 40 KB `Vec` every call. Writing the same arithmetic into
-    // a buffer that already exists is bit-identical and needs no
-    // sweep; replacing the per-sample `cos`/`sin` with a rotator is
-    // neither. Splitting them here says which one is worth which
-    // price, before either is written.
+    // **The reference the shift used to be.** This loop is what
+    // `freq_shift_cd0` computed before 2026-09-21: a fresh `cos`/`sin`
+    // pair per sample, written into a buffer that already exists. It
+    // stays here as the *baseline*, not as a component — the shipped
+    // function is now a rotating phasor (`engine::dsp::ddc::Mixer`)
+    // and no longer allocates per call, so the difference between the
+    // two lines below is what that change bought, not what an
+    // allocation costs.
+    //
+    // It was a component once: when both arms evaluated `cos`/`sin`,
+    // their difference was the 40 KB `Vec`, measured at 2 448 us. Both
+    // halves have been taken since.
     let mut shift_buf = alloc::vec![Complex32::new(0.0f32, 0.0f32); cd0.len()];
     let omega = -2.0 * core::f32::consts::PI * (s2.freq_hz - cand.freq_hz) / DS_RATE_HZ;
     let t0 = now_us();
@@ -973,13 +979,13 @@ fn llr_bp_probe(audio: &[i16], candidates: &[SyncCandidate]) {
     let whole_us = (now_us() - t0) / ITERS as i64;
 
     log::info!(
-        "ft4_bench: LLR/BP for one candidate — freq_shift_cd0 {} us (into a live buffer {} us, \
-         so the 40 KB alloc is {} us) | symbol_spectra {} us | \
+        "ft4_bench: LLR/BP for one candidate — freq_shift_cd0 {} us (the per-sample cos/sin \
+         it replaced: {} us, so the rotator is worth {} us) | symbol_spectra {} us | \
          compute_llr {} us | rest (BP + ladder + SNR) {} us | whole tail {} us | \
          sink {sink:e}/{shift_sink:e}",
         shift_us,
         shift_into_us,
-        shift_us - shift_into_us,
+        shift_into_us - shift_us,
         spectra_us,
         llr_us,
         whole_us - spectra_us - llr_us - shift_us,
