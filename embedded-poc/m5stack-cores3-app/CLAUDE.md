@@ -115,6 +115,8 @@ answering. Do not surface a cached value as a live one.
 | `MFSK_SIM_OFFSET_MS=N` | with `MFSK_CORES3_SIM`, prepend `N` ms of silence so the sink's slot grid starts `N` ms mis-aligned from the signal |
 | `MFSK_SIM_NO_CLOCK=1` | with `MFSK_CORES3_SIM`, make `time_sync::utc_now_ms` report nothing (`sim_suppress_clock`) — the clockless hilltop, without stopping `pmic::init` seeding the clock from the RTC |
 | `MFSK_CORES3_FORCE_MODE=<mode>` | compile-time boot-mode override — pick a mode for a measurement run without erasing NVS |
+| `MFSK_CORES3_FORCE_GRID=ntp\|air` | compile-time time-source override (the CONFIG page's `TIME`), NVS untouched. `AIR DT` never starts NTP, so testing anything that follows an NTP sync needs `ntp` |
+| `MFSK_SIM_CLOCK_STEP_MS=N` | with `MFSK_CORES3_SIM`, step the system clock by N ms once, 90 s into the feed — an NTP correction on demand, for the grid trim and the feed's re-alignment |
 | `MFSK_FT8_BUDGET_MS=N` / `MFSK_FT8_MAX_CAND` / `MFSK_FT8_PASS1_LIMIT` | `decode_pipeline` knobs for the #357 investigation. Budget defaults to 2000 |
 | `MFSK_CORES3_TX_PROBE=1` | **TX/QSO feasibility Phase T0.** Opens the IC-705's USB audio OUT interface on `TxConnected` and writes 20 chunks of digital silence, then closes it. Never sends a nonzero sample — a real tone risks keying TX by itself if the radio's `PTT SOURCE` is `VOX`, which this file cannot see. Off by default (`TxConnected` stays logged-and-ignored). See `uac.rs`'s `handle_tx_connected` doc comment |
 

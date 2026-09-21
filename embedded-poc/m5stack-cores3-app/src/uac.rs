@@ -820,6 +820,14 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
         /// anything the decoder would notice.
         const REALIGN_SAMPLES: u64 = 240;
         const NO_CLOCK_SIM: bool = option_env!("MFSK_SIM_NO_CLOCK").is_some();
+        // `MFSK_SIM_CLOCK_STEP_MS=N`: step the system clock by N ms once,
+        // 90 s into the feed — what an NTP correction does to a board
+        // whose RTC was off. For exercising what has to follow it (the
+        // receiver's grid trim, this feed's re-alignment) without
+        // waiting for a board with a bad RTC.
+        let clock_step_ms: Option<i64> =
+            option_env!("MFSK_SIM_CLOCK_STEP_MS").and_then(|v| v.parse().ok());
+        let mut clock_stepped = false;
         let t0 = unsafe { sys::esp_timer_get_time() };
         let mut fed: u64 = 0;
         let mut src = 0usize; // index into pcm, after the lead is done
@@ -845,6 +853,21 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
                 // where the recording's sample 0 should meet a boundary,
                 // measure against the clock and wait or skip the
                 // difference.
+                if let (Some(step), false) = (clock_step_ms, clock_stepped) {
+                    if unsafe { sys::esp_timer_get_time() } - t0 >= 90_000_000 {
+                        clock_stepped = true;
+                        let mut tv = sys::timeval { tv_sec: 0, tv_usec: 0 };
+                        // SAFETY: valid out-pointer; timezone unused.
+                        unsafe { sys::gettimeofday(&mut tv, core::ptr::null_mut()) };
+                        let us = tv.tv_sec as i64 * 1_000_000 + tv.tv_usec as i64 + step * 1_000;
+                        let tv = sys::timeval {
+                            tv_sec: (us / 1_000_000) as _,
+                            tv_usec: (us % 1_000_000) as _,
+                        };
+                        unsafe { sys::settimeofday(&tv, core::ptr::null()) };
+                        log::warn!("uac SIM: stepped the system clock by {step:+} ms (MFSK_SIM_CLOCK_STEP_MS)");
+                    }
+                }
                 if src == 0 && !NO_CLOCK_SIM && loop_len == slot_samples {
                     if let Some(to_b) = mfsk_app_shared::time_sync::samples_to_next_slot_12k_ms(
                         (slot_samples / 12) as u64,

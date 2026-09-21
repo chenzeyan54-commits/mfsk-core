@@ -103,8 +103,21 @@ fn main() -> ! {
     // which is why it also skips NTP (`net::Config::ntp`), and why it
     // leaves the clock alone.
     let grid_src = mfsk_app_shared::grid_src::read(&nvs);
+    // `MFSK_CORES3_FORCE_GRID=ntp|air`: this build's time source,
+    // whatever NVS holds — for a measurement run that needs one without
+    // changing the operator's setting (NVS is not written), the way
+    // `MFSK_CORES3_FORCE_MODE` does for the mode.
+    let grid_src = match option_env!("MFSK_CORES3_FORCE_GRID") {
+        Some("ntp") => mfsk_app_shared::grid_src::GridSource::Ntp,
+        Some("air") => mfsk_app_shared::grid_src::GridSource::AirDt,
+        _ => grid_src,
+    };
     set_grid_source(grid_src);
-    log::info!("grid source: {}", grid_src.label());
+    log::info!(
+        "grid source: {}{}",
+        grid_src.label(),
+        if option_env!("MFSK_CORES3_FORCE_GRID").is_some() { " (MFSK_CORES3_FORCE_GRID)" } else { "" }
+    );
 
     // **No seeding from a stored fix.** `AIR DT` is a cold start by
     // definition now: the air places the phase every boot, because a

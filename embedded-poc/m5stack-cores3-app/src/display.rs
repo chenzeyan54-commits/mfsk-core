@@ -122,16 +122,16 @@ const FORCE_UAC: bool = match option_env!("MFSK_CORES3_FORCE_UAC") {
 
 /// LCD bring-up + render loop. Returns `!`.
 #[allow(clippy::too_many_arguments)]
-/// The panel's priority when it runs on `main` (FT8, FT4): above the
-/// decoders (5-6) and the UAC reader (6), so the screen never stops for
-/// a decode — which at `main`'s own 1 it did, for 1.2-1.4 s every FT8
-/// slot and 2.1-2.5 s every FT4 one. FST4's display task has always run
-/// at 7 for the same reason.
+/// The panel's priority on `main` in FT8 mode: above the decoders (5-6)
+/// and the UAC reader (6), so the screen never stops for a decode —
+/// which at `main`'s own 1 it did, 1.2-1.4 s every slot. FST4's display
+/// task has always run at 7 for the same reason. **Not FT4**, whose
+/// panel stays at 1: its reply deadline is the tight one (`apps::ft4`).
 ///
 /// Affordable because the panel is cheap now — DMA it sleeps through,
 /// bars drawn on change, 6 frames/s: 8-13 % of core 0. Measured on FT8
 /// SIM with the panel at 1 and at 7: 7 decodes, 6 in time, 0 cut either
-/// way. FT4 at 7: 11 of 11 by 1 025 ms in 6 of 7 slots (2026-09-21).
+/// way (2026-09-21).
 pub const PANEL_PRIORITY: u32 = 7;
 
 /// One panel frame, µs: 6 a second, matching the waterfall's 6 rows a

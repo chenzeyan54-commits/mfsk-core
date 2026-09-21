@@ -208,17 +208,12 @@ impl Receiver for Ft4Rx {
         let Panel::DrawsLast(display) = panel else {
             unreachable!("ft4 draws from run_forever");
         };
-        // **The panel above the decode, so it never stops.** `main` is
-        // 1, and FT4 holds core 0 at 5 for ~2 s of every 7.5 s slot —
-        // the capture-time worker, then half the candidate loop — so at
-        // 1 the screen stood dead for all of it (2.1-2.5 s between
-        // frames, measured). Above it, the decode gives up the panel's
-        // CPU time and nothing else: its SPI writes are DMA the task
-        // sleeps through (`display.rs`), and the bars draw only on
-        // change. FST4's panel runs at 7 for the same reason.
-        unsafe {
-            esp_idf_svc::sys::vTaskPrioritySet(core::ptr::null_mut(), crate::display::PANEL_PRIORITY)
-        };
+        // **The panel stays at `main`'s 1 here, below the decode** —
+        // unlike FT8 (`display::PANEL_PRIORITY`). FT4 is the fast
+        // protocol and its reply deadline is the tight one: above the
+        // decode the panel cost it ~200 ms of loop end and one of eleven
+        // decodes in some slots (2026-09-21). The screen pauses for the
+        // decode instead.
         crate::display::run_log_panel(
             display.i2c0,
             display.spi2,
