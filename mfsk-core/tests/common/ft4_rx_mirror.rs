@@ -103,6 +103,44 @@ pub fn fir_producer(half: &[f32], f0_hz: f32) -> Vec<Complex<f32>> {
     candidate_baseband_half(half, f0_hz)
 }
 
+/// A phasor that steps rather than calling `cos`/`sin` per sample,
+/// with the same renormalisation discipline as the crate's own
+/// `engine::dsp::ddc::Mixer` (which is `pub(crate)`, so a test cannot
+/// borrow it). A real producer would use that one.
+struct Rotator {
+    step: Complex<f32>,
+    cur: Complex<f32>,
+    since_renorm: u32,
+}
+
+impl Rotator {
+    /// `hz` is the frequency being mixed **down** by, matching
+    /// `Mixer::new`'s `exp(-j2*pi*hz*n/rate)` convention.
+    fn new(hz: f32, rate_hz: f32) -> Self {
+        let dphi = -core::f32::consts::TAU * hz / rate_hz;
+        Self {
+            step: Complex::new(dphi.cos(), dphi.sin()),
+            cur: Complex::new(1.0, 0.0),
+            since_renorm: 0,
+        }
+    }
+
+    #[inline]
+    fn next(&mut self) -> Complex<f32> {
+        let out = self.cur;
+        self.cur *= self.step;
+        self.since_renorm += 1;
+        if self.since_renorm >= 4_096 {
+            let mag = (self.cur.re * self.cur.re + self.cur.im * self.cur.im).sqrt();
+            if mag > 0.0 {
+                self.cur /= mag;
+            }
+            self.since_renorm = 0;
+        }
+        out
+    }
+}
+
 /// Mix and boxcar-decimate by nine — the cheapest producer anyone would
 /// reach for, and the shape FT8's `fine_sync_12k` bins its mixing pass
 /// into.
@@ -114,32 +152,85 @@ pub fn fir_producer(half: &[f32], f0_hz: f32) -> Vec<Complex<f32>> {
 /// starting there. Get that wrong and every `dt` shifts by a constant,
 /// which reads as a sensitivity regression rather than as a bug.
 ///
-/// Written for clarity, not speed: a real one would carry a rotator
-/// rather than calling `cos`/`sin` per sample. It exists to answer
-/// whether the *numbers* survive, which is the question that decides
-/// whether the fast version is worth writing.
+/// One complex multiply per input sample and one per output, against
+/// the FIR chain's 101 + 263 taps — which is the whole point, and why
+/// this is written with a rotator rather than with the per-sample
+/// `cos`/`sin` of [`boxcar_producer_reference`]. A timing comparison
+/// against a transcendental-per-sample version would measure the
+/// transcendentals.
 pub fn boxcar_producer(half: &[f32], f0_hz: f32) -> Vec<Complex<f32>> {
-    use core::f32::consts::TAU;
-    const DECIM: i64 = 9;
-    let in_rate = 6_000.0f32;
-    let out_rate = in_rate / DECIM as f32;
+    const DECIM: usize = 9;
+    const HALF_WIN: usize = DECIM / 2;
     // `ft4::ddc` mixes the band centre to DC and rotates the output
     // back by the same amount, so `f0` — not the centre — lands at DC.
-    let centre = f0_hz + 31.25;
+    let mut mix = Rotator::new(f0_hz + 31.25, 6_000.0);
+    let mut derot = Rotator::new(-31.25, 6_000.0 / DECIM as f32);
     let mut out = Vec::with_capacity(mfsk_core::ft4::ddc::CD0_LEN);
+    let mut acc = Complex::new(0.0f32, 0.0);
+    let mut bin = 0usize;
+    let inv = 1.0 / DECIM as f32;
+    for (n, &x) in half.iter().enumerate() {
+        // Sample `n` belongs to the bin centred on `half[9j]`, i.e.
+        // `j = (n + 4) / 9`.
+        let j = (n + HALF_WIN) / DECIM;
+        if j != bin {
+            if out.len() < mfsk_core::ft4::ddc::CD0_LEN {
+                out.push(acc * inv * derot.next());
+            }
+            acc = Complex::new(0.0, 0.0);
+            bin = j;
+            if out.len() >= mfsk_core::ft4::ddc::CD0_LEN {
+                break;
+            }
+        }
+        acc += mix.next() * x;
+    }
+    if out.len() < mfsk_core::ft4::ddc::CD0_LEN {
+        out.push(acc * inv * derot.next());
+    }
+    out.resize(mfsk_core::ft4::ddc::CD0_LEN, Complex::new(0.0, 0.0));
+    out
+}
+
+/// [`boxcar_producer`] written the obvious way, with a `cos`/`sin` per
+/// sample. Kept as the reference the stepping version is checked
+/// against — the same discipline `sync2d`'s own rotator carries.
+pub fn boxcar_producer_reference(half: &[f32], f0_hz: f32) -> Vec<Complex<f32>> {
+    use core::f32::consts::TAU;
+    const DECIM: usize = 9;
+    const HALF_WIN: usize = DECIM / 2;
+    let in_rate = 6_000.0f32;
+    let out_rate = in_rate / DECIM as f32;
+    let centre = f0_hz + 31.25;
+    // **Phase by accumulation, reduced each step.** The obvious
+    // `-TAU * centre * n / rate` loses its low bits long before
+    // `n = 40 609`: at f32, `cos` of ~4.4e4 radians is argument
+    // reduction, not a cosine, and comparing the stepping version
+    // against *that* measured the reference's error (2.4e-3 of full
+    // scale) rather than the rotator's. Same discipline
+    // `make_costas_ref` already uses.
+    let dphi_in = -TAU * centre / in_rate;
+    let dphi_out = TAU * 31.25 / out_rate;
+    let mut mixed: Vec<Complex<f32>> = Vec::with_capacity(half.len());
+    let mut phi = 0.0f32;
+    for &x in half {
+        mixed.push(Complex::new(phi.cos(), phi.sin()) * x);
+        phi = (phi + dphi_in) % TAU;
+    }
+    let mut out = Vec::with_capacity(mfsk_core::ft4::ddc::CD0_LEN);
+    let mut psi = 0.0f32;
     for j in 0..mfsk_core::ft4::ddc::CD0_LEN {
-        let c = j as i64 * DECIM;
+        let c = (j * DECIM) as i64;
         let mut acc = Complex::new(0.0f32, 0.0);
-        for k in -(DECIM / 2)..=(DECIM / 2) {
+        for k in -(HALF_WIN as i64)..=(HALF_WIN as i64) {
             let n = c + k;
-            if n < 0 || n as usize >= half.len() {
+            if n < 0 || n as usize >= mixed.len() {
                 continue;
             }
-            let phi = -TAU * centre * n as f32 / in_rate;
-            acc += Complex::new(phi.cos(), phi.sin()) * half[n as usize];
+            acc += mixed[n as usize];
         }
-        let psi = TAU * 31.25 * j as f32 / out_rate;
         out.push(acc / DECIM as f32 * Complex::new(psi.cos(), psi.sin()));
+        psi = (psi + dphi_out) % TAU;
     }
     out
 }

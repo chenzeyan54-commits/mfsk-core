@@ -433,6 +433,118 @@ fn what_a_boxcar_front_end_would_decode_on_the_golden() {
     );
 }
 
+/// The stepping rotator is the transcendental one.
+///
+/// `boxcar_producer` steps a phasor where `boxcar_producer_reference`
+/// calls `cos`/`sin` per sample, so that a timing comparison measures
+/// the filter rather than the transcendentals. Same discipline as
+/// `sync2d`'s own `the_rotator_tracks_the_exact_rotation`: the claim
+/// is bounded, not asserted.
+#[test]
+fn the_stepping_boxcar_matches_the_transcendental_one() {
+    let Some(audio) = slot_audio() else {
+        assert!(
+            !require_corpus(),
+            "MFSK_REQUIRE_CORPUS=1 but the golden is missing"
+        );
+        return;
+    };
+    let (_savg, half) = rx::capture(&audio);
+    for f0 in [300.0f32, 1_000.0, 2_600.0] {
+        let fast = rx::boxcar_producer(&half, f0);
+        let slow = rx::boxcar_producer_reference(&half, f0);
+        assert_eq!(fast.len(), slow.len());
+        let scale = slow
+            .iter()
+            .map(|c| c.norm())
+            .fold(0.0f32, f32::max)
+            .max(1e-9);
+        let worst = fast
+            .iter()
+            .zip(&slow)
+            .map(|(a, b)| (a - b).norm())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst / scale < 1e-3,
+            "f0={f0}: stepping and transcendental differ by {:.2e} of full scale",
+            worst / scale
+        );
+    }
+}
+
+/// What the cheaper front end actually saves — **on the host**, which
+/// is the wrong machine and says so.
+///
+/// The board's FIR runs its taps through `dsps_dotprod_f32_aes3` at a
+/// measured 2.18 cycles per multiply-add (`FT4_BENCHMARK.md` §47); the
+/// host runs the portable dot product. So this comparison **flatters
+/// the boxcar**, and the ratio here is an upper bound on the one that
+/// matters. It is worth having anyway: it is the cheap check that the
+/// saving is the order of magnitude the arithmetic claims, before
+/// anything is wired into the receiver and flashed.
+///
+/// `#[ignore]` — timing, so it is noise on a shared runner.
+#[test]
+#[ignore = "timing — run with --ignored"]
+fn what_the_boxcar_front_end_saves_on_the_host() {
+    use std::time::Instant;
+
+    let Some(audio) = slot_audio() else {
+        assert!(
+            !require_corpus(),
+            "MFSK_REQUIRE_CORPUS=1 but the golden is missing"
+        );
+        return;
+    };
+    let (savg, half) = rx::capture(&audio);
+    let cands = rx::coarse(&savg);
+    let f0 = cands[0].freq_hz;
+
+    const REPS: u32 = 300;
+    let mut timings = Vec::new();
+    for (name, produce) in [
+        ("FIR 101+263", rx::fir_producer as rx::Producer),
+        ("boxcar /9", rx::boxcar_producer as rx::Producer),
+    ] {
+        // One untimed call so neither arm pays for a cold cache.
+        let mut sink = produce(&half, f0);
+        let t0 = Instant::now();
+        for _ in 0..REPS {
+            sink = produce(&half, f0);
+        }
+        let per_call = t0.elapsed().as_secs_f64() * 1e6 / REPS as f64;
+        core::hint::black_box(&sink);
+        timings.push((name, per_call));
+    }
+
+    // And the whole slot, which is what the budget is spent in.
+    let mut slots = Vec::new();
+    for (name, produce) in [
+        ("FIR 101+263", rx::fir_producer as rx::Producer),
+        ("boxcar /9", rx::boxcar_producer as rx::Producer),
+    ] {
+        let t0 = Instant::now();
+        let out = rx::run_slot_with(&audio, produce);
+        slots.push((name, t0.elapsed().as_secs_f64() * 1e3, out.len()));
+    }
+
+    eprintln!("\nft4 front end, host timing ({} candidates):", cands.len());
+    for (name, us) in &timings {
+        eprintln!("  producer  {name:<14} {us:>9.1} us/candidate");
+    }
+    eprintln!(
+        "  producer  ratio          {:>9.1}x",
+        timings[0].1 / timings[1].1
+    );
+    for (name, ms, n) in &slots {
+        eprintln!("  whole slot {name:<13} {ms:>9.1} ms   {n} decodes");
+    }
+    eprintln!(
+        "  whole slot ratio         {:>9.2}x\n",
+        slots[0].1 / slots[1].1
+    );
+}
+
 /// The constants above are a copy of `ft4_rx.rs`'s, and a copy rots.
 ///
 /// This cannot import them — `embedded-shared` is outside this
