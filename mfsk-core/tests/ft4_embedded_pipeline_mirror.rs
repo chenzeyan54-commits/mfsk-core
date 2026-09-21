@@ -561,6 +561,112 @@ fn what_the_boxcar_front_end_saves_on_the_host() {
     eprintln!();
 }
 
+/// What snapping each candidate's carrier to the periodogram bin costs.
+///
+/// The precondition for building basebands during capture: a
+/// provisional candidate list interpolates each peak slightly
+/// differently from the final one, so the two can only share a
+/// baseband if both are mixed at the same carrier — the bin centre.
+/// The Δt/Δf search still sweeps ±12 Hz from there, which is what
+/// should make it cheap. Diagnostic: prints both arms.
+#[test]
+fn what_snapping_the_carrier_to_the_bin_costs_on_the_golden() {
+    let Some(audio) = slot_audio() else {
+        assert!(
+            !require_corpus(),
+            "MFSK_REQUIRE_CORPUS=1 but the golden is missing"
+        );
+        return;
+    };
+    let shipped = rx::run_slot_with(&audio, rx::Variant::SHIPPED);
+    let snapped = rx::run_slot_with(&audio, rx::Variant::SNAPPED);
+    let lost: Vec<&String> = shipped.iter().filter(|m| !snapped.contains(m)).collect();
+    let gained: Vec<&String> = snapped.iter().filter(|m| !shipped.contains(m)).collect();
+    eprintln!(
+        "\nft4 golden, carrier snapped to the {:.3} Hz bin:\n  \
+         shipped {} decodes, snapped {}\n  lost {:?}\n  gained {:?}",
+        rx::COARSE_BIN_HZ,
+        shipped.len(),
+        snapped.len(),
+        lost,
+        gained
+    );
+    assert_eq!(shipped.len(), 11, "the control arm must not move");
+}
+
+/// How early is the candidate list known?
+///
+/// Building each candidate's baseband during capture needs the
+/// candidates before capture closes. The periodogram accumulates as
+/// audio arrives, so a *provisional* list can be read off it at any
+/// point — this measures how much of the final list, and in particular
+/// how much of the part that decodes, a provisional list taken at each
+/// time already holds. Candidates are compared by snapped bin, since
+/// that is what a shared baseband would be keyed on.
+///
+/// Diagnostic: prints the table.
+#[test]
+fn how_early_the_candidate_list_is_known() {
+    let Some(audio) = slot_audio() else {
+        assert!(
+            !require_corpus(),
+            "MFSK_REQUIRE_CORPUS=1 but the golden is missing"
+        );
+        return;
+    };
+    let bin = |f: f32| (f / rx::COARSE_BIN_HZ).round() as i32;
+
+    let (savg, half) = rx::capture(&audio);
+    let finals = rx::coarse(&savg);
+    let refs = Ft4CoarsePhasors::new::<Ft4>();
+    // Which final candidates decode — the ones a provisional list must
+    // not miss.
+    let decoding: Vec<i32> = finals
+        .iter()
+        .filter(|c| rx::decode_candidate_with(&half, c, &refs, rx::Variant::SNAPPED).is_some())
+        .map(|c| bin(c.freq_hz))
+        .collect();
+    let final_bins: Vec<i32> = finals.iter().map(|c| bin(c.freq_hz)).collect();
+
+    eprintln!(
+        "\nft4 golden: {} final candidates, {} of them decode",
+        final_bins.len(),
+        decoding.len()
+    );
+    eprintln!(
+        "  {:>7} {:>6} {:>12} {:>14} {:>10}",
+        "at (s)", "prov", "finals held", "decoders held", "spurious"
+    );
+    for tenths in [30, 35, 40, 45, 50, 55, 60, 65] {
+        let n = (tenths as usize * 1_200).min(rx::CAPTURE_CLOSE_SAMPLES);
+        let mut b = mfsk_core::engine::ft4_coarse::Ft4SavgBuilder::new(n);
+        let mut fed = 0usize;
+        while fed < n {
+            let take = rx::BLOCK.min(n - fed);
+            b.push_with_rows(&audio[fed..fed + take], &mut |_row| {});
+            fed += take;
+        }
+        let prov: Vec<i32> = rx::coarse(&b.finish())
+            .iter()
+            .map(|c| bin(c.freq_hz))
+            .collect();
+        let held = final_bins.iter().filter(|b| prov.contains(b)).count();
+        let held_dec = decoding.iter().filter(|b| prov.contains(b)).count();
+        let spurious = prov.iter().filter(|b| !final_bins.contains(b)).count();
+        eprintln!(
+            "  {:>7.1} {:>6} {:>7}/{:<4} {:>9}/{:<4} {:>10}",
+            tenths as f32 / 10.0,
+            prov.len(),
+            held,
+            final_bins.len(),
+            held_dec,
+            decoding.len(),
+            spurious
+        );
+    }
+    eprintln!();
+}
+
 /// The constants above are a copy of `ft4_rx.rs`'s, and a copy rots.
 ///
 /// This cannot import them — `embedded-shared` is outside this

@@ -335,11 +335,12 @@ fn what_the_boxcar_front_end_costs_at_threshold() {
 
     // Four arms: what ships, each half of the cheaper front end, and
     // both together.
-    let variants: [(&str, rx::Variant); 4] = [
+    let variants: [(&str, rx::Variant); 5] = [
         ("shipped", rx::Variant::SHIPPED),
         ("boxcar", rx::Variant::BOXCAR),
         ("binned", rx::Variant::BINNED_SEARCH),
         ("both", rx::Variant::BOTH),
+        ("snapped", rx::Variant::SNAPPED),
     ];
 
     eprintln!("\nFT4 threshold — {SEEDS} seeds per point, decode rate %");

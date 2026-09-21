@@ -161,25 +161,55 @@ pub struct Variant {
     /// Score the coarse Δt/Δf sweep over tone-demodulated bins instead
     /// of over every `cd0` sample.
     pub binned_search: bool,
+    /// Snap each candidate's carrier to the coarse periodogram's bin
+    /// centre before building its baseband.
+    ///
+    /// The precondition for building basebands *during* capture: a
+    /// provisional candidate list, taken from a partial periodogram,
+    /// interpolates each peak slightly differently from the final one,
+    /// so a baseband mixed at the provisional carrier is not the one
+    /// the final candidate would have built. Snapped to the bin grid,
+    /// both land on the same carrier and can share it. The Δt/Δf search
+    /// then starts from the bin centre and still sweeps ±12 Hz, which
+    /// is what should make the snap cheap — the question this switch
+    /// exists to measure.
+    pub snap_to_bin: bool,
 }
 
 impl Variant {
     pub const SHIPPED: Self = Self {
         produce: fir_producer,
         binned_search: false,
+        snap_to_bin: false,
     };
     pub const BOXCAR: Self = Self {
         produce: boxcar_producer,
         binned_search: false,
+        snap_to_bin: false,
     };
     pub const BINNED_SEARCH: Self = Self {
         produce: fir_producer,
         binned_search: true,
+        snap_to_bin: false,
     };
     pub const BOTH: Self = Self {
         produce: boxcar_producer,
         binned_search: true,
+        snap_to_bin: false,
     };
+    pub const SNAPPED: Self = Self {
+        produce: fir_producer,
+        binned_search: false,
+        snap_to_bin: true,
+    };
+}
+
+/// `ft4_coarse`'s periodogram bin width: `12 000 / NFFT1` = 5.208 Hz.
+pub const COARSE_BIN_HZ: f32 = 12_000.0 / 2_304.0;
+
+/// A carrier snapped to the nearest periodogram bin centre.
+pub fn snap_to_bin(freq_hz: f32) -> f32 {
+    (freq_hz / COARSE_BIN_HZ).round() * COARSE_BIN_HZ
 }
 
 /// `ft4_rx::decode_candidate`, call for call.
@@ -198,6 +228,16 @@ pub fn decode_candidate_with(
     refs: &Ft4CoarsePhasors,
     v: Variant,
 ) -> Option<String> {
+    let snapped;
+    let cand = if v.snap_to_bin {
+        snapped = SyncCandidate {
+            freq_hz: snap_to_bin(cand.freq_hz),
+            ..*cand
+        };
+        &snapped
+    } else {
+        cand
+    };
     let mut cd0 = (v.produce)(half, cand.freq_hz);
     rms_normalise(&mut cd0);
     let s2 = if v.binned_search {
