@@ -42,9 +42,17 @@ pub const WF_NFFT: usize = 2_048;
 /// Complex points the real transform runs as.
 const HALF: usize = WF_NFFT / 2;
 
-/// Samples between rows: 12 rows a second, the cadence FT8's stage-1
-/// feed ran at, so the FT8 screen scrolls as it always has.
-pub const WF_HOP: usize = 1_000;
+/// Samples between rows: 6 rows a second, one per panel frame
+/// (`display.rs`'s `FRAME_US`), so each redraw moves the waterfall by
+/// exactly one row and it scrolls smoothly. 100 rows are ~17 s of band.
+///
+/// It was 12, FT8's old stage-1 cadence. That put two to three new rows
+/// in every redraw once the panel had to be held to a frame rate — and
+/// it has to be: running above FT4's decode so the screen never stops,
+/// the panel at 10 frames/s used 16-19 % of core 0, which the decode
+/// paid for in full (loop ends 1 005-1 189 ms, one of eleven decodes
+/// late in half the slots; 2026-09-21).
+pub const WF_HOP: usize = 2_000;
 
 /// Frequency span a row covers, shared with the panel's axis
 /// (`ui::waterfall`).

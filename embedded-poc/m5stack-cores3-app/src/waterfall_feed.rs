@@ -43,6 +43,11 @@ const CAP: usize = 48_000;
 /// Samples lost to a busy lock or a full ring, for the periodic report.
 static DROPPED: AtomicU32 = AtomicU32::new(0);
 
+/// Slot boundaries the ring recorded, and rows the drain marked with one
+/// — for the periodic report. A rule on the screen needs both.
+static MARKS_SEEN: AtomicU32 = AtomicU32::new(0);
+static MARKS_DRAWN: AtomicU32 = AtomicU32::new(0);
+
 /// Slot period of the booted mode, ms; 0 draws no marks.
 static PERIOD_MS: AtomicU32 = AtomicU32::new(0);
 
@@ -116,6 +121,7 @@ pub fn push(samples: &[i16]) {
             let _ = r.marks.pop_front();
         }
         let _ = r.marks.push_back(b);
+        MARKS_SEEN.fetch_add(1, Ordering::Relaxed);
     }
     // Re-read every block, so a clock step (NTP landing) moves the
     // rules with it.
@@ -168,6 +174,9 @@ pub fn drain_to_ui() {
             let _ = marks.pop_front();
             mark = true;
         }
+        if mark {
+            MARKS_DRAWN.fetch_add(1, Ordering::Relaxed);
+        }
         if let Ok(mut ui) = UI.lock() {
             // `push_waterfall_at` rules a row whose slot index is 0 or
             // 1; `u8::MAX` is "not stated".
@@ -185,13 +194,15 @@ pub fn drain_to_ui() {
         if t.rows > 0 {
             log::info!(
                 "waterfall: {} rows — fft {} us/row (min {}) + map {} us/row (slowest row {} us), \
-                 {} samples dropped",
+                 {} samples dropped, slot marks {} seen / {} drawn",
                 t.rows,
                 t.fft_us / t.rows as i64,
                 t.min_fft_us,
                 t.map_us / t.rows as i64,
                 t.max_row_us,
                 DROPPED.swap(0, Ordering::Relaxed),
+                MARKS_SEEN.swap(0, Ordering::Relaxed),
+                MARKS_DRAWN.swap(0, Ordering::Relaxed),
             );
         }
         d.last_report_us = now;

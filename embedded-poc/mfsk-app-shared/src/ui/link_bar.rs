@@ -107,8 +107,9 @@ impl UsbLink {
     }
 }
 
-/// Everything the bar draws. Cheap to build once per frame.
-#[derive(Clone, Copy, Debug)]
+/// Everything the bar draws. Cheap to build once per frame, and
+/// comparable, so a panel can skip the draw when nothing changed.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LinkInfo {
     pub usb: UsbLink,
     /// Which time source the operator chose on the CONFIG page. Shown

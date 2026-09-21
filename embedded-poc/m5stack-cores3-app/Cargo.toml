@@ -274,6 +274,10 @@ mfsk-app-shared = { path = "../mfsk-app-shared" }
 embedded-graphics = "0.8"
 mipidsi = "0.8"
 display-interface-spi = "0.5"
+# `DataFormat`, for sending the waterfall as byte blocks rather than
+# through `fill_contiguous`'s per-pixel iterator (`display.rs`). Already
+# in the tree through `display-interface-spi`; named here to use it.
+display-interface = "0.5"
 
 [build-dependencies]
 embuild = "0.33"

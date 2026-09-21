@@ -122,6 +122,35 @@ const FORCE_UAC: bool = match option_env!("MFSK_CORES3_FORCE_UAC") {
 
 /// LCD bring-up + render loop. Returns `!`.
 #[allow(clippy::too_many_arguments)]
+/// The panel's priority when it runs on `main` (FT8, FT4): above the
+/// decoders (5-6) and the UAC reader (6), so the screen never stops for
+/// a decode — which at `main`'s own 1 it did, for 1.2-1.4 s every FT8
+/// slot and 2.1-2.5 s every FT4 one. FST4's display task has always run
+/// at 7 for the same reason.
+///
+/// Affordable because the panel is cheap now — DMA it sleeps through,
+/// bars drawn on change, 6 frames/s: 8-13 % of core 0. Measured on FT8
+/// SIM with the panel at 1 and at 7: 7 decodes, 6 in time, 0 cut either
+/// way. FT4 at 7: 11 of 11 by 1 025 ms in 6 of 7 slots (2026-09-21).
+pub const PANEL_PRIORITY: u32 = 7;
+
+/// One panel frame, µs: 6 a second, matching the waterfall's 6 rows a
+/// second (`embedded_shared::waterfall::WF_HOP`), so each redraw moves
+/// it by one row.
+///
+/// The panel's CPU is per frame — ~18 ms of it at 10 frames/s was
+/// 16-19 % of core 0 (FreeRTOS run-time counters, 2026-09-21) — and in
+/// FT4 mode the panel runs above the decode so the screen never stops,
+/// which makes every one of those milliseconds the decode's. Held to 6,
+/// the cost falls with the rate.
+const FRAME_US: i64 = 166_667;
+
+/// Waterfall rows per SPI write: 4 rows are 1 920 bytes, 25 writes for
+/// the region instead of ~375. Under the 2 KB internal-DRAM threshold on
+/// purpose, so the block lands in memory the SPI DMA can read directly
+/// rather than a PSRAM buffer the driver would copy into a bounce.
+const WF_BLOCK_ROWS: usize = 4;
+
 pub fn run_log_panel(
     i2c0: I2C0<'static>,
     spi2: SPI2<'static>,
@@ -260,15 +289,26 @@ pub fn run_log_panel(
         }
     }
     // ── SPI2 (FSPI) host for the ILI9342C. ───────────────────────────
+    //
+    // **DMA, and transfers the task sleeps through.** esp-idf-hal's
+    // defaults are no DMA (64-byte transactions) and `polling: true`,
+    // i.e. `spi_device_polling_transmit`: the calling task spins until
+    // every byte is on the wire. The panel sends ~48 KB for each
+    // waterfall redraw — ~20 ms at 20 MHz — and every one of those
+    // milliseconds was CPU no other task on the core could have, which
+    // is what made the panel cost the decode its own wire time the
+    // moment it ran above it (FT4, 2026-09-21). With DMA and queued
+    // transactions the task blocks on the driver's semaphore and the
+    // core is free while the display is written.
     let driver = SpiDriver::new(
         spi2,
         pins.gpio36, // SCK
         pins.gpio37, // MOSI
         Option::<AnyIOPin>::None,
-        &SpiDriverConfig::new(),
+        &SpiDriverConfig::new().dma(esp_idf_hal::spi::Dma::Auto(4096)),
     )
     .expect("SPI2 driver");
-    let spi_cfg = SpiConfig::new().baudrate(20_u32.MHz().into());
+    let spi_cfg = SpiConfig::new().baudrate(20_u32.MHz().into()).polling(false);
     let spi_dev =
         SpiDeviceDriver::new(driver, Some(pins.gpio3), &spi_cfg).expect("SPI device (CS=3)");
 
@@ -485,26 +525,66 @@ pub fn run_log_panel(
     // (`UiState::decoded_current_iter`), not a receiver's watermark.
     let mut current_snapshot: heapless::Vec<bool, 16> = heapless::Vec::new();
     let mut last_tx_seq: u32 = 0;
+    // One block of waterfall rows in wire format; see the draw site.
+    let mut wf_block: Vec<u8> =
+        vec![0u8; WF_BLOCK_ROWS * waterfall::WIDTH as usize * 2];
+    let mut last_status: Option<mfsk_app_shared::ui::state::StatusInfo> = None;
+    let mut last_link: Option<mfsk_app_shared::ui::link_bar::LinkInfo> = None;
     // The longest time between two frames, every ~10 s: how long the
     // screen stood still — a panel starved by something above it on its
     // core looks hung to the operator however well the rest is doing.
     let mut frame_prev_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
     let mut frame_gap_max_us: i64 = 0;
+    let mut frame_count: u32 = 0;
     let mut frame_report_us = frame_prev_us;
+    // Busy time, excluding the touch-poll wait at the end of a frame:
+    // the whole frame, the waterfall feed (its FFT), the redraw.
+    let mut busy_us: i64 = 0;
+    let mut feed_us: i64 = 0;
+    let mut wf_draw_us: i64 = 0;
+    let mut bars_us: i64 = 0;
+    let mut list_us: i64 = 0;
+    let mut pre_us: i64 = 0;
+    let mut frame_top_us: i64;
     loop {
         {
             let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
             frame_gap_max_us = frame_gap_max_us.max(now - frame_prev_us);
             frame_prev_us = now;
+            frame_count += 1;
+            frame_top_us = now;
             if now - frame_report_us >= 10_000_000 {
-                log::info!("panel: longest frame gap {} ms", frame_gap_max_us / 1_000);
+                let secs = ((now - frame_report_us) / 1_000_000).max(1);
+                log::info!(
+                    "panel: {frame_count} frames, longest gap {} ms | busy {} ms/s = feed {} + \
+                     waterfall {} + bars {} + list {} + pre-draw {} (incl. feed) + rest",
+                    frame_gap_max_us / 1_000,
+                    busy_us / 1_000 / secs,
+                    feed_us / 1_000 / secs,
+                    wf_draw_us / 1_000 / secs,
+                    bars_us / 1_000 / secs,
+                    list_us / 1_000 / secs,
+                    pre_us / 1_000 / secs,
+                );
+                bars_us = 0;
+                list_us = 0;
+                pre_us = 0;
+                crate::board::log_task_cpu();
                 frame_gap_max_us = 0;
+                frame_count = 0;
+                busy_us = 0;
+                feed_us = 0;
+                wf_draw_us = 0;
                 frame_report_us = now;
             }
         }
         // The waterfall's rows, built here from the audio itself — the
         // same feed in every mode (`waterfall_feed`).
-        crate::waterfall_feed::drain_to_ui();
+        {
+            let t = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+            crate::waterfall_feed::drain_to_ui();
+            feed_us += unsafe { esp_idf_svc::sys::esp_timer_get_time() } - t;
+        }
 
         // Touch, first thing in the frame and only when it changes.
         //
@@ -596,6 +676,8 @@ pub fn run_log_panel(
             last_wf_seq = u32::MAX;
             last_decoded_fp = (usize::MAX, u32::MAX, u16::MAX);
             last_tx_seq = last_tx_seq.wrapping_add(1);
+            last_status = None;
+            last_link = None;
         }
 
         let heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
@@ -643,6 +725,7 @@ pub fn run_log_panel(
         let status_snapshot;
         let decoded_fp;
         let wf_seq;
+        let wf_due_frame;
         let tx_seq;
         let tx_line_snapshot: heapless::String<48>;
         // What the strip shows: the acquisition, while one is running.
@@ -677,12 +760,14 @@ pub fn run_log_panel(
                 }
             }
             wf_seq = ui.wf_push_seq();
+            let wf_due = wf_seq != last_wf_seq;
+            wf_due_frame = wf_due;
             // Copy the waterfall only when it moved.
             //
             // The `wf_seq` gate below was already skipping the *draw*;
             // the 13.5 KB copy ran every frame regardless, ten times a
             // second, for a surface that changes once per slot.
-            if wf_seq != last_wf_seq {
+            if wf_due {
                 wf_snapshot.clear();
                 for line in ui.waterfall_iter() {
                     if wf_snapshot.push(*line).is_err() {
@@ -745,29 +830,83 @@ pub fn run_log_panel(
             continue;
         }
 
-        status_bar::render(&mut display, &status_snapshot, SHARED_UI_WIDTH).ok();
+        let t_bars = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+        pre_us += t_bars - frame_top_us;
+        // **Both bars only when what they show has changed** — or the
+        // picker has closed over them, which clears `last_*`. They used
+        // to repaint every frame on the reasoning that they were cheap;
+        // measured, the two together were 126-178 ms of every second on
+        // a CoreS3 panel, more than the station list and the waterfall
+        // feed combined, for text that changes about once a second.
+        if last_status.as_ref() != Some(&status_snapshot) {
+            status_bar::render(&mut display, &status_snapshot, SHARED_UI_WIDTH).ok();
+            last_status = Some(status_snapshot.clone());
+        }
+        let link = crate::uac::link_info();
+        if last_link != Some(link) {
+            link_bar::render(&mut display, &link, SHARED_UI_WIDTH, LINK_BAR_Y).ok();
+            last_link = Some(link);
+        }
+        bars_us += unsafe { esp_idf_svc::sys::esp_timer_get_time() } - t_bars;
 
-        // Cheap enough to repaint every frame (one 240x14 fill plus
-        // three short strings), and repainting unconditionally is what
-        // keeps it correct after the mode picker closes over it.
-        link_bar::render(
-            &mut display,
-            &crate::uac::link_info(),
-            SHARED_UI_WIDTH,
-            LINK_BAR_Y,
-        )
-        .ok();
-
-        if wf_seq != last_wf_seq {
-            let wf_refs: heapless::Vec<
-                &mfsk_app_shared::ui::state::WfLine,
-                { mfsk_app_shared::ui::state::WF_DEPTH },
-            > = wf_snapshot.iter().collect();
-            waterfall::render_marked(&mut display, &wf_refs, &wf_marks, SHARED_UI_WIDTH).ok();
+        if wf_due_frame {
+            let t = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+            // **As byte blocks, not through `fill_contiguous`.** That
+            // path hands `display-interface-spi` a per-pixel iterator it
+            // sends 64 pixels at a time — ~375 SPI transactions for this
+            // region, each with the driver's own overhead, which was
+            // half of a ~39 ms redraw against ~20 ms of wire time at
+            // 20 MHz. Here the window is opened once (an empty pixel
+            // iterator sends only the address window and RAMWR) and the
+            // rows follow as prebuilt RGB565 blocks of `WF_BLOCK_ROWS`
+            // rows, one `spi.write` each. Same pixels as
+            // `waterfall::render_marked` (`row_rgb565_be`).
+            let w = SHARED_UI_WIDTH.min(waterfall::WIDTH) as usize;
+            let n = wf_snapshot.len().min(mfsk_app_shared::ui::state::WF_DEPTH);
+            let blank = waterfall::HEIGHT as usize - n;
+            let first = wf_snapshot.len() - n;
+            let opened = display.set_pixels(
+                0,
+                waterfall::ORIGIN_Y as u16,
+                (w - 1) as u16,
+                (waterfall::ORIGIN_Y + waterfall::HEIGHT as i32 - 1) as u16,
+                core::iter::empty(),
+            );
+            if opened.is_ok() {
+                let mut row = 0usize;
+                while row < waterfall::HEIGHT as usize {
+                    let rows = WF_BLOCK_ROWS.min(waterfall::HEIGHT as usize - row);
+                    for k in 0..rows {
+                        let r = row + k;
+                        let (line, marked) = if r < blank {
+                            (None, false)
+                        } else {
+                            let j = first + r - blank;
+                            (wf_snapshot.get(j), wf_marks.get(j).copied().unwrap_or(false))
+                        };
+                        waterfall::row_rgb565_be(
+                            line,
+                            marked,
+                            w,
+                            &mut wf_block[k * w * 2..(k + 1) * w * 2],
+                        );
+                    }
+                    // SAFETY: raw data after the RAMWR `set_pixels` just
+                    // issued, inside the window it set — nothing the
+                    // driver tracks is changed.
+                    use display_interface::WriteOnlyDataCommand as _;
+                    let _ = unsafe { display.dcs() }
+                        .di
+                        .send_data(display_interface::DataFormat::U8(&wf_block[..rows * w * 2]));
+                    row += rows;
+                }
+            }
+            wf_draw_us += unsafe { esp_idf_svc::sys::esp_timer_get_time() } - t;
             last_wf_seq = wf_seq;
         }
 
         if decoded_fp != last_decoded_fp {
+            let t = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
             decoded_list::render_in_flags(
                 &mut display,
                 &decoded_snapshot,
@@ -782,6 +921,7 @@ pub fn run_log_panel(
                 },
             )
             .ok();
+            list_us += unsafe { esp_idf_svc::sys::esp_timer_get_time() } - t;
             last_decoded_fp = decoded_fp;
         }
 
@@ -974,6 +1114,7 @@ pub fn run_log_panel(
         }
 
         let _ = fanout;
+        busy_us += unsafe { esp_idf_svc::sys::esp_timer_get_time() } - frame_top_us;
         // The frame's idle time, spent sampling touch.
         //
         // It used to be `sleep(50)`, on the reasoning that the loop
@@ -981,8 +1122,16 @@ pub fn run_log_panel(
         // is the render plus the sleep, and the render is the larger
         // half. Polling inside the idle time instead puts three or four
         // samples under a ~100 ms tap however long the frame took.
+        // Paced to `FRAME_US` from the top of the frame, not a fixed
+        // wait after it: the frame rate is what costs, and holding it
+        // is what lets the panel run above FT4's decode without taking
+        // the decode's time (see `FRAME_US`). Touch is still sampled
+        // every 12 ms of the wait. At least 20 ms, so a slow frame
+        // still leaves the lower tasks a gap.
+        let spent_ms = (unsafe { esp_idf_svc::sys::esp_timer_get_time() } - frame_top_us) / 1_000;
+        let wait_ms = (FRAME_US / 1_000 - spent_ms).max(20) as u64;
         if let Some(commit) = pump_touch(
-            50,
+            wait_ms,
             &touch_int,
             pmic_i2c.as_mut(),
             &mut last_touch,

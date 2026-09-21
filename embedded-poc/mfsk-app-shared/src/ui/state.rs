@@ -65,7 +65,7 @@ pub struct SlotDecode<'a> {
 
 /// Status-bar fields. All optional so the bar renders during boot
 /// before peripherals are up.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct StatusInfo {
     /// Rig audio band centre (Hz). e.g. 7_074_000 for FT8 40 m.
     pub rig_freq_hz: Option<u32>,

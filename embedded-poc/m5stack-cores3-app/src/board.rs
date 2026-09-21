@@ -226,6 +226,61 @@ pub fn log_stack_hw(tag: &str) {
 /// call it from a task with room — a display loop, not an audio
 /// reader. It reports its own caller's headroom too, so if that ever
 /// stops being true it says so.
+/// Each task's CPU since the last call, as a percentage of one core —
+/// from FreeRTOS's run-time counters (`CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS`,
+/// esp_timer microseconds). The busiest ten, one line.
+///
+/// For the question wall-clock timers inside a task cannot answer once
+/// that task sleeps on DMA or is preempted: how much of a core it
+/// actually used. Added for the FT4 panel (2026-09-21), whose drawing
+/// is DMA it sleeps through, so its own timers read wall time.
+pub fn log_task_cpu() {
+    use esp_idf_svc::sys;
+    use std::sync::Mutex;
+    const MAX_TASKS: usize = 40;
+    static PREV: Mutex<(i64, heapless::Vec<(usize, u32), MAX_TASKS>)> =
+        Mutex::new((0, heapless::Vec::new()));
+
+    let mut tasks: [sys::TaskStatus_t; MAX_TASKS] = unsafe { core::mem::zeroed() };
+    let mut total: u32 = 0;
+    // SAFETY: `tasks` is `MAX_TASKS` correctly-typed entries.
+    let n = unsafe {
+        sys::uxTaskGetSystemState(tasks.as_mut_ptr(), MAX_TASKS as sys::UBaseType_t, &mut total)
+    } as usize;
+    let now = unsafe { sys::esp_timer_get_time() };
+    let Ok(mut prev) = PREV.lock() else {
+        return;
+    };
+    let wall = now - prev.0;
+    let mut rows: heapless::Vec<(u32, heapless::String<20>), MAX_TASKS> = heapless::Vec::new();
+    let mut next: heapless::Vec<(usize, u32), MAX_TASKS> = heapless::Vec::new();
+    for t in tasks.iter().take(n) {
+        let h = t.xHandle as usize;
+        let before = prev.1.iter().find(|(k, _)| *k == h).map(|(_, v)| *v);
+        let _ = next.push((h, t.ulRunTimeCounter));
+        if let Some(b) = before {
+            let mut name: heapless::String<20> = heapless::String::new();
+            // SAFETY: FreeRTOS task names are NUL-terminated C strings.
+            let cname = unsafe { core::ffi::CStr::from_ptr(t.pcTaskName) };
+            let _ = name.push_str(cname.to_str().unwrap_or("?"));
+            let _ = rows.push((t.ulRunTimeCounter.wrapping_sub(b), name));
+        }
+    }
+    let first = prev.0 == 0;
+    *prev = (now, next);
+    drop(prev);
+    if first || wall <= 0 {
+        return;
+    }
+    rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let mut line: heapless::String<256> = heapless::String::new();
+    use core::fmt::Write as _;
+    for (d, name) in rows.iter().take(10) {
+        let _ = write!(line, " {}:{}%", name, (*d as i64) * 100 / wall);
+    }
+    log::info!("[cpu]{line}");
+}
+
 pub fn log_task_stacks() {
     use esp_idf_svc::sys;
 

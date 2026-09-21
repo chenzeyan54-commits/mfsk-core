@@ -80,6 +80,25 @@ const SLOT_MARK: Rgb565 = Rgb565::new(31, 0, 0);
 /// the signal starts *at* the line, which a solid bar would cover.
 const SLOT_MARK_DASH: usize = 6;
 
+/// One waterfall row as the panel's wire format — RGB565, big-endian,
+/// two bytes a pixel — into `out`, which must hold `width * 2` bytes.
+/// `None` is a blank row. Same palette and the same dashed slot rule
+/// as [`render_marked`], for a panel that sends the region as byte
+/// blocks rather than through `fill_contiguous`'s per-pixel iterator.
+pub fn row_rgb565_be(line: Option<&WfLine>, marked: bool, width: usize, out: &mut [u8]) {
+    let width = width.min(WIDTH as usize);
+    for col in 0..width {
+        let c = match line {
+            Some(_) if marked && col % SLOT_MARK_DASH < SLOT_MARK_DASH / 2 => SLOT_MARK,
+            Some(l) => PALETTE[(l[col] & 0x0F) as usize],
+            None => PALETTE[0],
+        };
+        let v = embedded_graphics::pixelcolor::raw::RawU16::from(c).into_inner();
+        out[2 * col] = (v >> 8) as u8;
+        out[2 * col + 1] = v as u8;
+    }
+}
+
 /// [`render`] plus a rule across every row the caller marks.
 ///
 /// `marks` is parallel to `lines`; a `true` draws the slot-boundary

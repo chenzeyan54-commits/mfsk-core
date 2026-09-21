@@ -118,6 +118,12 @@ impl Receiver for Ft8Controller {
         let Panel::DrawsLast(display) = panel else {
             unreachable!("attach_panel hands this receiver's panel back to run_forever");
         };
+        // The panel above the decode, so the screen never stops — see
+        // `display::PANEL_PRIORITY` for what it costs FT8 (nothing
+        // measurable).
+        unsafe {
+            esp_idf_svc::sys::vTaskPrioritySet(core::ptr::null_mut(), crate::display::PANEL_PRIORITY)
+        };
         crate::display::run_log_panel(
             display.i2c0,
             display.spi2,
