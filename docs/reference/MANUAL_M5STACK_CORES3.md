@@ -37,7 +37,7 @@ waterfall, station list, link bar, and the menu over the top. WSPR
 and FST4 had spot-list screens of their own until 2026-09-21.
 
 - **The waterfall is drawn from the audio itself**, the same way in
-  every mode, at 12 rows a second over 200-2 700 Hz. Its horizontal
+  every mode, at 12 rows a second over 200-3 000 Hz. Its horizontal
   rules mark the slot boundaries of the running mode (7.5 s, 15 s,
   60 s or 120 s) by the board's clock — the clock's boundary, not
   necessarily the one the FT8 decoder locked onto when it has only

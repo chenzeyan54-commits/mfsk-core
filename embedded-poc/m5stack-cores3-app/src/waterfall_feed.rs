@@ -84,8 +84,16 @@ pub fn init(mode: BootMode) {
     }
 }
 
+/// `MFSK_WF_FEED_OFF=1` builds without the feed — no ring, no rows — so
+/// what it costs the decoders can be measured as a difference rather
+/// than argued. Compile-time, like every other measurement knob here.
+const FEED_OFF: bool = option_env!("MFSK_WF_FEED_OFF").is_some();
+
 /// Offer audio to the waterfall. Never blocks; see the module doc.
 pub fn push(samples: &[i16]) {
+    if FEED_OFF {
+        return;
+    }
     let Ok(mut g) = RING.try_lock() else {
         DROPPED.fetch_add(samples.len() as u32, Ordering::Relaxed);
         return;
@@ -118,6 +126,9 @@ pub fn push(samples: &[i16]) {
 /// Turn whatever audio has arrived into waterfall rows. From the panel
 /// loop, every frame.
 pub fn drain_to_ui() {
+    if FEED_OFF {
+        return;
+    }
     let Ok(mut dg) = DRAIN.lock() else {
         return;
     };

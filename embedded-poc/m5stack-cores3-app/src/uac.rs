@@ -811,8 +811,15 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
             let ms = (wait_samples / 12) as u32;
             unsafe { sys::vTaskDelay(ms / (1_000 / sys::configTICK_RATE_HZ).max(1)) };
         }
+        // The deliberate offset, kept for the re-alignment below before
+        // `lead` is reused for the (now always empty) silence prefix.
+        let offset_samples = lead % slot_samples.max(1);
         let lead = 0usize;
         const BLK: usize = 256;
+        /// 20 ms: past the jitter of one UAC-sized block and far below
+        /// anything the decoder would notice.
+        const REALIGN_SAMPLES: u64 = 240;
+        const NO_CLOCK_SIM: bool = option_env!("MFSK_SIM_NO_CLOCK").is_some();
         let t0 = unsafe { sys::esp_timer_get_time() };
         let mut fed: u64 = 0;
         let mut src = 0usize; // index into pcm, after the lead is done
@@ -827,6 +834,45 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
                 lead_left = 0;
                 &silence[..n]
             } else {
+                // **Back on the clock at every pass**, as a station
+                // transmitting on UTC would be. The feed is placed on a
+                // boundary once, at start, and after that runs on
+                // `esp_timer`; when NTP lands and moves the clock, the
+                // receiver follows it and the recording did not — the
+                // slot rules and the signals on the waterfall stayed a
+                // clock step apart and the decodes' DT walked out of the
+                // search (2026-09-21, 1.6 s). So at the top of each pass,
+                // where the recording's sample 0 should meet a boundary,
+                // measure against the clock and wait or skip the
+                // difference.
+                if src == 0 && !NO_CLOCK_SIM && loop_len == slot_samples {
+                    if let Some(to_b) = mfsk_app_shared::time_sync::samples_to_next_slot_12k_ms(
+                        (slot_samples / 12) as u64,
+                    ) {
+                        // To the *target* — the boundary plus any
+                        // deliberate `MFSK_SIM_OFFSET_MS` — not the
+                        // boundary. Positive: still ahead (early).
+                        let to_b = (to_b + offset_samples) % slot_samples;
+                        let err = if to_b < slot_samples / 2 {
+                            to_b as i64
+                        } else {
+                            to_b as i64 - slot_samples as i64
+                        };
+                        if err.unsigned_abs() > REALIGN_SAMPLES {
+                            if err > 0 {
+                                // Pacing is by `fed`; counting the wait
+                                // as fed holds the next block back.
+                                fed += err as u64;
+                            } else {
+                                src = ((-err) as usize).min(loop_len - 1);
+                            }
+                            log::info!(
+                                "uac SIM: re-aligned to the clock by {:+} ms",
+                                err * 1_000 / 12_000
+                            );
+                        }
+                    }
+                }
                 let end = (src + BLK).min(loop_len);
                 let s = &pcm[src..end];
                 src = if end == loop_len { 0 } else { end };

@@ -78,7 +78,8 @@ pub struct StatusInfo {
 }
 
 /// Single waterfall row — [`WF_COLS`] palette indices (0..15) covering
-/// the FT8 audio band 200..2700 Hz, ~10.4 Hz per column at 240.
+/// the audio band — 200..3000 Hz on the CoreS3 (11.7 Hz a column),
+/// 200..2700 Hz where the rows come from FT8's stage 1.
 /// Must match `embedded_shared::pipeline::WF_ROW_LEN`. The two crates
 /// do not depend on each other, so this is a hand-kept pair; the
 /// producer's `decimate_pair_to_wf` fills exactly this many columns.

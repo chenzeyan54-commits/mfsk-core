@@ -485,7 +485,23 @@ pub fn run_log_panel(
     // (`UiState::decoded_current_iter`), not a receiver's watermark.
     let mut current_snapshot: heapless::Vec<bool, 16> = heapless::Vec::new();
     let mut last_tx_seq: u32 = 0;
+    // The longest time between two frames, every ~10 s: how long the
+    // screen stood still — a panel starved by something above it on its
+    // core looks hung to the operator however well the rest is doing.
+    let mut frame_prev_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+    let mut frame_gap_max_us: i64 = 0;
+    let mut frame_report_us = frame_prev_us;
     loop {
+        {
+            let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+            frame_gap_max_us = frame_gap_max_us.max(now - frame_prev_us);
+            frame_prev_us = now;
+            if now - frame_report_us >= 10_000_000 {
+                log::info!("panel: longest frame gap {} ms", frame_gap_max_us / 1_000);
+                frame_gap_max_us = 0;
+                frame_report_us = now;
+            }
+        }
         // The waterfall's rows, built here from the audio itself — the
         // same feed in every mode (`waterfall_feed`).
         crate::waterfall_feed::drain_to_ui();

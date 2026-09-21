@@ -162,17 +162,28 @@ pub fn read_epoch(i2c: &mut I2cDriver<'_>) -> Option<i64> {
 /// what the two together buy is a network-free boot aligned to a few
 /// milliseconds instead of half a second.
 pub fn read_into_system_clock(i2c: &mut I2cDriver<'_>) -> Option<i64> {
+    let _urgent = Urgent::new();
     let first = read_epoch(i2c)?;
     // Bounded: a second plus a margin. If the value never changes the
     // chip is stopped or unreadable, and the un-aligned value is still
     // better than no clock — that is what the fallback keeps.
     let mut aligned = None;
+    // When the tick was seen, and the longest gap between two polls —
+    // the second is how late the tick can have been seen at all.
+    let mut tick_seen_us: i64 = 0;
+    let mut poll_gap_max_us: i64 = 0;
+    let mut poll_prev_us = now_us();
     let t0 = std::time::Instant::now();
     while t0.elapsed() < std::time::Duration::from_millis(1_150) {
         esp_idf_svc::hal::delay::FreeRtos::delay_ms(10);
-        match read_epoch(i2c) {
+        let polled = read_epoch(i2c);
+        let t = now_us();
+        poll_gap_max_us = poll_gap_max_us.max(t - poll_prev_us);
+        poll_prev_us = t;
+        match polled {
             Some(e) if e != first => {
                 aligned = Some(e);
+                tick_seen_us = t;
                 break;
             }
             Some(_) => {}
@@ -194,9 +205,17 @@ pub fn read_into_system_clock(i2c: &mut I2cDriver<'_>) -> Option<i64> {
     // can refuse to write it back. See `time_sync::ClockSource` for
     // the 186 s this cost (#354).
     mfsk_app_shared::time_sync::note_clock_from_rtc();
+    // **The tick plus the time since it was seen, not the tick.** This
+    // used to set `tv_usec: 0`, i.e. assert the second had only just
+    // started, however long ago the tick was actually seen. On a core
+    // where this task is the lowest priority — the panel's `main` at 1,
+    // with an FT4 decode at 5 beside it — that was the length of
+    // whatever preempted it: the NTP correction measured 0.9 to 3.1 s
+    // on FT4 boots and never on FST4 ones, whose panel runs at 7.
+    let since_tick_us = if aligned.is_some() { now_us() - tick_seen_us } else { 0 };
     let tv = esp_idf_svc::sys::timeval {
-        tv_sec: unix as esp_idf_svc::sys::time_t,
-        tv_usec: 0,
+        tv_sec: (unix + since_tick_us / 1_000_000) as esp_idf_svc::sys::time_t,
+        tv_usec: (since_tick_us % 1_000_000) as _,
     };
     // SAFETY: `tv` is a valid `timeval` for the duration of the call
     // and the timezone argument is documented as unused.
@@ -206,12 +225,15 @@ pub fn read_into_system_clock(i2c: &mut I2cDriver<'_>) -> Option<i64> {
         return None;
     }
     log::info!(
-        "rtc: system clock set from BM8563 — epoch {unix}{}",
+        "rtc: system clock set from BM8563 — epoch {unix}{} | tick seen {} us before set, \
+         polls up to {} ms apart",
         if aligned.is_some() {
             " (on the chip's tick, sub-second known)"
         } else {
             " (unaligned)"
-        }
+        },
+        since_tick_us,
+        poll_gap_max_us / 1_000,
     );
     {
         let mut msg: heapless::String<64> = heapless::String::new();
@@ -222,12 +244,50 @@ pub fn read_into_system_clock(i2c: &mut I2cDriver<'_>) -> Option<i64> {
     Some(unix)
 }
 
+/// Priority for the two timing-critical calls here, for their duration.
+///
+/// Both place a clock edge by polling: the read sees the chip's tick
+/// and sets the system clock, the write waits for a UTC boundary and
+/// releases the chip's `STOP`. A task preempted between the two halves
+/// puts the edge late by however long it was held — and on core 0 in
+/// FT4 and FT8 modes they run in the panel's `main` at priority 1,
+/// below the decoders at 5-6. Above them (7), and below the IDF's own
+/// system tasks, the calls lose nothing: they sleep in 10 ms steps and
+/// only busy-wait the last ~20 ms before an edge.
+const RTC_TIMING_PRIORITY: u32 = 7;
+
+/// Raises the calling task to [`RTC_TIMING_PRIORITY`] while held.
+struct Urgent(u32);
+
+impl Urgent {
+    fn new() -> Self {
+        // SAFETY: null is "the calling task" for both.
+        let was = unsafe { esp_idf_svc::sys::uxTaskPriorityGet(core::ptr::null_mut()) };
+        if was < RTC_TIMING_PRIORITY {
+            unsafe { esp_idf_svc::sys::vTaskPrioritySet(core::ptr::null_mut(), RTC_TIMING_PRIORITY) };
+        }
+        Self(was)
+    }
+}
+
+impl Drop for Urgent {
+    fn drop(&mut self) {
+        // SAFETY: as in `new`.
+        unsafe { esp_idf_svc::sys::vTaskPrioritySet(core::ptr::null_mut(), self.0) };
+    }
+}
+
+fn now_us() -> i64 {
+    unsafe { esp_idf_svc::sys::esp_timer_get_time() }
+}
+
 /// Write the system clock back to the chip.
 ///
 /// Call after NTP syncs. Cheap enough to do unconditionally; the point
 /// is that the *next* boot has a clock before WiFi exists, or without
 /// WiFi at all.
 pub fn write_from_system_clock(i2c: &mut I2cDriver<'_>) -> Result<()> {
+    let _urgent = Urgent::new();
     // **Only ever write a disciplined clock.** Plausibility is not
     // provenance: `pmic::init` seeds the system clock *from this
     // chip* 30 s before WiFi exists, so a value check passes for a
@@ -357,7 +417,15 @@ pub fn write_from_system_clock(i2c: &mut I2cDriver<'_>) -> Result<()> {
                 unsafe { esp_idf_svc::sys::esp_rom_delay_us(100) };
             }
         }
-        if let Err(e) = i2c.write(RTC_I2C_ADDR, &[REG_CONTROL1, 0x00], I2C_TIMEOUT_TICKS) {
+        let release = i2c.write(RTC_I2C_ADDR, &[REG_CONTROL1, 0x00], I2C_TIMEOUT_TICKS);
+        // How far past the boundary STOP actually came off — the phase
+        // error the next boot inherits.
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let late_us = (d.as_secs() as i64 - release_at as i64) * 1_000_000 + d.subsec_micros() as i64;
+        log::info!("rtc: STOP released {late_us} us after the boundary");
+        if let Err(e) = release {
             // Worse than a phase error: a stopped chip keeps no time.
             log::error!("rtc: could not clear STOP ({e}) — retrying once");
             if let Err(e) = i2c.write(RTC_I2C_ADDR, &[REG_CONTROL1, 0x00], I2C_TIMEOUT_TICKS) {

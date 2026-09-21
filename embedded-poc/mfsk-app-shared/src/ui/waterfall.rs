@@ -32,8 +32,12 @@ pub const HEIGHT: u32 = 100;
 /// Full row width. Narrow panels pass a smaller `width` to
 /// [`render`] and get the leading columns.
 pub const WIDTH: u32 = crate::ui::state::WF_COLS as u32;
+/// The span the CoreS3's rows cover (`embedded-shared::waterfall`, which
+/// builds them). The StickS3 and Core2 still take theirs from FT8's
+/// stage 1, which stops at 2 700 Hz.
 pub const WF_FREQ_LO_HZ: f32 = 200.0;
-pub const WF_FREQ_HI_HZ: f32 = 2700.0;
+/// See [`WF_FREQ_LO_HZ`].
+pub const WF_FREQ_HI_HZ: f32 = 3000.0;
 
 /// 16-step palette. Indices 0..15 map magnitude bands; 0 = silence
 /// (black), 15 = peak (white). RGB565 encoded inline.

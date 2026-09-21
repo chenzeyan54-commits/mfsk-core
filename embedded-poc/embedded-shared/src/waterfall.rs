@@ -35,8 +35,8 @@ use mfsk_core::engine::fft::AlignedComplexBuf;
 use crate::pipeline::WF_ROW_LEN;
 
 /// Transform length, in real samples: 5.86 Hz bins against the panel's
-/// 10.4 Hz columns, so every column sees at least one whole bin, over a
-/// 171 ms window.
+/// 11.7 Hz columns, so every column sees two whole bins, over a 171 ms
+/// window.
 pub const WF_NFFT: usize = 2_048;
 
 /// Complex points the real transform runs as.
@@ -46,10 +46,15 @@ const HALF: usize = WF_NFFT / 2;
 /// feed ran at, so the FT8 screen scrolls as it always has.
 pub const WF_HOP: usize = 1_000;
 
-/// Frequency span a row covers, shared with the panel's axis.
+/// Frequency span a row covers, shared with the panel's axis
+/// (`ui::waterfall`).
 pub const WF_FREQ_LO_HZ: f32 = 200.0;
-/// See [`WF_FREQ_LO_HZ`].
-pub const WF_FREQ_HI_HZ: f32 = 2_700.0;
+/// Up to 3 000 Hz: the top of the band the FT8 decoder searches
+/// (`stage1_inc`'s `ALLSUM_FREQ_MAX`). FT8's own rows used to stop at
+/// 2 700, so stations between 2 700 and 3 000 Hz decoded without ever
+/// being drawn. 240 columns over 2 800 Hz are 11.7 Hz each, two of this
+/// builder's bins.
+pub const WF_FREQ_HI_HZ: f32 = 3_000.0;
 
 const SAMPLE_RATE_HZ: f32 = 12_000.0;
 

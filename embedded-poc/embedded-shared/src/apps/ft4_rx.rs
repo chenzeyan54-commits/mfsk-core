@@ -582,13 +582,16 @@ impl Pipe {
 /// task draining it (5) — and above those WiFi and the timers. Neither
 /// worker can delay the audio.
 ///
-/// **The core-0 worker is level with the slot task, not under it.** At
-/// 2 it could not run once the slot task started decoding, so it could
-/// not release the pipe it held until the join slept a whole tick —
-/// measured at ~10 ms a slot, every slot. Level, the join yields to it
-/// and it lets go within one slice. During capture the slot task only
-/// drains a UAC read and sleeps, so sharing its level costs it at most
-/// a slice, against a 4 s staging buffer.
+/// **The core-0 worker is level with the slot task (5).** Run at the
+/// panel's priority (1) instead, to keep the screen moving, it shared
+/// core 0 with a panel that redraws its waterfall every frame and
+/// measured the worse way on both counts: 65-72 % of the sweep done by
+/// the close instead of 83-88 %, the loop ending at ~850 ms instead of
+/// ~700, and the screen no less still — 0.9-1.5 s between frames,
+/// because the decode after the close holds the core as long by itself
+/// (2026-09-21, FT4 SIM, with and without the waterfall feed). A timed
+/// yield to the panel every 100 ms did not shorten the gap either. The
+/// screen's stall is an open item, not solved by priorities alone.
 const EARLY_WORKERS: [(i32, u32); 2] = [(1, 4), (0, 5)];
 
 struct EarlyShared {
@@ -847,11 +850,14 @@ pub struct Ft4Decode {
 /// deliberate. A QSO-capable build had 500 ms under the old
 /// anchoring — the budget did not shrink, it was measured.
 ///
-/// **Settled 2026-09-21 as a transmit-chain lead, not a
-/// contradiction** — see [`REPLY_DEADLINE_MS`] and
-/// `docs/reference/EMBEDDED.md`, "FT4: the reply is due when the audio
-/// starts". The value is unchanged pending the `intime` measurement.
-/// The original note, kept for the reasoning it records:
+/// **1 025 ms since 2026-09-21: the reply deadline, [`REPLY_DEADLINE_MS`].**
+/// The 300 was settled as a transmit-chain lead, not a contradiction
+/// (`docs/reference/EMBEDDED.md`, "FT4: the reply is due when the audio
+/// starts"), and the `intime` measurement it waited on came in: with
+/// the basebands and the coarse sweep built during capture, all eleven
+/// of the golden's decodes land by 1 025 ms on a CoreS3 (loop ends
+/// 663-771 ms). At 1 225 the audio went out at 8.0 s, ~200 ms late at
+/// the other end. The original note, kept for the reasoning it records:
 ///
 /// **Upstream puts FT4's transmit audio at 0.3 s, not 0.5 s.** `Modulator::start` pads silence to `delay_ms`, and that
 /// constant is **300 for FT4** where it is 500 for FT8 and 1000
@@ -874,7 +880,7 @@ pub struct Ft4Decode {
 /// re-anchoring already had to undo once. What would settle it: a
 /// WSJT-X FT4 transmission recorded against a disciplined clock, or
 /// the upstream rationale for the 300.
-pub const TX_TURNAROUND_BUDGET_MS: i64 = 1_225;
+pub const TX_TURNAROUND_BUDGET_MS: i64 = REPLY_DEADLINE_MS;
 
 /// Milliseconds from [`CAPTURE_CLOSE_SAMPLES`] to the slot boundary:
 /// `(90 000 − 81 300) / 12 kHz` = 725 ms. Where WSJT-X's GUI commits
@@ -902,18 +908,11 @@ pub const FT4_AUDIO_START_AFTER_BOUNDARY_MS: i64 = 300;
 /// `docs/reference/EMBEDDED.md`, "FT4: the reply is due when the audio
 /// starts".
 ///
-/// **A measurement, never a cut.** A decode that lands after this is
-/// too late for *this* reply and still worth having — for the screen
-/// and for the choice after next. WSJT-X never stops a decode for a
-/// transmission; this board has a cut only because it decodes on the
-/// cores the transmitter needs, and that cut is
-/// [`TX_TURNAROUND_BUDGET_MS`]. What this feeds is `intime`: how many
-/// of a slot's decodes a transmitter could have answered.
-///
-/// Budget-shaped only by coincidence: this is exactly the 1 025 ms
-/// [`TX_TURNAROUND_BUDGET_MS`]'s own doc gives for the case where the
-/// modulator's 300 governs, and that constant still holds 1 225 until
-/// the measurement this feeds says whether to move it.
+/// **Also the cut, since 2026-09-21** — [`TX_TURNAROUND_BUDGET_MS`]
+/// is this. WSJT-X never stops a decode for a transmission; this board
+/// has a cut only because it decodes on the cores the transmitter
+/// needs. `intime` counts the decodes a transmitter could have
+/// answered; with the cut here, the two coincide.
 pub const REPLY_DEADLINE_MS: i64 = SLOT_BOUNDARY_MS + FT4_AUDIO_START_AFTER_BOUNDARY_MS;
 
 /// A whole FT4 slot, so a receive-only monitor can spend one.

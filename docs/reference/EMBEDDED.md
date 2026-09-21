@@ -736,10 +736,12 @@ Three consequences:
 
 - **The reply deadline is ~1 025 ms after capture close.** Not the
   boundary's 725, and not the 1 225 that
-  `ft4_rx::TX_TURNAROUND_BUDGET_MS` holds today, which places the
-  audio at 8.0 s and the frame ~200 ms late — DT ≈ +0.2 at the other
-  end, inside its ±1.0 s search but spending the margin its own clock
-  error needs.
+  `ft4_rx::TX_TURNAROUND_BUDGET_MS` held until 2026-09-21, which
+  placed the audio at 8.0 s and the frame ~200 ms late — DT ≈ +0.2 at
+  the other end, inside its ±1.0 s search but spending the margin its
+  own clock error needs. The cut is now this deadline, once the
+  capture-time basebands and coarse sweep brought all eleven golden
+  decodes inside it on a CoreS3.
 - **A decode that misses it is still kept.** It is too late for this
   reply and still wanted for the screen and the choice after next;
   WSJT-X never stops decoding for a transmission, and this board only
