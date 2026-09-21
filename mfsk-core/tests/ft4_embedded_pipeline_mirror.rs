@@ -57,7 +57,7 @@
 ))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
 use num_complex::Complex;
 
@@ -83,17 +83,34 @@ use common::load_wav_i16_opt as read_wsjtx_wav_i16;
 // and nothing else. It is what turns "the candidate loop allocates ~50
 // times" from a code reading into a number a change has to move.
 
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
-static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+// **Thread-local, not global.** `cargo test` runs a file's tests
+// concurrently by default, so global counters make each test count the
+// others' allocations — which is exactly what happened here: adding the
+// breakdown test below doubled the slot test's figures until this was
+// fixed. `Cell` in a `const`-initialised `thread_local!` is a plain TLS
+// slot, so the allocator does not allocate to record an allocation.
+thread_local! {
+    static ALLOCS: Cell<usize> = const { Cell::new(0) };
+    static ALLOC_BYTES: Cell<usize> = const { Cell::new(0) };
+}
 
 struct Counting;
 
+impl Counting {
+    #[inline]
+    fn charge(size: usize) {
+        // `try_with`: during thread teardown the slot is gone, and a
+        // panic from inside the allocator would be unrecoverable.
+        let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+        let _ = ALLOC_BYTES.try_with(|c| c.set(c.get() + size));
+    }
+}
+
 // SAFETY: every method forwards to `System` unchanged; the counters are
-// `Relaxed` adds that cannot affect the pointer returned.
+// thread-local `Cell` updates that cannot affect the pointer returned.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        Self::charge(layout.size());
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -102,8 +119,7 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // A realloc is an allocation as far as the board's heap lock is
         // concerned, so count it as one.
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        ALLOC_BYTES.fetch_add(new_size, Ordering::Relaxed);
+        Self::charge(new_size);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -111,13 +127,11 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-/// `(allocations, bytes)` since boot. Both monotonic; a caller reads the
-/// pair around a region and reports the difference.
+/// `(allocations, bytes)` on this thread since it started. Both
+/// monotonic; a caller reads the pair around a region and reports the
+/// difference.
 fn alloc_census() -> (usize, usize) {
-    (
-        ALLOCS.load(Ordering::Relaxed),
-        ALLOC_BYTES.load(Ordering::Relaxed),
-    )
+    (ALLOCS.with(|c| c.get()), ALLOC_BYTES.with(|c| c.get()))
 }
 
 // ── the receiver's own constants ────────────────────────────────────
@@ -180,6 +194,12 @@ struct SlotRun {
     /// figure L1 exists to drive to zero.
     cand_allocs: usize,
     cand_bytes: usize,
+    /// The candidate loop's allocations split by stage — `[ddc,
+    /// search, tail]`. Which stage a hoist has to target is not
+    /// something the byte total answers: the three 40 KB buffers
+    /// dominate the bytes and the small ones dominate the count.
+    stage_allocs: [usize; 3],
+    stage_bytes: [usize; 3],
     /// The same, for the capture side: everything before the window
     /// closes.
     capture_allocs: usize,
@@ -212,8 +232,11 @@ fn run_slot(audio: &[i16]) -> SlotRun {
     // ── the candidate loop ──────────────────────────────────────────
     let c2 = alloc_census();
     let mut messages: Vec<String> = Vec::new();
+    let mut stage_allocs = [0usize; 3];
+    let mut stage_bytes = [0usize; 3];
     for cand in &cands {
-        if let Some(text) = decode_candidate(&half, cand, &refs)
+        let text = decode_candidate(&half, cand, &refs, &mut stage_allocs, &mut stage_bytes);
+        if let Some(text) = text
             && !messages.contains(&text)
         {
             messages.push(text);
@@ -226,17 +249,34 @@ fn run_slot(audio: &[i16]) -> SlotRun {
         cands: cands.len(),
         cand_allocs: c3.0 - c2.0,
         cand_bytes: c3.1 - c2.1,
+        stage_allocs,
+        stage_bytes,
         capture_allocs: c1.0 - c0.0,
         capture_bytes: c1.1 - c0.1,
     }
 }
 
 /// `ft4_rx::decode_candidate`, call for call.
-fn decode_candidate(half: &[f32], cand: &SyncCandidate, refs: &Ft4CoarsePhasors) -> Option<String> {
+fn decode_candidate(
+    half: &[f32],
+    cand: &SyncCandidate,
+    refs: &Ft4CoarsePhasors,
+    stage_allocs: &mut [usize; 3],
+    stage_bytes: &mut [usize; 3],
+) -> Option<String> {
+    let mut charge = |k: usize, from: (usize, usize)| {
+        let now = alloc_census();
+        stage_allocs[k] += now.0 - from.0;
+        stage_bytes[k] += now.1 - from.1;
+        now
+    };
+    let t = alloc_census();
     let mut cd0 = candidate_baseband_half(half, cand.freq_hz);
     rms_normalise(&mut cd0);
+    let t = charge(0, t);
     let s2 = ft4_sync_search_window_with::<Ft4>(&cd0, cand, WSJTX_WINDOW.0, WSJTX_WINDOW.1, refs);
-    let r: DecodeResult = process_candidate_precomputed::<Ft4>(
+    let t = charge(1, t);
+    let r: Option<DecodeResult> = process_candidate_precomputed::<Ft4>(
         cand,
         // FT4's `snr_db` reads the coarse candidate score, not a
         // wide-band cache, so the board passes an empty slice here and
@@ -251,8 +291,12 @@ fn decode_candidate(half: &[f32], cand: &SyncCandidate, refs: &Ft4CoarsePhasors)
         (cd0, s2.freq_hz, s2.i0, s2.score),
         false,
         false,
-    )?;
-    let m77: [u8; 77] = r.message77().try_into().ok()?;
+    );
+    // Charged before the `?`: a candidate that fails still paid for
+    // everything the tail allocated on the way there, and those are
+    // the majority on a real band.
+    charge(2, t);
+    let m77: [u8; 77] = r?.message77().try_into().ok()?;
     unpack77(&m77)
 }
 
@@ -285,7 +329,10 @@ fn mirror_decodes_the_golden_and_reports_what_a_candidate_allocates() {
     eprintln!(
         "ft4 mirror: {} candidates, {} decodes\n  \
          capture side : {} allocations, {} B\n  \
-         candidate loop: {} allocations, {} B  ({:.1}/cand, {:.0} B/cand)",
+         candidate loop: {} allocations, {} B  ({:.1}/cand, {:.0} B/cand)\n    \
+         ddc    {:.1}/cand, {:.0} B\n    \
+         search {:.1}/cand, {:.0} B\n    \
+         tail   {:.1}/cand, {:.0} B",
         run.cands,
         run.messages.len(),
         run.capture_allocs,
@@ -294,6 +341,12 @@ fn mirror_decodes_the_golden_and_reports_what_a_candidate_allocates() {
         run.cand_bytes,
         per_cand_allocs,
         per_cand_bytes,
+        run.stage_allocs[0] as f64 / run.cands.max(1) as f64,
+        run.stage_bytes[0] as f64 / run.cands.max(1) as f64,
+        run.stage_allocs[1] as f64 / run.cands.max(1) as f64,
+        run.stage_bytes[1] as f64 / run.cands.max(1) as f64,
+        run.stage_allocs[2] as f64 / run.cands.max(1) as f64,
+        run.stage_bytes[2] as f64 / run.cands.max(1) as f64,
     );
     let mut sorted = run.messages.clone();
     sorted.sort();
@@ -307,6 +360,86 @@ fn mirror_decodes_the_golden_and_reports_what_a_candidate_allocates() {
         "the receiver's arrangement decodes 11 on this recording; got {:?}",
         sorted
     );
+}
+
+/// Where the tail's allocations actually are.
+///
+/// The per-stage split says the tail is ~80 % of the candidate loop's
+/// allocation count while being under half its bytes, which is the
+/// shape of many small buffers rather than a few large ones. This
+/// breaks it down over one candidate by calling the tail's public
+/// pieces directly, so a hoist can be aimed rather than guessed at.
+///
+/// Diagnostic, not a gate: it asserts only that the pieces it can call
+/// account for part of the whole, because the rest of the ladder is
+/// inside `process_candidate_precomputed` and has no public seam.
+#[test]
+fn mirror_tail_allocation_breakdown() {
+    use mfsk_core::engine::llr::symbol_spectra;
+    use mfsk_core::engine::sync::fine_sync_power_per_block;
+    use mfsk_core::engine::sync2d::freq_shift_cd0_into;
+    use mfsk_core::engine::{FrameLayout, ModulationParams};
+
+    let Some(audio) = slot_audio() else {
+        assert!(
+            !require_corpus(),
+            "MFSK_REQUIRE_CORPUS=1 but the golden is missing"
+        );
+        return;
+    };
+
+    // Same capture side as `run_slot`, then one candidate.
+    let mut savg = Ft4SavgBuilder::new(CAPTURE_CLOSE_SAMPLES);
+    let mut decim = SlotDecimator::new();
+    let mut half: Vec<f32> = Vec::with_capacity(CAPTURE_CLOSE_SAMPLES / 2 + 64);
+    let mut fed = 0usize;
+    while fed < CAPTURE_CLOSE_SAMPLES {
+        let take = BLOCK.min(CAPTURE_CLOSE_SAMPLES - fed);
+        savg.push_with_rows(&audio[fed..fed + take], &mut |_row| {});
+        decim.push_i16(&audio[fed..fed + take], &mut half);
+        fed += take;
+    }
+    let savg = savg.finish();
+    let cands =
+        ft4_coarse_sync_from_savg(&savg, FREQ_MIN_HZ, FREQ_MAX_HZ, SYNC_MIN, None, MAX_CAND);
+    let refs = Ft4CoarsePhasors::new::<Ft4>();
+    let cand = cands.first().expect("the golden yields candidates");
+
+    let mut cd0 = candidate_baseband_half(&half, cand.freq_hz);
+    rms_normalise(&mut cd0);
+    let s2 = ft4_sync_search_window_with::<Ft4>(&cd0, cand, WSJTX_WINDOW.0, WSJTX_WINDOW.1, &refs);
+
+    let ds_rate = 12_000.0 / Ft4::NDOWN as f32;
+    let mut shift_buf: Vec<Complex<f32>> = Vec::new();
+
+    let a = alloc_census();
+    freq_shift_cd0_into(&cd0, s2.freq_hz - cand.freq_hz, ds_rate, &mut shift_buf);
+    let b = alloc_census();
+    let cs = symbol_spectra::<Ft4>(&shift_buf, s2.i0);
+    let c = alloc_census();
+    let per_block = fine_sync_power_per_block::<Ft4>(&shift_buf, s2.i0);
+    let d = alloc_census();
+    let llr = mfsk_core::engine::llr::compute_llr_fast::<Ft4, f32>(&cs);
+    let e = alloc_census();
+
+    eprintln!(
+        "ft4 tail, one candidate:\n  \
+         freq_shift_cd0_into      {} allocations, {} B\n  \
+         symbol_spectra           {} allocations, {} B\n  \
+         fine_sync_power_per_block {} allocations, {} B\n  \
+         compute_llr_fast         {} allocations, {} B",
+        b.0 - a.0,
+        b.1 - a.1,
+        c.0 - b.0,
+        c.1 - b.1,
+        d.0 - c.0,
+        d.1 - c.1,
+        e.0 - d.0,
+        e.1 - d.1,
+    );
+    assert_eq!(cs.len(), (Ft4::N_SYMBOLS * Ft4::NTONES) as usize);
+    assert!(!per_block.is_empty());
+    assert_eq!(llr.llra.len(), 174);
 }
 
 /// The constants above are a copy of `ft4_rx.rs`'s, and a copy rots.

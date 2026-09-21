@@ -238,32 +238,70 @@ const MAX_IBMAX_PLUS_1: usize = 32;
 /// redundant calculations") ported to this per-`nsym`-call shape. For
 /// FST4's `nsym=8` rung (`nt=65536`) this cuts the s2-fill cost from
 /// `65536*8=524288` adds to `65536 + 256 + 16 ≈ 65808`, ~8x.
-fn build_group_amplitudes<S: SpecScalar>(
+/// **Writes into caller storage.** Every buffer this needs is sized
+/// from `(span, ntones)` alone, so it can be taken once per
+/// [`fill_bmet_for_nsym`] instead of once per symbol group — which is
+/// what it used to be. FT4 has 87 data groups per candidate and this
+/// returned a fresh 4-element `Vec` for each of them; measured on the
+/// CoreS3 mirror
+/// (`mfsk-core/tests/ft4_embedded_pipeline_mirror.rs`), `compute_llr_fast`
+/// was **94 allocations per candidate** and this was ~87 of them. On
+/// FST4's `nsym=8` rung each of those `Vec`s is 65 536 entries
+/// instead, so the churn scales with the rung.
+///
+/// The allocations were never the arithmetic: the association order
+/// below is unchanged (`half_hi[i] + half_lo[j]`, hi built before lo),
+/// which is what keeps the result bit-identical to the version that
+/// allocated.
+fn build_group_amplitudes_into<S: SpecScalar>(
     cs: &[Cmplx<S>],
     ks: usize,
     span: usize,
     ntones: usize,
     gray_map: &[u8],
-) -> Vec<Complex<f32>> {
+    out: &mut [Complex<f32>],
+    scratch: &mut [Complex<f32>],
+) {
     if span == 1 {
-        return (0..ntones)
-            .map(|t| {
-                let entry = cs[ks * ntones + gray_map[t] as usize];
-                Complex::new(entry.re.to_f32(), entry.im.to_f32())
-            })
-            .collect();
+        for (t, o) in out.iter_mut().enumerate().take(ntones) {
+            let entry = cs[ks * ntones + gray_map[t] as usize];
+            *o = Complex::new(entry.re.to_f32(), entry.im.to_f32());
+        }
+        return;
     }
     let hi = span / 2;
     let lo = span - hi;
-    let half_hi = build_group_amplitudes::<S>(cs, ks, hi, ntones, gray_map);
-    let half_lo = build_group_amplitudes::<S>(cs, ks + hi, lo, ntones, gray_map);
-    let mut out = Vec::with_capacity(half_hi.len() * half_lo.len());
-    for &a in &half_hi {
-        for &b in &half_lo {
-            out.push(a + b);
+    let n_hi = ntones.pow(hi as u32);
+    let n_lo = ntones.pow(lo as u32);
+    let (halves, rest) = scratch.split_at_mut(n_hi + n_lo);
+    let (half_hi, half_lo) = halves.split_at_mut(n_hi);
+    build_group_amplitudes_into::<S>(cs, ks, hi, ntones, gray_map, half_hi, rest);
+    build_group_amplitudes_into::<S>(cs, ks + hi, lo, ntones, gray_map, half_lo, rest);
+    let mut k = 0;
+    for &a in half_hi.iter() {
+        for &b in half_lo.iter() {
+            out[k] = a + b;
+            k += 1;
         }
     }
-    out
+}
+
+/// Exactly what [`build_group_amplitudes_into`]'s `scratch` has to
+/// hold, computed the same way the recursion spends it.
+///
+/// Sized rather than bounded: a generous `2 * ntones.pow(span)` would
+/// be 1 MB on FST4's `nsym=8` rung, where the true figure is 552
+/// entries — the halves shrink geometrically while only the top-level
+/// `out` is full width.
+fn group_scratch_len(span: usize, ntones: usize) -> usize {
+    if span <= 1 {
+        return 0;
+    }
+    let hi = span / 2;
+    let lo = span - hi;
+    ntones.pow(hi as u32)
+        + ntones.pow(lo as u32)
+        + group_scratch_len(hi, ntones).max(group_scratch_len(lo, ntones))
 }
 
 fn fill_bmet_for_nsym<P: Protocol, S: SpecScalar>(
@@ -281,6 +319,10 @@ fn fill_bmet_for_nsym<P: Protocol, S: SpecScalar>(
     let nt = ntones.pow(nsym as u32);
     let ibmax = bps * nsym - 1;
     let mut s2 = vec![0.0f32; nt];
+    // Taken once for every group this call will sweep, not once per
+    // group — see `build_group_amplitudes_into`.
+    let mut table = vec![Complex::new(0.0f32, 0.0); nt];
+    let mut group_scratch = vec![Complex::new(0.0f32, 0.0); group_scratch_len(nsym, ntones)];
 
     // Bit-normalised array (llrd) is only produced for nsym=1.
     let mut bmet_norm_holder = bmet_norm;
@@ -295,8 +337,16 @@ fn fill_bmet_for_nsym<P: Protocol, S: SpecScalar>(
          i_bit_base: usize,
          bmet_primary: &mut [f32],
          bmet_norm_holder: &mut Option<&mut [f32]>| {
-            let table = build_group_amplitudes::<S>(cs, ks, nsym, ntones, gray_map);
-            for (s2_i, entry) in s2.iter_mut().zip(&table) {
+            build_group_amplitudes_into::<S>(
+                cs,
+                ks,
+                nsym,
+                ntones,
+                gray_map,
+                &mut table,
+                &mut group_scratch,
+            );
+            for (s2_i, entry) in s2.iter_mut().zip(table.iter()) {
                 *s2_i = (entry.re * entry.re + entry.im * entry.im).sqrt();
             }
             // Updates every bit position's running max-when-1 /
