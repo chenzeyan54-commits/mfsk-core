@@ -370,6 +370,12 @@ fn slot_loop() -> ! {
     // once"), so the resolving and the learning both happen below,
     // after the workers have joined.
     let mut calls = mfsk_core::msg::CallsignHashTable::new();
+    // The per-candidate DDCs for the window being captured, started on
+    // core 1 once the provisional list is known — see
+    // `rx::EarlyBasebands`. Replaced whenever a new window reaches that
+    // point, so a window thrown away by a re-anchor takes its worker
+    // with it.
+    let mut early: Option<rx::EarlyBasebands> = None;
 
     loop {
         block.clear();
@@ -508,12 +514,15 @@ fn slot_loop() -> ! {
                 ui.push_waterfall(cells);
             }
         });
+        if let Some(carriers) = accum.take_provisional() {
+            early = rx::EarlyBasebands::start(accum.half_stream(), &carriers);
+        }
         let Some(slot) = done else {
             continue;
         };
 
         let seq = SLOT_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
-        let o = rx::decode_slot(&slot, BUDGET_MS);
+        let o = rx::decode_slot_with(&slot, BUDGET_MS, early.take());
         log::info!(
             "ft4_app: slot {seq} grid={} — {} of {} candidates tried, {} decodes in {} ms of \
              {BUDGET_MS} ms{}",

@@ -37,6 +37,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use mfsk_core::engine::equalize::EqMode;
@@ -45,7 +46,10 @@ use mfsk_core::engine::pipeline::{process_candidate_precomputed, DecodeDepth, De
 use mfsk_core::engine::sync2d::{
     Ft4CoarsePhasors, ft4_sync_search_window_binned, ft4_sync_search_window_with,
 };
-use mfsk_core::ft4::ddc::{SlotDecimator, candidate_baseband_boxcar, candidate_baseband_half};
+use mfsk_core::engine::{FrameLayout, ModulationParams};
+use mfsk_core::ft4::ddc::{
+    CD0_LEN, CandidateDdc, SlotDecimator, candidate_baseband_boxcar, candidate_baseband_half,
+};
 use mfsk_core::ft4::decode::FT4_DOWNSAMPLE;
 use mfsk_core::ft4::Ft4;
 use mfsk_core::msg::wsjt77::unpack77;
@@ -155,6 +159,65 @@ const WSJTX_WINDOW: (i32, i32) = (-344, 1012);
 /// it is corrected here and anything smaller is left to converge.
 const REANCHOR_THRESH_SAMPLES: i32 = 1_200;
 
+/// The slot at 6 kHz, growing while the slot arrives — written by
+/// [`SlotAccum`] on the capture task and read, a published prefix at a
+/// time, by [`EarlyBasebands`] on the other core.
+///
+/// **One writer, readers of the prefix only.** The capture side appends
+/// and then publishes the new length with `Release`; a reader loads the
+/// length with `Acquire` and touches nothing past it. The buffer is
+/// sized once, for the whole window, and never reallocates — the
+/// writer checks before every append that it cannot, because a
+/// reallocation would move the samples out from under a reader that is
+/// part-way through them.
+///
+/// Shared through an `Arc` rather than lent, because the two lifetimes
+/// genuinely differ: a grid re-anchor throws the accumulator's window
+/// away (`SlotAccum::anchor_or_reanchor`) while a worker may still be
+/// reading it, and the `Arc` is what keeps those samples alive until
+/// the worker notices it has been orphaned.
+pub struct HalfStream {
+    buf: UnsafeCell<Vec<f32>>,
+    /// The buffer's base, captured once. Never moves — see above.
+    base: *const f32,
+    len: AtomicUsize,
+    closed: AtomicBool,
+}
+// SAFETY: the only mutation is `SlotAccum::push_with_rows`, through
+// `&mut SlotAccum` (so one writer), appending past the published length;
+// readers read only below it. See the struct doc.
+unsafe impl Sync for HalfStream {}
+unsafe impl Send for HalfStream {}
+
+impl HalfStream {
+    fn new() -> Self {
+        // The stage's group delay makes the window a little short of
+        // exactly half; the margin is so no block split can make it one
+        // sample long.
+        let buf: Vec<f32> = Vec::with_capacity(CAPTURE_CLOSE_SAMPLES / 2 + 64);
+        let base = buf.as_ptr();
+        Self {
+            buf: UnsafeCell::new(buf),
+            base,
+            len: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// The published samples. After the window has closed this is the
+    /// whole slot at 6 kHz.
+    pub fn as_slice(&self) -> &[f32] {
+        let n = self.len.load(Ordering::Acquire);
+        // SAFETY: `[0, n)` was written before `n` was published and is
+        // never written again; the base never moves.
+        unsafe { core::slice::from_raw_parts(self.base, n) }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
 /// A finished slot: its audio, and the periodogram accumulated while
 /// that audio was arriving.
 pub struct CapturedSlot {
@@ -167,11 +230,59 @@ pub struct CapturedSlot {
     /// `ft4::ddc::decimate_slot` over the whole buffer whatever block
     /// sizes it was fed in (`slot_decimator_is_block_independent`),
     /// the same property `Ft4SavgBuilder` has and for the same reason:
-    /// a `FirStage` carries its own history.
-    pub half: Vec<f32>,
+    /// a `FirStage` carries its own history. Closed; read it through
+    /// [`CapturedSlot::half`].
+    pub half: Arc<HalfStream>,
     /// `esp_timer` microseconds at the moment the slot closed, so the
     /// decoder can report post-slot latency the way the benches do.
     pub closed_us: i64,
+}
+
+impl CapturedSlot {
+    /// The whole window at 6 kHz.
+    pub fn half(&self) -> &[f32] {
+        self.half.as_slice()
+    }
+}
+
+/// Bin spacing of the coarse periodogram, `12 000 / 2 304` Hz — the
+/// grid every carrier the coarse stage reports is built on.
+const COARSE_BIN_HZ: f32 = 12_000.0 / 2_304.0;
+
+fn bin_of(freq_hz: f32) -> i32 {
+    (freq_hz / COARSE_BIN_HZ).round() as i32
+}
+
+/// A carrier snapped to the nearest periodogram bin centre.
+///
+/// **What makes a baseband buildable before the list is final.** The
+/// coarse stage refines each peak off-grid, so the same station reads a
+/// slightly different carrier from a partial periodogram than from the
+/// finished one, and a baseband mixed at the first cannot be reused
+/// for the second. Snapped, both land on one bin. Free on the host
+/// mirror: the snapped receiver decodes the golden's eleven, the Δt
+/// search's own frequency refinement absorbing the half-bin
+/// (`ft4_embedded_pipeline_mirror.rs`).
+fn snap_to_bin(freq_hz: f32) -> f32 {
+    bin_of(freq_hz) as f32 * COARSE_BIN_HZ
+}
+
+/// 12 kHz samples into the window at which the provisional candidate
+/// list is read: the end of Costas block D — the last active symbol —
+/// of a frame at `dt = 0`. 65 328 samples, 5.444 s.
+///
+/// A protocol position rather than a tuned time. By then a
+/// nominally-timed frame has sent every one of its sync symbols, and on
+/// the golden the list read there is the list the finished window
+/// gives (`how_early_the_candidate_list_is_known`). A late station
+/// still adds power afterwards; what that can change is the ranking,
+/// and a candidate the provisional list missed is simply built after
+/// the close, as before.
+pub fn provisional_samples() -> usize {
+    let blocks = Ft4::SYNC_MODE.blocks();
+    let d = &blocks[blocks.len() - 1];
+    let end_symbol = d.start_symbol as usize + d.pattern.len();
+    (Ft4::TX_START_OFFSET_S * 12_000.0) as usize + end_symbol * Ft4::NSPS as usize
 }
 
 fn now_us() -> i64 {
@@ -195,7 +306,10 @@ pub struct SlotAccum {
     audio: Vec<i16>,
     savg: Ft4SavgBuilder,
     decim: SlotDecimator,
-    half: Vec<f32>,
+    half: Arc<HalfStream>,
+    /// Whether [`take_provisional`](Self::take_provisional) has fired
+    /// for this window.
+    provisional_taken: bool,
     /// Where the window sits on the slot grid: the inter-window skip
     /// that keeps this a *slot* grid after the early close (without it
     /// each window would start 0.725 s earlier than the last and walk
@@ -222,9 +336,8 @@ impl SlotAccum {
             audio: Vec::with_capacity(CAPTURE_CLOSE_SAMPLES),
             savg: Ft4SavgBuilder::new(CAPTURE_CLOSE_SAMPLES),
             decim: SlotDecimator::new(),
-            // Half the window; the stage's group delay is what makes
-            // it a little short of exactly half.
-            half: Vec::with_capacity(CAPTURE_CLOSE_SAMPLES / 2),
+            half: Arc::new(HalfStream::new()),
+            provisional_taken: false,
             grid: SlotGrid::new(CAPTURE_CLOSE_SAMPLES, SLOT_SAMPLES, REANCHOR_THRESH_SAMPLES),
         }
     }
@@ -290,6 +403,57 @@ impl SlotAccum {
         self.grid.shift_next_window(delta_samples);
     }
 
+    /// Decimate `samples` onto the shared stream and publish them.
+    fn push_half(&mut self, samples: &[i16]) {
+        // SAFETY: `&mut self` makes this the only writer; readers only
+        // read below the published length, which is stored after the
+        // append.
+        let buf = unsafe { &mut *self.half.buf.get() };
+        // The ÷2 yields at most one sample per two in, plus one.
+        assert!(
+            buf.len() + samples.len() / 2 + 1 <= buf.capacity(),
+            "ft4_rx: half-rate stream would reallocate under its readers"
+        );
+        self.decim.push_i16(samples, buf);
+        debug_assert_eq!(buf.as_ptr(), self.half.base);
+        self.half.len.store(buf.len(), Ordering::Release);
+    }
+
+    /// The window's half-rate stream, for a worker to read while it
+    /// grows.
+    pub fn half_stream(&self) -> Arc<HalfStream> {
+        self.half.clone()
+    }
+
+    /// The provisional candidate carriers — snapped, one per bin — once
+    /// the window has reached [`provisional_samples`], and `None` before
+    /// that and after it has fired once for this window.
+    ///
+    /// Read from a snapshot of the periodogram so far; the builder goes
+    /// on accumulating untouched (`ft4_savg_snapshot_leaves_the_builder_alone`).
+    pub fn take_provisional(&mut self) -> Option<Vec<f32>> {
+        if self.provisional_taken || self.audio.len() < provisional_samples() {
+            return None;
+        }
+        self.provisional_taken = true;
+        let cands = ft4_coarse_sync_from_savg(
+            &self.savg.snapshot(),
+            FREQ_MIN_HZ,
+            FREQ_MAX_HZ,
+            SYNC_MIN,
+            None,
+            MAX_CAND,
+        );
+        let mut carriers: Vec<f32> = Vec::with_capacity(cands.len());
+        for c in &cands {
+            let f = snap_to_bin(c.freq_hz);
+            if !carriers.iter().any(|&g| bin_of(g) == bin_of(f)) {
+                carriers.push(f);
+            }
+        }
+        Some(carriers)
+    }
+
     /// Feed the next block. Returns the finished slot on the block that
     /// closes its window, and resets for the next.
     ///
@@ -325,7 +489,7 @@ impl SlotAccum {
             let take = self.grid.room().min(rest.len());
             self.audio.extend_from_slice(&rest[..take]);
             self.savg.push_with_rows(&rest[..take], on_row);
-            self.decim.push_i16(&rest[..take], &mut self.half);
+            self.push_half(&rest[..take]);
             rest = &rest[take..];
             if self.grid.fill(take) {
                 // The grid counts what this struct buffers, and the two
@@ -348,6 +512,7 @@ impl SlotAccum {
                 let grid = self.grid;
                 let prev = core::mem::replace(self, Self::new());
                 self.grid = grid;
+                prev.half.closed.store(true, Ordering::Release);
                 done = Some(CapturedSlot {
                     audio: prev.audio,
                     savg: prev.savg.finish(),
@@ -358,6 +523,198 @@ impl SlotAccum {
         }
         done
     }
+}
+
+/// Each buffer a baseband built during capture owns is allocated at
+/// least this big: one byte over `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`
+/// (2 048 on the CoreS3), so the allocator puts it in PSRAM.
+///
+/// Measured on the host mirror with a counting allocator: twelve
+/// basebands in flight at once would hold 136 KB below that threshold —
+/// four times the largest internal block WiFi leaves — and with this
+/// floor they hold 27 888 B, less than the serial receiver's peak
+/// (`what_the_pipelined_receiver_asks_of_internal_dram`). The output is
+/// bit-identical; only the placement moves.
+const PIPELINED_MIN_ALLOC_BYTES: usize = 2_049;
+
+/// Half-rate samples the early worker feeds one baseband per step:
+/// ~2 ms of DDC on a CoreS3 (83 ms for the 40 609 of a whole window).
+/// Bounds how long the decode waits for the worker to let go at the
+/// close, and is large enough that `push_f32`'s per-call scratch is not
+/// the cost.
+const EARLY_CHUNK: usize = 2_048;
+
+/// Stack for the early worker — same code shape as the candidate
+/// worker (the buffers are heap), so the same measured 8 KB.
+const EARLY_STACK: u32 = 8 * 1024;
+
+/// One candidate baseband, built while the slot is still arriving.
+struct Pipe {
+    bin: i32,
+    ddc: CandidateDdc,
+    out: Vec<Complex<f32>>,
+    /// Half-rate samples already fed.
+    fed: usize,
+}
+
+impl Pipe {
+    /// Feed the rest of the window and flush: the baseband
+    /// `candidate_baseband_half` would have built from the whole slot,
+    /// bit for bit (`pipelined_ddc_decodes_exactly_what_the_snapped_receiver_does`).
+    fn finish(&mut self, half: &[f32]) -> Vec<Complex<f32>> {
+        if self.fed < half.len() {
+            self.ddc.push_f32(&half[self.fed..], &mut self.out);
+            self.fed = half.len();
+        }
+        let mut cd0 = core::mem::take(&mut self.out);
+        self.ddc.flush_to(CD0_LEN, &mut cd0);
+        cd0.resize(CD0_LEN, Complex::new(0.0, 0.0));
+        cd0
+    }
+}
+
+struct EarlyShared {
+    stream: Arc<HalfStream>,
+    /// Touched only by the worker until `done`, then only by the
+    /// decode — never both.
+    pipes: UnsafeCell<Vec<Pipe>>,
+    stop: AtomicBool,
+    done: AtomicBool,
+    stack_hw_bytes: AtomicU32,
+    started_us: i64,
+}
+// SAFETY: `pipes` is handed from the worker to the decode through
+// `done`'s Release/Acquire and never accessed by both; everything else
+// is atomics or immutable.
+unsafe impl Sync for EarlyShared {}
+unsafe impl Send for EarlyShared {}
+
+/// The per-candidate DDCs, run on core 1 while the slot is still
+/// arriving.
+///
+/// **Why.** Measured on the board, the DDC is ~83 ms of each
+/// candidate's post-close time, and a slot's twelve are about the
+/// amount by which decodes miss [`REPLY_DEADLINE_MS`]. Core 1 has
+/// nothing to do during capture. Every `FirStage` carries its own
+/// history, so a baseband fed in pieces is bit-identical to one fed the
+/// whole window — which is what makes building it early a pure
+/// scheduling change rather than a decoder change.
+///
+/// Started by the capture side at [`provisional_samples`] from
+/// [`SlotAccum::take_provisional`]'s carriers; handed to
+/// [`decode_slot_with`], which stops the worker (it lets go within one
+/// [`EARLY_CHUNK`]), finishes whichever basebands the final list asks
+/// for, and builds the rest from scratch as before.
+///
+/// Dropping it without decoding just tells the worker to stop; the
+/// worker holds its own reference and frees the state when it exits.
+pub struct EarlyBasebands {
+    shared: Arc<EarlyShared>,
+}
+
+impl EarlyBasebands {
+    /// Allocate one baseband per carrier and start the worker, or
+    /// `None` if its task cannot be created — in which case the slot
+    /// simply decodes the way it did before.
+    pub fn start(stream: Arc<HalfStream>, carriers: &[f32]) -> Option<Self> {
+        let pipes: Vec<Pipe> = carriers
+            .iter()
+            .map(|&f| Pipe {
+                bin: bin_of(f),
+                ddc: CandidateDdc::new_half_rate_with_min_alloc(f, PIPELINED_MIN_ALLOC_BYTES),
+                out: Vec::with_capacity(CD0_LEN),
+                fed: 0,
+            })
+            .collect();
+        let shared = Arc::new(EarlyShared {
+            stream,
+            pipes: UnsafeCell::new(pipes),
+            stop: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+            stack_hw_bytes: AtomicU32::new(0),
+            started_us: now_us(),
+        });
+        let arg = Arc::into_raw(shared.clone());
+        // Below the candidate worker's 5: nothing on core 1 during
+        // capture should wait for this.
+        let created = unsafe {
+            esp_idf_svc::sys::xTaskCreatePinnedToCore(
+                Some(early_worker),
+                c"ft4_early".as_ptr(),
+                EARLY_STACK,
+                arg as *mut core::ffi::c_void,
+                4,
+                core::ptr::null_mut(),
+                1,
+            )
+        } == 1;
+        if !created {
+            // SAFETY: the task never ran, so the reference is still ours.
+            drop(unsafe { Arc::from_raw(arg) });
+            log::warn!("ft4_rx: early DDC worker not created ({EARLY_STACK} B stack) — building basebands after the close");
+            return None;
+        }
+        Some(Self { shared })
+    }
+
+    /// Stop the worker and wait for it to let go of the basebands.
+    /// Returns the microseconds spent waiting.
+    fn join(&self) -> i64 {
+        let t0 = now_us();
+        self.shared.stop.store(true, Ordering::Release);
+        while !self.shared.done.load(Ordering::Acquire) {
+            unsafe { esp_idf_svc::sys::vTaskDelay(1) };
+        }
+        now_us() - t0
+    }
+}
+
+impl Drop for EarlyBasebands {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Release);
+    }
+}
+
+extern "C" fn early_worker(arg: *mut core::ffi::c_void) {
+    // SAFETY: `start` leaked exactly one reference for this task.
+    let shared: Arc<EarlyShared> = unsafe { Arc::from_raw(arg as *const EarlyShared) };
+    {
+        // SAFETY: the decode does not touch `pipes` until `done`.
+        let pipes = unsafe { &mut *shared.pipes.get() };
+        'run: loop {
+            let closed = shared.stream.is_closed();
+            let half = shared.stream.as_slice();
+            let mut progressed = false;
+            // Depth-first: each baseband catches up before the next
+            // starts, so the strongest candidates are the complete ones
+            // and a baseband's state stays in cache while it runs.
+            for p in pipes.iter_mut() {
+                while p.fed < half.len() {
+                    if shared.stop.load(Ordering::Acquire) {
+                        break 'run;
+                    }
+                    let end = (p.fed + EARLY_CHUNK).min(half.len());
+                    p.ddc.push_f32(&half[p.fed..end], &mut p.out);
+                    p.fed = end;
+                    progressed = true;
+                }
+            }
+            if shared.stop.load(Ordering::Acquire) || (closed && !progressed) {
+                break;
+            }
+            if !progressed {
+                // Caught up with the capture: one UAC read is ~21 ms.
+                unsafe { esp_idf_svc::sys::vTaskDelay(1) };
+            }
+        }
+    }
+    let hw = unsafe { esp_idf_svc::sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut()) };
+    shared.stack_hw_bytes.store(hw, Ordering::Relaxed);
+    shared.done.store(true, Ordering::Release);
+    // Dropped before the task deletes itself — `vTaskDelete` does not
+    // unwind, so anything still live here would leak.
+    drop(shared);
+    unsafe { esp_idf_svc::sys::vTaskDelete(core::ptr::null_mut()) };
 }
 
 /// One decoded transmission.
@@ -582,6 +939,11 @@ struct ParShared {
     half_len: usize,
     cands: *const SyncCandidate,
     n: usize,
+    /// Per candidate, the index into `pipes` of the baseband built for
+    /// it during capture, if any. Each pipe is assigned to at most one
+    /// candidate, so a core holding candidate `i` holds its pipe alone.
+    pipe_of: *const Option<usize>,
+    pipes: *mut Pipe,
     next: AtomicUsize,
     deadline: i64,
     /// One slot per candidate, written by whichever core took that
@@ -657,8 +1019,12 @@ fn run_candidates(s: &ParShared) {
         // SAFETY: built in `decode_slot`'s frame, which outlives every
         // worker (it waits for `done`), and never mutated after.
         let refs = unsafe { &*s.refs };
+        // SAFETY: `pipe_of[i]` is unique to candidate `i`, and index
+        // `i` is this core's alone (see `res`); the early worker has
+        // exited before either core starts.
+        let pipe = unsafe { (*s.pipe_of.add(i)).map(|k| &mut *s.pipes.add(k)) };
         let t0 = now_us();
-        let d = decode_candidate(half, &cands[i], refs, &mut stage);
+        let d = decode_candidate(half, &cands[i], refs, pipe, &mut stage);
         let t1 = now_us();
         busy += t1 - t0;
         took += 1;
@@ -707,10 +1073,15 @@ impl Drop for TailTimer<'_> {
 /// One candidate, end to end: half-rate DDC, RMS normalise, narrowed
 /// Δt search, decode. No shared mutable state beyond the global FFT
 /// planner's own guard, which is what lets two cores run it at once.
+///
+/// `pipe` is the baseband [`EarlyBasebands`] built for this carrier
+/// during capture, when there is one: only the part of the window it
+/// has not seen yet is left to filter.
 fn decode_candidate(
     half: &[f32],
     cand: &SyncCandidate,
     refs: &Ft4CoarsePhasors,
+    pipe: Option<&mut Pipe>,
     stage: &mut [i64; 3],
 ) -> Option<Ft4Decode> {
     let t_ddc = now_us();
@@ -721,7 +1092,9 @@ fn decode_candidate(
     // for a seventh of the time *there*, on a machine with no PIE dot
     // product. This knob is what turns that into a number from the
     // board, which is the only one the budget can be spent against.
-    let mut cd0 = if option_env!("MFSK_FT4_BOXCAR").is_some() {
+    let mut cd0 = if let Some(p) = pipe {
+        p.finish(half)
+    } else if option_env!("MFSK_FT4_BOXCAR").is_some() {
         candidate_baseband_boxcar(half, cand.freq_hz)
     } else {
         candidate_baseband_half(half, cand.freq_hz)
@@ -772,15 +1145,72 @@ fn decode_candidate(
 }
 
 pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
+    decode_slot_with(slot, budget_ms, None)
+}
+
+/// [`decode_slot`], taking over whatever basebands `early` built during
+/// capture.
+///
+/// Every candidate's carrier is snapped to its periodogram bin whether
+/// or not a baseband was built for it — see [`snap_to_bin`] — so a
+/// candidate decodes the same way on either path, and the host mirror
+/// that pins this (`pipelined_ddc_decodes_exactly_what_the_snapped_receiver_does`)
+/// describes both.
+pub fn decode_slot_with(
+    slot: &CapturedSlot,
+    budget_ms: i64,
+    early: Option<EarlyBasebands>,
+) -> SlotOutcome {
     let deadline = slot.closed_us + budget_ms * 1_000;
-    let cands = ft4_coarse_sync_from_savg(
+    // Before anything else: the worker is on core 1, where the
+    // candidate worker is about to go, and it lets go within a chunk.
+    let early_wait_us = early.as_ref().map(|e| e.join()).unwrap_or(0);
+    let early = early.filter(|e| {
+        let ours = Arc::ptr_eq(&e.shared.stream, &slot.half);
+        if !ours {
+            // A re-anchor threw the window it was reading away.
+            log::info!("ft4_rx: early basebands were for a discarded window — not used");
+        }
+        ours
+    });
+    let half = slot.half();
+    let cands: Vec<SyncCandidate> = ft4_coarse_sync_from_savg(
         &slot.savg,
         FREQ_MIN_HZ,
         FREQ_MAX_HZ,
         SYNC_MIN,
         None,
         MAX_CAND,
-    );
+    )
+    .into_iter()
+    .map(|c| SyncCandidate {
+        freq_hz: snap_to_bin(c.freq_hz),
+        ..c
+    })
+    .collect();
+
+    // SAFETY: the worker has set `done` (`join` above) and never
+    // touches the pipes again; nothing else has them.
+    let mut no_pipes: Vec<Pipe> = Vec::new();
+    let pipes: &mut Vec<Pipe> = match &early {
+        Some(e) => unsafe { &mut *e.shared.pipes.get() },
+        None => &mut no_pipes,
+    };
+    // How far the worker got, before the decode takes the rest.
+    let early_fed: usize = pipes.iter().map(|p| p.fed).sum();
+    let mut used = alloc::vec![false; pipes.len()];
+    let pipe_of: Vec<Option<usize>> = cands
+        .iter()
+        .map(|c| {
+            let k = pipes.iter().position(|p| p.bin == bin_of(c.freq_hz))?;
+            if used[k] {
+                return None;
+            }
+            used[k] = true;
+            Some(k)
+        })
+        .collect();
+    let reused = pipe_of.iter().filter(|k| k.is_some()).count();
 
     // The shared half of the front end costs nothing here: `SlotAccum`
     // decimated the window while it was arriving. `ft4::ddc`'s stage A
@@ -798,10 +1228,12 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
         (0..cands.len()).map(|_| UnsafeCell::new(None)).collect();
     let done_at: Vec<AtomicI32> = (0..cands.len()).map(|_| AtomicI32::new(-1)).collect();
     let shared = ParShared {
-        half: slot.half.as_ptr(),
-        half_len: slot.half.len(),
+        half: half.as_ptr(),
+        half_len: half.len(),
         cands: cands.as_ptr(),
         n: cands.len(),
+        pipe_of: pipe_of.as_ptr(),
+        pipes: pipes.as_mut_ptr(),
         next: AtomicUsize::new(0),
         deadline,
         res: res.as_ptr(),
@@ -965,6 +1397,25 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
         (loop_t0 - slot.closed_us + loop_us) / 1_000,
         done_ms,
     );
+
+    if let Some(e) = &early {
+        let internal = unsafe {
+            esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_INTERNAL)
+        };
+        // `fed` is how much of the DDC work was done before the close:
+        // the pipes' samples over what the reused ones needed in all.
+        log::info!(
+            "ft4_rx: early DDC — {} built from {} ms before close, reused {reused} fresh {} wasted {} \
+             | {}% fed at close | wait {} us | stack {} B free of {EARLY_STACK} | internal largest {internal} B",
+            pipes.len(),
+            (slot.closed_us - e.shared.started_us) / 1_000,
+            cands.len() - reused,
+            used.iter().filter(|u| !**u).count(),
+            early_fed * 100 / (pipes.len() * half.len()).max(1),
+            early_wait_us,
+            e.shared.stack_hw_bytes.load(Ordering::Relaxed),
+        );
+    }
 
     if created {
         let stack_hw = shared.stack_hw_bytes.load(Ordering::Relaxed);
