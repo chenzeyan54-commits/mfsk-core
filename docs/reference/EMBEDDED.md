@@ -662,6 +662,15 @@ deadline on most slots. Nothing is wrong today because this board does
 not transmit yet; when it does, the number to watch is `post_slotend`
 against **0**, not against 500.
 
+**That conclusion assumes the message is committed at the boundary**,
+which is what WSJT-X's GUI does rather than what the air requires. The
+waveform is the first thing that needs the message; PTT does not, and
+this board keys its radio by VOX on the USB audio, so there is no PTT
+step at all. The FT4 section below works that through. It has **not**
+been re-evaluated for FT8, where it would move the reply deadline from
+slot end to the audio start at slot end + 0.5 s — i.e. onto the bound
+`FT8_KEY_UP_AFTER_SLOT_END_US` already encodes.
+
 Keeping the 0.5 s is still right: stage 3's late path needs the full
 slot, and the full slot does not exist until the boundary. The 0.5 s is
 what makes a late path possible at all — it is borrowed from the
@@ -672,12 +681,77 @@ and `MainWindow::decode()` only declines to *start* a decode while the
 previous one is running. This board decodes on the cores that will
 drive the transmitter, which upstream does not have to consider.
 
-FT4 has the same structure with `delay_ms = 300` and `txDelay = 20 ms`,
-and upstream is internally inconsistent there — its decoder still
-references 0.5 s (`xdt = ibest/666.67 - 0.5`, `lib/ft4_decode.f90:462`).
-`ft4_rx::TX_TURNAROUND_BUDGET_MS` records what that would cost if the
-modulator's constant governs, and why it has not been changed on the
-strength of one reading.
+### FT4: the reply is due when the audio starts
+
+Settled 2026-09-21. FT4's 7.5 s period leaves no room to be vague
+about which of the moments above binds, and an earlier reading here
+called upstream "internally inconsistent" where it is not.
+
+**What upstream fixes**, all read from source:
+
+| where | value | meaning |
+|---|---|---|
+| `Modulator/Modulator.cpp:74` | `delay_ms = 300` | the waveform leaves the PC 0.300 s into the period |
+| `lib/ft4/ft4sim.f90:85` | `k = nint((xdt + 0.5)/dt) - NSPS` | **DT = 0 means the first active symbol at 0.500 s**; the 105-symbol waveform carries one 48 ms ramp symbol ahead of it |
+| `lib/ft4_decode.f90:462` | `xdt = ibest/666.67 - 0.5` | the decoder uses the same 0.5 s reference |
+| `widgets/mainwindow.cpp:8252` | `if(m_mode=="FT4") ms_delay=20` | FT4 does not wait on a relay sequencer |
+| `widgets/mainwindow.cpp:1819` | `samples = 21*3456` | a WSJT-X receiver decodes 6.048 s of the period |
+
+So the first active symbol leaves the PC at 0.348 s, and over a path
+with no latency it would decode at **DT −0.15 s**. WSJT-X sends FT4
+~150 ms early. The natural reading is an allowance for the transmit
+chain — sound card, rig, PTT or VOX — that FT4's forced 20 ms
+`txDelay` does not otherwise absorb; upstream does not say so in a
+comment, and this document should not pretend it does. Either way the
+0.3 and the 0.5 are not a contradiction: one is when the audio leaves,
+the other is where the frame is meant to land.
+
+**The message has to exist when the waveform starts**, and not before.
+WSJT-X commits it at the boundary because `guiUpdate` reads the message
+in the same pass that raises PTT (`mainwindow.cpp:4657-4711`), but PTT
+does not need the content and the waveform does. This board keys the
+IC-705 by **VOX on its USB audio**, so there is no separate PTT at
+all: the transmitter becomes active the moment the audio does.
+
+Measured from `ft4_rx::CAPTURE_CLOSE_SAMPLES` (6.775 s into the period
+the other station transmits in):
+
+```text
+ period N — the other station transmits, this board receives
+ 0.000 s  their boundary; their message and PTT
+ 0.300 s  their audio starts (first active symbol 0.348 s)
+ 5.340 s  their audio ends (105 x 576 / 12 000 = 5.04 s)
+ 6.775 s  capture closes (0 ms)         -> candidate loop starts
+
+ period N+1 — this board transmits
+ 7.500 s  boundary (725 ms)             -> nothing to do: VOX, no PTT
+ 7.8 - e  reply fixed (~1 025 ms)       -> encode + first USB buffer
+ 7.800 s  USB audio starts (1 025 ms)   -> IC-705 keys on VOX
+ 7.848 s  first active symbol leaves the board
+~7.95 s   on air after VOX + rig latency -> DT ~ 0 at the other end
+12.840 s  audio ends
+```
+
+Three consequences:
+
+- **The reply deadline is ~1 025 ms after capture close.** Not the
+  boundary's 725, and not the 1 225 that
+  `ft4_rx::TX_TURNAROUND_BUDGET_MS` holds today, which places the
+  audio at 8.0 s and the frame ~200 ms late — DT ≈ +0.2 at the other
+  end, inside its ±1.0 s search but spending the margin its own clock
+  error needs.
+- **A decode that misses it is still kept.** It is too late for this
+  reply and still wanted for the screen and the choice after next;
+  WSJT-X never stops decoding for a transmission, and this board only
+  has a cut because it decodes on the cores the transmitter needs.
+- **The other end bounds how late the audio may be.** A WSJT-X
+  receiver looks at 6.048 s of the period, so a whole 5.04 s frame has
+  to start within ~1.0 s of its boundary.
+
+**Open**: the ~150 ms is WSJT-X's allowance for a PC sound card. The
+CoreS3's UAC output path plus the IC-705's VOX attack is unmeasured,
+and landing on DT = 0 rather than near it needs this board's own
+transmission decoded on another receiver and its DT read.
 
 ### The coarse search window is a dependent variable
 

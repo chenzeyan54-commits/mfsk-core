@@ -394,8 +394,13 @@ pub struct Ft4Decode {
 /// deliberate. A QSO-capable build had 500 ms under the old
 /// anchoring — the budget did not shrink, it was measured.
 ///
-/// **Unresolved: upstream puts FT4's transmit audio at 0.3 s, not
-/// 0.5 s.** `Modulator::start` pads silence to `delay_ms`, and that
+/// **Settled 2026-09-21 as a transmit-chain lead, not a
+/// contradiction** — see [`REPLY_DEADLINE_MS`] and
+/// `docs/reference/EMBEDDED.md`, "FT4: the reply is due when the audio
+/// starts". The value is unchanged pending the `intime` measurement.
+/// The original note, kept for the reasoning it records:
+///
+/// **Upstream puts FT4's transmit audio at 0.3 s, not 0.5 s.** `Modulator::start` pads silence to `delay_ms`, and that
 /// constant is **300 for FT4** where it is 500 for FT8 and 1000
 /// otherwise (`Modulator/Modulator.cpp:71-74`). The FT4 *decoder*
 /// nevertheless references 0.5 s — `xdt = ibest/666.67 - 0.5`
@@ -419,22 +424,44 @@ pub struct Ft4Decode {
 pub const TX_TURNAROUND_BUDGET_MS: i64 = 1_225;
 
 /// Milliseconds from [`CAPTURE_CLOSE_SAMPLES`] to the slot boundary:
-/// `(90 000 − 81 300) / 12 kHz` = 725 ms.
-///
-/// **The reply deadline, as WSJT-X defines it** — and as this board's
-/// FT8 side has used since 2026-09-20. `MainWindow::guiUpdate` opens
-/// the transmit window at `tx1 = 0.0` for every mode, FT4 included
-/// (`widgets/mainwindow.cpp:4552`), and in the same pass reads the
-/// message to send and raises PTT (`:4657-4711`). What is sent is fixed
-/// *at the boundary*; the 0.3 s / 0.5 s question in
-/// [`TX_TURNAROUND_BUDGET_MS`]'s doc is about when the audio starts,
-/// which a decode finishing after the boundary cannot use.
-///
-/// Measured against, not yet enforced: `decode_slot` still cuts at the
-/// budget its caller passes, and reports how many decodes landed by
-/// this boundary so the gap is a number before the constant moves.
-pub const REPLY_BOUNDARY_MS: i64 =
+/// `(90 000 − 81 300) / 12 kHz` = 725 ms. Where WSJT-X's GUI commits
+/// its message, and **not** the reply deadline — see
+/// [`REPLY_DEADLINE_MS`].
+pub const SLOT_BOUNDARY_MS: i64 =
     ((SLOT_SAMPLES - CAPTURE_CLOSE_SAMPLES) as i64 * 1_000) / 12_000;
+
+/// WSJT-X's FT4 audio start, measured from the boundary:
+/// `Modulator::start`'s `delay_ms = 300` for FT4
+/// (`Modulator/Modulator.cpp:74`).
+pub const FT4_AUDIO_START_AFTER_BOUNDARY_MS: i64 = 300;
+
+/// Milliseconds from [`CAPTURE_CLOSE_SAMPLES`] to the moment this
+/// station's audio must start: [`SLOT_BOUNDARY_MS`] +
+/// [`FT4_AUDIO_START_AFTER_BOUNDARY_MS`] = **1 025 ms**.
+///
+/// **The reply deadline.** The message has to exist when the waveform
+/// starts, and not before: PTT needs no content, and this board keys
+/// the IC-705 by VOX on its USB audio, so there is no PTT step at all —
+/// the transmitter becomes active the moment the audio does. WSJT-X
+/// commits at the boundary only because `guiUpdate` reads the message
+/// in the same pass that raises PTT. The derivation, the upstream
+/// sources and the ~150 ms transmit-chain lead the 300 carries are in
+/// `docs/reference/EMBEDDED.md`, "FT4: the reply is due when the audio
+/// starts".
+///
+/// **A measurement, never a cut.** A decode that lands after this is
+/// too late for *this* reply and still worth having — for the screen
+/// and for the choice after next. WSJT-X never stops a decode for a
+/// transmission; this board has a cut only because it decodes on the
+/// cores the transmitter needs, and that cut is
+/// [`TX_TURNAROUND_BUDGET_MS`]. What this feeds is `intime`: how many
+/// of a slot's decodes a transmitter could have answered.
+///
+/// Budget-shaped only by coincidence: this is exactly the 1 025 ms
+/// [`TX_TURNAROUND_BUDGET_MS`]'s own doc gives for the case where the
+/// modulator's 300 governs, and that constant still holds 1 225 until
+/// the measurement this feeds says whether to move it.
+pub const REPLY_DEADLINE_MS: i64 = SLOT_BOUNDARY_MS + FT4_AUDIO_START_AFTER_BOUNDARY_MS;
 
 /// A whole FT4 slot, so a receive-only monitor can spend one.
 ///
@@ -470,7 +497,7 @@ pub struct SlotOutcome {
     /// baseline-normalised, so 1.2 is WSJT-X's own threshold and a cut
     /// landing near it dropped almost nothing.
     pub cut_at_score: Option<f32>,
-    /// Decodes that finished by [`REPLY_BOUNDARY_MS`] after slot close.
+    /// Decodes that finished by [`REPLY_DEADLINE_MS`] after slot close.
     pub intime: usize,
     /// When the last distinct message finished, in ms after slot close.
     pub last_decode_ms: i64,
@@ -862,8 +889,8 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
         out.push(d);
         first_at.push(at);
     }
-    let boundary_us = REPLY_BOUNDARY_MS * 1_000;
-    let intime = first_at.iter().filter(|&&t| t <= boundary_us).count();
+    let deadline_us = REPLY_DEADLINE_MS * 1_000;
+    let intime = first_at.iter().filter(|&&t| t <= deadline_us).count();
     let last_decode_ms = first_at.iter().copied().max().unwrap_or(0) / 1_000;
 
     // Where a second core's missing speed-up actually goes.
@@ -921,11 +948,22 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
     // How far short of the reply boundary this slot is. `intime` is the
     // FT8 side's figure of the same name: decodes that finished before
     // the boundary, i.e. that a transmitter could have answered.
+    // Every distinct decode's completion, sorted, so any deadline can be
+    // read off the same capture — the boundary, the audio start and the
+    // current cut side by side — rather than re-flashing to move one.
+    let mut done_ms: Vec<i64> = first_at.iter().map(|t| t / 1_000).collect();
+    done_ms.sort_unstable();
+    let by = |ms: i64| done_ms.iter().filter(|&&t| t <= ms).count();
     log::info!(
-        "ft4_rx: reply boundary {REPLY_BOUNDARY_MS} ms — intime {intime} of {} decodes \
-         | last decode at {last_decode_ms} ms | loop ends {} ms",
+        "ft4_rx: reply deadline {REPLY_DEADLINE_MS} ms — intime {intime} of {} decodes \
+         | by {SLOT_BOUNDARY_MS}: {} by {REPLY_DEADLINE_MS}: {} by {TX_TURNAROUND_BUDGET_MS}: {} \
+         | loop ends {} ms | done {:?}",
         out.len(),
+        by(SLOT_BOUNDARY_MS),
+        by(REPLY_DEADLINE_MS),
+        by(TX_TURNAROUND_BUDGET_MS),
         (loop_t0 - slot.closed_us + loop_us) / 1_000,
+        done_ms,
     );
 
     if created {
