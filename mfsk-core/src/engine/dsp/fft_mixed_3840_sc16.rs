@@ -21,6 +21,8 @@ use alloc::vec::Vec;
 
 use num_complex::{Complex, Complex32};
 #[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
+// needed with no std in the graph; a dep linking std (the dev-only rustfft) makes f32's own methods shadow it
 use num_traits::Float;
 
 use super::fft_15::fft_15;

@@ -84,12 +84,13 @@ echo "► FT8 recall floors under fixed-point (issue #359)"
 # recall-floor tests, not the whole crate — a few seconds, not another
 # full `cargo test`.
 #
-# Deliberately no `RUSTFLAGS="-D warnings"` here (unlike the build
-# matrix below): `+fixed-point,internal-testing` alone already emits
-# pre-existing `unused import: num_traits::Float` warnings in library
-# code this change didn't touch, and turning those into failures here
-# is a separate cleanup, not this issue's scope.
-MFSK_REQUIRE_CORPUS=1 cargo test -p mfsk-core --release --no-default-features \
+# `-D warnings` here too, since 2026-09-21. It used to be left off
+# because the no-std arm below emitted 32 `unused import:
+# num_traits::Float` warnings: those imports are needed when nothing in
+# the graph links std, and the dev-only `rustfft` does, which makes
+# f32's own methods visible and the trait unused. Each site now says so
+# with an `allow`.
+RUSTFLAGS="-D warnings" MFSK_REQUIRE_CORPUS=1 cargo test -p mfsk-core --release --no-default-features \
   --features full,fixed-point,internal-testing \
   --test ft8_qso3_apoff_recall \
   --test ft8_qso3_apon_recall \
@@ -100,7 +101,7 @@ MFSK_REQUIRE_CORPUS=1 cargo test -p mfsk-core --release --no-default-features \
 # `ft8_decode_block_streaming` stays out of this line: it has no
 # `fixed-point` i16 FFT shim of its own and isn't fixed-point-specific
 # (streaming-vs-batch consistency, unaffected by numeric path).
-MFSK_REQUIRE_CORPUS=1 cargo test -p mfsk-core --release --no-default-features \
+RUSTFLAGS="-D warnings" MFSK_REQUIRE_CORPUS=1 cargo test -p mfsk-core --release --no-default-features \
   --features alloc,ft8,fft-extern,fixed-point,internal-testing \
   --test ft8_embedded_driver_recall
 

@@ -92,6 +92,8 @@ pub fn apply_ramp(out: &mut [f32], nramp: usize) {
     let twopi = core::f32::consts::TAU;
     for i in 0..nramp {
         #[cfg(not(feature = "std"))]
+        #[allow(unused_imports)]
+        // needed with no std in the graph; a dep linking std (the dev-only rustfft) makes f32's own methods shadow it
         use num_traits::Float as _;
         let env = (1.0 - (twopi * i as f32 / (2.0 * nramp as f32)).cos()) / 2.0;
         out[i] *= env;
@@ -99,6 +101,8 @@ pub fn apply_ramp(out: &mut [f32], nramp: usize) {
     let k1 = n - nramp;
     for i in 0..nramp {
         #[cfg(not(feature = "std"))]
+        #[allow(unused_imports)]
+        // needed with no std in the graph; a dep linking std (the dev-only rustfft) makes f32's own methods shadow it
         use num_traits::Float as _;
         let env = (1.0 + (twopi * i as f32 / (2.0 * nramp as f32)).cos()) / 2.0;
         out[k1 + i] *= env;

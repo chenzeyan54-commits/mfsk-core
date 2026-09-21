@@ -16,6 +16,8 @@ use alloc::vec::Vec;
 // Float methods (.atanh / .signum) are inherent on f32 under std but
 // require this trait under no_std (where libm provides them).
 #[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
+// needed with no std in the graph; a dep linking std (the dev-only rustfft) makes f32's own methods shadow it
 use num_traits::Float;
 
 use super::params::{Ldpc174_91Params, LdpcParams};

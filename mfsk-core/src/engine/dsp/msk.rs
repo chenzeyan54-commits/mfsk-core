@@ -20,6 +20,8 @@
 
 use num_complex::Complex32;
 #[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
+// needed with no std in the graph; a dep linking std (the dev-only rustfft) makes f32's own methods shadow it
 use num_traits::Float;
 
 /// Samples per MSK144 frame at 12 kHz (144 symbols x 6 samples/symbol).
