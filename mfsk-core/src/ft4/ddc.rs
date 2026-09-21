@@ -282,7 +282,7 @@ impl CandidateDdc {
     /// space as `SyncCandidate::freq_hz` — the frequency this baseband
     /// will carry at DC.
     pub fn new(f0_hz: f32) -> Self {
-        Self::build(f0_hz, INPUT_RATE_HZ, STAGE_A_NTAPS, Ft4::NDOWN as usize)
+        Self::build(f0_hz, INPUT_RATE_HZ, STAGE_A_NTAPS, Ft4::NDOWN as usize, 0)
     }
 
     /// Same down-converter, fed the **half-rate** stream
@@ -301,23 +301,56 @@ impl CandidateDdc {
     /// shared stage's output `k` is centred on `audio[2k]` and this
     /// chain's output 0 on that stage's output 0.
     pub fn new_half_rate(f0_hz: f32) -> Self {
-        Self::build(f0_hz, HALF_RATE_HZ, STAGE_A_HALF_NTAPS, STAGE_A_HALF_DECIM)
+        Self::build(
+            f0_hz,
+            HALF_RATE_HZ,
+            STAGE_A_HALF_NTAPS,
+            STAGE_A_HALF_DECIM,
+            0,
+        )
     }
 
-    fn build(f0_hz: f32, in_rate_hz: f32, taps_a: usize, decim_a: usize) -> Self {
+    /// [`Self::new_half_rate`], with both stages' buffers allocated at
+    /// no less than `min_alloc_bytes` each — see
+    /// [`FirStage::new_with_min_alloc`]. Bit-identical output; the only
+    /// difference is where the allocator puts the state.
+    ///
+    /// For a baseband built during capture, of which a receiver holds
+    /// one per candidate at once: the caller passes just over its
+    /// board's internal-DRAM threshold so none of it competes with
+    /// WiFi and the USB host for internal DRAM.
+    pub fn new_half_rate_with_min_alloc(f0_hz: f32, min_alloc_bytes: usize) -> Self {
+        Self::build(
+            f0_hz,
+            HALF_RATE_HZ,
+            STAGE_A_HALF_NTAPS,
+            STAGE_A_HALF_DECIM,
+            min_alloc_bytes,
+        )
+    }
+
+    fn build(
+        f0_hz: f32,
+        in_rate_hz: f32,
+        taps_a: usize,
+        decim_a: usize,
+        min_alloc_bytes: usize,
+    ) -> Self {
         Self {
             mixer: Mixer::new(f0_hz + BAND_CENTER_OFFSET_HZ, in_rate_hz),
-            stage_a: FirStage::new(
+            stage_a: FirStage::new_with_min_alloc(
                 taps_a,
                 decim_a,
                 STAGE_A_FC_HZ / in_rate_hz,
                 HIST_MARGIN_STAGE_A,
+                min_alloc_bytes,
             ),
-            stage_b: FirStage::new(
+            stage_b: FirStage::new_with_min_alloc(
                 STAGE_B_NTAPS,
                 1,
                 STAGE_B_FC_HZ / DS_RATE_HZ,
                 HIST_MARGIN_STAGE_B,
+                min_alloc_bytes,
             ),
             // Negative centre: `Mixer` is `exp(-j2π·centre·n/Fs)`, and
             // this stage has to undo the `+BAND_CENTER_OFFSET_HZ` the

@@ -53,7 +53,6 @@
 //! allocator block header.
 
 extern crate alloc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 /// Four `f32` under a 16-byte alignment guarantee — the backing unit
@@ -95,9 +94,25 @@ pub(crate) struct AlignedF32 {
 impl AlignedF32 {
     /// Rounds `len` **up** to a multiple of four and zero-fills.
     pub(crate) fn new(len: usize) -> Self {
+        Self::with_min_alloc(len, 0)
+    }
+
+    /// [`Self::new`], but the allocation is at least `min_bytes`.
+    ///
+    /// The logical length — what `as_slice` returns, and so everything
+    /// the arithmetic sees — is `len` rounded up to four exactly as
+    /// before; only the *capacity* grows. That is the whole point: on
+    /// an ESP32-S3 the allocator decides internal DRAM versus PSRAM by
+    /// allocation size (`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`), so a
+    /// caller that wants a buffer off internal DRAM without changing
+    /// its contents asks for a bigger block and uses the same slice.
+    pub(crate) fn with_min_alloc(len: usize, min_bytes: usize) -> Self {
         let quads = len.div_ceil(4);
+        let cap = quads.max(min_bytes.div_ceil(core::mem::size_of::<AlignedQuad>()));
+        let mut v = Vec::with_capacity(cap);
+        v.resize(quads, AlignedQuad([0.0; 4]));
         Self {
-            quads: vec![AlignedQuad([0.0; 4]); quads],
+            quads: v,
             len: quads * 4,
         }
     }

@@ -323,6 +323,11 @@ pub fn costas_block_end_samples(block: usize) -> usize {
     (Ft4::TX_START_OFFSET_S * 12_000.0) as usize + end_symbol * Ft4::NSPS as usize
 }
 
+/// Each buffer a baseband built during capture owns is allocated at
+/// least this big: one byte over `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`
+/// (2 048 on the CoreS3), so the allocator puts it in PSRAM.
+pub const PIPELINED_MIN_ALLOC_BYTES: usize = 2_049;
+
 /// When the pipelined receiver reads its provisional list: the last
 /// active symbol of a nominally-timed frame (Costas block D's end).
 pub fn provisional_samples() -> usize {
@@ -392,7 +397,10 @@ pub fn run_slot_pipelined(audio: &[i16], prov_samples: usize) -> (Vec<String>, P
                 }
                 pipes.push(Pipe {
                     bin: b,
-                    ddc: CandidateDdc::new_half_rate(f),
+                    // Just over the CoreS3's 2 048-byte internal-DRAM
+                    // threshold, as the receiver will ask for — so the
+                    // host counts the same placement the board makes.
+                    ddc: CandidateDdc::new_half_rate_with_min_alloc(f, PIPELINED_MIN_ALLOC_BYTES),
                     out: Vec::with_capacity(CD0_LEN),
                     fed: 0,
                 });

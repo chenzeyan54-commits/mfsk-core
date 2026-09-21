@@ -131,9 +131,35 @@ impl FirStage {
     /// the compaction copy further at the cost of a bigger buffer; see
     /// the caller for the tradeoff against a specific memory budget.
     pub fn new(ntaps: usize, decim: usize, fc_norm: f32, hist_margin: usize) -> Self {
+        Self::new_with_min_alloc(ntaps, decim, fc_norm, hist_margin, 0)
+    }
+
+    /// [`Self::new`], with every buffer the stage owns allocated at
+    /// **at least** `min_alloc_bytes`.
+    ///
+    /// Same filter, same contents, same arithmetic — only the capacity
+    /// of each allocation grows, which is what an ESP32-S3's allocator
+    /// places by (`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`: at or under the
+    /// threshold prefers internal DRAM, over it goes to PSRAM). A stage
+    /// kept alive for a long time, many at once, off the critical path —
+    /// FT4's basebands built during capture, twelve concurrently — has
+    /// no business in internal DRAM, and would drain it: measured on the
+    /// host mirror at 136 KB of sub-threshold allocations for twelve,
+    /// against ~31 KB of largest free block once WiFi is up. Passing
+    /// just over the threshold moves the lot to PSRAM, where twelve
+    /// copies cost nothing that matters.
+    pub fn new_with_min_alloc(
+        ntaps: usize,
+        decim: usize,
+        fc_norm: f32,
+        hist_margin: usize,
+        min_alloc_bytes: usize,
+    ) -> Self {
         assert!(ntaps % 2 == 1, "ntaps must be odd for linear phase");
         let designed = design_lowpass(ntaps, fc_norm);
-        let mut taps_rev = vec![0.0f32; ntaps];
+        let mut taps_rev: Vec<f32> =
+            Vec::with_capacity(ntaps.max(min_alloc_bytes.div_ceil(core::mem::size_of::<f32>())));
+        taps_rev.resize(ntaps, 0.0);
         // Index loop, not `.iter().rev()` — see the field doc comment
         // on `win_start` for why (this mirrors `StreamingDdc::new_in`'s
         // own identical workaround).
@@ -154,14 +180,14 @@ impl FirStage {
         // phase, which never underflows since the phase is
         // `win_start % 4`.
         let hist_alloc = hist_cap + (3 + ntaps).next_multiple_of(4) - ntaps;
-        let hist_i = AlignedF32::new(hist_alloc);
-        let hist_q = AlignedF32::new(hist_alloc);
+        let hist_i = AlignedF32::with_min_alloc(hist_alloc, min_alloc_bytes);
+        let hist_q = AlignedF32::with_min_alloc(hist_alloc, min_alloc_bytes);
         let group_delay = (ntaps - 1) / 2;
         #[cfg(feature = "dotprod-extern")]
         let taps_phase = core::array::from_fn(|phase| {
             // Zeros before and after, so every added term is exactly
             // `0.0 · x` and only the rounding of the sum differs.
-            let mut t = AlignedF32::new(phase + ntaps);
+            let mut t = AlignedF32::with_min_alloc(phase + ntaps, min_alloc_bytes);
             t.as_mut_slice()[phase..phase + ntaps].copy_from_slice(&taps_rev);
             t
         });

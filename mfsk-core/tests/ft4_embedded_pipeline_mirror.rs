@@ -85,7 +85,18 @@ use common::load_wav_i16_opt as read_wsjtx_wav_i16;
 thread_local! {
     static ALLOCS: Cell<usize> = const { Cell::new(0) };
     static ALLOC_BYTES: Cell<usize> = const { Cell::new(0) };
+    /// Bytes currently live in allocations of at most
+    /// [`INTERNAL_THRESHOLD`] bytes, and the highest that has reached.
+    /// On the board those are the ones `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`
+    /// steers into internal DRAM, so the peak is the internal-DRAM
+    /// appetite of whatever ran in between.
+    static SMALL_LIVE: Cell<usize> = const { Cell::new(0) };
+    static SMALL_PEAK: Cell<usize> = const { Cell::new(0) };
 }
+
+/// `m5stack-cores3-app/sdkconfig.defaults`'s
+/// `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`.
+const INTERNAL_THRESHOLD: usize = 2_048;
 
 struct Counting;
 
@@ -96,6 +107,19 @@ impl Counting {
         // panic from inside the allocator would be unrecoverable.
         let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
         let _ = ALLOC_BYTES.try_with(|c| c.set(c.get() + size));
+        if size <= INTERNAL_THRESHOLD {
+            let _ = SMALL_LIVE.try_with(|c| {
+                let live = c.get() + size;
+                c.set(live);
+                let _ = SMALL_PEAK.try_with(|p| p.set(p.get().max(live)));
+            });
+        }
+    }
+    #[inline]
+    fn release(size: usize) {
+        if size <= INTERNAL_THRESHOLD {
+            let _ = SMALL_LIVE.try_with(|c| c.set(c.get().saturating_sub(size)));
+        }
     }
 }
 
@@ -107,11 +131,13 @@ unsafe impl GlobalAlloc for Counting {
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        Self::release(layout.size());
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // A realloc is an allocation as far as the board's heap lock is
         // concerned, so count it as one.
+        Self::release(layout.size());
         Self::charge(new_size);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -715,6 +741,47 @@ fn pipelined_ddc_decodes_exactly_what_the_snapped_receiver_does() {
         assert_eq!(got, want, "provisional at {name} changed the decodes");
     }
     eprintln!();
+}
+
+/// How much internal DRAM the pipelined receiver would ask for.
+///
+/// Building every candidate's baseband during capture keeps twelve
+/// `CandidateDdc`s alive at once where today's loop holds at most two
+/// (one per core). Each carries FIR histories and phase-shifted tap
+/// tables, all under the board's 2 048-byte threshold, so on a CoreS3
+/// they would all *prefer* internal DRAM — of which there is ~31 KB
+/// largest-block once WiFi is up, and which has already run out once
+/// and taken WiFi with it. This measures the peak of those small
+/// allocations under each arrangement, on the host, before anything is
+/// flashed.
+#[test]
+fn what_the_pipelined_receiver_asks_of_internal_dram() {
+    let Some(audio) = slot_audio() else {
+        assert!(
+            !require_corpus(),
+            "MFSK_REQUIRE_CORPUS=1 but the golden is missing"
+        );
+        return;
+    };
+    let reset = || {
+        SMALL_LIVE.with(|c| c.set(0));
+        SMALL_PEAK.with(|c| c.set(0));
+    };
+    // Small allocations still live from earlier work would count
+    // against the arm that runs next, so each arm is measured from a
+    // clean live count; `saturating_sub` absorbs frees of blocks
+    // allocated before the reset.
+    reset();
+    let _ = rx::run_slot_with(&audio, rx::Variant::SNAPPED);
+    let serial_peak = SMALL_PEAK.with(|c| c.get());
+    reset();
+    let _ = rx::run_slot_pipelined(&audio, rx::provisional_samples());
+    let piped_peak = SMALL_PEAK.with(|c| c.get());
+    eprintln!(
+        "\nft4 small-allocation (<= {INTERNAL_THRESHOLD} B) peak live bytes:\n  \
+         candidates one at a time  {serial_peak:>8} B\n  \
+         all built during capture  {piped_peak:>8} B\n"
+    );
 }
 
 /// The constants above are a copy of `ft4_rx.rs`'s, and a copy rots.
