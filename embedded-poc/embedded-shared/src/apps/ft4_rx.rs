@@ -418,6 +418,24 @@ pub struct Ft4Decode {
 /// the upstream rationale for the 300.
 pub const TX_TURNAROUND_BUDGET_MS: i64 = 1_225;
 
+/// Milliseconds from [`CAPTURE_CLOSE_SAMPLES`] to the slot boundary:
+/// `(90 000 − 81 300) / 12 kHz` = 725 ms.
+///
+/// **The reply deadline, as WSJT-X defines it** — and as this board's
+/// FT8 side has used since 2026-09-20. `MainWindow::guiUpdate` opens
+/// the transmit window at `tx1 = 0.0` for every mode, FT4 included
+/// (`widgets/mainwindow.cpp:4552`), and in the same pass reads the
+/// message to send and raises PTT (`:4657-4711`). What is sent is fixed
+/// *at the boundary*; the 0.3 s / 0.5 s question in
+/// [`TX_TURNAROUND_BUDGET_MS`]'s doc is about when the audio starts,
+/// which a decode finishing after the boundary cannot use.
+///
+/// Measured against, not yet enforced: `decode_slot` still cuts at the
+/// budget its caller passes, and reports how many decodes landed by
+/// this boundary so the gap is a number before the constant moves.
+pub const REPLY_BOUNDARY_MS: i64 =
+    ((SLOT_SAMPLES - CAPTURE_CLOSE_SAMPLES) as i64 * 1_000) / 12_000;
+
 /// A whole FT4 slot, so a receive-only monitor can spend one.
 ///
 /// Nothing is lost by overrunning [`TX_TURNAROUND_BUDGET_MS`] unless
@@ -452,6 +470,10 @@ pub struct SlotOutcome {
     /// baseline-normalised, so 1.2 is WSJT-X's own threshold and a cut
     /// landing near it dropped almost nothing.
     pub cut_at_score: Option<f32>,
+    /// Decodes that finished by [`REPLY_BOUNDARY_MS`] after slot close.
+    pub intime: usize,
+    /// When the last distinct message finished, in ms after slot close.
+    pub last_decode_ms: i64,
     /// Microseconds each core spent inside `decode_candidate`, and how
     /// many candidates each took. See `ParShared::busy_us` for what
     /// the pair is for.
@@ -540,6 +562,12 @@ struct ParShared {
     /// so the writes are disjoint, and `done`'s Release/Acquire pair
     /// publishes them all at the join.
     res: *const UnsafeCell<Option<Ft4Decode>>,
+    /// Per candidate, microseconds after slot close that its decode
+    /// finished, or −1 for none. Written by whichever core took the
+    /// index, read after the join — the same disjoint-write argument
+    /// as `res`. What turns "in time" from a total into a count.
+    done_at_us: *const AtomicI32,
+    closed_us: i64,
     /// The coarse Δt references, built once for the slot and read by
     /// both cores. Immutable after construction, which is what makes
     /// sharing it sound.
@@ -604,8 +632,14 @@ fn run_candidates(s: &ParShared) {
         let refs = unsafe { &*s.refs };
         let t0 = now_us();
         let d = decode_candidate(half, &cands[i], refs, &mut stage);
-        busy += now_us() - t0;
+        let t1 = now_us();
+        busy += t1 - t0;
         took += 1;
+        if d.is_some() {
+            // SAFETY: as `res` below — index `i` is this core's alone.
+            unsafe { &*s.done_at_us.add(i) }
+                .store((t1 - s.closed_us) as i32, Ordering::Relaxed);
+        }
         // SAFETY: index `i` came from `fetch_add`, so this core is the
         // only one that has it, and nothing reads the slots until
         // `done` is observed.
@@ -735,6 +769,7 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
     let coarse_refs = Ft4CoarsePhasors::new::<Ft4>();
     let res: Vec<UnsafeCell<Option<Ft4Decode>>> =
         (0..cands.len()).map(|_| UnsafeCell::new(None)).collect();
+    let done_at: Vec<AtomicI32> = (0..cands.len()).map(|_| AtomicI32::new(-1)).collect();
     let shared = ParShared {
         half: slot.half.as_ptr(),
         half_len: slot.half.len(),
@@ -743,6 +778,8 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
         next: AtomicUsize::new(0),
         deadline,
         res: res.as_ptr(),
+        done_at_us: done_at.as_ptr(),
+        closed_us: slot.closed_us,
         refs: &coarse_refs,
         done: AtomicBool::new(false),
         stack_hw_bytes: AtomicU32::new(0),
@@ -807,17 +844,27 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
     // because two candidates can land on one signal and which core
     // finished first must not decide which copy survives.
     let mut out: Vec<Ft4Decode> = Vec::new();
-    for cell in &res {
+    // Each message's earliest completion: when two candidates land on
+    // one signal, the reply could have used whichever finished first,
+    // so that is the one "in time" is judged by.
+    let mut first_at: Vec<i64> = Vec::new();
+    for (i, cell) in res.iter().enumerate() {
         // SAFETY: both cores are finished — the worker through `done`,
         // this one by returning from `run_candidates`.
         let Some(d) = (unsafe { (*cell.get()).take() }) else {
             continue;
         };
-        if out.iter().any(|k| k.msg == d.msg) {
+        let at = done_at[i].load(Ordering::Relaxed) as i64;
+        if let Some(k) = out.iter().position(|k| k.msg == d.msg) {
+            first_at[k] = first_at[k].min(at);
             continue;
         }
         out.push(d);
+        first_at.push(at);
     }
+    let boundary_us = REPLY_BOUNDARY_MS * 1_000;
+    let intime = first_at.iter().filter(|&&t| t <= boundary_us).count();
+    let last_decode_ms = first_at.iter().copied().max().unwrap_or(0) / 1_000;
 
     // Where a second core's missing speed-up actually goes.
     // `occ` is the two cores' busy time over twice the loop's wall
@@ -871,6 +918,16 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
         dot_fast + dot_slow,
     );
 
+    // How far short of the reply boundary this slot is. `intime` is the
+    // FT8 side's figure of the same name: decodes that finished before
+    // the boundary, i.e. that a transmitter could have answered.
+    log::info!(
+        "ft4_rx: reply boundary {REPLY_BOUNDARY_MS} ms — intime {intime} of {} decodes \
+         | last decode at {last_decode_ms} ms | loop ends {} ms",
+        out.len(),
+        (loop_t0 - slot.closed_us + loop_us) / 1_000,
+    );
+
     if created {
         let stack_hw = shared.stack_hw_bytes.load(Ordering::Relaxed);
         // At info, not debug: this is the number that justifies
@@ -891,6 +948,8 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
         tried: started,
         elapsed_us: now_us() - slot.closed_us,
         cut_at_score,
+        intime,
+        last_decode_ms,
         busy_us: [
             shared.busy_us[0].load(Ordering::Relaxed) as i64,
             shared.busy_us[1].load(Ordering::Relaxed) as i64,
