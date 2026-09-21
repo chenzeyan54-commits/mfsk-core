@@ -48,7 +48,7 @@ use mfsk_core::ft4::decode::FT4_DOWNSAMPLE;
 use mfsk_core::ft4::Ft4;
 use mfsk_core::msg::wsjt77::unpack77;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use super::ft4_grid::{Anchor, SlotGrid};
 use mfsk_core::engine::sync::SyncCandidate;
 use num_complex::Complex;
@@ -450,6 +450,16 @@ pub struct SlotOutcome {
     /// baseline-normalised, so 1.2 is WSJT-X's own threshold and a cut
     /// landing near it dropped almost nothing.
     pub cut_at_score: Option<f32>,
+    /// Microseconds each core spent inside `decode_candidate`, and how
+    /// many candidates each took. See `ParShared::busy_us` for what
+    /// the pair is for.
+    pub busy_us: [i64; 2],
+    pub took: [usize; 2],
+    /// Wall clock of the candidate loop alone — from the worker being
+    /// created to the join. The denominator `busy_us` is a fraction
+    /// of; `elapsed_us` is not, because it also carries the coarse
+    /// sweep and the reference build.
+    pub loop_us: i64,
 }
 
 /// Decode one captured slot, stopping when `budget_ms` after the slot
@@ -534,6 +544,32 @@ struct ParShared {
     refs: *const Ft4CoarsePhasors,
     done: AtomicBool,
     stack_hw_bytes: AtomicU32,
+    /// Per-core occupancy, indexed by `xPortGetCoreID`. Each core
+    /// accumulates on its own stack and stores once on the way out, so
+    /// the two cores never share a cache line while they work.
+    ///
+    /// This is what separates the two ways a second core disappoints:
+    /// if `busy[0] + busy[1]` is close to twice the wall clock, both
+    /// cores worked the whole slot and the loss is *inside* a
+    /// candidate (the FFT guard, the PSRAM bus); if it is well under,
+    /// a core sat idle and the loss is the hand-out — the tail, or the
+    /// deadline stopping one core early.
+    /// Microseconds as `i32`: Xtensa has no 64-bit atomics, and a
+    /// slot's busy time is bounded by the deadline (~1.2 s) with three
+    /// orders of magnitude to spare.
+    busy_us: [AtomicI32; 2],
+    /// Candidates each core took off the cursor. Unequal counts with
+    /// equal busy time is the cost spread, not an imbalance.
+    took: [AtomicUsize; 2],
+    /// The same busy time split by stage — `[DDC, Δt search, tail]`,
+    /// per core. With occupancy already near 100 %, what is left to
+    /// find is *which* stage a second core makes slower, and the
+    /// stages differ in what they contend for: the DDC and the Δt
+    /// search touch no FFT at all, while the tail's `symbol_spectra`
+    /// takes esp-dsp's process-global `Fc32Guard`. A tail that alone
+    /// inflates is the lock; all three inflating together is the
+    /// memory bus.
+    stage_us: [[AtomicI32; 3]; 2],
 }
 // SAFETY: `half` and `cands` address buffers owned by `decode_slot`'s
 // frame, which does not return until `done` is set; every mutation
@@ -545,22 +581,38 @@ fn run_candidates(s: &ParShared) {
     // SAFETY: see the `Sync` impl — both slices outlive this call.
     let half = unsafe { core::slice::from_raw_parts(s.half, s.half_len) };
     let cands = unsafe { core::slice::from_raw_parts(s.cands, s.n) };
+    // Both accumulators live on this core's stack (16 B) and are
+    // published once below: a probe that wrote a shared atomic per
+    // candidate would be measuring its own contention.
+    let core =
+        (unsafe { esp_idf_svc::sys::xTaskGetCoreID(core::ptr::null_mut()) } as usize).min(1);
+    let mut busy = 0i64;
+    let mut took = 0usize;
+    let mut stage = [0i64; 3];
     loop {
         if now_us() >= s.deadline {
-            return;
+            break;
         }
         let i = s.next.fetch_add(1, Ordering::AcqRel);
         if i >= cands.len() {
-            return;
+            break;
         }
         // SAFETY: built in `decode_slot`'s frame, which outlives every
         // worker (it waits for `done`), and never mutated after.
         let refs = unsafe { &*s.refs };
-        let d = decode_candidate(half, &cands[i], refs);
+        let t0 = now_us();
+        let d = decode_candidate(half, &cands[i], refs, &mut stage);
+        busy += now_us() - t0;
+        took += 1;
         // SAFETY: index `i` came from `fetch_add`, so this core is the
         // only one that has it, and nothing reads the slots until
         // `done` is observed.
         unsafe { *(*s.res.add(i)).get() = d };
+    }
+    s.busy_us[core].store(busy as i32, Ordering::Relaxed);
+    s.took[core].store(took, Ordering::Relaxed);
+    for (slot, us) in s.stage_us[core].iter().zip(stage) {
+        slot.store(us as i32, Ordering::Relaxed);
     }
 }
 
@@ -575,6 +627,20 @@ extern "C" fn par_worker(arg: *mut core::ffi::c_void) {
     unsafe { esp_idf_svc::sys::vTaskDelete(core::ptr::null_mut()) };
 }
 
+/// Charges the tail's time on whichever way the tail ends. It ends at
+/// a `?` as often as it ends at a decode, and a timer that only ran to
+/// the end would report the successes and drop the failures — which
+/// are the expensive ones.
+struct TailTimer<'a> {
+    stage: &'a mut [i64; 3],
+    t_tail: i64,
+}
+impl Drop for TailTimer<'_> {
+    fn drop(&mut self) {
+        self.stage[2] += now_us() - self.t_tail;
+    }
+}
+
 /// One candidate, end to end: half-rate DDC, RMS normalise, narrowed
 /// Δt search, decode. No shared mutable state beyond the global FFT
 /// planner's own guard, which is what lets two cores run it at once.
@@ -582,10 +648,17 @@ fn decode_candidate(
     half: &[f32],
     cand: &SyncCandidate,
     refs: &Ft4CoarsePhasors,
+    stage: &mut [i64; 3],
 ) -> Option<Ft4Decode> {
+    let t_ddc = now_us();
     let mut cd0 = candidate_baseband_half(half, cand.freq_hz);
     rms_normalise(&mut cd0);
+    let t_search = now_us();
+    stage[0] += t_search - t_ddc;
     let s2 = ft4_sync_search_window_with::<Ft4>(&cd0, cand, WSJTX_WINDOW.0, WSJTX_WINDOW.1, refs);
+    let t_tail = now_us();
+    stage[1] += t_tail - t_search;
+    let _tail = TailTimer { stage, t_tail };
     let r = process_candidate_precomputed::<Ft4>(
         cand,
         &[],
@@ -649,6 +722,12 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
         refs: &coarse_refs,
         done: AtomicBool::new(false),
         stack_hw_bytes: AtomicU32::new(0),
+        busy_us: [AtomicI32::new(0), AtomicI32::new(0)],
+        took: [AtomicUsize::new(0), AtomicUsize::new(0)],
+        stage_us: [
+            [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)],
+            [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)],
+        ],
     };
 
     // Core 1 takes candidates from the same cursor this core does.
@@ -658,24 +737,32 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
     // the same probe at 1.17x and called dual-core closed; the shared
     // decimation is what changed that, by taking most of the PSRAM
     // streaming out of the per-candidate half.
-    let created = unsafe {
-        esp_idf_svc::sys::xTaskCreatePinnedToCore(
-            Some(par_worker),
-            c"ft4_cand".as_ptr(),
-            WORKER_STACK,
-            &shared as *const ParShared as *mut core::ffi::c_void,
-            5,
-            core::ptr::null_mut(),
-            1,
-        )
-    } == 1;
-    if !created {
+    // `MFSK_FT4_SINGLE_CORE=1` runs the same loop on one core, which is
+    // the only honest baseline for the two-core numbers: it is this
+    // binary, this cursor and this cached Δt path, with the worker not
+    // created. A serial figure taken from a bench that calls a
+    // different entry point cannot be divided into a parallel one.
+    let want_two_cores = option_env!("MFSK_FT4_SINGLE_CORE").is_none();
+    let created = want_two_cores
+        && unsafe {
+            esp_idf_svc::sys::xTaskCreatePinnedToCore(
+                Some(par_worker),
+                c"ft4_cand".as_ptr(),
+                WORKER_STACK,
+                &shared as *const ParShared as *mut core::ffi::c_void,
+                5,
+                core::ptr::null_mut(),
+                1,
+            )
+        } == 1;
+    if want_two_cores && !created {
         // Not fatal, and not silent: this is the internal-DRAM
         // constraint biting, and the receiver keeps working at the
         // single-core rate with a shorter candidate list.
         log::warn!("ft4_rx: core-1 worker not created ({WORKER_STACK} B stack) — decoding on one core");
     }
 
+    let loop_t0 = now_us();
     run_candidates(&shared);
 
     if created {
@@ -685,6 +772,7 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
         }
     }
 
+    let loop_us = now_us() - loop_t0;
     let started = shared.next.load(Ordering::Acquire).min(cands.len());
     let cut_at_score = cands.get(started).map(|c| c.score);
 
@@ -704,6 +792,41 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
         }
         out.push(d);
     }
+
+    // Where a second core's missing speed-up actually goes.
+    // `occ` is the two cores' busy time over twice the loop's wall
+    // clock: near 100 % means both cores worked the whole loop and
+    // whatever was lost was lost *inside* a candidate; well under
+    // means a core was idle, and `took` says whether that was the
+    // hand-out or the deadline. The per-stage split says which stage
+    // pays — see `ParShared::stage_us`.
+    let b0 = shared.busy_us[0].load(Ordering::Relaxed) as i64;
+    let b1 = shared.busy_us[1].load(Ordering::Relaxed) as i64;
+    let t0 = shared.took[0].load(Ordering::Relaxed);
+    let t1 = shared.took[1].load(Ordering::Relaxed);
+    let cores = if created { 2 } else { 1 };
+    let occ = if loop_us > 0 {
+        (b0 + b1) * 100 / (cores * loop_us)
+    } else {
+        0
+    };
+    let st = |k: usize| {
+        (shared.stage_us[0][k].load(Ordering::Relaxed) as i64
+            + shared.stage_us[1][k].load(Ordering::Relaxed) as i64)
+            / 1000
+    };
+    let n = (t0 + t1).max(1) as i64;
+    log::info!(
+        "ft4_rx: cores — loop {} ms | core0 {} ms/{t0} cand | core1 {} ms/{t1} cand | occ {occ}% \
+         | per cand {} ms = ddc {} + search {} + tail {}",
+        loop_us / 1000,
+        b0 / 1000,
+        b1 / 1000,
+        (b0 + b1) / 1000 / n,
+        st(0) / n,
+        st(1) / n,
+        st(2) / n,
+    );
 
     if created {
         let stack_hw = shared.stack_hw_bytes.load(Ordering::Relaxed);
@@ -725,6 +848,15 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
         tried: started,
         elapsed_us: now_us() - slot.closed_us,
         cut_at_score,
+        busy_us: [
+            shared.busy_us[0].load(Ordering::Relaxed) as i64,
+            shared.busy_us[1].load(Ordering::Relaxed) as i64,
+        ],
+        took: [
+            shared.took[0].load(Ordering::Relaxed),
+            shared.took[1].load(Ordering::Relaxed),
+        ],
+        loop_us,
     }
 }
 
