@@ -2,6 +2,22 @@
 
 ## 0.11.1 — FT4 filters phantoms by default (#383), FT4 on the CoreS3 answers by the reply deadline, one screen for every mode, one boot sequence for the CoreS3's four receivers, WiFi becomes a setting of its own (#381)
 
+- **`pack77` packs `/P` and `/R` callsigns.** It refused them: the
+  suffixed call went straight to `pack28`, which takes six characters
+  at most, and the whole message came back `None` — so a portable
+  station could not produce `CQ SOTA JA1ABC/P PM95` or any reply after
+  it, and the only `/P` path left was Type 4, which drops the grid.
+  `pack77` now does what `pack77_1` does (`packjt77.f90:1176-1193`):
+  the suffix becomes the `ipa`/`ipb` flag beside its 28-bit field, and
+  a `/P` on either call makes the message Type 2 (i3=2), otherwise
+  Type 1. `unpack77` already read both, so this completes a round trip
+  that was half there. Two callers change with it: the FFI's FT8
+  encoder (`mfsk_encode_ft8`) accepts suffixed calls instead of
+  returning `InvalidArg`, and Q65's `standard_qso_codewords` builds its
+  AP list for a `/P` station instead of returning it empty — both now
+  as WSJT-X, whose `pack77` never had the gap. `pack77_type1` routes
+  through `pack77`, so it gains the same.
+
 - **CoreS3: the four receivers share one boot sequence
   (`boot::Receiver`).** This crate carried four `main`s: one per app,
   plus the FT8 controller's, inline in `main.rs`. Each opened with its

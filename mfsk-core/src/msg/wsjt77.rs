@@ -1614,19 +1614,28 @@ pub fn pack_grid4(grid: &str) -> Option<u32> {
 /// Both callsigns must be packable via [`pack28`], and `grid` must be a valid
 /// 4-character Maidenhead locator.  Returns the 77-bit message array.
 pub fn pack77_type1(call1: &str, call2: &str, grid: &str) -> Option<[u8; 77]> {
-    let n28a = pack28(call1)?;
-    let n28b = pack28(call2)?;
-    let igrid = pack_grid4(grid)?;
+    pack_grid4(grid)?;
+    pack77(call1, call2, grid)
+}
 
-    let mut msg = [0u8; 77];
-    write_bits(&mut msg, 0, 28, n28a); // call1 (bits 0–27)
-    // ipa = 0 (bit 28) — already zero
-    write_bits(&mut msg, 29, 28, n28b); // call2 (bits 29–56)
-    // ipb = 0 (bit 57) — already zero
-    // ir  = 0 (bit 58) — already zero
-    write_bits(&mut msg, 59, 15, igrid); // grid  (bits 59–73)
-    write_bits(&mut msg, 74, 3, 1); // i3=1  (bits 74–76)
-    Some(msg)
+/// `JA1ABC/P` → `("JA1ABC", true, true)`, `W9XYZ/R` → `("W9XYZ", true,
+/// false)`, anything else unchanged with `(false, false)`.
+///
+/// `packjt77.f90:1176-1193`: the suffix counts only when it starts at
+/// column 4 or later (`index(w//' ','/P ') >= 4`), i.e. behind a base
+/// of at least three characters — `CQ` tokens and the like never have
+/// one.
+fn split_rp_suffix(call: &str) -> (&str, bool, bool) {
+    let c = call.trim();
+    if c.len() >= 5 {
+        if let Some(base) = c.strip_suffix("/P") {
+            return (base, true, true);
+        }
+        if let Some(base) = c.strip_suffix("/R") {
+            return (base, true, false);
+        }
+    }
+    (c, false, false)
 }
 
 /// Pack a Type 1 standard message with any report/grid field.
@@ -1638,17 +1647,30 @@ pub fn pack77_type1(call1: &str, call2: &str, grid: &str) -> Option<[u8; 77]> {
 /// - A standard response: `"RRR"`, `"RR73"`, `"73"`
 /// - Empty string (no report)
 ///
+/// Either callsign may carry a `/R` or `/P` suffix, set as the `ipa` /
+/// `ipb` flag beside its 28-bit field. A `/P` on either makes the
+/// message Type 2 (i3=2), where both flags read as `/P`; otherwise it is
+/// Type 1, where they read as `/R` — `pack77_1` in `packjt77.f90`
+/// (1176-1193), mirrored by [`unpack77`]'s `1 | 2` arm. Before this, a
+/// suffixed call made `pack28` fail and the whole message with it, so a
+/// portable station could not send a standard message at all.
+///
 /// # Examples
 /// ```
-/// # use mfsk_core::msg::wsjt77::pack77;
+/// # use mfsk_core::msg::wsjt77::{pack77, unpack77};
 /// let msg = pack77("CQ", "JA1ABC", "PM95").unwrap();
 /// let msg = pack77("JA1ABC", "3Y0Z", "-12").unwrap();
 /// let msg = pack77("3Y0Z", "JA1ABC", "R-12").unwrap();
 /// let msg = pack77("JA1ABC", "3Y0Z", "RR73").unwrap();
+/// let msg = pack77("CQ SOTA", "JA1ABC/P", "PM95").unwrap();
+/// assert_eq!(unpack77(&msg).unwrap(), "CQ SOTA JA1ABC/P PM95");
 /// ```
 pub fn pack77(call1: &str, call2: &str, report: &str) -> Option<[u8; 77]> {
-    let n28a = pack28(call1)?;
-    let n28b = pack28(call2)?;
+    let (base1, ipa, p1) = split_rp_suffix(call1);
+    let (base2, ipb, p2) = split_rp_suffix(call2);
+    let n28a = pack28(base1)?;
+    let n28b = pack28(base2)?;
+    let i3 = if p1 || p2 { 2 } else { 1 };
 
     let report = report.trim();
 
@@ -1684,12 +1706,12 @@ pub fn pack77(call1: &str, call2: &str, report: &str) -> Option<[u8; 77]> {
 
     let mut msg = [0u8; 77];
     write_bits(&mut msg, 0, 28, n28a);
-    // ipa = 0 (bit 28)
+    msg[28] = ipa as u8;
     write_bits(&mut msg, 29, 28, n28b);
-    // ipb = 0 (bit 57)
+    msg[57] = ipb as u8;
     msg[58] = ir; // ir (bit 58)
     write_bits(&mut msg, 59, 15, igrid);
-    write_bits(&mut msg, 74, 3, 1); // i3=1
+    write_bits(&mut msg, 74, 3, i3);
     Some(msg)
 }
 
@@ -2116,6 +2138,35 @@ mod tests {
         ] {
             assert!(!is_plausible_call(f), "{f:?} must be refused");
         }
+    }
+
+    /// `/P` and `/R` ride as the ipa/ipb flag; any `/P` makes it i3=2
+    /// (`packjt77.f90:1176-1193`). A portable activator's whole
+    /// exchange depends on this — `pack77` used to refuse every one.
+    #[test]
+    fn pack77_suffixed_calls_set_the_flag_and_i3() {
+        let i3 = |m: &[u8; 77]| read_bits(m, 74, 3);
+        for (c1, c2, rpt, want_i3, ipa, ipb) in [
+            ("CQ SOTA", "JL1NIE/P", "PM95", 2, 0, 1),
+            ("W1AW", "JL1NIE/P", "-07", 2, 0, 1),
+            ("JL1NIE/P", "W1AW", "R-12", 2, 1, 0),
+            ("W1AW", "JL1NIE/P", "RR73", 2, 0, 1),
+            ("G4ABC/P", "PA3XYZ/P", "JO22", 2, 1, 1),
+            ("W9XYZ/R", "K1ABC", "FN42", 1, 1, 0),
+            ("CQ", "K1ABC/R", "FN42", 1, 0, 1),
+            ("W1AW", "JL1NIE", "-07", 1, 0, 0),
+        ] {
+            let m = pack77(c1, c2, rpt).unwrap_or_else(|| panic!("{c1} {c2} {rpt}"));
+            assert_eq!(
+                (i3(&m), m[28], m[57]),
+                (want_i3, ipa, ipb),
+                "{c1} {c2} {rpt}"
+            );
+            assert_eq!(unpack77(&m).unwrap(), format!("{c1} {c2} {rpt}"));
+        }
+        // Nothing to split in a bare short call or a CQ token.
+        assert_eq!(split_rp_suffix("CQ"), ("CQ", false, false));
+        assert_eq!(split_rp_suffix("K1/P"), ("K1/P", false, false));
     }
 
     #[test]
