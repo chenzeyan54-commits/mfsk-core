@@ -945,6 +945,9 @@ impl FrameLayout for Ft4 {
 impl Protocol for Ft4 {
     type Fec = Ldpc174_91;          // FT8 と共有
     type Msg = Wsjt77Message;       // FT8 と共有
+    // Δt 探索が事前計算するもの。通常は `()`。FT4 本体は
+    // `Ft4CoarsePhasors` を持つので、この例とは異なる。
+    type SyncPhasors = ();
     const ID: ProtocolId = ProtocolId::Ft4;
 }
 
@@ -997,6 +1000,7 @@ impl FrameLayout for Wspr {
 impl Protocol for Wspr {
     type Fec = ConvFano;                     // 畳み込み符号 + Fano
     type Msg = Wspr50Message;                // 50 bit メッセージ
+    type SyncPhasors = ();                   // Δt 探索の表は持たない
     const ID: ProtocolId = ProtocolId::Wspr;
 }
 

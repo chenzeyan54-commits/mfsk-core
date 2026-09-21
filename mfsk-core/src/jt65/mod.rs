@@ -603,6 +603,7 @@ impl Protocol for Jt65 {
     type Fec = Rs63_12;
     /// 72-bit message payload (12 × 6-bit words), shared with JT9.
     type Msg = Jt72Codec;
+    type SyncPhasors = ();
     const ID: ProtocolId = ProtocolId::Jt65;
 }
 

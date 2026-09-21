@@ -778,6 +778,56 @@ pub trait Protocol: ModulationParams + FrameLayout + 'static {
     /// Message codec consuming the FEC-decoded information bits.
     type Msg: MessageCodec;
 
+    /// What this protocol's Δt search precomputes, if anything.
+    ///
+    /// `()` for all but FT4, and `()` is not a placeholder: it is the
+    /// implementation that holds no tables and answers every lookup
+    /// with `None`, so the search builds each `df` on demand — what
+    /// every protocol did before FT4 had a reason not to.
+    ///
+    /// It is an associated type because the alternative was tried and
+    /// is what this replaces: `Option<&Ft4CoarsePhasors>` passed to a
+    /// second entry point. That put one protocol's concrete type in a
+    /// shared signature, and it left the *fine* pass unable to use the
+    /// tables at all, since an argument cannot answer for a `df` the
+    /// caller has not visited yet. See [`SyncPhasors`].
+    type SyncPhasors: SyncPhasors;
+
     /// Runtime tag used at FFI / WASM boundaries.
     const ID: ProtocolId;
+}
+
+/// Phasor tables a protocol's Δt search reuses instead of evaluating
+/// `cos`/`sin` per sample.
+///
+/// **An associated type rather than an argument.** This started as
+/// `Option<&Ft4CoarsePhasors>` threaded through a second entry point,
+/// which is why only the coarse pass could reach it: the fine pass is
+/// inside the same function and had no way to ask for a `df` the
+/// coarse sweep does not visit. One protocol's concrete type in a
+/// shared signature, two entry points, and a cache half the search
+/// could not use.
+///
+/// As [[`Protocol::SyncPhasors`]] the question becomes "what does *this*
+/// protocol precompute", `()` costs nothing and compiles to the path
+/// with no table at all, and both passes ask the same way.
+pub trait SyncPhasors: Sized {
+    /// Build the set for a search at `ds_rate` over blocks of `n`
+    /// samples. Every Costas block is the same length, which is what
+    /// lets one table serve all of them.
+    fn build(ds_rate: f32, n: usize) -> Self;
+
+    /// The table for `df`, or `None` when this set does not hold it —
+    /// the caller then builds one, once, for that `df`.
+    fn table_for(&self, df: f32) -> Option<&[num_complex::Complex<f32>]>;
+}
+
+/// No tables: every `df` is built on demand, which is what every
+/// protocol but FT4 did before this existed and still does.
+impl SyncPhasors for () {
+    fn build(_ds_rate: f32, _n: usize) -> Self {}
+
+    fn table_for(&self, _df: f32) -> Option<&[num_complex::Complex<f32>]> {
+        None
+    }
 }

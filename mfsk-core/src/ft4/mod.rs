@@ -122,6 +122,18 @@ impl Protocol for Ft4 {
     const DECODE_FFT1_SIZE: u32 = 92_160;
     type Fec = Ldpc174_91;
     type Msg = Wsjt77Message;
+    /// The only protocol with a reason to precompute: its coarse sweep
+    /// visits nine fixed `df`, and both passes read them.
+    ///
+    /// Split on the FFT backend because `ft4` does not imply one
+    /// (`ft4 = []` in `Cargo.toml`, and the feature matrix builds it
+    /// alone). Without a backend there is no `engine::sync2d`, so
+    /// there is no Δt search either and nothing to precompute for —
+    /// the tables' own module is gated the same way.
+    #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+    type SyncPhasors = crate::engine::sync2d::Ft4CoarsePhasors;
+    #[cfg(not(any(feature = "fft-rustfft", feature = "fft-extern")))]
+    type SyncPhasors = ();
     const ID: ProtocolId = ProtocolId::Ft4;
     /// `ft4_decode.f90:327` — `apmag = maxval(abs(llra)) * 1.1`, where
     /// FT8 uses 1.01. The two share `Ldpc174_91`, so this cannot live

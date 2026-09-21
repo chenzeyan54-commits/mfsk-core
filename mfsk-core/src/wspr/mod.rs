@@ -145,6 +145,7 @@ impl FrameLayout for Wspr {
 impl Protocol for Wspr {
     type Fec = ConvFano;
     type Msg = Wspr50Message;
+    type SyncPhasors = ();
     const ID: ProtocolId = ProtocolId::Wspr;
 }
 

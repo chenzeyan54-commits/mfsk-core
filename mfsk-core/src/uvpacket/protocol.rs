@@ -134,6 +134,7 @@ macro_rules! uvpacket_submode {
         impl Protocol for $name {
             type Fec = Ldpc240_101;
             type Msg = UvPacketRawMessage;
+            type SyncPhasors = ();
             const ID: ProtocolId = ProtocolId::UvPacket;
         }
     };

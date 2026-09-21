@@ -98,6 +98,7 @@ macro_rules! q65_submode {
         impl Protocol for $name {
             type Fec = Q65Fec;
             type Msg = Q65Message;
+            type SyncPhasors = ();
             const ID: ProtocolId = ProtocolId::Q65;
         }
     };

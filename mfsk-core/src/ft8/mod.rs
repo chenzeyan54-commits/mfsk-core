@@ -123,6 +123,7 @@ impl Protocol for Ft8 {
     const DECODE_FFT1_SIZE: u32 = 192_000;
     type Fec = Ldpc174_91;
     type Msg = Wsjt77Message;
+    type SyncPhasors = ();
     const ID: ProtocolId = ProtocolId::Ft8;
 }
 

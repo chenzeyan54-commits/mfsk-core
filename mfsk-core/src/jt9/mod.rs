@@ -307,6 +307,7 @@ impl Protocol for Jt9 {
     type Fec = ConvFano232;
     /// 72-bit message payload, shared with JT65.
     type Msg = Jt72Codec;
+    type SyncPhasors = ();
     const ID: ProtocolId = ProtocolId::Jt9;
 }
 

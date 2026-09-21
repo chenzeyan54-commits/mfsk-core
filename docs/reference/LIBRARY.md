@@ -878,6 +878,10 @@ impl FrameLayout for Ft4 {
 impl Protocol for Ft4 {
     type Fec = Ldpc174_91;          // shared with FT8
     type Msg = Wsjt77Message;       // shared with FT8
+    // What the Δt search precomputes. `()` is the ordinary answer;
+    // FT4 itself carries `Ft4CoarsePhasors`, which is why the real
+    // impl differs from this example here.
+    type SyncPhasors = ();
     const ID: ProtocolId = ProtocolId::Ft4;
 }
 
@@ -931,6 +935,7 @@ impl FrameLayout for Wspr {
 impl Protocol for Wspr {
     type Fec = ConvFano;                     // convolutional + Fano
     type Msg = Wspr50Message;                // 50-bit message
+    type SyncPhasors = ();                   // no Δt search tables
     const ID: ProtocolId = ProtocolId::Wspr;
 }
 

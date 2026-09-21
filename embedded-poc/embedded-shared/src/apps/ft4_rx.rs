@@ -42,7 +42,7 @@ use alloc::vec::Vec;
 use mfsk_core::engine::equalize::EqMode;
 use mfsk_core::engine::ft4_coarse::{ft4_coarse_sync_from_savg, Ft4SavgBuilder};
 use mfsk_core::engine::pipeline::{process_candidate_precomputed, DecodeDepth, DecodeStrictness};
-use mfsk_core::engine::sync2d::{Ft4CoarsePhasors, ft4_sync_search_window_cached};
+use mfsk_core::engine::sync2d::{Ft4CoarsePhasors, ft4_sync_search_window_with};
 use mfsk_core::ft4::ddc::{SlotDecimator, candidate_baseband_half};
 use mfsk_core::ft4::decode::FT4_DOWNSAMPLE;
 use mfsk_core::ft4::Ft4;
@@ -585,13 +585,7 @@ fn decode_candidate(
 ) -> Option<Ft4Decode> {
     let mut cd0 = candidate_baseband_half(half, cand.freq_hz);
     rms_normalise(&mut cd0);
-    let s2 = ft4_sync_search_window_cached::<Ft4>(
-        &cd0,
-        cand,
-        WSJTX_WINDOW.0,
-        WSJTX_WINDOW.1,
-        Some(refs),
-    );
+    let s2 = ft4_sync_search_window_with::<Ft4>(&cd0, cand, WSJTX_WINDOW.0, WSJTX_WINDOW.1, refs);
     let r = process_candidate_precomputed::<Ft4>(
         cand,
         &[],

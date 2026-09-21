@@ -850,7 +850,7 @@ fn llr_bp_probe(audio: &[i16], candidates: &[SyncCandidate]) {
         // measurements, because a 2.6x regression with no mechanism is
         // not a finding (issue #352 / §47).
         {
-            use mfsk_core::engine::sync2d::{ft4_sync_search_window_cached, Ft4CoarsePhasors};
+            use mfsk_core::engine::sync2d::{ft4_sync_search_window_with, Ft4CoarsePhasors};
             let refs = Ft4CoarsePhasors::new::<Ft4>();
             let (a0, a1) = refs.buffer_addrs();
             let where_ = |a: usize| {
@@ -870,12 +870,16 @@ fn llr_bp_probe(audio: &[i16], candidates: &[SyncCandidate]) {
 
             let (f0, sa0, sl0) = crate::esp_dsp_dotprod::dotprod_path_report();
             let t0 = now_us();
-            let r_plain = ft4_sync_search_window::<Ft4>(&cd0, cand, -344, 1012);
+            // The uncached arm is now "a table set that holds
+            // nothing" rather than a separate entry point — the
+            // tables became `Ft4::SyncPhasors`, so this is how the
+            // no-table path is reached for a protocol that has one.
+            let none = Ft4CoarsePhasors::empty();
+            let r_plain = ft4_sync_search_window_with::<Ft4>(&cd0, cand, -344, 1012, &none);
             let plain_us = now_us() - t0;
             let (f1, sa1, sl1) = crate::esp_dsp_dotprod::dotprod_path_report();
             let t0 = now_us();
-            let r_cached =
-                ft4_sync_search_window_cached::<Ft4>(&cd0, cand, -344, 1012, Some(&refs));
+            let r_cached = ft4_sync_search_window_with::<Ft4>(&cd0, cand, -344, 1012, &refs);
             let cached_us = now_us() - t0;
             let (f2, sa2, sl2) = crate::esp_dsp_dotprod::dotprod_path_report();
             log::info!(
