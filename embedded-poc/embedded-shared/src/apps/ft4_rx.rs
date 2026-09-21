@@ -763,6 +763,8 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
     }
 
     let loop_t0 = now_us();
+    let fft0 = crate::esp_dsp_fft::fc32_table_stats();
+    let dot0 = crate::esp_dsp_dotprod::dotprod_path_report();
     run_candidates(&shared);
 
     if created {
@@ -816,9 +818,25 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
             / 1000
     };
     let n = (t0 + t1).max(1) as i64;
+    // Both should read zero every slot after the first: a table is
+    // built once per length, and FT4's decode path takes no lock at
+    // all (the only `Fc32Guard` left guards `MIXED_SCRATCH`, and the
+    // coarse transform on the audio task is its only user here).
+    let fft1 = crate::esp_dsp_fft::fc32_table_stats();
+    // The Δt search's dot products take esp-dsp's PIE path only when
+    // both operands are 16-byte aligned and the length is a multiple
+    // of four. §32.1 measured what losing that costs — 1 049 -> 1 789
+    // ms — from an allocation elsewhere shifting the heap, so this
+    // belongs next to the timing rather than in a separate probe.
+    let dot1 = crate::esp_dsp_dotprod::dotprod_path_report();
+    let dot_fast = dot1.0 - dot0.0;
+    let dot_slow = (dot1.1 - dot0.1) + (dot1.2 - dot0.2);
+    let dot_pct = dot_fast * 100 / (dot_fast + dot_slow).max(1);
+    let fft_new = fft1.0 - fft0.0;
+    let fft_wait = fft1.1 - fft0.1;
     log::info!(
         "ft4_rx: cores — loop {} ms | core0 {} ms/{t0} cand | core1 {} ms/{t1} cand | occ {occ}% \
-         | per cand {} ms = ddc {} + search {} + tail {}",
+         | per cand {} ms = ddc {} + search {} + tail {} | fft tables +{fft_new} waits {fft_wait} | dot PIE {dot_pct}% of {}",
         loop_us / 1000,
         b0 / 1000,
         b1 / 1000,
@@ -826,6 +844,7 @@ pub fn decode_slot(slot: &CapturedSlot, budget_ms: i64) -> SlotOutcome {
         st(0) / n,
         st(1) / n,
         st(2) / n,
+        dot_fast + dot_slow,
     );
 
     if created {

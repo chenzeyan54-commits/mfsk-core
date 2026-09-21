@@ -15,8 +15,8 @@
 //! `CONFIG_DSP_TABLE_SIZE_4096_TO_32768` symbol that doesn't exist in
 //! the pinned `espressif/esp-dsp` 1.8.2 Kconfig — that symbol was
 //! never real for this version, and the claim went unnoticed because
-//! the one-shot-init bug `ensure_fc32_table` fixes, see
-//! [`FC32_TABLE_LEN`], made `dsps_fft2r_init_fc32` short-circuit
+//! the one-shot-init bug (see [`fc32_table`]) made
+//! `dsps_fft2r_init_fc32` short-circuit
 //! before it ever reached its own `table_size > CONFIG_DSP_MAX_FFT_SIZE`
 //! bounds check whenever a smaller size like `coarse_baseband`'s 512
 //! had already been requested first — so a genuine call for 32768 was
@@ -30,9 +30,11 @@
 //!
 //! ## Memory
 //!
-//! `dsps_fft2r_init_fc32` allocates a twiddle table the first time;
-//! subsequent plans reuse it. We initialise on the first
-//! `plan_forward` / `plan_inverse` call.
+//! One twiddle table per transform length, built on first use by
+//! [`fc32_table`] and never freed or rewritten. A length costs `4 * N`
+//! bytes — 128 B for FT4's 32-point symbol spectra, 1 KB for the
+//! 256-point stage inside its coarse transform — and a binary holds
+//! only the lengths it actually transforms at.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -388,12 +390,11 @@ pub fn prewarm(len: usize) {
     } else {
         panic!("prewarm: unsupported len {len}");
     };
-    // Route through the tracked helpers (not the raw FFI calls) so
-    // `FC32_TABLE_LEN` / `SC16_TABLE_LEN` agree with what's actually
-    // initialised — see `ensure_fc32_table`'s doc comment. A caller
-    // that later requests a *different* size still gets a real
-    // regenerate instead of a silent no-op.
-    ensure_fc32_table(radix2_len);
+    // Route through the tracked helpers (not the raw FFI calls): the
+    // fc32 side builds this length's own permanent table, and the
+    // sc16 side still has to force a real regenerate rather than
+    // accept `dsps_fft2r_init_sc16`'s silent no-op.
+    fc32_table(radix2_len);
     ensure_sc16_table(radix2_len);
 }
 
@@ -432,14 +433,10 @@ fn describe_esp_dsp_err(code: i32) -> &'static str {
 }
 
 unsafe extern "C" {
-    /// Pre-compute the twiddle table for radix-2 FFTs up to `table_size`
-    /// points. Pass a NULL buffer to let the lib `malloc` its own table.
-    fn dsps_fft2r_init_fc32(fft_table_buff: *mut f32, table_size: i32) -> i32;
-
     /// Forward radix-2 FFT, in place. `data` is interleaved
     /// `{re, im, ...}` with `2 * N` floats; `N` must be a power of
-    /// 2 ≤ the initialised table size; `w` is the global twiddle
-    /// table populated by `dsps_fft2r_init_fc32`.
+    /// 2; `w` is the twiddle table for exactly that `N`, which
+    /// [`fc32_table`] owns.
     ///
     /// **Three-argument signature.** From `dsps_fft2r.h`:
     /// ```c
@@ -463,21 +460,25 @@ unsafe extern "C" {
     fn dsps_fft2r_fc32_aes3_(data: *mut f32, N: i32, w: *const f32) -> i32;
 
     /// Bit-reverse the radix-2 output into natural order. Call after
-    /// `dsps_fft2r_fc32_ae32_` / `_aes3_`.
+    /// `dsps_fft2r_fc32_ae32_` / `_aes3_`. Also what
+    /// `dsps_fft2r_init_fc32` runs over the twiddle table it has just
+    /// generated (`dsps_fft2r_fc32_ansi.c:93`, `N >> 1`), which
+    /// [`fc32_table`] has to reproduce.
     fn dsps_bit_rev_fc32_ansi(data: *mut f32, N: i32) -> i32;
 
-    /// Twiddle-factor table allocated and populated by
-    /// `dsps_fft2r_init_fc32`. Pointer becomes valid after init.
-    static dsps_fft_w_table_fc32: *const f32;
-
-    /// Frees the table and clears `dsps_fft2r_initialized`, so the
-    /// *next* `dsps_fft2r_init_fc32` call actually regenerates
-    /// instead of no-opping. See [`ensure_fc32_table`].
-    fn dsps_fft2r_deinit_fc32();
+    /// Generate the radix-2 twiddle coefficients for `N` into a
+    /// caller-supplied buffer of `N` floats. Public esp-dsp API
+    /// (`dsps_fft2r.h:157`) — the same function `dsps_fft2r_init_fc32`
+    /// calls on its global, which is what makes [`fc32_table`]'s
+    /// tables bit-identical to the ones this code used to share.
+    fn dsps_gen_w_r2_fc32(w: *mut f32, n: i32) -> i32;
 
     // ── i16 (sc16) variants ──────────────────────────────────
     fn dsps_fft2r_init_sc16(fft_table_buff: *mut i16, table_size: i32) -> i32;
-    /// sc16 sibling of `dsps_fft2r_deinit_fc32`.
+    /// Frees the sc16 table and clears `dsps_fft2r_sc16_initialized`,
+    /// so the *next* init actually regenerates instead of no-opping.
+    /// The fc32 side no longer needs its equivalent — see
+    /// [`fc32_table`].
     fn dsps_fft2r_deinit_sc16();
     fn dsps_fft2r_sc16_ae32_(data: *mut i16, N: i32, w: *const i16) -> i32;
     /// LX7 PIE sc16 FFT. Requires 16-byte aligned input — caller must use
@@ -488,65 +489,6 @@ unsafe extern "C" {
     static dsps_fft_w_table_sc16: *const i16;
 }
 
-/// Exact length the process-global esp-dsp fc32 twiddle table is
-/// *actually* built for right now. `0` = never initialised.
-///
-/// This has to live here, at module (process) scope, rather than on
-/// [`EspDspPlanner`] — `dsps_fft2r_init_fc32` guards its work with a
-/// **C file-scope static** (`dsps_fft2r_initialized` in
-/// `dsps_fft2r_fc32_ansi.c`), not anything keyed by the `table_size`
-/// argument:
-/// ```c
-/// esp_err_t dsps_fft2r_init_fc32(float *fft_table_buff, int table_size) {
-///     if (dsps_fft2r_initialized != 0) { return result; }  // <- no-op regardless of table_size
-///     ...
-///     dsps_fft_w_table_size = table_size;
-///     result = dsps_gen_w_r2_fc32(dsps_fft_w_table_fc32, dsps_fft_w_table_size);
-///     dsps_fft2r_initialized = 1;
-/// }
-/// ```
-/// So *whichever* size is requested **first, from anywhere in the
-/// process**, wins forever — every later call for a *different* size
-/// silently returns `ESP_OK` without touching the table, and the
-/// kernel (`dsps_fft2r_fc32_ae32_`/`_aes3_`) then runs against a
-/// twiddle table sized (and allocated!) for the wrong N. For a
-/// smaller N this reads nonsense angles (the front slice of a bigger
-/// table is not a smaller table); for a bigger N it reads **out of
-/// bounds of the original, too-small allocation**.
-///
-/// `EspDspPlanner::ensure_table` used to track only its own
-/// `initialised_max` and assume `dsps_fft2r_init_fc32` would "grow"
-/// the table on a bigger request — a reasonable-sounding API but not
-/// what the C side does, and doubly misleading because a *fresh*
-/// `EspDspPlanner` (the common case — see `downsample.rs`'s
-/// `with_default_planner` on `no_std`, which constructs one per
-/// call) starts remembering nothing, so it can't even self-consistently
-/// detect "the process-wide table is already the wrong size for me".
-/// Found 2026-08-14 (issue #260): the WSPR overlap-save LPF experiment
-/// planned a 32768-pt FFT into the same process as `coarse_baseband`'s
-/// existing 512-pt plans; the Rust wrapper only ever saw the 512-pt
-/// table it *thought* had grown, while the kernel actually walked off
-/// the end of the original 512-entry allocation. Three independent,
-/// real fixes to the LPF code itself (kernel-placement off-by-one,
-/// the 32768-pt hardware ceiling, forward/inverse normalisation) left
-/// the on-device symptom byte-for-byte unchanged, because none of
-/// them touched this.
-///
-/// The fix: track the *actually-initialised* size at module (i.e.
-/// process) scope, matching where the real C-side state lives, and
-/// force a real regenerate — `dsps_fft2r_deinit_fc32()` then
-/// `dsps_fft2r_init_fc32()` — whenever the requested size differs
-/// from it, not just when it's bigger.
-///
-/// **Caveat**: `dsps_fft2r_initialized` and friends are plain C
-/// globals with no locking. If two cores ever plan *different* fc32
-/// sizes concurrently (they don't today — `wspr_dual_core`'s workers
-/// share one post-subtract candidate loop with no FFT in it, and FT8
-/// decode is single-core through the spectrogram stage), the
-/// deinit/reinit dance here would race exactly like the original bug
-/// did. Not fixed here; flagging for whoever adds the next
-/// concurrent FFT caller.
-static FC32_TABLE_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Serialises the twiddle table against the transforms that read it.
 ///
@@ -568,15 +510,43 @@ static FC32_TABLE_LEN: AtomicUsize = AtomicUsize::new(0);
 /// necessarily available.
 static FC32_LOCK: AtomicUsize = AtomicUsize::new(0);
 
+/// How often the table was actually regenerated, and how often a core
+/// found the lock already held.
+///
+/// The two are different costs and the fix for each is different. A
+/// regeneration is `deinit` + `init(NULL, len)`: a free, an allocation
+/// and a fresh sin/cos table, run *inside* the lock, so every other
+/// core waits through it. Contention without regeneration is only the
+/// transforms serialising. Which of the two dominates decides whether
+/// a caller should stop asking for a different length or stop sharing
+/// the table at all.
+static FC32_INSTALLED: AtomicUsize = AtomicUsize::new(0);
+static FC32_CONTENDED: AtomicUsize = AtomicUsize::new(0);
+
+/// Table regenerations and contended acquisitions since boot. Both are
+/// monotonic; a caller reads the pair around a slot and reports the
+/// difference.
+pub fn fc32_table_stats() -> (usize, usize) {
+    (
+        FC32_INSTALLED.load(Ordering::Relaxed),
+        FC32_CONTENDED.load(Ordering::Relaxed),
+    )
+}
+
 struct Fc32Guard;
 
 impl Fc32Guard {
     fn acquire() -> Self {
+        let mut waited = false;
         while FC32_LOCK
             .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
+            waited = true;
             core::hint::spin_loop();
+        }
+        if waited {
+            FC32_CONTENDED.fetch_add(1, Ordering::Relaxed);
         }
         Self
     }
@@ -588,42 +558,129 @@ impl Drop for Fc32Guard {
     }
 }
 
-/// Force the process-global fc32 twiddle table to be exactly `len`
-/// entries, regenerating it if it currently isn't. See
-/// [`FC32_TABLE_LEN`] for why this can't just be "call init if we
-/// haven't seen this size before" on a per-planner-instance basis.
+/// How many transform lengths one binary can hold tables for. FT4
+/// uses two (32 for `symbol_spectra`, 256 inside the 2 304-point
+/// coarse transform); the other receivers add 512, 1 024 and 2 048.
+const FC32_TABLE_SLOTS: usize = 8;
+static FC32_TABLE_LENS: [AtomicUsize; FC32_TABLE_SLOTS] =
+    [const { AtomicUsize::new(0) }; FC32_TABLE_SLOTS];
+static FC32_TABLE_PTRS: [AtomicPtr<f32>; FC32_TABLE_SLOTS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; FC32_TABLE_SLOTS];
+/// Held only while a table is *installed*, which happens once per
+/// length per boot. Transforms never take it.
+static FC32_INSTALL_LOCK: AtomicUsize = AtomicUsize::new(0);
+
+/// The twiddle table for `len`, generated on first use and then never
+/// written again.
 ///
-/// **Caller must hold [`Fc32Guard`]** and keep holding it until the
-/// transform that reads the table has finished — resizing it is only
-/// half the invariant.
-fn ensure_fc32_table(len: usize) {
-    let _guard = Fc32Guard::acquire();
-    ensure_fc32_table_locked(len);
+/// **This is what replaced the process-global table**, and the reason
+/// is worth keeping. esp-dsp's convenience form is a macro —
+///
+/// ```c
+/// #define dsps_fft2r_fc32_aes3(data, N) dsps_fft2r_fc32_aes3_(data, N, dsps_fft_w_table_fc32)
+/// ```
+///
+/// — over a kernel that takes the table **as an argument**
+/// (`dsps_fft2r.h:96`), and `dsps_gen_w_r2_fc32` (`:157`) fills any
+/// buffer the caller supplies. Only the macro insists on one global.
+/// Taking the underscore form directly and keeping a table per length
+/// removes the resize, and with the resize the exclusion: a table that
+/// is only ever read can be read by both cores at once.
+///
+/// **The trap this retires.** `dsps_fft2r_init_fc32` returns `ESP_OK`
+/// without touching anything once `dsps_fft2r_initialized` is set, so
+/// whichever size was requested *first, from anywhere in the process*
+/// won for ever and every later transform ran against a table sized —
+/// and allocated — for the wrong N (issue #260: a 32 768-point plan
+/// entering a process that had already planned 512 walked off the end
+/// of the 512-entry allocation; three real, independent fixes to the
+/// caller left the symptom byte-for-byte unchanged). The workaround
+/// was to force `deinit` + `init` on every size change and hold a
+/// lock across the transform that read the result. Per-length tables
+/// remove the cause instead: nothing is ever resized, so nothing has
+/// to be serialised against a resize.
+///
+/// What that cost before, measured on a CoreS3 running FT4: the audio
+/// task's coarse transform asks for 256 while the decode's
+/// `symbol_spectra` asks for 32, so every interleaving ran
+/// `dsps_fft2r_deinit_fc32` + `dsps_fft2r_init_fc32` — a free, an
+/// allocation and a fresh sin/cos table — *inside* the lock every
+/// other core was waiting on.
+///
+/// The bit-reversal at the end is not an extra: `dsps_fft2r_init_fc32`
+/// does exactly this to its own table after generating it
+/// (`dsps_fft2r_fc32_ansi.c:89-93`), so these tables are the same
+/// bytes the shared one held, and the transforms are bit-identical.
+fn fc32_table(len: usize) -> *const f32 {
+    for (l, p) in FC32_TABLE_LENS.iter().zip(&FC32_TABLE_PTRS) {
+        if l.load(Ordering::Acquire) == len {
+            return p.load(Ordering::Acquire);
+        }
+    }
+    install_fc32_table(len)
 }
 
-/// [`ensure_fc32_table`]'s body, for callers already holding
-/// [`Fc32Guard`] because they are about to run a transform against the
-/// table and must not let it change underneath them.
-fn ensure_fc32_table_locked(len: usize) {
-    if FC32_TABLE_LEN.load(Ordering::Relaxed) == len {
-        return;
+#[cold]
+fn install_fc32_table(len: usize) -> *const f32 {
+    while FC32_INSTALL_LOCK
+        .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
     }
-    // SAFETY: `dsps_fft2r_deinit_fc32` is safe to call even when
-    // nothing was ever initialised (it checks its own "allocated"
-    // flag first) and NULL asks the lib to alloc+size its own table
-    // for exactly `len`, a power of 2 ≤ `CONFIG_DSP_MAX_FFT_SIZE`
-    // (`CONFIG_DSP_TABLE_SIZE_*` in sdkconfig.defaults).
+    let table = install_fc32_table_locked(len);
+    FC32_INSTALL_LOCK.store(0, Ordering::Release);
+    table
+}
+
+fn install_fc32_table_locked(len: usize) -> *const f32 {
+    // Another core may have installed it between the scan and the
+    // lock.
+    for (l, p) in FC32_TABLE_LENS.iter().zip(&FC32_TABLE_PTRS) {
+        if l.load(Ordering::Acquire) == len {
+            return p.load(Ordering::Acquire);
+        }
+    }
+    const MALLOC_CAP_INTERNAL_8BIT: u32 = (1 << 11) | (1 << 2);
+    let bytes = len * core::mem::size_of::<f32>();
+    // SAFETY: `heap_caps_aligned_alloc` returns null or an aligned
+    // block of at least `bytes`. Never freed: a table lives for the
+    // process, which is the whole point of not resizing one.
+    let mut p =
+        unsafe { esp_idf_svc::sys::heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_INTERNAL_8BIT) }
+            as *mut f32;
+    if p.is_null() {
+        // PSRAM is slower to read a twiddle from, and still far better
+        // than not having the table.
+        // SAFETY: same contract, without the capability constraint.
+        p = unsafe { esp_idf_svc::sys::malloc(bytes as u32) } as *mut f32;
+    }
+    assert!(!p.is_null(), "fc32 twiddle table {len} ({bytes} B) could not be allocated");
+    // SAFETY: `p` covers `len` floats, which is what both calls want —
+    // `dsps_gen_w_r2_fc32` writes `2 * (len/2)` of them and the
+    // bit-reversal permutes the same buffer as `len/2` complex pairs.
     unsafe {
-        dsps_fft2r_deinit_fc32();
-        let r = dsps_fft2r_init_fc32(core::ptr::null_mut(), len as i32);
+        let r = dsps_gen_w_r2_fc32(p, len as i32);
         assert_eq!(
             r,
             ESP_OK,
-            "dsps_fft2r_init_fc32({len}) returned {r} = {}",
+            "dsps_gen_w_r2_fc32({len}) returned {r} = {}",
             describe_esp_dsp_err(r)
         );
+        dsps_bit_rev_fc32_ansi(p, (len >> 1) as i32);
     }
-    FC32_TABLE_LEN.store(len, Ordering::Relaxed);
+    for (l, slot) in FC32_TABLE_LENS.iter().zip(&FC32_TABLE_PTRS) {
+        if l.load(Ordering::Relaxed) == 0 {
+            // The pointer first: a reader that sees the length must
+            // see a table behind it.
+            slot.store(p, Ordering::Release);
+            l.store(len, Ordering::Release);
+            FC32_INSTALLED.fetch_add(1, Ordering::Relaxed);
+            log::info!("esp_dsp_fft: fc32 twiddle table for {len} ({bytes} B) at {p:p}");
+            return p;
+        }
+    }
+    panic!("fc32 twiddle tables: more than {FC32_TABLE_SLOTS} lengths in one binary");
 }
 
 /// `esp-dsp` FFT planner. Construct once per session, share across
@@ -641,7 +698,8 @@ impl EspDspPlanner {
     }
 
     fn ensure_table(&mut self, len: usize) {
-        ensure_fc32_table(len);
+        // Builds the table now rather than inside the first transform.
+        fc32_table(len);
     }
 }
 
@@ -822,11 +880,12 @@ impl Fft for MixedRadix3840Fft {
         assert_eq!(buf.len(), N, "3840 FFT input length mismatch");
         let buf_arr: &mut [Complex32; N] = buf.try_into().expect("buf.len() == N already asserted");
 
-        // Same table discipline as `EspDspFft::process` — see its
-        // comment. Held across every inner 256-pt transform below, not
-        // re-acquired per call, since they are one logical FFT.
+        // The guard is no longer about the twiddle table — that is
+        // per-length and read-only now (`fc32_table`). It is about
+        // `MIXED_SCRATCH`, the one shared 30 KB buffer this wrapper
+        // slices below, and it is held across all the inner transforms
+        // because they are one logical FFT over that buffer.
         let _guard = Fc32Guard::acquire();
-        ensure_fc32_table_locked(256);
 
         // Inner 256-pt forward FFT via esp-dsp asm path. Mirrors
         // `EspDspFft::process` but specialised to len=256.
@@ -834,9 +893,9 @@ impl Fft for MixedRadix3840Fft {
             let ptr = slice.as_mut_ptr() as *mut f32;
             unsafe {
                 #[cfg(not(feature = "aes3"))]
-                dsps_fft2r_fc32_ae32_(ptr, 256, dsps_fft_w_table_fc32);
+                dsps_fft2r_fc32_ae32_(ptr, 256, fc32_table(256));
                 #[cfg(feature = "aes3")]
-                dsps_fft2r_fc32_aes3_(ptr, 256, dsps_fft_w_table_fc32);
+                dsps_fft2r_fc32_aes3_(ptr, 256, fc32_table(256));
                 dsps_bit_rev_fc32_ansi(ptr, 256);
             }
         };
@@ -942,19 +1001,19 @@ impl Fft for MixedRadix2304Fft {
         assert_eq!(buf.len(), N, "2304 FFT input length mismatch");
         let buf_arr: &mut [Complex32; N] = buf.try_into().expect("buf.len() == N already asserted");
 
-        // One guard across all nine inner 256-pt transforms -- they are
-        // one logical FFT over a process-global twiddle table, same
-        // discipline as `MixedRadix3840Fft::process`.
+        // One guard across all nine inner 256-pt transforms: they are
+        // one logical FFT over the shared `MIXED_SCRATCH`, same
+        // discipline as `MixedRadix3840Fft::process`. Not the twiddle
+        // table — see `fc32_table`.
         let _guard = Fc32Guard::acquire();
-        ensure_fc32_table_locked(256);
 
         let run_256 = |slice: &mut [Complex32]| {
             let ptr = slice.as_mut_ptr() as *mut f32;
             unsafe {
                 #[cfg(not(feature = "aes3"))]
-                dsps_fft2r_fc32_ae32_(ptr, 256, dsps_fft_w_table_fc32);
+                dsps_fft2r_fc32_ae32_(ptr, 256, fc32_table(256));
                 #[cfg(feature = "aes3")]
-                dsps_fft2r_fc32_aes3_(ptr, 256, dsps_fft_w_table_fc32);
+                dsps_fft2r_fc32_aes3_(ptr, 256, fc32_table(256));
                 dsps_bit_rev_fc32_ansi(ptr, 256);
             }
         };
@@ -1063,19 +1122,18 @@ impl Fft for MixedRadix5120Fft {
         assert_eq!(buf.len(), N, "5120 FFT input length mismatch");
         let buf_arr: &mut [Complex32; N] = buf.try_into().expect("buf.len() == N already asserted");
 
-        // Same table discipline as `MixedRadix3840Fft::process`: one
-        // guard held across all five inner 1024-pt transforms, since
-        // they are one logical FFT over a process-global twiddle table.
-        let _guard = Fc32Guard::acquire();
-        ensure_fc32_table_locked(1024);
+        // No lock: the 1 024-point table is read-only (see
+        // `fc32_table`) and this wrapper's scratch is its own — unlike
+        // the 3 840 and 2 304 wrappers, it does not touch
+        // `MIXED_SCRATCH`.
 
         let run_1024 = |slice: &mut [Complex32]| {
             let ptr = slice.as_mut_ptr() as *mut f32;
             unsafe {
                 #[cfg(not(feature = "aes3"))]
-                dsps_fft2r_fc32_ae32_(ptr, 1024, dsps_fft_w_table_fc32);
+                dsps_fft2r_fc32_ae32_(ptr, 1024, fc32_table(1024));
                 #[cfg(feature = "aes3")]
-                dsps_fft2r_fc32_aes3_(ptr, 1024, dsps_fft_w_table_fc32);
+                dsps_fft2r_fc32_aes3_(ptr, 1024, fc32_table(1024));
                 dsps_bit_rev_fc32_ansi(ptr, 1024);
             }
         };
@@ -1157,9 +1215,9 @@ impl EspDspFft {
         // already called `dsps_fft2r_init_fc32` which populates it.
         unsafe {
             #[cfg(not(feature = "aes3"))]
-            dsps_fft2r_fc32_ae32_(ptr, self.len as i32, dsps_fft_w_table_fc32);
+            dsps_fft2r_fc32_ae32_(ptr, self.len as i32, fc32_table(self.len));
             #[cfg(feature = "aes3")]
-            dsps_fft2r_fc32_aes3_(ptr, self.len as i32, dsps_fft_w_table_fc32);
+            dsps_fft2r_fc32_aes3_(ptr, self.len as i32, fc32_table(self.len));
             // Bit-reverse the in-place output to get natural order.
             dsps_bit_rev_fc32_ansi(ptr, self.len as i32);
         }
@@ -1176,8 +1234,11 @@ impl Fft for EspDspFft {
         // the size here rather than trusting `plan_forward`'s call is
         // the other half — a `Box<dyn Fft>` outlives any number of
         // other plans.
-        let _guard = Fc32Guard::acquire();
-        ensure_fc32_table_locked(self.len);
+        // No lock: `fc32_table` hands back a table that is written
+        // once and read for ever, and `staging` below belongs to this
+        // plan — `with_default_planner` builds one per call on
+        // `no_std`, so two cores decoding two candidates share nothing
+        // here at all.
         // esp-dsp expects an interleaved {re, im, re, im, ...} f32
         // array of length 2*N. Complex32 is repr(C) with this exact
         // layout, so we can cast in place — subject to alignment, see
@@ -1219,8 +1280,8 @@ impl Fft for EspDspFft {
 
 // ── i16 / sc16 planner ──────────────────────────────────────────────────
 
-/// sc16 sibling of [`FC32_TABLE_LEN`] / [`ensure_fc32_table`] — same
-/// one-shot-gate structure on the C side (`dsps_fft2r_sc16_initialized`
+/// The sc16 sibling of the fc32 one-shot-init trap — same structure on
+/// the C side (`dsps_fft2r_sc16_initialized`
 /// in `dsps_fft2r_sc16_ansi.c`), same fix (deinit+reinit on any size
 /// change, tracked at process scope, not per-`EspDspPlanner16`).
 ///
