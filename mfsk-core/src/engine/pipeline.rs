@@ -1067,16 +1067,23 @@ where
     // single-position call below so FT4 can retry it at up to 3 positions
     // (see the segment loop further down) without duplicating the LLR/BP/
     // OSD logic.
-    let try_position = |freq_hz: f32, i0: i32, score: f32| -> Option<DecodeResult> {
+    // **One buffer for every position this candidate tries.** The shift
+    // used to allocate a fresh `cd0`-sized `Vec` per call — 40 KB for
+    // FT4, more for FST4 — and FST4 calls this up to three times per
+    // candidate. Measured at 2 448 µs of the shift's 13 629 µs on a
+    // CoreS3; see `freq_shift_cd0_into`.
+    let mut shift_buf: Vec<Complex<f32>> = Vec::new();
+    let mut try_position = |freq_hz: f32, i0: i32, score: f32| -> Option<DecodeResult> {
         let df_hz = freq_hz - cand.freq_hz;
-        let cd0 = super::sync2d::freq_shift_cd0(&cd0_base, df_hz, ds_rate);
+        super::sync2d::freq_shift_cd0_into(&cd0_base, df_hz, ds_rate, &mut shift_buf);
+        let cd0 = &shift_buf[..];
         let refined = SyncCandidate {
             freq_hz,
             dt_sec: (i0 as f32) / ds_rate - tx_start,
             score,
         };
 
-        let cs_raw = symbol_spectra::<P>(&cd0, i0);
+        let cs_raw = symbol_spectra::<P>(cd0, i0);
         let nsync = sync_quality::<P>(&cs_raw);
         if nsync <= sync_q_min {
             #[cfg(feature = "std")]
@@ -1086,7 +1093,7 @@ where
         #[cfg(feature = "std")]
         TRACE_NSYNC_PASS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
-        let per_block = fine_sync_power_per_block::<P>(&cd0, i0);
+        let per_block = fine_sync_power_per_block::<P>(cd0, i0);
         let sync_cv = if !per_block.is_empty() {
             let n = per_block.len() as f32;
             let mean = per_block.iter().sum::<f32>() / n;
@@ -1138,7 +1145,7 @@ where
                     P::snr_db(SnrCtx {
                         cs,
                         itone: &itone,
-                        cd0: &cd0,
+                        cd0,
                         ds_rate_hz: ds_rate,
                         cand_score: cand.score,
                         cand_freq_hz: cand.freq_hz,
@@ -1312,7 +1319,7 @@ where
                             let snr_db = P::snr_db(SnrCtx {
                                 cs,
                                 itone: &itone,
-                                cd0: &cd0,
+                                cd0,
                                 ds_rate_hz: ds_rate,
                                 cand_score: cand.score,
                                 cand_freq_hz: cand.freq_hz,
@@ -1360,7 +1367,7 @@ where
                                 let snr_db = P::snr_db(SnrCtx {
                                     cs,
                                     itone: &itone,
-                                    cd0: &cd0,
+                                    cd0,
                                     ds_rate_hz: ds_rate,
                                     cand_score: cand.score,
                                     cand_freq_hz: cand.freq_hz,
@@ -1444,7 +1451,7 @@ where
                         let snr_db = P::snr_db(SnrCtx {
                             cs,
                             itone: &itone,
-                            cd0: &cd0,
+                            cd0,
                             ds_rate_hz: ds_rate,
                             cand_score: cand.score,
                             cand_freq_hz: cand.freq_hz,

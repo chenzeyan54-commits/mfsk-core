@@ -874,17 +874,45 @@ pub fn ft4_sync_search_window_cached<P: Protocol>(
 /// run [`crate::engine::llr::symbol_spectra`] on a baseband whose
 /// carrier sits at the refined freq.
 pub fn freq_shift_cd0(cd0: &[Complex<f32>], df_hz: f32, ds_rate: f32) -> Vec<Complex<f32>> {
+    let mut out = Vec::new();
+    freq_shift_cd0_into(cd0, df_hz, ds_rate, &mut out);
+    out
+}
+
+/// [`freq_shift_cd0`] into a buffer the caller keeps.
+///
+/// **The allocation is 18 % of the call.** Measured on a CoreS3
+/// (2026-09-21, `ft4-bench`'s `llr_bp_probe`): the whole call is
+/// 13 629 µs per FT4 candidate, and the same arithmetic written into a
+/// buffer that already exists is 11 181 µs — so the fresh 40 KB `Vec`
+/// costs **2 448 µs a candidate**, ~29 ms a slot at twelve.
+///
+/// That is worth a second entry point on its own, but it is also the
+/// shape the rest of the work needs: a 40 KB allocation per candidate
+/// is exactly the heap traffic §29/§32/§47 of `FT4_BENCHMARK.md` all
+/// turn on, where one extra internal-DRAM block moved elsewhere took
+/// the search from 100 % PIE to 0 % with no change to the code that
+/// ran.
+///
+/// `out` is resized to `cd0.len()`; its previous contents are not read.
+/// Bit-identical to [`freq_shift_cd0`], which is now a wrapper.
+pub fn freq_shift_cd0_into(
+    cd0: &[Complex<f32>],
+    df_hz: f32,
+    ds_rate: f32,
+    out: &mut Vec<Complex<f32>>,
+) {
+    out.clear();
+    out.reserve(cd0.len());
     if df_hz.abs() < f32::EPSILON {
-        return cd0.to_vec();
+        out.extend_from_slice(cd0);
+        return;
     }
     let omega = -2.0 * PI * df_hz / ds_rate;
-    cd0.iter()
-        .enumerate()
-        .map(|(n, &c)| {
-            let p = omega * n as f32;
-            c * Complex::new(p.cos(), p.sin())
-        })
-        .collect()
+    out.extend(cd0.iter().enumerate().map(|(n, &c)| {
+        let p = omega * n as f32;
+        c * Complex::new(p.cos(), p.sin())
+    }));
 }
 
 #[cfg(test)]

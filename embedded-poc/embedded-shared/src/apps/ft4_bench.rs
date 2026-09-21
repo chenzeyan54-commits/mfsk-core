@@ -778,6 +778,8 @@ fn savg_realtime_probe(audio: &[i16]) {
 /// the three add up.
 fn llr_bp_probe(audio: &[i16], candidates: &[SyncCandidate]) {
     use mfsk_core::engine::llr::{compute_llr_fast, symbol_spectra};
+    use mfsk_core::engine::sync2d::freq_shift_cd0;
+    use mfsk_core::ft4::ddc::DS_RATE_HZ;
 
     let Some(cand) = candidates.first() else {
         return;
@@ -899,6 +901,43 @@ fn llr_bp_probe(audio: &[i16], candidates: &[SyncCandidate]) {
         );
     }
 
+    // **The rotation, alone.** `try_position` opens by shifting the
+    // whole 5 120-sample `cd0` to the refined frequency
+    // (`engine::sync2d::freq_shift_cd0`), evaluating `cos` and `sin`
+    // per sample and allocating a fresh 40 KB `Vec` to hold the
+    // result. It has never been timed: it lives inside the "rest"
+    // bucket below, which is otherwise read as BP.
+    //
+    // The prediction being tested is ~8 ms, from the 1.57 us/sample
+    // this file's own `FlatRef` fills measure for a `cos`+`sin` pair.
+    // A prediction from a per-sample rate is not a measurement, which
+    // is why this is here before anything is changed.
+    let t0 = now_us();
+    let mut shift_sink = 0.0f32;
+    for _ in 0..ITERS {
+        let shifted = freq_shift_cd0(&cd0, s2.freq_hz - cand.freq_hz, DS_RATE_HZ);
+        shift_sink += shifted[0].re;
+    }
+    let shift_us = (now_us() - t0) / ITERS as i64;
+
+    // **Which half of it is the allocation.** `freq_shift_cd0` returns
+    // a fresh 40 KB `Vec` every call. Writing the same arithmetic into
+    // a buffer that already exists is bit-identical and needs no
+    // sweep; replacing the per-sample `cos`/`sin` with a rotator is
+    // neither. Splitting them here says which one is worth which
+    // price, before either is written.
+    let mut shift_buf = alloc::vec![Complex32::new(0.0f32, 0.0f32); cd0.len()];
+    let omega = -2.0 * core::f32::consts::PI * (s2.freq_hz - cand.freq_hz) / DS_RATE_HZ;
+    let t0 = now_us();
+    for _ in 0..ITERS {
+        for (n, (dst, &c)) in shift_buf.iter_mut().zip(cd0.iter()).enumerate() {
+            let p = omega * n as f32;
+            *dst = c * Complex32::new(p.cos(), p.sin());
+        }
+        shift_sink += shift_buf[0].re;
+    }
+    let shift_into_us = (now_us() - t0) / ITERS as i64;
+
     let t0 = now_us();
     let mut cs = Vec::new();
     for _ in 0..ITERS {
@@ -934,11 +973,16 @@ fn llr_bp_probe(audio: &[i16], candidates: &[SyncCandidate]) {
     let whole_us = (now_us() - t0) / ITERS as i64;
 
     log::info!(
-        "ft4_bench: LLR/BP for one candidate — symbol_spectra {} us | compute_llr {} us | \
-         rest (BP + ladder + SNR) {} us | whole tail {} us | sink {sink:e}",
+        "ft4_bench: LLR/BP for one candidate — freq_shift_cd0 {} us (into a live buffer {} us, \
+         so the 40 KB alloc is {} us) | symbol_spectra {} us | \
+         compute_llr {} us | rest (BP + ladder + SNR) {} us | whole tail {} us | \
+         sink {sink:e}/{shift_sink:e}",
+        shift_us,
+        shift_into_us,
+        shift_us - shift_into_us,
         spectra_us,
         llr_us,
-        whole_us - spectra_us - llr_us,
+        whole_us - spectra_us - llr_us - shift_us,
         whole_us,
     );
     log::info!(
