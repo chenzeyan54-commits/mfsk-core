@@ -262,8 +262,8 @@ fn ft4_front_end_rejects_a_neighbour_off_the_wanted_band() {
 fn what_the_boxcar_front_end_costs_against_a_neighbour() {
     let wanted = mfsk_core::msg::wsjt77::unpack77(&wanted()).expect("wanted unpacks");
 
-    let alone_fir = rx::run_slot_with(&slot(None), rx::fir_producer);
-    let alone_box = rx::run_slot_with(&slot(None), rx::boxcar_producer);
+    let alone_fir = rx::run_slot_with(&slot(None), rx::Variant::SHIPPED);
+    let alone_box = rx::run_slot_with(&slot(None), rx::Variant::BOXCAR);
     eprintln!("\nFT4 adjacent-signal rejection — FIR against boxcar/9");
     eprintln!(
         "  alone: FIR {}, boxcar {}",
@@ -281,14 +281,14 @@ fn what_the_boxcar_front_end_costs_against_a_neighbour() {
         for level in [0.0f32, 10.0, 20.0] {
             let audio = slot(Some((offset, level)));
             fir.push_str(
-                if rx::run_slot_with(&audio, rx::fir_producer).contains(&wanted) {
+                if rx::run_slot_with(&audio, rx::Variant::SHIPPED).contains(&wanted) {
                     " ok "
                 } else {
                     "LOST"
                 },
             );
             boxcar.push_str(
-                if rx::run_slot_with(&audio, rx::boxcar_producer).contains(&wanted) {
+                if rx::run_slot_with(&audio, rx::Variant::BOXCAR).contains(&wanted) {
                     " ok "
                 } else {
                     "LOST"
@@ -333,75 +333,73 @@ fn what_the_boxcar_front_end_costs_at_threshold() {
     let arms: [(&str, Option<(f32, f32)>); 2] =
         [("alone", None), ("+20 dB fold", Some((worst, 20.0)))];
 
-    eprintln!("\nFT4 threshold, by front end — {SEEDS} seeds per point");
-    eprintln!("  {:<14} {:>28} {:>28}", "", "FIR 101+263", "boxcar /9");
-    eprintln!(
-        "  {:<14} {:>28} {:>28}",
-        "SNR", "alone   +20 dB fold", "alone   +20 dB fold"
-    );
+    // Four arms: what ships, each half of the cheaper front end, and
+    // both together.
+    let variants: [(&str, rx::Variant); 4] = [
+        ("shipped", rx::Variant::SHIPPED),
+        ("boxcar", rx::Variant::BOXCAR),
+        ("binned", rx::Variant::BINNED_SEARCH),
+        ("both", rx::Variant::BOTH),
+    ];
 
-    let mut crossings = [[f32::NAN; 2]; 2];
-    let mut curves = [[Vec::new(), Vec::new()], [Vec::new(), Vec::new()]];
+    eprintln!("\nFT4 threshold — {SEEDS} seeds per point, decode rate %");
+    eprint!("  {:<8}", "SNR");
+    for (name, _) in &variants {
+        eprint!("  {:>10}", format!("{name} alone"));
+        eprint!("  {:>10}", format!("{name} fold"));
+    }
+    eprintln!();
+
+    let mut curves: Vec<[Vec<(f32, f32)>; 2]> =
+        variants.iter().map(|_| [Vec::new(), Vec::new()]).collect();
     for &snr in &snrs {
-        let mut cells = Vec::new();
-        for (ai, (_, interferer)) in arms.iter().enumerate() {
-            for (pi, produce) in [rx::fir_producer, rx::boxcar_producer].iter().enumerate() {
+        eprint!("  {snr:<8.1}");
+        for (vi, (_, v)) in variants.iter().enumerate() {
+            for (ai, (_, interferer)) in arms.iter().enumerate() {
                 let mut hits = 0;
                 for seed in 0..SEEDS {
                     let audio = slot_at(snr, *interferer, 0x5EED_0000 + seed);
-                    if rx::run_slot_with(&audio, *produce).contains(&wanted) {
+                    if rx::run_slot_with(&audio, *v).contains(&wanted) {
                         hits += 1;
                     }
                 }
                 let rate = hits as f32 / SEEDS as f32;
-                curves[pi][ai].push((snr, rate));
-                cells.push((pi, ai, rate));
+                curves[vi][ai].push((snr, rate));
+                eprint!("  {:>10.0}", rate * 100.0);
             }
         }
-        let g = |pi: usize, ai: usize| {
-            cells
-                .iter()
-                .find(|(p, a, _)| *p == pi && *a == ai)
-                .map(|(_, _, r)| *r)
-                .unwrap_or(f32::NAN)
-        };
-        eprintln!(
-            "  {snr:<14.1} {:>12.0}% {:>14.0}% {:>12.0}% {:>14.0}%",
-            g(0, 0) * 100.0,
-            g(0, 1) * 100.0,
-            g(1, 0) * 100.0,
-            g(1, 1) * 100.0,
-        );
+        eprintln!();
     }
 
     // Linear interpolation of the 50 % crossing, walking down from the
     // top — the same shape `sweep-regression-check.py` uses on the
     // tier-C CSVs.
-    for pi in 0..2 {
-        for ai in 0..2 {
-            let c = &curves[pi][ai];
-            for w in c.windows(2) {
-                if w[0].1 >= 0.5 && w[1].1 < 0.5 {
-                    let t = (w[0].1 - 0.5) / (w[0].1 - w[1].1);
-                    crossings[pi][ai] = w[0].0 + t * (w[1].0 - w[0].0);
-                    break;
-                }
+    let cross = |c: &Vec<(f32, f32)>| -> f32 {
+        for w in c.windows(2) {
+            if w[0].1 >= 0.5 && w[1].1 < 0.5 {
+                let t = (w[0].1 - 0.5) / (w[0].1 - w[1].1);
+                return w[0].0 + t * (w[1].0 - w[0].0);
             }
         }
+        f32::NAN
+    };
+    let base = [cross(&curves[0][0]), cross(&curves[0][1])];
+    eprintln!("\n  50 % crossing, and the cost against what ships");
+    eprintln!(
+        "  {:<10} {:>10} {:>10} {:>10} {:>10}",
+        "arm", "alone", "vs ship", "fold", "vs ship"
+    );
+    for (vi, (name, _)) in variants.iter().enumerate() {
+        let a = cross(&curves[vi][0]);
+        let f = cross(&curves[vi][1]);
+        // Positive = needs a stronger signal, i.e. costs sensitivity.
+        eprintln!(
+            "  {name:<10} {a:>10.2} {:>10.2} {f:>10.2} {:>10.2}",
+            a - base[0],
+            f - base[1]
+        );
     }
-    eprintln!(
-        "\n  50 %% crossing (dB)   FIR alone {:.1}   FIR fold {:.1}   box alone {:.1}   box fold {:.1}",
-        crossings[0][0], crossings[0][1], crossings[1][0], crossings[1][1]
-    );
-    // Positive = the boxcar needs a stronger signal, i.e. it costs
-    // sensitivity. Spelled out because the subtraction reads either way
-    // and a sign error here would invert the conclusion.
-    eprintln!(
-        "  boxcar costs {:.2} dB alone, {:.2} dB against the fold \
-         (positive = worse)\n",
-        crossings[1][0] - crossings[0][0],
-        crossings[1][1] - crossings[0][1],
-    );
+    eprintln!();
 }
 
 /// Do the fold offsets actually fold?

@@ -153,25 +153,64 @@ pub fn boxcar_producer_reference(half: &[f32], f0_hz: f32) -> Vec<Complex<f32>> 
     out
 }
 
+/// Which of the two experimental arms a run uses. `Variant::SHIPPED`
+/// is what the board does today.
+#[derive(Clone, Copy)]
+pub struct Variant {
+    pub produce: Producer,
+    /// Score the coarse Δt/Δf sweep over tone-demodulated bins instead
+    /// of over every `cd0` sample.
+    pub binned_search: bool,
+}
+
+impl Variant {
+    pub const SHIPPED: Self = Self {
+        produce: fir_producer,
+        binned_search: false,
+    };
+    pub const BOXCAR: Self = Self {
+        produce: boxcar_producer,
+        binned_search: false,
+    };
+    pub const BINNED_SEARCH: Self = Self {
+        produce: fir_producer,
+        binned_search: true,
+    };
+    pub const BOTH: Self = Self {
+        produce: boxcar_producer,
+        binned_search: true,
+    };
+}
+
 /// `ft4_rx::decode_candidate`, call for call.
 pub fn decode_candidate(
     half: &[f32],
     cand: &SyncCandidate,
     refs: &Ft4CoarsePhasors,
 ) -> Option<String> {
-    decode_candidate_with(half, cand, refs, fir_producer)
+    decode_candidate_with(half, cand, refs, Variant::SHIPPED)
 }
 
-/// [`decode_candidate`] over a chosen baseband producer.
+/// [`decode_candidate`] over a chosen arm.
 pub fn decode_candidate_with(
     half: &[f32],
     cand: &SyncCandidate,
     refs: &Ft4CoarsePhasors,
-    produce: Producer,
+    v: Variant,
 ) -> Option<String> {
-    let mut cd0 = produce(half, cand.freq_hz);
+    let mut cd0 = (v.produce)(half, cand.freq_hz);
     rms_normalise(&mut cd0);
-    let s2 = ft4_sync_search_window_with::<Ft4>(&cd0, cand, WSJTX_WINDOW.0, WSJTX_WINDOW.1, refs);
+    let s2 = if v.binned_search {
+        mfsk_core::engine::sync2d::ft4_sync_search_window_binned::<Ft4>(
+            &cd0,
+            cand,
+            WSJTX_WINDOW.0,
+            WSJTX_WINDOW.1,
+            refs,
+        )
+    } else {
+        ft4_sync_search_window_with::<Ft4>(&cd0, cand, WSJTX_WINDOW.0, WSJTX_WINDOW.1, refs)
+    };
     let r: Option<DecodeResult> = process_candidate_precomputed::<Ft4>(
         cand,
         // FT4's `snr_db` reads the coarse candidate score, not a
@@ -195,17 +234,17 @@ pub fn decode_candidate_with(
 /// One whole slot in, its distinct messages out, in candidate order —
 /// which is descending coarse score, the order the receiver dedups in.
 pub fn run_slot(audio: &[i16]) -> Vec<String> {
-    run_slot_with(audio, fir_producer)
+    run_slot_with(audio, Variant::SHIPPED)
 }
 
-/// [`run_slot`] over a chosen baseband producer.
-pub fn run_slot_with(audio: &[i16], produce: Producer) -> Vec<String> {
+/// [`run_slot`] over a chosen arm.
+pub fn run_slot_with(audio: &[i16], v: Variant) -> Vec<String> {
     let (savg, half) = capture(audio);
     let cands = coarse(&savg);
     let refs = Ft4CoarsePhasors::new::<Ft4>();
     let mut out: Vec<String> = Vec::new();
     for cand in &cands {
-        if let Some(text) = decode_candidate_with(&half, cand, &refs, produce)
+        if let Some(text) = decode_candidate_with(&half, cand, &refs, v)
             && !out.contains(&text)
         {
             out.push(text);

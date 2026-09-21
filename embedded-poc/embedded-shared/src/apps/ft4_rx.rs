@@ -42,7 +42,9 @@ use alloc::vec::Vec;
 use mfsk_core::engine::equalize::EqMode;
 use mfsk_core::engine::ft4_coarse::{ft4_coarse_sync_from_savg, Ft4SavgBuilder};
 use mfsk_core::engine::pipeline::{process_candidate_precomputed, DecodeDepth, DecodeStrictness};
-use mfsk_core::engine::sync2d::{Ft4CoarsePhasors, ft4_sync_search_window_with};
+use mfsk_core::engine::sync2d::{
+    Ft4CoarsePhasors, ft4_sync_search_window_binned, ft4_sync_search_window_with,
+};
 use mfsk_core::ft4::ddc::{SlotDecimator, candidate_baseband_boxcar, candidate_baseband_half};
 use mfsk_core::ft4::decode::FT4_DOWNSAMPLE;
 use mfsk_core::ft4::Ft4;
@@ -666,7 +668,18 @@ fn decode_candidate(
     rms_normalise(&mut cd0);
     let t_search = now_us();
     stage[0] += t_search - t_ddc;
-    let s2 = ft4_sync_search_window_with::<Ft4>(&cd0, cand, WSJTX_WINDOW.0, WSJTX_WINDOW.1, refs);
+    // `MFSK_FT4_BINNED_SEARCH=1` scores the coarse sweep over
+    // tone-demodulated bins: a quarter of the multiply-adds, and a
+    // different shape of loop. Whether a quarter of the arithmetic is
+    // a quarter of the time is exactly what the shipped path makes
+    // doubtful — it runs its dots through `dsps_dotprod_f32_aes3` at
+    // 2.18 cycles per multiply-add (§47), which a shorter, less
+    // predictably aligned inner product will not match.
+    let s2 = if option_env!("MFSK_FT4_BINNED_SEARCH").is_some() {
+        ft4_sync_search_window_binned::<Ft4>(&cd0, cand, WSJTX_WINDOW.0, WSJTX_WINDOW.1, refs)
+    } else {
+        ft4_sync_search_window_with::<Ft4>(&cd0, cand, WSJTX_WINDOW.0, WSJTX_WINDOW.1, refs)
+    };
     let t_tail = now_us();
     stage[1] += t_tail - t_search;
     let _tail = TailTimer { stage, t_tail };

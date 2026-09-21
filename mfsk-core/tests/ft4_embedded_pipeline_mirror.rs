@@ -406,8 +406,8 @@ fn what_a_boxcar_front_end_would_decode_on_the_golden() {
         return;
     };
 
-    let fir = rx::run_slot_with(&audio, rx::fir_producer);
-    let boxcar = rx::run_slot_with(&audio, rx::boxcar_producer);
+    let fir = rx::run_slot_with(&audio, rx::Variant::SHIPPED);
+    let boxcar = rx::run_slot_with(&audio, rx::Variant::BOXCAR);
 
     let mut only_fir: Vec<&String> = fir.iter().filter(|m| !boxcar.contains(m)).collect();
     let mut only_box: Vec<&String> = boxcar.iter().filter(|m| !fir.contains(m)).collect();
@@ -530,14 +530,17 @@ fn what_the_boxcar_front_end_saves_on_the_host() {
         timings.push((name, per_call));
     }
 
-    // And the whole slot, which is what the budget is spent in.
+    // And the whole slot, which is what the budget is spent in — for
+    // each half of the cheaper front end and for both together.
     let mut slots = Vec::new();
-    for (name, produce) in [
-        ("FIR 101+263", rx::fir_producer as rx::Producer),
-        ("boxcar /9", rx::boxcar_producer as rx::Producer),
+    for (name, v) in [
+        ("shipped", rx::Variant::SHIPPED),
+        ("boxcar", rx::Variant::BOXCAR),
+        ("binned search", rx::Variant::BINNED_SEARCH),
+        ("both", rx::Variant::BOTH),
     ] {
         let t0 = Instant::now();
-        let out = rx::run_slot_with(&audio, produce);
+        let out = rx::run_slot_with(&audio, v);
         slots.push((name, t0.elapsed().as_secs_f64() * 1e3, out.len()));
     }
 
@@ -550,12 +553,12 @@ fn what_the_boxcar_front_end_saves_on_the_host() {
         timings[0].1 / timings[1].1
     );
     for (name, ms, n) in &slots {
-        eprintln!("  whole slot {name:<13} {ms:>9.1} ms   {n} decodes");
+        eprintln!(
+            "  whole slot {name:<13} {ms:>9.1} ms   {n} decodes   {:>5.2}x",
+            slots[0].1 / ms
+        );
     }
-    eprintln!(
-        "  whole slot ratio         {:>9.2}x\n",
-        slots[0].1 / slots[1].1
-    );
+    eprintln!();
 }
 
 /// The constants above are a copy of `ft4_rx.rs`'s, and a copy rots.

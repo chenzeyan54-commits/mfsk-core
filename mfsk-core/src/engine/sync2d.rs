@@ -677,6 +677,11 @@ impl Ft4CoarsePhasors {
 /// The coarse `df` sweep, as `ft4_decode.f90` runs it: -12..=12 Hz in
 /// steps of 3. Named because [`Ft4CoarsePhasors`] has to visit exactly
 /// the same values in the same order.
+/// Δt step of the coarse sweep, in `cd0` samples. Also the bin width
+/// `ft4_sync_search_window_binned` uses, which is what makes its bins
+/// line up with the grid for free.
+const COARSE_DT_STEP: i32 = 4;
+
 const COARSE_DF_MIN: i32 = -12;
 const COARSE_DF_MAX: i32 = 12;
 const COARSE_DF_STEP: i32 = 3;
@@ -752,6 +757,44 @@ pub fn ft4_sync_search_window<P: Protocol>(
     ft4_sync_search_window_with::<P>(cd0, candidate, ib_min, ib_max, &refs)
 }
 
+/// Fill every Costas block's carrier-shifted reference for one `df`.
+///
+/// One table per `df`, then four `fill_with` from it: `fill`
+/// evaluates the phasor per sample and every block indexes it from
+/// zero, so filling four blocks used to evaluate the same 128
+/// `cos`/`sin` pairs four times.
+///
+/// At module scope because both FT4 coarse passes and the shared
+/// fine pass call it.
+fn twiddle_all<S: SyncPhasors>(
+    twiddled: &mut [(i32, FlatRef)],
+    flat_blocks: &[(i32, Vec<Complex<f32>>)],
+    scratch: &mut [Complex<f32>],
+    refs: &S,
+    df: f32,
+    ds_rate: f32,
+) {
+    // `fill_with` leaves the reference alone at `df == 0` — the
+    // same branch `fill` has — so that case needs no table.
+    let table: &[Complex<f32>] = if df.abs() < f32::EPSILON {
+        &[]
+    } else if let Some(t) = refs.table_for(df) {
+        t
+    } else {
+        // Exactly `fill`'s expression, which is what keeps this
+        // bit-identical to evaluating it inside the block loop.
+        let omega = 2.0 * PI * df / ds_rate;
+        for (k, slot) in scratch.iter_mut().enumerate() {
+            let p = omega * k as f32;
+            *slot = Complex::new(p.cos(), p.sin());
+        }
+        &scratch[..]
+    };
+    for ((_, dst), (_, src)) in twiddled.iter_mut().zip(flat_blocks.iter()) {
+        dst.fill_with(src, df, table);
+    }
+}
+
 /// [`ft4_sync_search_window`] against phasor tables the caller keeps
 /// across candidates.
 ///
@@ -782,7 +825,6 @@ pub fn ft4_sync_search_window_with<P: Protocol>(
     let d = SyncDims::of::<P>(12_000.0);
     let ds_spb = d.ds_spb;
     let ds_rate = d.ds_rate;
-    const COARSE_DT_STEP: i32 = 4;
 
     // Pre-built phase-continuous references, one per Costas block.
     let flat_blocks: Vec<(i32, Vec<Complex<f32>>)> = P::SYNC_MODE
@@ -826,13 +868,6 @@ pub fn ft4_sync_search_window_with<P: Protocol>(
         .map(|(off, flat)| (*off, FlatRef::with_len(flat.len())))
         .collect();
 
-    let score_flat = |twiddled: &Vec<(i32, FlatRef)>, i0: i32| -> f32 {
-        twiddled
-            .iter()
-            .map(|(off, flat)| score_flat_coherent(cd0, flat, i0 + off))
-            .sum::<f32>()
-    };
-
     // `FlatRef::fill` applies `e^{+j.2pi.df.n/ds_rate}` to the reference
     // and `score_flat_coherent` conjugates it, giving
     // `sum c[n].conj(r[n]).e^{-j.2pi.df.n/ds_rate}` — exactly the sign
@@ -872,34 +907,6 @@ pub fn ft4_sync_search_window_with<P: Protocol>(
     } else {
         &mut stack_scratch[..table_n]
     };
-    fn twiddle_all<S: SyncPhasors>(
-        twiddled: &mut [(i32, FlatRef)],
-        flat_blocks: &[(i32, Vec<Complex<f32>>)],
-        scratch: &mut [Complex<f32>],
-        refs: &S,
-        df: f32,
-        ds_rate: f32,
-    ) {
-        // `fill_with` leaves the reference alone at `df == 0` — the
-        // same branch `fill` has — so that case needs no table.
-        let table: &[Complex<f32>] = if df.abs() < f32::EPSILON {
-            &[]
-        } else if let Some(t) = refs.table_for(df) {
-            t
-        } else {
-            // Exactly `fill`'s expression, which is what keeps this
-            // bit-identical to evaluating it inside the block loop.
-            let omega = 2.0 * PI * df / ds_rate;
-            for (k, slot) in scratch.iter_mut().enumerate() {
-                let p = omega * k as f32;
-                *slot = Complex::new(p.cos(), p.sin());
-            }
-            &scratch[..]
-        };
-        for ((_, dst), (_, src)) in twiddled.iter_mut().zip(flat_blocks.iter()) {
-            dst.fill_with(src, df, table);
-        }
-    }
 
     let mut best_df = 0.0f32;
     let mut best_i0 = ((candidate.dt_sec + P::TX_START_OFFSET_S) * ds_rate).round() as i32;
@@ -942,16 +949,244 @@ pub fn ft4_sync_search_window_with<P: Protocol>(
     }
 
     // Fine pass around the coarse winner.
-    let coarse_winner_df = best_df;
-    let coarse_winner_i0 = best_i0;
-    best_score = f32::NEG_INFINITY;
+    let (best_score, best_df, best_i0) = ft4_fine_pass::<P>(
+        cd0,
+        &flat_blocks,
+        &mut twiddled,
+        scratch,
+        refs,
+        ds_rate,
+        best_df,
+        best_i0,
+    );
 
+    Sync2dResult {
+        freq_hz: candidate.freq_hz + best_df,
+        i0: best_i0,
+        score: best_score,
+    }
+}
+
+/// **Experimental**: the coarse sweep over tone-demodulated bins.
+///
+/// Off by default; `ft4_rx` selects it with `MFSK_FT4_BINNED_SEARCH`.
+/// It exists to measure the trade, not as a recommendation.
+///
+/// ## What it does differently
+///
+/// [`ft4_sync_search_window_with`] scores a cell by correlating every
+/// one of a Costas block's `4 * ds_spb` samples against a reference —
+/// 512 complex multiply-adds a cell for FT4, 3 060 cells in the coarse
+/// sweep. The reference is a tone times a carrier offset, and the tone
+/// part is the fast one, so demodulating by it *first* leaves a
+/// residual that barely turns inside four samples:
+/// `2*pi * 12 Hz * 4 / 666.667 = 0.45 rad` at the widest `df` the
+/// sweep visits, and exactly zero at the winning one.
+///
+/// So this demodulates `cd0` by each tone on the absolute sample grid,
+/// sums the result in fours, and scores from those bins. The coarse
+/// grid steps `i0` by `COARSE_DT_STEP` = 4 and every Costas block
+/// starts at a multiple of `ds_spb`, so a bin never straddles a cell
+/// boundary and the same bins serve every `i0`. A cell becomes
+/// `4 blocks * 4 symbols * 8 bins` = **128 complex multiply-adds**
+/// plus 16 per-symbol constants, against 512.
+///
+/// The per-symbol constant is what makes the demodulation legal:
+/// writing `n` for the absolute sample and `start` for the block's
+/// position, `exp(-j2*pi*t*(n - start - k*ds_spb)/ds_spb)` factors
+/// into `exp(-j2*pi*t*n/ds_spb)` — which is the demodulation, free of
+/// `start` — times `exp(+j2*pi*t*start/ds_spb)`, which depends only on
+/// `start mod ds_spb`, i.e. on `i0 mod ds_spb`, i.e. on one of eight
+/// values. `k*ds_spb` drops out because `t*k` is an integer.
+///
+/// ## What it approximates
+///
+/// One thing only: the carrier-offset twiddle is applied at each bin's
+/// centre rather than per sample. Over four samples at 12 Hz that is
+/// +-0.22 rad at the edges, ~0.07 dB of coherent loss at the widest
+/// `df` and none at the winner.
+///
+/// The fine pass is **not** binned — it steps `i0` by one, so nothing
+/// lines up — and runs `ft4_fine_pass` exactly as the shipped search
+/// does. The refined position this returns is therefore produced by
+/// the same code either way; only which cell the fine pass is centred
+/// on can differ.
+pub fn ft4_sync_search_window_binned<P: Protocol>(
+    cd0: &[Complex<f32>],
+    candidate: &SyncCandidate,
+    ib_min: i32,
+    ib_max: i32,
+    refs: &P::SyncPhasors,
+) -> Sync2dResult {
+    const BIN: usize = COARSE_DT_STEP as usize;
+
+    let aligned = AlignedCd0::new(cd0);
+    let cd0 = aligned.get(cd0);
+
+    let d = SyncDims::of::<P>(12_000.0);
+    let ds_spb = d.ds_spb;
+    let ds_rate = d.ds_rate;
+    let ntones = P::NTONES as usize;
+    let blocks = P::SYNC_MODE.blocks();
+
+    // Needed twice: for each symbol's start phase here, and by the
+    // fine pass below.
+    let flat_blocks: Vec<(i32, Vec<Complex<f32>>)> = blocks
+        .iter()
+        .map(|b| {
+            let off = b.start_symbol as i32 * ds_spb as i32;
+            (off, cached_costas_ref_continuous(b.pattern, ds_spb))
+        })
+        .collect();
+
+    // One binned, tone-demodulated copy of `cd0` per tone. `ntones *
+    // cd0.len() / BIN` complex — the same size as `cd0` itself for
+    // FT4, since `ntones == BIN`.
+    let nbins = cd0.len() / BIN;
+    let mut binned: Vec<Complex<f32>> = alloc::vec![Complex::new(0.0f32, 0.0); ntones * nbins];
+    for t in 0..ntones {
+        // `exp(-j2*pi*t*n/ds_spb)` repeats every `ds_spb` samples.
+        let tp: Vec<Complex<f32>> = (0..ds_spb)
+            .map(|n| {
+                let a = -2.0 * PI * t as f32 * n as f32 / ds_spb as f32;
+                Complex::new(a.cos(), a.sin())
+            })
+            .collect();
+        let dst = &mut binned[t * nbins..(t + 1) * nbins];
+        for (j, slot) in dst.iter_mut().enumerate() {
+            let base = j * BIN;
+            let mut acc = Complex::new(0.0f32, 0.0);
+            for n in base..base + BIN {
+                acc += cd0[n] * tp[n % ds_spb];
+            }
+            *slot = acc;
+        }
+    }
+
+    // `exp(+j2*pi*t*p/ds_spb)` for the eight `p = i0 mod ds_spb` the
+    // coarse grid can produce.
+    let nph = ds_spb / BIN;
+    let tf: Vec<Complex<f32>> = (0..ntones)
+        .flat_map(|t| {
+            (0..nph).map(move |pi| {
+                let a = 2.0 * PI * t as f32 * (pi * BIN) as f32 / ds_spb as f32;
+                Complex::new(a.cos(), a.sin())
+            })
+        })
+        .collect();
+
+    let nsym = blocks[0].pattern.len();
+    let bins_per_sym = ds_spb / BIN;
+    let bins_per_block = nsym * bins_per_sym;
+    let block_len = (nsym * ds_spb) as i32;
+    let np = cd0.len() as i32;
+
+    let mut twb: Vec<Complex<f32>> = alloc::vec![Complex::new(0.0f32, 0.0); bins_per_block];
+    let mut best_df = 0.0f32;
+    let mut best_i0 = ((candidate.dt_sec + P::TX_START_OFFSET_S) * ds_rate).round() as i32;
+    let mut best_score = f32::NEG_INFINITY;
+
+    let mut idf = COARSE_DF_MIN;
+    while idf <= COARSE_DF_MAX {
+        let df = idf as f32;
+        let omega = 2.0 * PI * df / ds_rate;
+        for (i, slot) in twb.iter_mut().enumerate() {
+            // Conjugated, at the bin's centre.
+            let a = -omega * ((i * BIN) as f32 + (BIN as f32 - 1.0) * 0.5);
+            *slot = Complex::new(a.cos(), a.sin());
+        }
+        let mut i0 = ib_min;
+        while i0 <= ib_max {
+            let p_idx = (i0.rem_euclid(ds_spb as i32) as usize) / BIN;
+            let mut total = 0.0f32;
+            for (bi, b) in blocks.iter().enumerate() {
+                let start = i0 + flat_blocks[bi].0;
+                // `score_flat_coherent` scores an out-of-range window
+                // as zero; so does this.
+                if start < 0 || start + block_len > np {
+                    continue;
+                }
+                let mut acc = Complex::new(0.0f32, 0.0);
+                for k in 0..nsym {
+                    let t = b.pattern[k] as usize;
+                    let c = flat_blocks[bi].1[k * ds_spb].conj() * tf[t * nph + p_idx];
+                    let base = (start as usize + k * ds_spb) / BIN;
+                    let row = &binned[t * nbins..];
+                    let mut sacc = Complex::new(0.0f32, 0.0);
+                    for j in 0..bins_per_sym {
+                        sacc += row[base + j] * twb[k * bins_per_sym + j];
+                    }
+                    acc += c * sacc;
+                }
+                total += acc.norm_sqr();
+            }
+            if total > best_score {
+                best_score = total;
+                best_df = df;
+                best_i0 = i0;
+            }
+            i0 += COARSE_DT_STEP;
+        }
+        idf += COARSE_DF_STEP;
+    }
+
+    // Fine pass, exact and shared.
+    let mut twiddled: Vec<(i32, FlatRef)> = flat_blocks
+        .iter()
+        .map(|(off, flat)| (*off, FlatRef::with_len(flat.len())))
+        .collect();
+    let table_n = flat_blocks.iter().map(|(_, b)| b.len()).max().unwrap_or(0);
+    let mut scratch: Vec<Complex<f32>> = alloc::vec![Complex::new(0.0f32, 0.0); table_n];
+    let (best_score, best_df, best_i0) = ft4_fine_pass::<P>(
+        cd0,
+        &flat_blocks,
+        &mut twiddled,
+        &mut scratch,
+        refs,
+        ds_rate,
+        best_df,
+        best_i0,
+    );
+
+    Sync2dResult {
+        freq_hz: candidate.freq_hz + best_df,
+        i0: best_i0,
+        score: best_score,
+    }
+}
+
+/// The exact +-4 Hz / +-5 sample refinement both FT4 coarse passes end
+/// with, extracted so the binned one can share it rather than carry a
+/// second copy. Bit-identical to what it replaced: same loop bounds,
+/// same order, same `score_flat_coherent`.
+///
+/// Takes the already-built references rather than building its own —
+/// `cached_costas_ref_continuous` is uncached on `no_std`, so a second
+/// build would be four allocations and four trig sweeps per candidate
+/// on the board.
+#[allow(clippy::too_many_arguments)]
+fn ft4_fine_pass<P: Protocol>(
+    cd0: &[Complex<f32>],
+    flat_blocks: &[(i32, Vec<Complex<f32>>)],
+    twiddled: &mut [(i32, FlatRef)],
+    scratch: &mut [Complex<f32>],
+    refs: &P::SyncPhasors,
+    ds_rate: f32,
+    coarse_df: f32,
+    coarse_i0: i32,
+) -> (f32, f32, i32) {
+    let mut best_score = f32::NEG_INFINITY;
+    let mut best_df = coarse_df;
+    let mut best_i0 = coarse_i0;
     for si in -4i32..=4 {
-        let df = coarse_winner_df + si as f32;
-        twiddle_all(&mut twiddled, &flat_blocks, scratch, refs, df, ds_rate);
+        let df = coarse_df + si as f32;
+        twiddle_all(twiddled, flat_blocks, scratch, refs, df, ds_rate);
         for di in -5i32..=5 {
-            let i0 = coarse_winner_i0 + di;
-            let s = score_flat(&twiddled, i0);
+            let i0 = coarse_i0 + di;
+            let s = twiddled
+                .iter()
+                .map(|(off, flat)| score_flat_coherent(cd0, flat, i0 + off))
+                .sum::<f32>();
             if s > best_score {
                 best_score = s;
                 best_df = df;
@@ -959,12 +1194,7 @@ pub fn ft4_sync_search_window_with<P: Protocol>(
             }
         }
     }
-
-    Sync2dResult {
-        freq_hz: candidate.freq_hz + best_df,
-        i0: best_i0,
-        score: best_score,
-    }
+    (best_score, best_df, best_i0)
 }
 
 /// Apply a complex-phasor freq shift to `cd0`. Used by callers that
