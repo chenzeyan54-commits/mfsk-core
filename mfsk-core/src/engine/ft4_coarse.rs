@@ -323,6 +323,33 @@ impl Ft4SavgBuilder {
         on_row(row_pow);
     }
 
+    /// The periodogram averaged over the rows accumulated **so far**,
+    /// leaving the builder running.
+    ///
+    /// What a receiver reads a *provisional* candidate list off, before
+    /// the capture window has closed, so each candidate's baseband can
+    /// start building during capture instead of after it. Measured on
+    /// the WSJT-X golden (`ft4_embedded_pipeline_mirror`'s
+    /// `how_early_the_candidate_list_is_known`): at 5.5 s the
+    /// provisional list is already the final one.
+    ///
+    /// Equal to [`Self::finish`] once every row is in; before that it
+    /// averages whatever rows have completed, which is the same set a
+    /// fresh builder over the samples seen so far would hold, give or
+    /// take the row still being filled. The coarse stage normalises by
+    /// a fitted baseline, so the row count only matters through which
+    /// rows are in, not through the scale.
+    pub fn snapshot(&self) -> Vec<f32> {
+        let mut out = self.savg.clone();
+        if self.count > 0 {
+            let inv = 1.0 / self.count as f32;
+            for s in out.iter_mut() {
+                *s *= inv;
+            }
+        }
+        out
+    }
+
     /// The averaged periodogram. Identical to `symbol_spectra_avg`
     /// over the same samples.
     pub fn finish(mut self) -> Vec<f32> {
@@ -508,6 +535,40 @@ mod tests {
             for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
                 assert_eq!(g.to_bits(), w.to_bits(), "chunk {chunk}, bin {i}");
             }
+        }
+    }
+
+    /// `snapshot` reads the running average without disturbing it.
+    ///
+    /// A receiver takes a provisional candidate list mid-capture and
+    /// keeps feeding the same builder, so the snapshot must neither
+    /// consume nor perturb it: the builder's eventual `finish` has to be
+    /// bit-identical to one that was never snapshotted, and a snapshot
+    /// taken after the last row has to *be* that result.
+    #[test]
+    fn ft4_savg_snapshot_leaves_the_builder_alone() {
+        let audio = tone_slot();
+        let mut plain = Ft4SavgBuilder::new(audio.len());
+        let mut peeked = Ft4SavgBuilder::new(audio.len());
+        for c in audio.chunks(1_024) {
+            plain.push(c);
+            peeked.push(c);
+            let _ = peeked.snapshot();
+        }
+        let last = peeked.snapshot();
+        let a = plain.finish();
+        let b = peeked.finish();
+        for (i, ((x, y), z)) in a.iter().zip(b.iter()).zip(last.iter()).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "bin {i}: snapshot perturbed the builder"
+            );
+            assert_eq!(
+                x.to_bits(),
+                z.to_bits(),
+                "bin {i}: a full snapshot is not finish()"
+            );
         }
     }
 

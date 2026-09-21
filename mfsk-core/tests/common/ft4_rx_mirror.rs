@@ -238,9 +238,22 @@ pub fn decode_candidate_with(
     } else {
         cand
     };
-    let mut cd0 = (v.produce)(half, cand.freq_hz);
+    let cd0 = (v.produce)(half, cand.freq_hz);
+    decode_from_cd0(cd0, cand, refs, v.binned_search)
+}
+
+/// The part of a candidate's decode that comes after its baseband:
+/// normalise, Δt/Δf search, LLR, BP, unpack. Split out so a caller that
+/// built the baseband some other way — during capture, say — runs the
+/// rest through the same code.
+pub fn decode_from_cd0(
+    mut cd0: Vec<Complex<f32>>,
+    cand: &SyncCandidate,
+    refs: &Ft4CoarsePhasors,
+    binned_search: bool,
+) -> Option<String> {
     rms_normalise(&mut cd0);
-    let s2 = if v.binned_search {
+    let s2 = if binned_search {
         mfsk_core::engine::sync2d::ft4_sync_search_window_binned::<Ft4>(
             &cd0,
             cand,
@@ -291,4 +304,135 @@ pub fn run_slot_with(audio: &[i16], v: Variant) -> Vec<String> {
         }
     }
     out
+}
+
+/// The sample at which a Costas block's last symbol has arrived, for a
+/// frame at nominal timing (DT = 0: first active symbol at
+/// `TX_START_OFFSET_S`). `block` is 0..=3; 3 is the frame's last
+/// active symbol.
+///
+/// Derived from the protocol rather than chosen: the periodogram the
+/// coarse stage reads is a sum over a frame's tones, so a candidate's
+/// peak is settled once its frame has arrived. For block 3 that is
+/// `0.5 + 103 x 576 / 12 000` = 5.444 s. A station with positive DT
+/// finishes later and simply falls to the build-after-close path.
+pub fn costas_block_end_samples(block: usize) -> usize {
+    use mfsk_core::engine::{FrameLayout, ModulationParams};
+    let b = &Ft4::SYNC_MODE.blocks()[block];
+    let end_symbol = b.start_symbol as usize + b.pattern.len();
+    (Ft4::TX_START_OFFSET_S * 12_000.0) as usize + end_symbol * Ft4::NSPS as usize
+}
+
+/// When the pipelined receiver reads its provisional list: the last
+/// active symbol of a nominally-timed frame (Costas block D's end).
+pub fn provisional_samples() -> usize {
+    costas_block_end_samples(3)
+}
+
+/// What the pipelined receiver did with its early basebands.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PipelineStats {
+    /// Final candidates whose baseband was already built during capture.
+    pub reused: usize,
+    /// Final candidates with no provisional match, built after the close.
+    pub fresh: usize,
+    /// Provisional basebands the final list did not ask for.
+    pub wasted: usize,
+}
+
+/// The receiver with its per-candidate DDC moved into capture time.
+///
+/// At `prov_samples` a provisional candidate list is read off the
+/// running periodogram (`Ft4SavgBuilder::snapshot`) and a streaming
+/// `CandidateDdc` starts for each — at the **snapped** carrier, so the
+/// final list can share it — fed the half-rate backlog and then every
+/// block as it arrives. At the close the final list takes a matching
+/// baseband by bin, or builds one as today if the provisional list
+/// missed it.
+///
+/// Must decode exactly what [`Variant::SNAPPED`] decodes: the carrier
+/// is the same snapped value either way, and `FirStage` is
+/// block-independent, so feeding the backlog and then the tail is the
+/// same filter over the same samples as feeding them at once.
+pub fn run_slot_pipelined(audio: &[i16], prov_samples: usize) -> (Vec<String>, PipelineStats) {
+    use mfsk_core::ft4::ddc::{CD0_LEN, CandidateDdc};
+
+    let bin_of = |f: f32| (f / COARSE_BIN_HZ).round() as i32;
+    let close = CAPTURE_CLOSE_SAMPLES.min(audio.len());
+
+    let mut savg = Ft4SavgBuilder::new(CAPTURE_CLOSE_SAMPLES);
+    let mut decim = SlotDecimator::new();
+    let mut half: Vec<f32> = Vec::with_capacity(CAPTURE_CLOSE_SAMPLES / 2 + 64);
+    /// One baseband being built during capture.
+    struct Pipe {
+        bin: i32,
+        ddc: CandidateDdc,
+        out: Vec<Complex<f32>>,
+        /// Half-rate samples already fed.
+        fed: usize,
+    }
+    let mut pipes: Vec<Pipe> = Vec::new();
+    let mut started = false;
+
+    let mut fed = 0usize;
+    while fed < close {
+        let take = BLOCK.min(close - fed);
+        let block = &audio[fed..fed + take];
+        savg.push_with_rows(block, &mut |_row| {});
+        decim.push_i16(block, &mut half);
+        fed += take;
+
+        if !started && fed >= prov_samples {
+            started = true;
+            for c in coarse(&savg.snapshot()) {
+                let f = snap_to_bin(c.freq_hz);
+                let b = bin_of(f);
+                if pipes.iter().any(|p| p.bin == b) {
+                    continue;
+                }
+                pipes.push(Pipe {
+                    bin: b,
+                    ddc: CandidateDdc::new_half_rate(f),
+                    out: Vec::with_capacity(CD0_LEN),
+                    fed: 0,
+                });
+            }
+        }
+        for p in pipes.iter_mut() {
+            p.ddc.push_f32(&half[p.fed..], &mut p.out);
+            p.fed = half.len();
+        }
+    }
+
+    let finals = coarse(&savg.finish());
+    let refs = Ft4CoarsePhasors::new::<Ft4>();
+    let mut stats = PipelineStats::default();
+    let mut used = vec![false; pipes.len()];
+    let mut messages: Vec<String> = Vec::new();
+    for cand in &finals {
+        let f = snap_to_bin(cand.freq_hz);
+        let snapped = SyncCandidate {
+            freq_hz: f,
+            ..*cand
+        };
+        let cd0 = if let Some(k) = pipes.iter().position(|p| p.bin == bin_of(f)) {
+            used[k] = true;
+            stats.reused += 1;
+            let p = &mut pipes[k];
+            let mut cd0 = core::mem::take(&mut p.out);
+            p.ddc.flush_to(CD0_LEN, &mut cd0);
+            cd0.resize(CD0_LEN, Complex::new(0.0, 0.0));
+            cd0
+        } else {
+            stats.fresh += 1;
+            candidate_baseband_half(&half, f)
+        };
+        if let Some(text) = decode_from_cd0(cd0, &snapped, &refs, false)
+            && !messages.contains(&text)
+        {
+            messages.push(text);
+        }
+    }
+    stats.wasted = used.iter().filter(|u| !**u).count();
+    (messages, stats)
 }

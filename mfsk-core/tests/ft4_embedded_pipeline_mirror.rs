@@ -634,11 +634,20 @@ fn how_early_the_candidate_list_is_known() {
         decoding.len()
     );
     eprintln!(
-        "  {:>7} {:>6} {:>12} {:>14} {:>10}",
-        "at (s)", "prov", "finals held", "decoders held", "spurious"
+        "  {:<14} {:>7} {:>6} {:>12} {:>14} {:>10}",
+        "at", "", "prov", "finals held", "decoders held", "spurious"
     );
-    for tenths in [30, 35, 40, 45, 50, 55, 60, 65] {
-        let n = (tenths as usize * 1_200).min(rx::CAPTURE_CLOSE_SAMPLES);
+    // At each Costas block's end for a nominally-timed frame, then the
+    // close — protocol-defined points rather than round seconds.
+    let points: Vec<(&str, usize)> = vec![
+        ("Costas A end", rx::costas_block_end_samples(0)),
+        ("Costas B end", rx::costas_block_end_samples(1)),
+        ("Costas C end", rx::costas_block_end_samples(2)),
+        ("Costas D end", rx::costas_block_end_samples(3)),
+        ("capture close", rx::CAPTURE_CLOSE_SAMPLES),
+    ];
+    for (name, n) in points {
+        let n = n.min(rx::CAPTURE_CLOSE_SAMPLES);
         let mut b = mfsk_core::engine::ft4_coarse::Ft4SavgBuilder::new(n);
         let mut fed = 0usize;
         while fed < n {
@@ -654,8 +663,8 @@ fn how_early_the_candidate_list_is_known() {
         let held_dec = decoding.iter().filter(|b| prov.contains(b)).count();
         let spurious = prov.iter().filter(|b| !final_bins.contains(b)).count();
         eprintln!(
-            "  {:>7.1} {:>6} {:>7}/{:<4} {:>9}/{:<4} {:>10}",
-            tenths as f32 / 10.0,
+            "  {name:<14} {:>5.3} s {:>6} {:>7}/{:<4} {:>9}/{:<4} {:>10}",
+            n as f32 / 12_000.0,
             prov.len(),
             held,
             final_bins.len(),
@@ -663,6 +672,47 @@ fn how_early_the_candidate_list_is_known() {
             decoding.len(),
             spurious
         );
+    }
+    eprintln!();
+}
+
+/// The pipelined receiver decodes exactly what the snapped one does.
+///
+/// Building each baseband during capture is only a scheduling change
+/// if it is bit-identical: same snapped carrier, same samples, and
+/// `FirStage`'s block independence doing the rest. This is the
+/// assertion that makes it one, across provisional times from early
+/// (where the provisional list misses a candidate and the close has to
+/// build it) to late (where it is already the final list).
+#[test]
+fn pipelined_ddc_decodes_exactly_what_the_snapped_receiver_does() {
+    let Some(audio) = slot_audio() else {
+        assert!(
+            !require_corpus(),
+            "MFSK_REQUIRE_CORPUS=1 but the golden is missing"
+        );
+        return;
+    };
+    let mut want = rx::run_slot_with(&audio, rx::Variant::SNAPPED);
+    want.sort();
+    eprintln!("\nft4 golden, DDC moved into capture time:");
+    for (name, n) in [
+        ("Costas B end", rx::costas_block_end_samples(1)),
+        ("Costas C end", rx::costas_block_end_samples(2)),
+        ("Costas D end (shipped)", rx::provisional_samples()),
+    ] {
+        let (mut got, st) = rx::run_slot_pipelined(&audio, n);
+        got.sort();
+        eprintln!(
+            "  {name:<24} {:.3} s: reused {:>2}, built after close {:>2}, \
+             wasted {:>2}, decodes {}",
+            n as f32 / 12_000.0,
+            st.reused,
+            st.fresh,
+            st.wasted,
+            got.len()
+        );
+        assert_eq!(got, want, "provisional at {name} changed the decodes");
     }
     eprintln!();
 }
