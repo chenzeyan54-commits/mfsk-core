@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.11.1 — FT4 filters phantoms by default (#383), one boot sequence for the CoreS3's four receivers, WiFi becomes a setting of its own (#381)
+## 0.11.1 — FT4 filters phantoms by default (#383), FT4 on the CoreS3 answers by the reply deadline, one screen for every mode, one boot sequence for the CoreS3's four receivers, WiFi becomes a setting of its own (#381)
 
 - **CoreS3: the four receivers share one boot sequence
   (`boot::Receiver`).** This crate carried four `main`s: one per app,
@@ -158,6 +158,159 @@
   caller asks for a policy. Whether FT4 *should* default to the codec
   verdict — it has FT8's CRC-14 and `SupportsSicRounds`, which is the
   reason FT8 does — is a measurement nobody has run.
+
+
+- **Breaking, for code that implements `Protocol` or calls the Δt
+  search directly: `Protocol::SyncPhasors`.** The Δt search's
+  precomputed phasor tables used to reach it as
+  `Option<&Ft4CoarsePhasors>` through a second entry point — one
+  protocol's concrete type in a signature every protocol shares, and a
+  fine pass that could not use the tables at all, since an argument
+  cannot answer for a `df` the caller has not reached yet (it rebuilt
+  nine `df` from `cos`/`sin` four times each). They are now an
+  associated type: `Ft4` holds `Ft4CoarsePhasors`, every other protocol
+  `()`, which answers every lookup with "build it" — what they all did
+  before. **An out-of-tree `Protocol` impl needs
+  `type SyncPhasors = ();`**, and `ft4_sync_search_window_with` takes
+  `&P::SyncPhasors` where it took the `Option`. Decodes are unchanged
+  (tier A+B).
+
+- **FT4 per-candidate cost, found by instrumenting the board rather
+  than the bench.** `ft4-bench`'s LLR/BP probe had attributed its whole
+  "rest" to BP (`FT4_BENCHMARK.md` §38: "87 % is BP"). Timed in place on
+  a CoreS3, more than half of it was `freq_shift_cd0` — 13.6 ms of a
+  23.5 ms tail, evaluating `cos`/`sin` per sample and allocating its
+  output every call. It now writes into a caller's buffer
+  (`freq_shift_cd0_into`) through `engine::dsp::ddc::Mixer`, the NCO
+  every other rotation in the crate already used. Beside it, all
+  bit-identical and measured on the new FT4 host mirror
+  (`tests/ft4_embedded_pipeline_mirror.rs`, which reproduces the board's
+  12 candidates and 11 decodes call for call and counts allocations):
+  `fine_sync_power_per_block` lends its Costas reference instead of
+  cloning it on every cache hit (42 allocations a candidate → 0; the
+  cache now also hits for FT4's four distinct patterns),
+  `build_group_amplitudes` writes into reused storage
+  (`compute_llr_fast` 94 allocations → 8), `SlotDecimator` owns its
+  staging chunk (−317 allocations and −1.30 MB a slot on the capture
+  side), and `ft4::ddc` sizes each FIR stage's history margin to stay
+  under the CoreS3's 2 KB internal-DRAM threshold.
+
+  Two cheaper front ends were built behind knobs and measured losing,
+  and are kept for the record: `candidate_baseband_boxcar`
+  (`MFSK_FT4_BOXCAR`; 4.4x faster DDC on the board, 0.29-0.50 dB of
+  threshold and one of the golden's eleven decodes) and
+  `ft4_sync_search_window_binned` (`MFSK_FT4_BINNED_SEARCH`; a quarter of
+  the multiply-adds, no faster on the board, where the shipped dot
+  product already runs on esp-dsp's PIE path).
+
+- **FT4 on the CoreS3 answers by the reply deadline: 11 of 11 golden
+  decodes inside 1 025 ms.** The deadline is the moment this station's
+  audio must start — WSJT-X's FT4 modulator starts at the boundary +
+  300 ms (`Modulator.cpp:74`), and the board keys the IC-705 by VOX on
+  its USB audio, so the message has to exist then and not before
+  (`EMBEDDED.md`, "FT4: the reply is due when the audio starts").
+  `TX_TURNAROUND_BUDGET_MS` is now `REPLY_DEADLINE_MS`, 1 025 ms after
+  capture close; it was 1 225, which put the audio at 8.0 s and the
+  frame ~200 ms late at the other end. Decodes that land later are still
+  kept for the screen.
+
+  What made it fit is moving work into capture time, on both cores,
+  with nothing about the decode changed. At Costas block D's end
+  (5.444 s into the window) the receiver reads a provisional candidate
+  list from a snapshot of the running periodogram
+  (`Ft4SavgBuilder::snapshot`), snaps each carrier to its bin, and
+  streams the half-rate audio into one `CandidateDdc` per carrier as it
+  arrives — bit-identical to building it after the close, because every
+  `FirStage` carries its own history. The coarse Δt/Δf sweep runs
+  alongside it (`engine::sync2d::Ft4CoarseSweep` / `Ft4SweepScratch`):
+  a cell's score is four Costas-block correlations, each readable the
+  moment its 128 samples exist, and on a 5.04 s frame every cell of the
+  ±1.0 s window is readable before the close. At the close only each
+  baseband's last few percent and flush, the rest of the sweep and the
+  fine pass remain. On the golden every candidate's search result is
+  bit-identical to the one-shot search, score included, at any chunking.
+  Buffers held across the capture are allocated just over the 2 KB
+  threshold (`CandidateDdc::new_half_rate_with_min_alloc`,
+  `FirStage::new_with_min_alloc`) so twelve of them do not sit in
+  internal DRAM; the host mirror's small-allocation peak falls from
+  31 536 B to 24 517 B.
+
+  CoreS3 SIM, golden slot: the candidate loop ends at ~700-790 ms
+  (from 1 300-1 600), with 11 of 11 decodes by 1 025 ms.
+
+- **docs.rs builds `full`, and the release job waits for crates.io and
+  docs.rs.** docs.rs built with `all-features`, which enables the
+  mutually exclusive `wspr-ddc` / `wspr-ddc-cascade` pair and stops at
+  their `compile_error!` — so 0.10.0, 0.10.1 and 0.11.0 published with
+  no documentation, and nothing said so. `[package.metadata.docs.rs]`
+  now lists `features = ["full"]`, and `release.yml` ends only once
+  crates.io serves the new version and docs.rs reports its build — the
+  first release to exercise that is this one.
+
+- **CoreS3: one screen for every mode.** WSPR and FST4 had spot-list
+  screens of their own; every mode now shows FT8's panel — status bar,
+  waterfall, station list, link bar, menu — and five `mfsk-app-shared`
+  spot-list modules and `spot_panel.rs` are gone. Where a mode's decode
+  holds core 0 (WSPR, FST4) the panel runs on a core-1 PSRAM-stack task
+  (`display::spawn_log_panel`), so its menu commits now go through the
+  PSRAM-safe `commit_and_restart` helpers.
+
+  The waterfall is drawn from the audio, the same way in every mode
+  (`embedded_shared::waterfall` + `waterfall_feed`): the audio paths
+  append to a ring without ever blocking, and the panel builds rows on
+  esp-dsp — a real 2 048-point transform as 1 024 complex points through
+  the radix-4 PIE kernel and `dsps_cplx2real_fc32` — 6 rows a second over
+  200-3 000 Hz (FT8's decode band; its old rows stopped at 2 700). Slot
+  rules come from the clock at the mode's period
+  (`BootMode::slot_period_ms`). FT8's stage-1 row queue and its
+  `wf_drain` task are gone, as are FT4's periodogram rows.
+
+  The station list has one entry point, `UiState::publish_slot`, and
+  the panel decides which rows are green: heard within one slot period,
+  by the row's own time (`decoded_current_iter`, `render_in_flags`).
+  Receivers no longer keep a watermark — FT4, WSPR and FST4 never moved
+  it, so their new stations were never highlighted. The StickS3 and
+  Core2 keep the watermark path unchanged.
+
+- **CoreS3: the panel no longer stops for an FT8 decode.** It ran at
+  `main`'s priority 1 and stood still 1.2-1.4 s every FT8 slot. Running
+  it above the decode was unaffordable as it was — 16-19 % of core 0,
+  measured with FreeRTOS run-time counters, which this adds
+  (`CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS`, a `[cpu]` line every
+  10 s). What made it cheap: SPI2 with DMA and interrupt-driven
+  transfers (esp-idf-hal's defaults, no DMA and `polling: true`, spin
+  the task through every byte), the waterfall sent as 4-row RGB565
+  blocks instead of `fill_contiguous`'s per-pixel iterator (~375 SPI
+  transactions a redraw), the status and link bars drawn only when
+  their content changes (126-178 → 23-31 ms/s), and 6 frames a second.
+  `display::PANEL_PRIORITY` (7) then applies in FT8 mode: 7 decodes, 6
+  in time, 0 cut with the panel at 1 or at 7 on FT8 SIM, longest frame
+  gap 1.2-1.4 s → 0.18-0.35 s. **FT4's panel stays at 1**: its reply
+  deadline is the tight one, and above the decode the panel cost it
+  ~200 ms of loop end.
+
+- **CoreS3: clock and grid fixes found on the way.**
+  - The RTC read and write-back ran in the panel at priority 1, below
+    the decoders, and place a clock edge by polling; a preemption
+    between the two halves put the edge late by its length. FT4 boots
+    measured 0.9-3.1 s of NTP correction, FST4 ones none. Both now run
+    at priority 7 for their duration, and the read sets the tick plus
+    the time since the tick was seen. After the fix: tick seen 11-15 µs
+    before the clock is set, STOP released 265-407 µs after the
+    boundary, and the next boot within ±50 ms of NTP.
+  - FT4 stopped steering its grid from decode DTs: the DT-median trim
+    and the clock re-anchor pulled opposite ways and fired on every
+    slot. `observe_slot_phase` stays as a readout.
+  - The live grid phase is persisted every 20 slots while the air owns
+    the grid, so FT4 inherits a fresh one from FT8; it used to be written
+    only by a cold acquisition.
+  - The esp-dsp FFT keeps one twiddle table per length, built once and
+    never rewritten, so no transform holds a lock across its body.
+  - The SIM harness feeds the real sink, aligns to the clock the
+    receiver will use (not a stale one surviving the reset), and
+    re-aligns at every pass so an NTP step no longer strands it.
+    Measurement knobs: `MFSK_CORES3_FORCE_GRID`, `MFSK_SIM_CLOCK_STEP_MS`,
+    `MFSK_WF_FEED_OFF`, `MFSK_FT4_SINGLE_CORE`.
 
 ## 0.11.0 — a new C ABI for every mode (breaking), FT4/FST4 a-priori decoding fixed (−1.1 dB AWGN), the sniper becomes FT8-only (breaking), a caller-supplied decode budget, `mfsk-ffi-ft8` retired, the CoreS3 FT8 receiver holds its slot grid and stops starving its own internal DRAM
 
