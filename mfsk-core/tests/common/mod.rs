@@ -5,6 +5,12 @@
 pub mod air_channel;
 pub mod channel;
 pub mod corpus;
+// The CoreS3 FT4 receiver reproduced on the host. Gated the way it
+// compiles: `ft4` for the protocol, and one FFT backend because
+// `engine::sync2d` needs one.
+#[allow(dead_code)]
+#[cfg(all(feature = "ft4", any(feature = "fft-rustfft", feature = "fft-extern")))]
+pub mod ft4_rx_mirror;
 // FT8-specific (qso3_busy.wav golden reference shared across
 // tests/ft8_qso3_*.rs) but lives alongside the other shared fixtures
 // rather than duplicated per file — see its own module doc for why.
