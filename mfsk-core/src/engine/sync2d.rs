@@ -311,7 +311,7 @@ impl AlignedCd0 {
             return Self { store: None };
         }
         let n2 = cd0.len() * 2;
-        let mut a = AlignedF32::new(n2);
+        let mut a = AlignedF32::with_min_alloc(n2, 0);
         // SAFETY: `Complex<f32>` is `repr(C)` over two `f32`, so this
         // is exactly the interleaved view of the same samples.
         let src = unsafe { core::slice::from_raw_parts(cd0.as_ptr() as *const f32, n2) };

@@ -169,7 +169,7 @@ impl FirStage {
         }
         // The dot reads `ntaps` on a host build and `ntaps` rounded up
         // to a multiple of four on a backend build, so the buffer is
-        // sized for the larger. `AlignedF32::new` zero-fills, which is
+        // sized for the larger. `AlignedF32::with_min_alloc` zero-fills, which is
         // also the zeros the filter would have seen before the stream
         // started.
         let hist_cap = ntaps + hist_margin;

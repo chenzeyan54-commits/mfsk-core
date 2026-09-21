@@ -92,12 +92,8 @@ pub(crate) struct AlignedF32 {
 }
 
 impl AlignedF32 {
-    /// Rounds `len` **up** to a multiple of four and zero-fills.
-    pub(crate) fn new(len: usize) -> Self {
-        Self::with_min_alloc(len, 0)
-    }
-
-    /// [`Self::new`], but the allocation is at least `min_bytes`.
+    /// Rounds `len` **up** to a multiple of four and zero-fills, with
+    /// the allocation at least `min_bytes` (0 for no floor).
     ///
     /// The logical length — what `as_slice` returns, and so everything
     /// the arithmetic sees — is `len` rounded up to four exactly as
