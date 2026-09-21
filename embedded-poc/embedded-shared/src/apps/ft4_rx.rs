@@ -43,7 +43,7 @@ use mfsk_core::engine::equalize::EqMode;
 use mfsk_core::engine::ft4_coarse::{ft4_coarse_sync_from_savg, Ft4SavgBuilder};
 use mfsk_core::engine::pipeline::{process_candidate_precomputed, DecodeDepth, DecodeStrictness};
 use mfsk_core::engine::sync2d::{Ft4CoarsePhasors, ft4_sync_search_window_with};
-use mfsk_core::ft4::ddc::{SlotDecimator, candidate_baseband_half};
+use mfsk_core::ft4::ddc::{SlotDecimator, candidate_baseband_boxcar, candidate_baseband_half};
 use mfsk_core::ft4::decode::FT4_DOWNSAMPLE;
 use mfsk_core::ft4::Ft4;
 use mfsk_core::msg::wsjt77::unpack77;
@@ -651,7 +651,18 @@ fn decode_candidate(
     stage: &mut [i64; 3],
 ) -> Option<Ft4Decode> {
     let t_ddc = now_us();
-    let mut cd0 = candidate_baseband_half(half, cand.freq_hz);
+    // `MFSK_FT4_BOXCAR=1` swaps the 101 + 263-tap chain for a mix and
+    // a nine-sample boxcar. Measured on the host it costs 0.29 dB of
+    // threshold alone and 0.50 dB against a +20 dB neighbour folding
+    // onto the band, and takes the golden's eleven decodes to ten —
+    // for a seventh of the time *there*, on a machine with no PIE dot
+    // product. This knob is what turns that into a number from the
+    // board, which is the only one the budget can be spent against.
+    let mut cd0 = if option_env!("MFSK_FT4_BOXCAR").is_some() {
+        candidate_baseband_boxcar(half, cand.freq_hz)
+    } else {
+        candidate_baseband_half(half, cand.freq_hz)
+    };
     rms_normalise(&mut cd0);
     let t_search = now_us();
     stage[0] += t_search - t_ddc;

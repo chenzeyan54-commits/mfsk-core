@@ -458,6 +458,80 @@ pub fn candidate_baseband(audio: &[i16], f0_hz: f32) -> Vec<Complex<f32>> {
     out
 }
 
+/// [`candidate_baseband_half`]'s arithmetic, replaced by a boxcar.
+///
+/// **Experimental, and not what ships.** It exists so the board can
+/// measure the trade rather than have it extrapolated from a host
+/// timing: one complex multiply per input sample and one per output,
+/// against the shipped chain's 101 + 263 taps. Selected at build time
+/// by the receiver (`MFSK_FT4_BOXCAR`), never by default.
+///
+/// Same contract as [`candidate_baseband_half`] — [`CD0_LEN`] samples
+/// at [`DS_RATE_HZ`] with `f0` at DC — **including the alignment**.
+/// [`FirStage`] starts its output counter at `group_delay + 1` so
+/// `cd0[0]` is centred on `half[0]`; bin `j` here is therefore centred
+/// on `half[9j]` rather than starting there. A bin that started there
+/// would shift every `dt` by a constant, which reads as a sensitivity
+/// regression rather than as a bug.
+///
+/// ## What it costs, measured on the host
+///
+/// `mfsk-core/tests/ft4_adjacent_signal_rejection.rs` and
+/// `ft4_embedded_pipeline_mirror.rs`, against the WSJT-X golden and a
+/// two-signal fixture:
+///
+/// - the golden's eleven decodes become ten, losing the weakest
+///   (`W7BOB KJ7G RR73` at −17 dB);
+/// - **0.29 dB** of threshold alone, **0.50 dB** against a +20 dB
+///   neighbour folding onto the wanted band;
+/// - 7.1× faster than the FIR chain per candidate — but on the host,
+///   which runs the portable dot product where the board runs
+///   `dsps_dotprod_f32_aes3` at 2.18 cycles per multiply-add, so that
+///   ratio is an upper bound and the board is the instrument that
+///   settles it.
+///
+/// The rejection numbers are the ones to watch: a boxcar's sinc nulls
+/// sit exactly on the fold centres, so it rejects an interferer *on* a
+/// fold best and one half a frame off it worst — 57 dB more than the
+/// FIR chain admits at that geometry.
+pub fn candidate_baseband_boxcar(half: &[f32], f0_hz: f32) -> Vec<Complex<f32>> {
+    const DECIM: usize = 9;
+    const HALF_WIN: usize = DECIM / 2;
+    let half_rate = INPUT_RATE_HZ / SHARED_DECIM as f32;
+    // The band centre to DC, then the output back by the same amount,
+    // so `f0` — not the centre — lands at DC. Same convention as
+    // `CandidateDdc`.
+    let mut mixer = Mixer::new(f0_hz + BAND_CENTER_OFFSET_HZ, half_rate);
+    let mut derot = Mixer::new(-BAND_CENTER_OFFSET_HZ, DS_RATE_HZ);
+    let mut out = Vec::with_capacity(CD0_LEN);
+    let mut acc = (0.0f32, 0.0f32);
+    let mut bin = 0usize;
+    let inv = 1.0 / DECIM as f32;
+    let emit = |acc: (f32, f32), out: &mut Vec<Complex<f32>>, derot: &mut Mixer| {
+        let (i, q) = derot.mix_complex(acc.0 * inv, acc.1 * inv);
+        out.push(Complex::new(i, q));
+    };
+    for (n, &x) in half.iter().enumerate() {
+        let j = (n + HALF_WIN) / DECIM;
+        if j != bin {
+            emit(acc, &mut out, &mut derot);
+            acc = (0.0, 0.0);
+            bin = j;
+            if out.len() >= CD0_LEN {
+                break;
+            }
+        }
+        let (i, q) = mixer.mix(x);
+        acc.0 += i;
+        acc.1 += q;
+    }
+    if out.len() < CD0_LEN {
+        emit(acc, &mut out, &mut derot);
+    }
+    out.resize(CD0_LEN, Complex::new(0.0, 0.0));
+    out
+}
+
 /// The shared half of the front end: one real decimate-by-2 over the
 /// slot's 12 kHz audio, paid **once** and read by every candidate.
 ///
