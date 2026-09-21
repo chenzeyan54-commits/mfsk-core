@@ -1668,7 +1668,19 @@ pub(crate) fn rank_candidates(
 // one despite it never depending on the loop variable — no separate
 // fix needed there once this cache exists.
 #[cfg(feature = "std")]
-type CostasRefCacheEntry = (&'static [u8], usize, Vec<Vec<Complex<f32>>>);
+type CostasRefCacheEntry = (&'static [u8], usize, Vec<Complex<f32>>);
+
+/// Slots in [`COSTAS_REF_CACHE`].
+///
+/// **Four, not two.** The note above says "FT8/FT4 reuse one pattern
+/// across all their sync blocks"; that is true of FT8 and false of
+/// FT4, whose four blocks carry four different Costas arrays
+/// (`FT4_SYNC_BLOCKS`, upstream `sync4d.f90`'s `icos4a..d`). With two
+/// slots FT4 evicted on every block and the cache never hit — it paid
+/// the lookup and the rebuild both. Four covers every protocol wired
+/// here: FT8 one pattern, FST4 two, FT4 four.
+#[cfg(feature = "std")]
+const COSTAS_REF_CACHE_SLOTS: usize = 4;
 
 #[cfg(feature = "std")]
 std::thread_local! {
@@ -1682,17 +1694,24 @@ std::thread_local! {
 /// `const`/`static` table data) so the cache can hold a reference to it
 /// past this call's return.
 #[cfg(feature = "std")]
-fn cached_costas_ref(pattern: &'static [u8], ds_spb: usize) -> Vec<Vec<Complex<f32>>> {
+fn with_costas_ref<R>(
+    pattern: &'static [u8],
+    ds_spb: usize,
+    f: impl FnOnce(&[Complex<f32>]) -> R,
+) -> R {
     COSTAS_REF_CACHE.with_borrow_mut(|cache| {
-        if let Some((_, _, csync)) = cache.iter().find(|(p, d, _)| *p == pattern && *d == ds_spb) {
-            return csync.clone();
+        if let Some(i) = cache
+            .iter()
+            .position(|(p, d, _)| *p == pattern && *d == ds_spb)
+        {
+            return f(&cache[i].2);
         }
-        let csync = make_costas_ref(pattern, ds_spb);
-        if cache.len() >= 2 {
+        let csync = make_costas_ref_flat(pattern, ds_spb);
+        if cache.len() >= COSTAS_REF_CACHE_SLOTS {
             cache.remove(0);
         }
-        cache.push((pattern, ds_spb, csync.clone()));
-        csync
+        cache.push((pattern, ds_spb, csync));
+        f(&cache.last().unwrap().2)
     })
 }
 
@@ -1703,8 +1722,65 @@ fn cached_costas_ref(pattern: &'static [u8], ds_spb: usize) -> Vec<Vec<Complex<f
 /// `downsample_cached`'s own `no_std` fallback (`engine/dsp/
 /// downsample.rs`).
 #[cfg(not(feature = "std"))]
-fn cached_costas_ref(pattern: &'static [u8], ds_spb: usize) -> Vec<Vec<Complex<f32>>> {
-    make_costas_ref(pattern, ds_spb)
+fn with_costas_ref<R>(
+    pattern: &'static [u8],
+    ds_spb: usize,
+    f: impl FnOnce(&[Complex<f32>]) -> R,
+) -> R {
+    f(&make_costas_ref_flat(pattern, ds_spb))
+}
+
+/// [`make_costas_ref`]'s values in one allocation instead of
+/// `1 + pattern.len()`.
+///
+/// The nested form's inner `Vec`s are all `ds_spb` long and are only
+/// ever read tone by tone, so the shape bought nothing and cost an
+/// allocation per tone — and a clone of all of them on every cache
+/// hit, because the cache returned by value. Laid out tone-major, so
+/// tone `k` is `[k * ds_spb .. (k + 1) * ds_spb]`.
+///
+/// Bit-identical to the nested builder by construction (same `dphi`,
+/// same per-tone phase reset, same accumulation), and
+/// `flat_costas_ref_matches_the_nested_one` asserts it.
+fn make_costas_ref_flat(pattern: &[u8], ds_spb: usize) -> Vec<Complex<f32>> {
+    let mut out = vec![Complex::new(0.0f32, 0.0); pattern.len() * ds_spb];
+    for (k, &tone) in pattern.iter().enumerate() {
+        let dphi = 2.0 * PI * tone as f32 / ds_spb as f32;
+        let mut phi = 0.0f32;
+        for w in out[k * ds_spb..(k + 1) * ds_spb].iter_mut() {
+            *w = Complex::new(phi.cos(), phi.sin());
+            phi = (phi + dphi) % (2.0 * PI);
+        }
+    }
+    out
+}
+
+/// [`score_costas_block`] over [`make_costas_ref_flat`]'s layout.
+fn score_costas_block_flat(
+    cd0: &[Complex<f32>],
+    csync: &[Complex<f32>],
+    ds_spb: usize,
+    array_start: i32,
+) -> f32 {
+    let np2 = cd0.len() as i32;
+    csync
+        .chunks_exact(ds_spb)
+        .enumerate()
+        .map(|(k, ref_tone)| {
+            let start = array_start + (k * ds_spb) as i32;
+            if start >= 0 && start + ds_spb as i32 <= np2 {
+                let s0 = start as usize;
+                cd0[s0..s0 + ds_spb]
+                    .iter()
+                    .zip(ref_tone.iter())
+                    .map(|(&s, &r)| s * r.conj())
+                    .sum::<Complex<f32>>()
+                    .norm_sqr()
+            } else {
+                0.0
+            }
+        })
+        .sum()
 }
 
 /// Build complex sinusoidal references (one per Costas tone) for a sync block.
@@ -1764,34 +1840,30 @@ pub fn fine_sync_power<P: Protocol>(cd0: &[Complex<f32>], i0: i32) -> f32 {
 
 /// Per-block Costas correlation powers for diagnostics and the FT8 double-sync.
 ///
-/// Caches `make_costas_ref`'s result across consecutive blocks that
-/// share the same (content-equal) `pattern` — FT8's 3 sync blocks all
-/// use the identical Costas array, so this avoids rebuilding the same
-/// `Vec<Vec<Complex<f32>>>` reference waveform 3x per call for no
-/// reason. Content equality (not pointer identity) so it's correct for
-/// any `Protocol`, not just ones whose blocks happen to share a
-/// `&'static` allocation (issue #182 follow-up — same "don't recompute
-/// a value that hasn't changed" pattern as `refine_fine.rs`'s Costas
-/// reference table, scoped to this smaller, protocol-generic case).
+/// Each block's Costas reference comes from `with_costas_ref`, which
+/// keeps them across calls and lends rather than hands them over, so a
+/// repeat costs nothing. This used to memoise only *consecutive*
+/// blocks sharing a pattern — right for FT8, whose three blocks carry
+/// the same Costas array, and useless for FT4, whose four carry four
+/// different ones (`FT4_SYNC_BLOCKS`, upstream `icos4a..d`). Measured
+/// on the FT4 host mirror at **42 allocations per candidate**, from a
+/// function whose whole output is four floats.
 pub fn fine_sync_power_per_block<P: Protocol>(cd0: &[Complex<f32>], i0: i32) -> Vec<f32> {
-    type CachedCsync = (&'static [u8], Vec<Vec<Complex<f32>>>);
     // Only `d.ds_spb` is read below — a `SyncDims::of` field that
     // `downsample_cached`'s own rate governs, not the `sample_rate_hz`
     // parameter (see that doc comment), so the argument here is inert.
     let d = SyncDims::of::<P>(12_000.0);
     let blocks = P::SYNC_MODE.blocks();
     let mut out = Vec::with_capacity(blocks.len());
-    let mut last: Option<CachedCsync> = None;
     for block in blocks {
-        let csync = match &last {
-            Some((p, c)) if *p == block.pattern => c,
-            _ => {
-                last = Some((block.pattern, cached_costas_ref(block.pattern, d.ds_spb)));
-                &last.as_ref().unwrap().1
-            }
-        };
         let start = i0 + (block.start_symbol as usize * d.ds_spb) as i32;
-        out.push(score_costas_block(cd0, csync, d.ds_spb, start));
+        // Scored inside the borrow, so a cache hit copies nothing —
+        // the previous shape handed the caller an owned
+        // `Vec<Vec<Complex<f32>>>` and therefore allocated `1 +
+        // ntones` times per block even when it had the value already.
+        out.push(with_costas_ref(block.pattern, d.ds_spb, |csync| {
+            score_costas_block_flat(cd0, csync, d.ds_spb, start)
+        }));
     }
     out
 }
@@ -1901,12 +1973,64 @@ pub fn refine_candidate<P: Protocol>(
 mod tests {
     use super::{
         AudioSource, DEDUP_HZ, DEDUP_SEC, PI, Protocol, RxGrid, SyncCandidate, SyncDims,
-        compute_spectra, dedup_suppress,
+        compute_spectra, dedup_suppress, make_costas_ref, make_costas_ref_flat, score_costas_block,
+        score_costas_block_flat,
     };
-    use crate::engine::protocol::ModulationParams;
+    use crate::engine::protocol::{FrameLayout, ModulationParams};
     use crate::fst4::{Fst4s15, Fst4s30, Fst4s60, Fst4s120, Fst4s300};
     use crate::ft4::Ft4;
     use alloc::vec::Vec;
+
+    /// The flat Costas reference is the nested one, laid out end to
+    /// end — asserted bit-for-bit, because the flat form is what
+    /// `fine_sync_power_per_block` scores against and the nested one
+    /// is what every previously-recorded number was measured with.
+    ///
+    /// Both halves matter: the references themselves, and the score
+    /// computed from them, since `score_costas_block_flat` re-derives
+    /// the per-tone slices with `chunks_exact` where the nested form
+    /// had them already separated.
+    #[test]
+    fn flat_costas_ref_matches_the_nested_one() {
+        use num_complex::Complex;
+        for pattern in crate::ft4::Ft4::SYNC_MODE.blocks() {
+            for ds_spb in [8usize, 32, 60] {
+                let nested = make_costas_ref(pattern.pattern, ds_spb);
+                let flat = make_costas_ref_flat(pattern.pattern, ds_spb);
+                assert_eq!(flat.len(), nested.len() * ds_spb);
+                for (k, tone) in nested.iter().enumerate() {
+                    for (j, &w) in tone.iter().enumerate() {
+                        let f = flat[k * ds_spb + j];
+                        assert_eq!(
+                            (w.re.to_bits(), w.im.to_bits()),
+                            (f.re.to_bits(), f.im.to_bits()),
+                            "tone {k} sample {j} at ds_spb={ds_spb}"
+                        );
+                    }
+                }
+
+                // A deterministic, non-trivial `cd0` — a chirp, so no
+                // two windows see the same values and a mis-sliced
+                // reference cannot score the same by luck.
+                let cd0: Vec<Complex<f32>> = (0..(nested.len() + 2) * ds_spb)
+                    .map(|n| {
+                        let t = n as f32;
+                        let phi = 0.017 * t + 0.0003 * t * t;
+                        Complex::new(phi.cos(), phi.sin())
+                    })
+                    .collect();
+                for start in [-3i32, 0, 5, (ds_spb as i32) * 2] {
+                    let a = score_costas_block(&cd0, &nested, ds_spb, start);
+                    let b = score_costas_block_flat(&cd0, &flat, ds_spb, start);
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "score differs at ds_spb={ds_spb}, start={start}"
+                    );
+                }
+            }
+        }
+    }
 
     /// `SyncDims::of::<P>(12_000.0)`'s `nsps` is derived from
     /// `P::SYMBOL_DT * sample_rate_hz` (issue #309/#323), not read
