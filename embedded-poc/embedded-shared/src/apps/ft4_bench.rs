@@ -1139,7 +1139,8 @@ fn shared_decim_probe(audio: &[i16]) {
     // the zero-copy idea is aimed at nothing.
     {
         const CHUNK: usize = 1_024;
-        let mut st = FirStage::new(101, 9, 320.0 / 6_000.0, 512);
+        use mfsk_core::ft4::ddc;
+        let mut st = FirStage::new(101, 9, 320.0 / 6_000.0, ddc::HIST_MARGIN_STAGE_A);
         let (mut oi, mut oq) = (Vec::with_capacity(5_100), Vec::with_capacity(5_100));
         let was = crate::esp_dsp_dotprod::set_dot_stub(true);
         let t0 = now_us();
@@ -1200,7 +1201,8 @@ fn shared_decim_probe(audio: &[i16]) {
     // history of zeros. `push_block_real_matches_push_block` pins it
     // bit-identical to the complex path's I channel.
     let shared = {
-        let mut st = FirStage::new(165, 2, 2_800.0 / 12_000.0, 512);
+        use mfsk_core::ft4::ddc;
+        let mut st = FirStage::new(165, 2, 2_800.0 / 12_000.0, ddc::HIST_MARGIN_SHARED);
         let mut out = Vec::with_capacity(45_000);
         let t0 = now_us();
         st.push_block_real(&xi, &mut out);
@@ -1467,18 +1469,21 @@ fn ddc_stage_probe(audio: &[i16]) {
     const A_FC: f32 = 320.0 / 12_000.0;
     const B_NTAPS: usize = 263;
     const B_FC: f32 = 56.0 / (12_000.0 / 18.0);
-    const HIST_MARGIN: usize = 512;
+    // The shipped margins, read from the module that ships them —
+    // this probe used to keep its own 512 and reported the same number
+    // before and after they changed.
+    use mfsk_core::ft4::ddc;
 
     let xi: Vec<f32> = audio.iter().map(|&s| s as f32).collect();
     let xq: Vec<f32> = xi.clone();
 
-    let mut a = FirStage::new(A_NTAPS, 18, A_FC, HIST_MARGIN);
+    let mut a = FirStage::new(A_NTAPS, 18, A_FC, ddc::HIST_MARGIN_STAGE_A);
     let (mut ai, mut aq) = (Vec::with_capacity(5_120), Vec::with_capacity(5_120));
     let t0 = now_us();
     a.push_block(&xi, &xq, &mut ai, &mut aq);
     let a_us = now_us() - t0;
 
-    let mut b = FirStage::new(B_NTAPS, 1, B_FC, HIST_MARGIN);
+    let mut b = FirStage::new(B_NTAPS, 1, B_FC, ddc::HIST_MARGIN_STAGE_B);
     let (mut bi, mut bq) = (Vec::with_capacity(5_120), Vec::with_capacity(5_120));
     let t1 = now_us();
     b.push_block(&ai, &aq, &mut bi, &mut bq);

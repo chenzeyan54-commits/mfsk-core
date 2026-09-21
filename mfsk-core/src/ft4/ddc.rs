@@ -176,10 +176,48 @@ const STAGE_B_FC_HZ: f32 = 56.0;
 /// per-*sample*, so anything well above one is most of the win.
 const MIX_CHUNK: usize = 1_024;
 
-/// History margin for both stages, matching `fst4::ddc`'s: the stages
-/// are small enough that a generous fixed margin costs little and keeps
-/// `FirStage`'s compaction well amortised.
-const HIST_MARGIN: usize = 512;
+/// History margin, chosen so each stage's history **fits in internal
+/// DRAM**, which on this board means staying under
+/// `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`.
+///
+/// It used to be a flat 512 for every stage, "matching `fst4::ddc`'s:
+/// the stages are small enough that a generous fixed margin costs
+/// little". The margin does cost little. What it buys is where the
+/// buffer lands: `FirStage` allocates `margin + (3 + ntaps)` rounded
+/// to a quad, and an allocation at or above the board's threshold goes
+/// to PSRAM — which the WSPR DDC measured at 7.04 us/sample, about 15
+/// cycles a multiply-add (`wspr::ddc::StreamingDdc::new_in`).
+///
+/// At 512 the three stages ask for 2 464 / 3 120 / 2 720 B. That was
+/// under the 4 096 the CoreS3 shipped until 2026-09-21, when the
+/// threshold went to 2 048 to keep FT8's `coarse_sync` arrays out of
+/// internal DRAM — and these three silently moved the other way. Stage
+/// A' went 30 828 us to 34 971 us per candidate across that change
+/// (`FT4_BENCHMARK.md` §37.2 against `logs/ft4bench_2026-09-21.log`),
+/// +13 %, which is the cost of reading 101 taps and a 104-sample
+/// window out of PSRAM for every one of ~4 500 outputs.
+///
+/// So the margin is per stage now, and each is the largest that keeps
+/// its allocation under 2 048 B. The compaction it trades against is a
+/// `copy_within` of `ntaps` floats once per margin inputs: at stage
+/// A' that is ~100 compactions of 202 floats across a slot, against
+/// ~4 500 outputs that each read the window.
+///
+/// **This couples a constant here to a board's sdkconfig**, which is
+/// the coupling that caused the regression above. It is stated rather
+/// than hidden: a board that raises the threshold may raise these, and
+/// `ft4-bench`'s `ddc_stage_probe` is what says whether it helped.
+/// **Public so a bench can measure the shipped chain rather than a
+/// copy of it.** `ft4_bench` mirrored the old flat 512 in seven places
+/// and its own comment said what that costs: "if those move this
+/// measurement quietly stops describing the shipped chain". They moved,
+/// and it did — the floor probe read the same 34 971 us before and
+/// after this change while the real chain's DDC went 873 ms to 812 ms.
+pub const HIST_MARGIN_STAGE_A: usize = 384;
+/// See [`HIST_MARGIN_STAGE_A`].
+pub const HIST_MARGIN_STAGE_B: usize = 192;
+/// See [`HIST_MARGIN_STAGE_A`].
+pub const HIST_MARGIN_SHARED: usize = 320;
 
 /// Rate the shared front end hands the per-candidate chain:
 /// `12_000 / 2`. See [`SlotDecimator`].
@@ -269,8 +307,18 @@ impl CandidateDdc {
     fn build(f0_hz: f32, in_rate_hz: f32, taps_a: usize, decim_a: usize) -> Self {
         Self {
             mixer: Mixer::new(f0_hz + BAND_CENTER_OFFSET_HZ, in_rate_hz),
-            stage_a: FirStage::new(taps_a, decim_a, STAGE_A_FC_HZ / in_rate_hz, HIST_MARGIN),
-            stage_b: FirStage::new(STAGE_B_NTAPS, 1, STAGE_B_FC_HZ / DS_RATE_HZ, HIST_MARGIN),
+            stage_a: FirStage::new(
+                taps_a,
+                decim_a,
+                STAGE_A_FC_HZ / in_rate_hz,
+                HIST_MARGIN_STAGE_A,
+            ),
+            stage_b: FirStage::new(
+                STAGE_B_NTAPS,
+                1,
+                STAGE_B_FC_HZ / DS_RATE_HZ,
+                HIST_MARGIN_STAGE_B,
+            ),
             // Negative centre: `Mixer` is `exp(-j2π·centre·n/Fs)`, and
             // this stage has to undo the `+BAND_CENTER_OFFSET_HZ` the
             // input mixer applied, moving `f0` from `-31.25 Hz` to DC.
@@ -472,7 +520,7 @@ impl SlotDecimator {
                 SHARED_NTAPS,
                 SHARED_DECIM,
                 SHARED_FC_HZ / INPUT_RATE_HZ,
-                HIST_MARGIN,
+                HIST_MARGIN_SHARED,
             ),
         }
     }
