@@ -4,41 +4,43 @@
     "note": "Provenance for the 50%-recall crossing SNRs below. Written and read by scripts/sweep-regression-check.py; scripts/release-status.sh uses each protocol's own date to decide what a release actually needs re-swept. Entries stamped c757d32 were seeded before this block existed and carry no trial count \u2014 the CSVs were not kept. Every later entry is written by --update-baseline from the run itself.",
     "protocols": {
       "fst4": {
-        "date": "2026-09-20",
-        "commit": "8585dbb2",
+        "date": "2026-09-21",
+        "commit": "7561cd57",
         "machine": "AMD Ryzen 9 9900X 12-Core Processor",
         "trials": 4880,
         "groups": 20
       },
       "ft4": {
-        "date": "2026-09-20",
-        "commit": "8585dbb2",
+        "date": "2026-09-21",
+        "commit": "7561cd57",
         "machine": "AMD Ryzen 9 9900X 12-Core Processor",
         "trials": 720,
         "groups": 4
       },
       "ft8": {
-        "date": "2026-09-20",
-        "commit": "8585dbb2",
+        "date": "2026-09-21",
+        "commit": "7561cd57",
         "machine": "AMD Ryzen 9 9900X 12-Core Processor",
         "trials": 720,
         "groups": 4
       },
       "jt65": {
-        "date": "2026-08-20",
-        "commit": "c757d32",
-        "machine": "AMD Ryzen 9 9900X (12C/24T), Ubuntu 24.04 under WSL2",
+        "date": "2026-09-21",
+        "commit": "7561cd57",
+        "machine": "AMD Ryzen 9 9900X 12-Core Processor",
+        "trials": 300,
         "groups": 1
       },
       "jt65_chase": {
-        "date": "2026-08-20",
-        "commit": "c757d32",
-        "machine": "AMD Ryzen 9 9900X (12C/24T), Ubuntu 24.04 under WSL2",
+        "date": "2026-09-21",
+        "commit": "7561cd57",
+        "machine": "AMD Ryzen 9 9900X 12-Core Processor",
+        "trials": 300,
         "groups": 1
       },
       "jt9": {
-        "date": "2026-09-05",
-        "commit": "c7acb4da",
+        "date": "2026-09-21",
+        "commit": "7561cd57",
         "machine": "AMD Ryzen 9 9900X 12-Core Processor",
         "trials": 300,
         "groups": 1
@@ -50,15 +52,16 @@
         "groups": 2
       },
       "q65": {
-        "date": "2026-08-20",
-        "commit": "c757d32",
-        "machine": "AMD Ryzen 9 9900X (12C/24T), Ubuntu 24.04 under WSL2",
+        "date": "2026-09-21",
+        "commit": "7561cd57",
+        "machine": "AMD Ryzen 9 9900X 12-Core Processor",
+        "trials": 2820,
         "groups": 20
       },
       "wspr": {
-        "date": "2026-08-27",
-        "commit": "b9b4850",
-        "machine": "AMD Ryzen 9 9900X (12C/24T), Ubuntu 24.04 under WSL2",
+        "date": "2026-09-21",
+        "commit": "7561cd57",
+        "machine": "AMD Ryzen 9 9900X 12-Core Processor",
         "trials": 500,
         "groups": 1
       }
