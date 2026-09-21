@@ -159,6 +159,13 @@ pub fn run<R: Receiver>(
         mode,
     };
     crate::set_wait_for_log_sink(R::WAIT_FOR_LOG_SINK);
+    // Before anything can deliver audio: the ring is what the audio
+    // paths append to, for every mode alike.
+    crate::waterfall_feed::init(mode);
+    // What "heard this slot" is measured against on the station list.
+    if let Ok(mut ui) = mfsk_app_shared::ui::state::UI.lock() {
+        ui.set_slot_period_ms(mode.slot_period_ms());
+    }
     R::prepare(&ctx);
 
     let display = Display {

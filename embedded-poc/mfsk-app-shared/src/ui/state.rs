@@ -47,6 +47,22 @@ pub struct DecodedRow {
     pub first_seq: u32,
 }
 
+/// One decode as any receiver reports it, in the decoder's own units —
+/// the input to [`UiState::publish_slot`].
+#[derive(Clone, Copy, Debug)]
+pub struct SlotDecode<'a> {
+    /// Audio frequency, Hz.
+    pub freq_hz: f32,
+    /// SNR, dB. Non-finite when the decoder has none to give.
+    pub snr_db: f32,
+    /// Time offset, s.
+    pub dt_sec: f32,
+    /// The rendered message.
+    pub text: &'a str,
+    /// BP hard errors; 0 for decoders without them (WSPR's Fano).
+    pub hard_errors: u32,
+}
+
 /// Status-bar fields. All optional so the bar renders during boot
 /// before peripherals are up.
 #[derive(Clone, Debug, Default)]
@@ -81,6 +97,19 @@ pub struct UiState {
     /// updated at the back. Vec (not Deque) so `push_decode` can
     /// search-and-remove existing entries in place to dedupe by msg.
     decoded: heapless::Vec<DecodedRow, 16>,
+    /// When each row of `decoded` was last heard, index for index —
+    /// stamped here by [`Self::push_decode`], never by a receiver. Kept
+    /// beside the rows rather than in them so the row type the other
+    /// boards build is unchanged.
+    heard_at: heapless::Vec<std::time::Instant, 16>,
+    /// The booted mode's slot period — see [`Self::decoded_current_iter`].
+    slot_period: Option<core::time::Duration>,
+    /// Slots published through [`Self::publish_slot`]; fills the rows'
+    /// `slot_seq`/`first_seq` so a receiver need not count.
+    published: u32,
+    /// Rows pushed in all — with the length and the current-row mask,
+    /// what tells the panel the list has changed.
+    decoded_seq: u32,
     waterfall: heapless::Deque<WfLine, WF_DEPTH>,
     /// One flag per retained waterfall row: was it the first pair of a
     /// slot? 100 bytes, kept beside the rows rather than inside them
@@ -181,6 +210,10 @@ impl UiState {
     pub const fn new() -> Self {
         Self {
             decoded: heapless::Vec::new(),
+            heard_at: heapless::Vec::new(),
+            slot_period: None,
+            published: 0,
+            decoded_seq: 0,
             waterfall: heapless::Deque::new(),
             wf_slot_start: heapless::Deque::new(),
             status: StatusInfo {
@@ -270,6 +303,48 @@ impl UiState {
         }
     }
 
+    /// Publish one slot's decodes to the station list — **the one way
+    /// every receiver fills it**.
+    ///
+    /// Moves the "latest slot" watermark whether or not anything
+    /// decoded (a slot with no decode adds no row, so the list cannot
+    /// derive it — and without it the previous slot's stations stay
+    /// marked as new), then adds a row per decode through
+    /// [`Self::push_decode`]. The conversion from decoder units to the
+    /// row's — rounding, clamping, the 22-character cut, a missing SNR
+    /// — is here once, where each receiver used to repeat it; FT4, WSPR
+    /// and FST4 also never moved the watermark, so their new stations
+    /// were never highlighted as such.
+    pub fn publish_slot<'a>(&mut self, decodes: impl IntoIterator<Item = SlotDecode<'a>>) {
+        self.published = self.published.wrapping_add(1);
+        let slot_seq = self.published;
+        self.latest_slot_seq = slot_seq;
+        for d in decodes {
+            let mut msg: String<22> = String::new();
+            // By characters, not bytes: a cut inside a multi-byte
+            // character would not be a `str`.
+            for ch in d.text.chars() {
+                if msg.push(ch).is_err() {
+                    break;
+                }
+            }
+            self.push_decode(DecodedRow {
+                df_hz: d.freq_hz.round().clamp(0.0, 65_535.0) as u16,
+                snr_db: if d.snr_db.is_finite() {
+                    d.snr_db.round().clamp(-128.0, 127.0) as i8
+                } else {
+                    0
+                },
+                hard_errors: d.hard_errors.min(255) as u8,
+                dt_ds: (d.dt_sec * 10.0).round().clamp(-99.0, 99.0) as i8,
+                msg,
+                slot_seq,
+                first_seq: slot_seq,
+            });
+        }
+        self.bump();
+    }
+
     /// Push a fresh decode. Dedupes by `msg` — if the message text
     /// already lives in the ring, the existing entry is removed and
     /// the new copy appended at the back, preserving its original
@@ -277,19 +352,62 @@ impl UiState {
     /// "new" highlight). When the message is genuinely new, append
     /// and stamp `first_seq = slot_seq`. Drops the front when full.
     pub fn push_decode(&mut self, mut row: DecodedRow) {
+        // `heard_at` is only ever changed here, in step with `decoded`;
+        // a board that never stamped it starts with it empty, so bring
+        // it level first.
+        while self.heard_at.len() < self.decoded.len() {
+            let _ = self.heard_at.push(std::time::Instant::now());
+        }
         if let Some(idx) = self.decoded.iter().position(|r| r.msg == row.msg) {
             // Carry forward the first-seen seq from the existing
             // entry — its highlight semantics belong to *that* slot,
             // not this re-detection.
             row.first_seq = self.decoded[idx].first_seq;
             self.decoded.remove(idx);
+            self.heard_at.remove(idx);
         } else if self.decoded.is_full() {
             self.decoded.remove(0);
+            self.heard_at.remove(0);
         }
         // `push` only fails on saturation; the branches above ensure
         // there's room.
         let _ = self.decoded.push(row);
+        let _ = self.heard_at.push(std::time::Instant::now());
+        self.decoded_seq = self.decoded_seq.wrapping_add(1);
         self.bump();
+    }
+
+    /// Rows pushed in all; see the field.
+    pub fn decoded_seq(&self) -> u32 {
+        self.decoded_seq
+    }
+
+    /// Set the slot period "heard this slot" is measured against — once,
+    /// at boot, from the mode.
+    pub fn set_slot_period_ms(&mut self, ms: u32) {
+        self.slot_period = Some(core::time::Duration::from_millis(ms as u64));
+    }
+
+    /// Every row, oldest first, with whether it counts as **heard this
+    /// slot**: last heard less than one slot period ago.
+    ///
+    /// **The display's rule, not the receiver's.** This used to be a
+    /// watermark each receiver had to move every slot
+    /// (`latest_slot_seq`), including slots that decoded nothing — and
+    /// FT4, WSPR and FST4 never moved it. Measured from the row's own
+    /// time instead, a slot that decodes nothing turns the last one's
+    /// stations white by itself, and a receiver only has to report
+    /// decodes. `false` for every row when no period was set.
+    pub fn decoded_current_iter(&self) -> impl Iterator<Item = (&DecodedRow, bool)> {
+        let now = std::time::Instant::now();
+        let period = self.slot_period;
+        self.decoded.iter().enumerate().map(move |(i, r)| {
+            let current = match (period, self.heard_at.get(i)) {
+                (Some(p), Some(t)) => now.duration_since(*t) < p,
+                _ => false,
+            };
+            (r, current)
+        })
     }
 
     /// Push one fresh waterfall row (= one stage1_inc pair's

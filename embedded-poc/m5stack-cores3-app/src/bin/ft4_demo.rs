@@ -13,15 +13,9 @@
 //! Waterfall, decoded list and status bar all go through
 //! `mfsk_app_shared::ui::state::UI` and are drawn by
 //! `display::run_log_panel` — the same state and the same loop the FT8
-//! path uses, not a second implementation of either. FT4 only supplies
-//! rows and decodes.
-//!
-//! The one thing FT4 brings is *rate*: the coarse stage transforms 152
-//! rows per 7.5 s slot and [`Ft4SavgBuilder::push_with_rows`] hands
-//! each one over on the way past, so the waterfall flows at one row
-//! per 48 ms during capture. The FT8 controller pushes one row per
-//! 15 s slot. No extra transform either way — these are the rows the
-//! decoder is already computing.
+//! path uses, not a second implementation of either. FT4 supplies
+//! decodes; the waterfall is fed from the audio through
+//! `waterfall_feed`, as in every mode.
 //!
 //! **This is a separate bin rather than a boot mode** so it can be
 //! flashed and re-flashed freely: it brings up no USB host, so the
@@ -30,9 +24,6 @@
 //! the PHY.
 //!
 //! Build: `cargo build --release --features ft4 --bin ft4-demo`.
-//!
-//! [`Ft4SavgBuilder::push_with_rows`]:
-//!     mfsk_core::engine::ft4_coarse::Ft4SavgBuilder::push_with_rows
 
 use embedded_shared::apps::ft4_rx as ft4;
 
@@ -150,6 +141,11 @@ fn main() -> ! {
         );
     }
 
+    // Not `boot::run`, so the feed is set up here.
+    app::waterfall_feed::init(BootMode::Ft4);
+    if let Ok(mut ui) = UI.lock() {
+        ui.set_slot_period_ms(BootMode::Ft4.slot_period_ms());
+    }
     let spawn = app::board::spawn_named(c"ft4feed", FEED_STACK, feed_loop);
     if let Err(e) = spawn {
         log::error!("ft4-demo: feed thread spawn failed ({e})");
@@ -197,15 +193,8 @@ fn feed_loop() {
 
     loop {
         for chunk in audio.chunks(BLOCK) {
-            // The rows the coarse stage is already transforming, turned
-            // into palette indices on the way past and handed to the
-            // shared UI. No extra FFT — see `push_with_rows`.
-            let slot = accum.push_with_rows(chunk, &mut |row| {
-                let cells = ft4::wf_row(row);
-                if let Ok(mut ui) = UI.lock() {
-                    ui.push_waterfall(cells);
-                }
-            });
+            app::waterfall_feed::push(chunk);
+            let slot = accum.push(chunk);
 
             if let Some(slot) = slot {
                 slot_no += 1;

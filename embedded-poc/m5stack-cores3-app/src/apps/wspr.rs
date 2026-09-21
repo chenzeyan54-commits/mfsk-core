@@ -109,10 +109,9 @@
 //! `usb_serial_jtag_is_connected()`) *and* a UDP datagram sink once
 //! WiFi is up, so `embedded-poc/scripts/udp-log-listen.sh` on the host
 //! PC keeps showing logs even with no serial port to attach to. The
-//! LCD-scroll-panel half of `LogFanout` is left unused here (nobody
-//! calls `display::run_log_panel` — this receiver draws its spot list
-//! through `crate::spot_panel` instead), which is harmless: `FanoutLogger` still
-//! pushes into it, just nothing ever reads it back out.
+//! screen is FT8's own `display::run_log_panel`, started on core 1 by
+//! `display::spawn_log_panel` (2026-09-21 — it used to be a spot-list
+//! screen of its own).
 //!
 //! One consequence worth being explicit about regardless: the band
 //! selector in the web settings form changes what dial frequency gets
@@ -142,9 +141,7 @@ use mfsk_app_shared::boot_mode::BootMode;
 use mfsk_app_shared::capture_window::{CaptureWindow, Step};
 use mfsk_app_shared::civil_time::civil_from_unix;
 use mfsk_app_shared::settings::{self, Settings};
-use mfsk_app_shared::ui::wspr_list;
-use mfsk_app_shared::ui::wspr_row::WsprSpotRow;
-use mfsk_app_shared::ui::wspr_state::WSPR_UI;
+use mfsk_app_shared::ui::state::{SlotDecode, UI};
 use mfsk_app_shared::wspr_bands::{WsprBand, WSPR_BANDS};
 
 /// Linked in only for the synthetic/bench build. 360 KB of flash that a
@@ -154,6 +151,10 @@ const GOLDEN_BASEBAND: &[u8] = include_bytes!("../../../assets/wspr_golden_baseb
 #[cfg(not(feature = "wspr-golden"))]
 #[allow(dead_code)]
 const GOLDEN_BASEBAND: &[u8] = &[];
+
+/// Whether NTP has disciplined the clock this run — a spot reported to
+/// wsprnet names its slot, so an undisciplined clock reports nothing.
+static NTP_SYNCED: AtomicBool = AtomicBool::new(false);
 
 /// How long to wait for the boot-time NTP attempt before giving up
 /// and running without absolute time (`ntp_synced` stays false, and
@@ -431,12 +432,14 @@ impl Receiver for WsprRx {
     }
 
     fn attach_panel(ctx: &BootCtx, display: Display) -> Panel {
-        crate::spot_panel::spawn::<WsprPanel>(crate::spot_panel::DisplayCtx {
-            i2c0: display.i2c0,
-            spi2: display.spi2,
-            pins: display.pins,
-            nvs: ctx.nvs.clone(),
-        });
+        // FT8's panel, on core 1 — see `display::spawn_log_panel`.
+        crate::display::spawn_log_panel(
+            display,
+            ctx.nvs.clone(),
+            BootMode::Wspr,
+            DISPLAY_STACK,
+            DISPLAY_PRIORITY,
+        );
         log_heap("post-display-spawn");
         Panel::Spawned
     }
@@ -454,8 +457,7 @@ impl Receiver for WsprRx {
             bringup: crate::net::Bringup::Connect,
             http: true,
             on_ntp: |synced| {
-                let mut ui = WSPR_UI.lock().expect("WSPR_UI mutex poisoned");
-                ui.update_status(|u| u.ntp_synced = synced);
+                NTP_SYNCED.store(synced, Ordering::Release);
             },
         })
     }
@@ -472,61 +474,6 @@ impl Receiver for WsprRx {
         loop {
             FreeRtos::delay_ms(1000);
         }
-    }
-}
-
-struct WsprPanel;
-
-impl crate::spot_panel::SpotPanel for WsprPanel {
-    type Ui = mfsk_app_shared::ui::wspr_state::WsprUiState;
-
-    const MODE: BootMode = BootMode::Wspr;
-    const TAG: &'static str = "wspr_app::display";
-    const TASK_NAME: &'static core::ffi::CStr = c"wspr_display";
-    const STACK: u32 = DISPLAY_STACK;
-    const PRIORITY: u32 = DISPLAY_PRIORITY;
-
-    fn with_ui<R, F: FnOnce(&mut Self::Ui) -> R>(f: F) -> R {
-        f(&mut WSPR_UI.lock().expect("WSPR_UI mutex poisoned"))
-    }
-
-    fn set_status(ui: &mut Self::Ui, heap_kb: u32, utc_hhmmss: &str) {
-        ui.free_heap_kb = heap_kb;
-        ui.utc_hhmmss = heapless::String::try_from(utc_hhmmss).unwrap_or_default();
-    }
-
-    fn dirty_seq(ui: &Self::Ui) -> u32 {
-        ui.dirty_seq()
-    }
-
-    fn render_all<D>(display: &mut D, ui: &Self::Ui) -> Result<(), D::Error>
-    where
-        D: embedded_graphics::prelude::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>,
-    {
-        wspr_list::render_all(display, ui)
-    }
-
-    fn render_status<D>(display: &mut D, ui: &Self::Ui) -> Result<(), D::Error>
-    where
-        D: embedded_graphics::prelude::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>,
-    {
-        wspr_list::render_status(display, ui)
-    }
-
-    /// The latest slot's stations. Named `render_discovered` here
-    /// because a WSPR slot is a discovery pass, not a QSO exchange.
-    fn render_rows<D>(display: &mut D, ui: &Self::Ui) -> Result<(), D::Error>
-    where
-        D: embedded_graphics::prelude::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>,
-    {
-        wspr_list::render_discovered(display, ui)
-    }
-
-    fn render_history<D>(display: &mut D, ui: &Self::Ui) -> Result<(), D::Error>
-    where
-        D: embedded_graphics::prelude::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>,
-    {
-        wspr_list::render_history(display, ui)
     }
 }
 
@@ -717,22 +664,24 @@ fn run_one_slot(
         Some(secs) => date_time_from_unix(secs),
         None => current_date_time(),
     };
-    let rows: Vec<WsprSpotRow> = results.iter().map(|r| to_row(r, &time)).collect();
 
-    {
-        let mut ui = WSPR_UI.lock().expect("WSPR_UI mutex poisoned");
-        ui.set_slot(time.clone(), &rows);
-        ui.update_status(|u| {
-            u.band_label = heapless::String::try_from(band.label).unwrap_or_default();
-            u.dial_mhz = band.dial_mhz;
-            u.wsprnet_enabled = mfsk_app_shared::wsprnet::SpotSink::from_config(Some(
-                &settings.wsprnet_spot_config,
-            ))
-            .is_enabled();
-        });
+    // Onto FT8's panel, the way FT4 feeds it: one decode row per
+    // station, the dial frequency in the status bar. The text is the
+    // decoder's own `"<call> <grid> <dBm>"`, which fits the row's 22.
+    if let Ok(mut ui) = UI.lock() {
+        ui.update_status(|st| st.rig_freq_hz = Some((band.dial_mhz * 1e6).round() as u32));
+        let texts: Vec<String> = results.iter().map(|r| r.message.to_string()).collect();
+        ui.publish_slot(results.iter().zip(&texts).map(|(r, text)| SlotDecode {
+            freq_hz: r.freq_hz,
+            snr_db: r.snr_db,
+            dt_sec: r.dt_sec,
+            text,
+            // Fano, not BP: no hard-error count to mark rows by.
+            hard_errors: 0,
+        }));
     }
 
-    let ntp_synced = WSPR_UI.lock().expect("WSPR_UI mutex poisoned").ntp_synced;
+    let ntp_synced = NTP_SYNCED.load(Ordering::Acquire);
     if is_synthetic_source {
         log::info!("wspr_app: slot {slot_label} is DDC-synthetic — skipping wsprnet report");
     } else if ntp_synced {
@@ -1213,20 +1162,6 @@ fn parse_message(msg: &str) -> ParsedMsg {
     }
 }
 
-fn to_row(r: &WsprResult, hhmm: &heapless::String<4>) -> WsprSpotRow {
-    let parsed = parse_message(&r.message.to_string());
-    WsprSpotRow {
-        utc_hhmm: hhmm.clone(),
-        call: parsed.call,
-        grid: parsed.grid,
-        power_dbm: parsed.dbm,
-        freq_offset_hz: r.freq_hz,
-        snr_db: r.snr_db as i8,
-        dt_sec: r.dt_sec,
-        drift_hz: r.drift_hz as i8,
-    }
-}
-
 /// Off by default (`SpotSink::Disabled`) or missing callsign both
 /// skip silently by design — `settings.rs`'s own doc comment: an
 /// empty callsign means "not configured," not an error to surface
@@ -1281,12 +1216,10 @@ fn report_to_wsprnet(
 
 // ── Clock formatting ─────────────────────────────────────────────────
 
-/// `(yyMMdd, HHmm)` — wsprnet's `date`/`time` fields, and the second
-/// also doubles as [`WsprSpotRow::utc_hhmm`]. Meaningless (reads
-/// whatever the unsynced system clock happens to hold) unless NTP
-/// synced this run — callers gate on that separately rather than this
-/// function returning an `Option`, since the WSPR UI still wants
-/// *some* 4 digits to show even before/without a sync.
+/// `(yyMMdd, HHmm)` — wsprnet's `date`/`time` fields. Meaningless
+/// (reads whatever the unsynced system clock happens to hold) unless
+/// NTP synced this run — callers gate on that separately rather than
+/// this function returning an `Option`.
 fn current_date_time() -> (heapless::String<6>, heapless::String<4>) {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(dur) => date_time_from_unix(dur.as_secs() as i64),

@@ -80,9 +80,9 @@ use esp_idf_hal::delay::FreeRtos;
 use embedded_shared::fst4_dual_core;
 
 use crate::boot::{BootCtx, Display, Panel, Receiver};
-use embedded_shared::fst4_monitor::{self, CapturedSlot, MonitorConfig, MonitorHit, SlotCapture};
+use embedded_shared::fst4_monitor::{self, CapturedSlot, MonitorConfig, SlotCapture};
 use mfsk_app_shared::boot_mode::BootMode;
-use mfsk_app_shared::ui::slot_list::{self, SlotSpotRow, SlotUiState};
+use mfsk_app_shared::ui::state::{SlotDecode, UI};
 
 /// The same baked golden slot `fst4-ddc-bench` runs — raw `i16` little
 /// endian at 12 kHz, byte-wise rather than transmuted (1-byte
@@ -292,7 +292,7 @@ const STAGING_CAP: usize = 24_000;
 /// slot; real audio arriving during it is held in [`AUDIO_STAGING`].
 static SPECTRA_FREE: AtomicBool = AtomicBool::new(true);
 
-static FST4_UI: Mutex<SlotUiState> = Mutex::new(SlotUiState::new());
+
 
 fn now_us() -> i64 {
     unsafe { esp_idf_svc::sys::esp_timer_get_time() }
@@ -352,12 +352,14 @@ impl Receiver for Fst4Rx {
     }
 
     fn attach_panel(ctx: &BootCtx, display: Display) -> Panel {
-        crate::spot_panel::spawn::<Fst4Panel>(crate::spot_panel::DisplayCtx {
-            i2c0: display.i2c0,
-            spi2: display.spi2,
-            pins: display.pins,
-            nvs: ctx.nvs.clone(),
-        });
+        // FT8's panel, on core 1 — see `display::spawn_log_panel`.
+        crate::display::spawn_log_panel(
+            display,
+            ctx.nvs.clone(),
+            BootMode::Fst4,
+            DISPLAY_STACK,
+            DISPLAY_PRIORITY,
+        );
         log_heap("post-display-spawn");
         Panel::Spawned
     }
@@ -383,9 +385,10 @@ impl Receiver for Fst4Rx {
                 crate::net::Bringup::Connect
             },
             http: true,
-            on_ntp: |synced| {
-                FST4_UI.lock().expect("FST4_UI poisoned").ntp_synced = synced;
-            },
+            // Nothing here reads it: the flag fed the spot-list
+            // screen's status line, and FT8's panel shows the grid
+            // lock in the link bar instead.
+            on_ntp: |_| {},
         })
     }
 
@@ -581,6 +584,9 @@ fn capture_loop() -> ! {
                 let t = now_us();
                 cap.push_i16(&block);
                 t_compute += now_us() - t;
+                // The replay does not pass through `uac`, so it offers
+                // the waterfall its audio itself.
+                crate::waterfall_feed::push(&block);
                 fed += take;
 
                 // Pace to real time, so the front end's cost is a duty
@@ -780,99 +786,18 @@ fn scan_loop() -> ! {
             decode_ms / n,
         );
 
-        let rows: Vec<SlotSpotRow> = decoded.iter().map(|h| to_row(h, t_search_ms)).collect();
-        {
-            let mut ui = FST4_UI.lock().expect("FST4_UI poisoned");
-            ui.last_slot_cands = candidates.len();
-            ui.last_slot_tried = hits.len();
-            ui.last_first_decode_ms = first_ms;
-            ui.audio_live = UAC_AUDIO_ACTIVE.load(Ordering::Acquire);
-            ui.set_slot(&current_hhmm(), &rows);
+        // Onto FT8's panel, the way FT4 feeds it.
+        if let Ok(mut ui) = UI.lock() {
+            ui.publish_slot(decoded.iter().map(|h| SlotDecode {
+                freq_hz: h.refined_hz,
+                snr_db: h.snr_db,
+                dt_sec: h.dt_sec,
+                text: h.msg.as_deref().unwrap_or(""),
+                hard_errors: 0,
+            }));
         }
         log_heap("post-slot");
         slot_num = slot_num.wrapping_add(1);
     }
 }
 
-fn to_row(h: &MonitorHit, search_ms: i64) -> SlotSpotRow {
-    let mut msg: heapless::String<22> = heapless::String::new();
-    let text = h.msg.as_deref().unwrap_or("");
-    let _ = msg.push_str(&text[..text.len().min(22)]);
-    SlotSpotRow {
-        utc_hhmm: current_hhmm(),
-        freq_hz: h.refined_hz,
-        snr_db: h
-            .snr_db
-            .is_finite()
-            .then(|| h.snr_db.clamp(-99.0, 99.0) as i8),
-        dt_sec: h.dt_sec,
-        msg,
-        t_s: (h.t_ms + search_ms) as f32 / 1000.0,
-    }
-}
-
-fn current_hhmm() -> heapless::String<4> {
-    use core::fmt::Write as _;
-    let mut s: heapless::String<4> = heapless::String::new();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let _ = write!(&mut s, "{:02}{:02}", (now / 3600) % 24, (now / 60) % 60);
-    s
-}
-
-/// The FST4 screen's half of [`crate::spot_panel`]: which renderers to
-/// call, which state to lock, and the task's own name and priority.
-struct Fst4Panel;
-
-impl crate::spot_panel::SpotPanel for Fst4Panel {
-    type Ui = slot_list::SlotUiState;
-
-    const MODE: BootMode = BootMode::Fst4;
-    const TAG: &'static str = "fst4_app::display";
-    const TASK_NAME: &'static core::ffi::CStr = c"fst4_display";
-    const STACK: u32 = DISPLAY_STACK;
-    const PRIORITY: u32 = DISPLAY_PRIORITY;
-
-    fn with_ui<R, F: FnOnce(&mut Self::Ui) -> R>(f: F) -> R {
-        f(&mut FST4_UI.lock().expect("FST4_UI poisoned"))
-    }
-
-    fn set_status(ui: &mut Self::Ui, heap_kb: u32, utc_hhmmss: &str) {
-        ui.free_heap_kb = heap_kb;
-        ui.utc_hhmmss = heapless::String::try_from(utc_hhmmss).unwrap_or_default();
-    }
-
-    fn dirty_seq(ui: &Self::Ui) -> u32 {
-        ui.dirty_seq()
-    }
-
-    fn render_all<D>(display: &mut D, ui: &Self::Ui) -> Result<(), D::Error>
-    where
-        D: embedded_graphics::prelude::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>,
-    {
-        slot_list::render_all(display, ui)
-    }
-
-    fn render_status<D>(display: &mut D, ui: &Self::Ui) -> Result<(), D::Error>
-    where
-        D: embedded_graphics::prelude::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>,
-    {
-        slot_list::render_status(display, ui)
-    }
-
-    fn render_rows<D>(display: &mut D, ui: &Self::Ui) -> Result<(), D::Error>
-    where
-        D: embedded_graphics::prelude::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>,
-    {
-        slot_list::render_slot(display, ui)
-    }
-
-    fn render_history<D>(display: &mut D, ui: &Self::Ui) -> Result<(), D::Error>
-    where
-        D: embedded_graphics::prelude::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>,
-    {
-        slot_list::render_history(display, ui)
-    }
-}

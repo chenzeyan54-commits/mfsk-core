@@ -166,6 +166,73 @@ pub fn render_in<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    // GREEN = "appeared in pipeline's CURRENT slot". If caller passes
+    // the pipeline watermark, use that — otherwise fall back to the
+    // legacy "max slot_seq among visible rows" (which makes every
+    // row green when no new decodes arrive).
+    let take = rows.len().min(row_count.min(MAX_ROWS));
+    let latest_seq = latest_slot_seq.unwrap_or_else(|| {
+        rows[rows.len() - take..]
+            .iter()
+            .map(|r| r.slot_seq)
+            .max()
+            .unwrap_or(0)
+    });
+    render_core(
+        display,
+        rows,
+        &|k| rows[k].slot_seq == latest_seq,
+        selected_idx,
+        width,
+        origin_y,
+        row_count,
+    )
+}
+
+/// [`render_in`] with "heard this slot" decided by the caller, one flag
+/// per row of `rows` — what `UiState::decoded_current_iter` yields. The
+/// CoreS3 panel uses this: the rule is the UI's own (a row heard less
+/// than one slot period ago), not a watermark each receiver has to
+/// move. A missing flag reads as not current.
+#[allow(clippy::too_many_arguments)]
+pub fn render_in_flags<D>(
+    display: &mut D,
+    rows: &[DecodedRow],
+    current: &[bool],
+    selected_idx: Option<u8>,
+    width: u32,
+    origin_y: i32,
+    row_count: usize,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    render_core(
+        display,
+        rows,
+        &|k| current.get(k).copied().unwrap_or(false),
+        selected_idx,
+        width,
+        origin_y,
+        row_count,
+    )
+}
+
+/// The drawing both rules share. `is_current(k)` is asked about
+/// `rows[k]`.
+#[allow(clippy::too_many_arguments)]
+fn render_core<D>(
+    display: &mut D,
+    rows: &[DecodedRow],
+    is_current: &dyn Fn(usize) -> bool,
+    selected_idx: Option<u8>,
+    width: u32,
+    origin_y: i32,
+    row_count: usize,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
     let row_count = row_count.min(MAX_ROWS);
     // Operator-requested 2026-05-17 final simplification: black bg
     // always (native panel contrast max), distinguish via text color
@@ -184,18 +251,17 @@ where
     let take = n.min(row_count);
     let start = n - take;
     // Trailing `take` entries = most recently updated. Reverse so
-    // the most-recently-updated lands at the *top* of the region.
-    let visible: heapless::Vec<&DecodedRow, MAX_ROWS> =
-        rows[start..].iter().rev().take(row_count).collect();
+    // the most-recently-updated lands at the *top* of the region —
+    // carrying each row's index into `rows` for `is_current`.
+    let visible: heapless::Vec<(usize, &DecodedRow), MAX_ROWS> = rows[start..]
+        .iter()
+        .enumerate()
+        .rev()
+        .take(row_count)
+        .map(|(j, r)| (start + j, r))
+        .collect();
 
-    // GREEN = "appeared in pipeline's CURRENT slot". If caller passes
-    // the pipeline watermark, use that — otherwise fall back to the
-    // legacy "max slot_seq among visible rows" (which makes every
-    // row green when no new decodes arrive).
-    let latest_seq =
-        latest_slot_seq.unwrap_or_else(|| visible.iter().map(|r| r.slot_seq).max().unwrap_or(0));
-
-    for (i, row) in visible.iter().enumerate() {
+    for (i, (k, row)) in visible.iter().enumerate() {
         let y = origin_y + (i as i32) * ROW_PX as i32;
         let row_y_text = y + 3; // 3 px top padding inside the row band
 
@@ -204,7 +270,7 @@ where
         // slots too (operator semantics 2026-05-17: focus is "did I
         // hear this station this cycle?" not "first time ever").
         // Cursor takes visual precedence — it's the actionable row.
-        let is_current_slot = row.slot_seq == latest_seq;
+        let is_current_slot = is_current(*k);
         let is_selected = selected_idx == Some(i as u8);
         let row_fg = if is_selected {
             cur_fg

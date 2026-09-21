@@ -109,6 +109,18 @@ impl BootMode {
         }
     }
 
+    /// The receiver's slot period, ms — what the panel measures "heard
+    /// this slot" and rules its waterfall against. FT8's 15 s for every
+    /// mode that runs the FT8 pipeline.
+    pub fn slot_period_ms(self) -> u32 {
+        match self {
+            BootMode::Ft4 => 7_500,
+            BootMode::Wspr => 120_000,
+            BootMode::Fst4 => 60_000,
+            _ => 15_000,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             BootMode::Decode => "DECODE",

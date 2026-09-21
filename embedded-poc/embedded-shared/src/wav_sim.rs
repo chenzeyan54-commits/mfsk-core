@@ -36,14 +36,26 @@ const SLOT_SAMPLES: usize = 180_000;
 struct Cfg {
     wavs: &'static [&'static [u8]],
     chunk_q: QueueHandle_t,
+    tap: Option<fn(&[i16])>,
 }
 
 /// Spawn the WAV-feed task. Cycles through `wavs` indefinitely, sending
 /// CHUNK_LEN-sized `ChunkMsg::Samples` every 100 ms and `ChunkMsg::SlotEnd`
 /// at WAV completion.
 pub fn spawn(wavs: &'static [&'static [u8]], chunk_q: QueueHandle_t) {
+    spawn_inner(wavs, chunk_q, None);
+}
+
+/// [`spawn`], also handing every chunk to `tap` before it is queued —
+/// for a board whose waterfall is fed from the audio rather than from
+/// the decoder (`m5stack-cores3-app`'s `waterfall_feed`).
+pub fn spawn_with_tap(wavs: &'static [&'static [u8]], chunk_q: QueueHandle_t, tap: fn(&[i16])) {
+    spawn_inner(wavs, chunk_q, Some(tap));
+}
+
+fn spawn_inner(wavs: &'static [&'static [u8]], chunk_q: QueueHandle_t, tap: Option<fn(&[i16])>) {
     assert!(!wavs.is_empty(), "wav_sim::spawn: no WAVs provided");
-    let cfg = Box::new(Cfg { wavs, chunk_q });
+    let cfg = Box::new(Cfg { wavs, chunk_q, tap });
     let arg = Box::into_raw(cfg) as *mut c_void;
     let r = unsafe {
         xTaskCreatePinnedToCore(
@@ -66,6 +78,7 @@ extern "C" fn sim_task_main(arg: *mut c_void) {
     let cfg: Box<Cfg> = unsafe { Box::from_raw(arg as *mut Cfg) };
     let chunk_q = cfg.chunk_q;
     let wavs = cfg.wavs;
+    let tap = cfg.tap;
     // Keep cfg alive forever; leak intentionally since the task never returns.
     core::mem::forget(cfg);
 
@@ -85,6 +98,9 @@ extern "C" fn sim_task_main(arg: *mut c_void) {
                 for k in 0..n_this {
                     let off = (i + k) * 2;
                     chunk.push(i16::from_le_bytes([payload[off], payload[off + 1]]));
+                }
+                if let Some(tap) = tap {
+                    tap(&chunk);
                 }
                 send_box(chunk_q, Box::new(ChunkMsg::Samples(chunk)));
                 i = end;

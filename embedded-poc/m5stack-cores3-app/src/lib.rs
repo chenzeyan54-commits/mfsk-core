@@ -23,9 +23,9 @@ pub mod log_slot;
 pub mod net;
 pub mod pmic;
 pub mod rtc;
-pub mod spot_panel;
 pub mod touch;
 pub mod uac;
+pub mod waterfall_feed;
 
 use esp_idf_svc::sys::{
     heap_caps_get_free_size, heap_caps_get_largest_free_block, MALLOC_CAP_8BIT, MALLOC_CAP_INTERNAL,

@@ -16,7 +16,7 @@ use embedded_shared::{dual_core, esp_dsp_fft, pipeline, stage1_inc, wav_sim};
 use esp_idf_svc::sys::QueueHandle_t;
 
 use mfsk_app_shared::qso::{self, QsoManager, QsoState};
-use mfsk_app_shared::ui::state::{DecodedRow, UI};
+use mfsk_app_shared::ui::state::{SlotDecode, UI};
 
 /// Operator identity, from `cfg.toml`'s `[station]` section.
 ///
@@ -449,11 +449,13 @@ pub(crate) const fn parse_u32(s: &str) -> u32 {
 /// `QSO_WAVS` playlist as the audio source. Thin wrapper around
 /// [`run_with_source`].
 pub fn run() -> ! {
-    run_with_source("wav", |q| wav_sim::spawn(QSO_WAVS, q))
+    run_with_source("wav", |q| {
+        wav_sim::spawn_with_tap(QSO_WAVS, q, crate::waterfall_feed::push)
+    })
 }
 
 /// Source-agnostic entry. Allocates the pipeline queues, spawns
-/// `stage1_inc` + `wf_drain`, calls `source_spawn` (which must push
+/// `stage1_inc`, calls `source_spawn` (which must push
 /// `ChunkMsg::Samples` + `ChunkMsg::SlotEnd` into the chunk queue),
 /// then runs the decode loop. Never returns.
 ///
@@ -473,15 +475,12 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
     let chunk_q = pipeline::create_chunk_queue(4);
     let slot_q = pipeline::create_slot_queue(2);
     let spec_q = pipeline::create_spec_queue(2);
-    let wf_q = pipeline::create_wf_queue(8);
-    stage1_inc::spawn_with_wf(chunk_q, slot_q, spec_q, Some(wf_q));
+    // No waterfall queue: the panel's rows come from the audio itself,
+    // the same feed every mode uses (`waterfall_feed`). This used to
+    // wire stage 1's per-pair spectra to a `wf_drain` task — one more
+    // 4 KB internal-DRAM stack, for rows only FT8 could produce.
+    stage1_inc::spawn_with_wf(chunk_q, slot_q, spec_q, None);
     source_spawn(chunk_q);
-
-    let wf_q_addr = wf_q as usize;
-    crate::board::spawn_named(c"wf_drain", 4 * 1024, move || {
-        wf_drain(wf_q_addr as esp_idf_svc::sys::QueueHandle_t)
-    })
-    .expect("spawn wf drainer");
 
     log::info!("decode pipeline ready (q_thresh={DEFAULT_Q_THRESH}, band 200..3000 Hz, cores3-app phase 0)");
     // **The arm belongs in the boot line**, same reason `stage1_inc`
@@ -985,9 +984,6 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                 margin_at(slot.slotend_us),
                 t_post_recv - spec.emit_us
             );
-            if let Ok(mut ui) = UI.lock() {
-                ui.latest_slot_seq = slot_seq;
-            }
             slot_seq = slot_seq.wrapping_add(1);
             continue;
         }
@@ -1977,12 +1973,11 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
         }
 
         let mut had_response_this_slot = false;
+        // The slot's rows, published together below through the list's
+        // one entry point (`UiState::publish_slot`) — which rows count
+        // as heard this slot is the panel's call, by time.
+        let mut published: Vec<(String, f32, f32, f32, u32)> = Vec::new();
         if let Ok(mut ui) = UI.lock() {
-            // **Every slot moves the watermark, decoded or not.** It is
-            // what turns the previous slot's stations from green back to
-            // white; the list cannot derive it from its own rows,
-            // because a slot with no decode adds none.
-            ui.latest_slot_seq = slot_seq;
             for r in results.iter() {
                 // Resolve against what earlier slots taught us, then
                 // learn this message's own callsigns for the next.
@@ -1997,24 +1992,18 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                     if text.contains("<...>") {
                         unresolved_total += 1;
                     }
-                    let mut msg: heapless::String<22> = heapless::String::new();
-                    let take = text.len().min(msg.capacity());
-                    let _ = msg.push_str(&text[..take]);
                     const FP_SPEC_SHIFT: u32 = 12;
                     let cell_scale = (1u32 << FP_SPEC_SHIFT) as f32;
                     let calibrated_snr =
                         mfsk_core::ft8::decode_block::xsnr2_db_simple(&spec.spec, r, cell_scale);
                     let snr_i8 = calibrated_snr.round().clamp(-128.0, 127.0) as i8;
-                    let row = DecodedRow {
-                        df_hz: r.freq_hz.round().clamp(0.0, 65_535.0) as u16,
-                        snr_db: snr_i8,
-                        hard_errors: r.hard_errors.min(255) as u8,
-                        dt_ds: (r.dt_sec * 10.0).round().clamp(-99.0, 99.0) as i8,
-                        msg,
-                        slot_seq,
-                        first_seq: slot_seq,
-                    };
-                    ui.push_decode(row);
+                    published.push((
+                        text.clone(),
+                        r.freq_hz,
+                        calibrated_snr,
+                        r.dt_sec,
+                        r.hard_errors,
+                    ));
                     log::info!(
                         // WSJT-X's order — dB, DT, Freq, message — so
                         // a log read beside its Band Activity window
@@ -2039,6 +2028,17 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                     }
                 }
             }
+            // Every slot, decoded or not — an empty slot costs nothing
+            // and keeps the list's own slot count honest.
+            ui.publish_slot(published.iter().map(|(text, freq_hz, snr_db, dt_sec, hard)| {
+                SlotDecode {
+                    freq_hz: *freq_hz,
+                    snr_db: *snr_db,
+                    dt_sec: *dt_sec,
+                    text,
+                    hard_errors: *hard,
+                }
+            }));
         }
 
         // **This period's transmission is decided here** — before
@@ -2097,13 +2097,3 @@ fn push_tx_line(qso: &QsoManager, intent: Option<&qso::TxIntent>) {
     }
 }
 
-fn wf_drain(wf_q: esp_idf_svc::sys::QueueHandle_t) -> ! {
-    let n: u32 = 0;
-    loop {
-        let tick = pipeline::recv_box::<pipeline::WfTick>(wf_q);
-        if let Ok(mut ui) = UI.lock() {
-            ui.push_waterfall_at(tick.row, tick.pair_idx);
-        }
-        let _ = n;
-    }
-}

@@ -33,19 +33,6 @@ pub mod capture_window;
 #[path = "../../../embedded-poc/mfsk-app-shared/src/wspr_bands.rs"]
 pub mod wspr_bands;
 
-/// WSPR UI row formatting — pure string building, no I/O, no
-/// `embedded-graphics` draw calls (those live in `wspr_list.rs`,
-/// which does need this crate's `esp_idf_svc`-adjacent draw stack and
-/// so is not pulled in here).
-#[path = "../../../embedded-poc/mfsk-app-shared/src/ui/wspr_row.rs"]
-pub mod wspr_row;
-
-/// The spot-list container shared by the FST4 and WSPR screens —
-/// `heapless` plus one atomic, no draw stack, so the truncation and
-/// history-rolling rules can be tested where tests actually run.
-#[path = "../../../embedded-poc/mfsk-app-shared/src/ui/spot_state.rs"]
-pub mod spot_state;
-
 /// Slot parity — pure arithmetic; `time_sync` needs it.
 #[path = "../../../embedded-poc/mfsk-app-shared/src/parity.rs"]
 pub mod parity;

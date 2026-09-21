@@ -185,7 +185,7 @@ pub struct HalfStream {
     len: AtomicUsize,
     closed: AtomicBool,
 }
-// SAFETY: the only mutation is `SlotAccum::push_with_rows`, through
+// SAFETY: the only mutation is `SlotAccum::push`, through
 // `&mut SlotAccum` (so one writer), appending past the published length;
 // readers read only below it. See the struct doc.
 unsafe impl Sync for HalfStream {}
@@ -302,8 +302,7 @@ fn now_us() -> i64 {
 /// (`docs/notes/FT4_BENCHMARK.md` §32, §37, §42).
 ///
 /// The audio is still kept whole: `snr_db` aside, a caller that wants
-/// to re-run anything at 12 kHz needs it, and the waterfall and the
-/// replay path both read it.
+/// to re-run anything at 12 kHz needs it, and the replay path reads it.
 pub struct SlotAccum {
     audio: Vec<i16>,
     savg: Ft4SavgBuilder,
@@ -467,19 +466,11 @@ impl SlotAccum {
     /// 7.5 s slot — and the remaining 0.725 s is discarded, because a
     /// QSO-capable receiver has to have answered by 8.0 s and no
     /// candidate can read that audio anyway.
+    ///
+    /// No waterfall rows from here any more: the panel's waterfall is
+    /// fed from the audio itself, the same way in every mode
+    /// (`waterfall::WfRowBuilder`).
     pub fn push(&mut self, samples: &[i16]) -> Option<CapturedSlot> {
-        self.push_with_rows(samples, &mut |_| {})
-    }
-
-    /// [`push`](Self::push), forwarding each completed spectrum row to
-    /// `on_row` — see [`Ft4SavgBuilder::push_with_rows`]. This is how a
-    /// waterfall gets 152 rows a slot without a transform of its own;
-    /// [`wf_row`] turns one into palette indices.
-    pub fn push_with_rows(
-        &mut self,
-        samples: &[i16],
-        on_row: &mut dyn FnMut(&[f32]),
-    ) -> Option<CapturedSlot> {
         let mut rest = samples;
         let mut done = None;
         while !rest.is_empty() {
@@ -490,7 +481,7 @@ impl SlotAccum {
             }
             let take = self.grid.room().min(rest.len());
             self.audio.extend_from_slice(&rest[..take]);
-            self.savg.push_with_rows(&rest[..take], on_row);
+            self.savg.push(&rest[..take]);
             self.push_half(&rest[..take]);
             rest = &rest[take..];
             if self.grid.fill(take) {
@@ -1614,115 +1605,6 @@ pub fn decode_slot_with(
         ],
         loop_us,
     }
-}
-
-/// Frequency span the waterfall covers, matching `ui::waterfall`'s
-/// own `WF_FREQ_LO_HZ`/`HI` and FT8's row builder — the panel is
-/// shared, so the axis has to be.
-pub const WF_FREQ_LO_HZ: f32 = 200.0;
-/// See [`WF_FREQ_LO_HZ`].
-pub const WF_FREQ_HI_HZ: f32 = 2_700.0;
-
-/// Bin spacing of a row from [`Ft4SavgBuilder`]: `12 000 / 2304`.
-const ROW_DF_HZ: f32 = 12_000.0 / 2_304.0;
-
-/// Turn one row's power spectrum into [`crate::pipeline::WF_ROW_LEN`]
-/// palette indices, 0..15.
-///
-/// Rows come from [`Ft4SavgBuilder::push_with_rows`], which hands over
-/// the spectra it is already averaging — so the *transforms* are free.
-/// This mapping is not, and it runs on the capture thread: 152 rows a
-/// slot against §33's 21.3 ms per-block budget.
-///
-/// **Integer log2, not `log10`.** The first version took
-/// `10 * log10(p)` per column and measured **623 µs per row, 94 ms a
-/// slot, 10 % of the coarse stage** — display-only work costing a
-/// tenth of the stage it rides on, which is not a reasonable price for
-/// a picture. `f32::log10` is ~620 cycles on this core and there are
-/// 240 of them per row.
-///
-/// So the level comes from the exponent instead, the way FT8's own
-/// `decimate_pair_to_wf` has always done it: scale the power by the
-/// row's mean, take the bit position of the MSB, and keep one
-/// fractional bit for half-octave resolution. One float multiply per
-/// column and the rest is integer.
-///
-/// The palette is 16 coarse steps over [`WF_SPAN_DB`], so quantising
-/// the level to half-octaves (~1.5 dB) is below what it can show.
-///
-/// **Per-column maximum, not mean.** A column is ~2 bins wide
-/// (2 500 Hz over 240 columns is 10.4 Hz, against 5.2 Hz bins) and an
-/// FT4 tone is narrower than that, so averaging would halve every
-/// signal against its neighbouring noise bin while leaving the noise
-/// floor alone — visible as a waterfall where the signals are dimmer
-/// than the background is bright.
-///
-/// **The scale is per-row and relative**, against the row's own mean
-/// power. An absolute scale would need a calibrated input level, which
-/// a receiver taking whatever a radio's USB audio hands it does not
-/// have; this shows the band the way an operator reads one, relative
-/// to its own noise.
-pub fn wf_row(spectrum: &[f32]) -> [u8; crate::pipeline::WF_ROW_LEN] {
-    const N: usize = crate::pipeline::WF_ROW_LEN;
-    /// `1.0` in the fixed-point ratio below, i.e. `2^SCALE_LOG2`.
-    const SCALE_LOG2: u32 = 10;
-    /// Half-octaves the palette spans. [`WF_SPAN_DB`] dB of *power* is
-    /// `WF_SPAN_DB / 3.01` octaves, doubled.
-    const HALF_OCTAVES: u32 = 20;
-    /// First column's low bin, and the bin step per column — the whole
-    /// frequency mapping, folded into two constants so the loop is an
-    /// add and two truncations rather than four divides.
-    const BIN0: f32 = WF_FREQ_LO_HZ / ROW_DF_HZ;
-    /// See [`BIN0`].
-    const BIN_STEP: f32 = (WF_FREQ_HI_HZ - WF_FREQ_LO_HZ) / (N as f32) / ROW_DF_HZ;
-
-    let mut out = [0u8; N];
-    if spectrum.is_empty() {
-        return out;
-    }
-    let mean: f32 = spectrum.iter().sum::<f32>() / spectrum.len() as f32;
-    // A silent input (all zero) has no scale to speak of; leave the
-    // row black rather than dividing by it.
-    if !(mean > 0.0) {
-        return out;
-    }
-    // One divide per row, not per column.
-    let inv = (1u32 << SCALE_LOG2) as f32 / mean;
-
-    // Column -> bin range, walked rather than computed. The mapping is
-    // fixed — it depends on nothing but the constants — yet the first
-    // version recomputed it per row with four float divides per
-    // column, 960 a row. Dropping `log10` only took 623 us/row to 384;
-    // this is the rest of it.
-    let mut edge = BIN0;
-
-    for cell in out.iter_mut() {
-        let lo = edge as usize;
-        edge += BIN_STEP;
-        let hi = ((edge as usize) + 1).min(spectrum.len());
-        if hi <= lo {
-            continue;
-        }
-        let mut peak = 0.0f32;
-        for &p in &spectrum[lo..hi] {
-            if p > peak {
-                peak = p;
-            }
-        }
-        // Ratio to the row's mean, in units of `2^SCALE_LOG2`.
-        let scaled = peak * inv;
-        if !(scaled >= 1.0) {
-            continue;
-        }
-        let q = scaled as u32;
-        // `31 - leading_zeros` is floor(log2), and the bit below the
-        // MSB is the half-octave.
-        let e = 31 - q.leading_zeros();
-        let frac = if e > 0 { (q >> (e - 1)) & 1 } else { 0 };
-        let half_oct = (e * 2 + frac).saturating_sub(SCALE_LOG2 * 2);
-        *cell = ((half_oct * 15) / HALF_OCTAVES).min(15) as u8;
-    }
-    out
 }
 
 /// Unit-power normalisation, matching what

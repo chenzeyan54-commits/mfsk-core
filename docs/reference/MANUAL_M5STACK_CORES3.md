@@ -24,12 +24,28 @@ driver takes the port a flasher would use.
 | Mode | What it does | Radio needed |
 |---|---|---|
 | `uac` | FT8 from the radio's USB Audio interface | yes |
-| `wspr` | WSPR receiver — spot list, wsprnet upload | yes |
+| `ft4` | FT4 from the radio's USB Audio interface | yes |
+| `wspr` | WSPR receiver, with wsprnet upload | yes |
 | `fst4` | FST4 wideband monitor | yes |
 | `decode` | FT8 from a WAV baked into the image | no |
 
 `decode` is the demo mode: it needs no radio and no antenna, and is
 the fastest way to confirm a board works at all.
+
+**Every mode shows the same screen** — the FT8 one: status bar,
+waterfall, station list, link bar, and the menu over the top. WSPR
+and FST4 had spot-list screens of their own until 2026-09-21.
+
+- **The waterfall is drawn from the audio itself**, the same way in
+  every mode, at 12 rows a second over 200-2 700 Hz. Its horizontal
+  rules mark the slot boundaries of the running mode (7.5 s, 15 s,
+  60 s or 120 s) by the board's clock — the clock's boundary, not
+  necessarily the one the FT8 decoder locked onto when it has only
+  the RTC and is following the air.
+- **A station is green while it was heard within the last slot
+  period**, then turns white on its own, whether or not the next slot
+  decodes anything. The screen decides this from the time, not the
+  receiver.
 
 ---
 
@@ -221,7 +237,7 @@ Environment variables read at compile time. All default to off.
 
 The last two exist for desk work with no radio. **They are off by
 default because what they produce is indistinguishable from a real
-decode**: a fabricated `K1ABC` lands on the spot list every two
+decode**: a fabricated `K1ABC` lands on the station list every two
 minutes, and a replayed slot shows the same stations forever. A
 receiver with nothing to hear should say so.
 

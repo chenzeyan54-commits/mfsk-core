@@ -108,7 +108,7 @@ use mfsk_core::engine::dsp::resample::LinearResamplerI16To12k;
 /// tasks can fail too, and on this esp-idf-svc std target an alloc
 /// failure surfaces as a genuine Rust panic rather than an abort —
 /// which then poisons whichever `std::sync::Mutex` it held
-/// (`BASEBAND_BUFS`/`DDC_READY_IDX`/`WSPR_UI`/`ctx.nvs`), so the next
+/// (`BASEBAND_BUFS`/`DDC_READY_IDX`/`ctx.nvs`), so the next
 /// task to touch that lock panics too. That's the double-panic crash
 /// loop, and it explains why the observed backtrace lands in a
 /// different task on different boots — it's whichever task loses the
@@ -837,6 +837,7 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
                     sink.push_samples(block);
                 }
             }
+            crate::waterfall_feed::push(block);
             fed += block.len() as u64;
             let due = (fed * 1_000_000 / 12_000) as i64;
             let now = unsafe { sys::esp_timer_get_time() } - t0;
@@ -2408,6 +2409,8 @@ fn reader_thread(handle: DeviceHandle, addr: u8, iface_num: u8) {
                 }
                 out_samples += produced as u32;
                 sink.push_samples(&dst_scratch[..produced]);
+                // Never blocks — see `waterfall_feed::push`.
+                crate::waterfall_feed::push(&dst_scratch[..produced]);
             }
             // Defensive: if process() makes zero progress (shouldn't,
             // given the input is non-empty), break to avoid an

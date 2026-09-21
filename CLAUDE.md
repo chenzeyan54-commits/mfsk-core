@@ -478,7 +478,7 @@ else already works against WAV-fed/synthetic baseband, and #163 itself
 cleared 2026-08-23 on the FT8 controller). Lives in the
 same `m5stack-cores3-app` crate as two separate binaries:
 `src/bin/wspr_bench.rs` (timing measurement) and `src/bin/wspr_app.rs`
-(the standalone receiver — LCD spot list, WiFi, HTTP config, NTP, and
+(the standalone receiver — the shared FT8 panel, WiFi, HTTP config, NTP, and
 real UAC audio through `AudioSink`). Note that `wspr_app` *does* now
 share `uac.rs` with the FT8 line; that path is proven on the FT8
 controller but `wspr_app` itself has not been run against a radio yet

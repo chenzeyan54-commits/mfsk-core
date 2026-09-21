@@ -25,6 +25,7 @@ pub mod internal_pool;
 pub mod pipeline;
 pub mod stage1_inc;
 pub mod wav_sim;
+pub mod waterfall;
 // Ungated: `fst4_dual_core` and `internal_pool` use it too, and they
 // are not behind `wspr-bench`.
 pub mod worker_arena;

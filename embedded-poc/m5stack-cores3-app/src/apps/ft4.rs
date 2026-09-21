@@ -30,10 +30,10 @@
 //! **The screen is the FT8 controller's.** Waterfall, decoded list and
 //! status bar all go through `mfsk_app_shared::ui::state::UI` and are
 //! drawn by `display::run_log_panel` — the same state and loop the FT8
-//! path uses, not a second implementation. What FT4 adds is rate: 152
-//! spectrogram rows a slot against FT8's one, handed over by the same
-//! hook that feeds the coarse stage, so the waterfall costs no
-//! transform of its own.
+//! path uses, not a second implementation. The waterfall's rows come
+//! from the audio itself through `waterfall_feed`, the same feed every
+//! mode uses; FT4 used to hand over rows from its coarse periodogram
+//! instead.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use embedded_shared::apps::ft4_rx as rx;
 use crate::boot::{BootCtx, Display, Panel, Receiver};
-use mfsk_app_shared::ui::state::{DecodedRow, UI};
+use mfsk_app_shared::ui::state::{SlotDecode, UI};
 
 /// The deadline the candidate loop is held to, from slot close.
 ///
@@ -113,26 +113,6 @@ const FT4_SLOT_MS: u64 = 7_500;
 /// and this number only decides whether the measurement is worth
 /// printing.
 const FT4_DT_REPORT_MIN_SAMPLES: u32 = 288;
-
-/// Spectrogram rows per waterfall row.
-///
-/// The coarse stage produces one row per 48 ms — 152 a slot — and the
-/// shared waterfall was built for FT8, which pushes **one per 15 s
-/// slot**. Feeding it all 152 turns the 100-row ring over 1.5 times
-/// per slot, so the display shows about 4.8 s of band and races; and
-/// since every `push_waterfall` bumps `wf_push_seq`, the display loop
-/// repaints its 48 KB region ~20 times a second chasing them. On the
-/// panel that reads as the waterfall overflowing, which is exactly
-/// what it is.
-///
-/// Every 6th row is ~one per 288 ms: still visibly flowing during
-/// capture, which is the point of having the rows at all, but 100 rows
-/// is now ~29 s of history and the repaint rate is ~3.5 Hz.
-///
-/// The rows themselves are not thrown away cheaply — they are free, and
-/// the decoder consumes all of them. This decimates the *drawing*
-/// only.
-const WF_ROW_DECIM: usize = 6;
 
 /// Stack for the decode task.
 ///
@@ -322,10 +302,10 @@ fn spawn_slot_task() {
 /// One task, not two: the accumulation is ~12 % duty (§33) and the
 /// decode ~2.4 s of a 7.5 s slot, so they fit in series with room, and
 /// a second hand-off would only add a place for a slot to go missing.
-/// The cost is that rows for the next slot are computed in a burst
-/// after a decode finishes rather than smoothly — the waterfall
-/// stutters, `savg` does not, because it is bit-identical at any block
-/// size (`ft4_savg_builder_matches_whole_slot`).
+/// The cost is that the next slot's periodogram is accumulated in a
+/// burst after a decode finishes rather than smoothly, which `savg`
+/// does not notice: it is bit-identical at any block size
+/// (`ft4_savg_builder_matches_whole_slot`).
 fn slot_loop() -> ! {
     let mut accum = rx::SlotAccum::new();
     let mut block: Vec<i16> = Vec::with_capacity(STAGING_CAP);
@@ -347,7 +327,6 @@ fn slot_loop() -> ! {
         log::info!("ft4_app: replay requested but no golden linked — build with --features ft4-replay");
     }
     let mut gpos = 0usize;
-    let mut row_seq: usize = 0;
     // Slot-grid alignment (#354). `false` until the first block of real
     // UAC audio; the replay source is not real-time, so anchoring it to
     // UTC would be meaningless.
@@ -391,6 +370,9 @@ fn slot_loop() -> ! {
             // One UAC-sized block of the golden, at 12 kHz.
             let take = REPLAY_BLOCK.min(golden.len() - gpos);
             block.extend_from_slice(&golden[gpos..gpos + take]);
+            // The replay does not pass through `uac`, so it offers the
+            // waterfall its audio itself.
+            crate::waterfall_feed::push(&block);
             gpos = (gpos + take) % golden.len();
             fed += take as u64;
             let due_us = (fed * 1_000_000 / 12_000) as i64;
@@ -501,19 +483,7 @@ fn slot_loop() -> ! {
             }
         }
 
-        // The rows the coarse stage is already transforming, mapped to
-        // palette indices on the way past. §35.2: 174 us a row after
-        // the mapping was made integer.
-        let done = accum.push_with_rows(&block, &mut |row| {
-            row_seq += 1;
-            if !row_seq.is_multiple_of(WF_ROW_DECIM) {
-                return;
-            }
-            let cells = rx::wf_row(row);
-            if let Ok(mut ui) = UI.lock() {
-                ui.push_waterfall(cells);
-            }
-        });
+        let done = accum.push(&block);
         if let Some(carriers) = accum.take_provisional() {
             early = rx::EarlyBasebands::start(accum.half_stream(), &carriers);
         }
@@ -552,18 +522,15 @@ fn slot_loop() -> ! {
             ui.update_status(|st| {
                 st.free_heap_kb = free_heap_kb();
             });
+            // The station list's one entry point, as every mode.
+            ui.publish_slot(o.decodes.iter().map(|d| SlotDecode {
+                freq_hz: d.freq_hz,
+                snr_db: d.snr_db,
+                dt_sec: d.dt_sec,
+                text: &d.msg,
+                hard_errors: d.hard_errors,
+            }));
             for d in &o.decodes {
-                let mut msg: heapless::String<22> = heapless::String::new();
-                let _ = msg.push_str(&d.msg[..d.msg.len().min(22)]);
-                ui.push_decode(DecodedRow {
-                    df_hz: d.freq_hz.round().clamp(0.0, 65_535.0) as u16,
-                    snr_db: d.snr_db.round().clamp(-128.0, 127.0) as i8,
-                    hard_errors: d.hard_errors.min(255) as u8,
-                    dt_ds: (d.dt_sec * 10.0).round().clamp(-99.0, 99.0) as i8,
-                    msg,
-                    slot_seq: seq,
-                    first_seq: seq,
-                });
                 log::info!(
                     "    {:>6.1} Hz  {:>+5.2} s  {:>3.0} dB  {}",
                     d.freq_hz,

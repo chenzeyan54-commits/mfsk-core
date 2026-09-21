@@ -109,7 +109,7 @@ answering. Do not surface a cached value as a live one.
 |---|---|
 | `MFSK_CORES3_FORCE_UAC=1` | take USB host mode even with external power. Back-powers a PC; for bench use only |
 | `MFSK_CORES3_USB_PANEL=1` | draw the ten-line USB diagnostic panel. Off by default — it covers the decodes, and the link bar carries what an operator needs |
-| `MFSK_WSPR_SYNTH=1` | fabricate a WSPR slot when no radio is attached. Off by default: it puts `DDC_TEST_CALL` on the spot list every two minutes, indistinguishable from a real decode |
+| `MFSK_WSPR_SYNTH=1` | fabricate a WSPR slot when no radio is attached. Off by default: it puts `DDC_TEST_CALL` on the station list every two minutes, indistinguishable from a real decode |
 | `MFSK_FST4_REPLAY=1` | replay a baked FST4 slot when no radio is attached. Same reasoning |
 | `MFSK_CORES3_SIM=1` | in `BootMode::Uac`, feed `qso3_busy.wav` through the **real** `Ft8ChunkSink` on loop — unlike `Decode`/wav_sim it exercises the UTC anchor, air-sync, cold acquisition and the NVS grid fix. Flashed over USB the board stays a peripheral (console alive). Compile-time — a sim build is a deliberate rebuild |
 | `MFSK_SIM_OFFSET_MS=N` | with `MFSK_CORES3_SIM`, prepend `N` ms of silence so the sink's slot grid starts `N` ms mis-aligned from the signal |

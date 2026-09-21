@@ -1310,7 +1310,7 @@ fn wf_row_probe(audio: &[i16]) {
     let t0 = now_us();
     b.push_with_rows(audio, &mut |row| {
         let t = now_us();
-        let r = crate::apps::ft4_rx::wf_row(row);
+        let r = crate::waterfall::wf_row(row, 12_000.0 / 2_304.0);
         map_us += now_us() - t;
         sink = sink.wrapping_add(r[120] as u32);
         rows += 1;

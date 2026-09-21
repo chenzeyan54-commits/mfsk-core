@@ -138,7 +138,14 @@ pub fn run_log_panel(
     // where the host driver was never installed, so the receiver
     // silently ran on its baked replay slot and every number measured
     // for it came from a recording.
-    let mut host_mode = matches!(mode, BootMode::Uac | BootMode::Ft4);
+    //
+    // WSPR and FST4 joined when they moved onto this panel from their
+    // own spot-list screen (2026-09-21), which had always installed the
+    // host unconditionally on battery.
+    let mut host_mode = matches!(
+        mode,
+        BootMode::Uac | BootMode::Ft4 | BootMode::Wspr | BootMode::Fst4
+    );
 
     // Boot-time reading only.
     //
@@ -473,9 +480,16 @@ pub fn run_log_panel(
     );
     let mut touch_read_failed = false;
     let mut last_wf_seq: u32 = u32::MAX;
-    let mut last_decoded_fp: (usize, u32) = (usize::MAX, u32::MAX);
+    let mut last_decoded_fp: (usize, u32, u16) = (usize::MAX, u32::MAX, u16::MAX);
+    // One flag per snapshot row: heard this slot. The UI's rule
+    // (`UiState::decoded_current_iter`), not a receiver's watermark.
+    let mut current_snapshot: heapless::Vec<bool, 16> = heapless::Vec::new();
     let mut last_tx_seq: u32 = 0;
     loop {
+        // The waterfall's rows, built here from the audio itself — the
+        // same feed in every mode (`waterfall_feed`).
+        crate::waterfall_feed::drain_to_ui();
+
         // Touch, first thing in the frame and only when it changes.
         //
         // Input before rendering, because the render path takes an
@@ -564,7 +578,7 @@ pub fn run_log_panel(
             // The overlay covered the panel; force everything back.
             last_usb_panel.clear();
             last_wf_seq = u32::MAX;
-            last_decoded_fp = (usize::MAX, u32::MAX);
+            last_decoded_fp = (usize::MAX, u32::MAX, u16::MAX);
             last_tx_seq = last_tx_seq.wrapping_add(1);
         }
 
@@ -612,7 +626,6 @@ pub fn run_log_panel(
 
         let status_snapshot;
         let decoded_fp;
-        let latest_slot_seq: u32;
         let wf_seq;
         let tx_seq;
         let tx_line_snapshot: heapless::String<48>;
@@ -636,9 +649,15 @@ pub fn run_log_panel(
                 mfsk_app_shared::time_sync::utc_now_ms().map(|ms| ((ms / 1000) % 86_400) as u32);
             status_snapshot = ui.status.clone();
             decoded_snapshot.clear();
-            for row in ui.decoded_iter() {
+            current_snapshot.clear();
+            let mut current_mask: u16 = 0;
+            for (k, (row, current)) in ui.decoded_current_iter().enumerate() {
                 if decoded_snapshot.push(row.clone()).is_err() {
                     break;
+                }
+                let _ = current_snapshot.push(current);
+                if current {
+                    current_mask |= 1 << k;
                 }
             }
             wf_seq = ui.wf_push_seq();
@@ -676,16 +695,14 @@ pub fn run_log_panel(
                 }
             }
             acq_line_snapshot = abuf;
-            // **The watermark is the pipeline's, not the rows'.**
-            // Deriving it from the visible rows makes the newest row
-            // green forever: a slot that decodes nothing adds no row,
-            // so `max` does not move and the previous slot's stations
-            // stay marked as heard this cycle. It is in the
-            // fingerprint for the same reason — the rows are
-            // unchanged on such a slot, and a redraw that never fires
-            // cannot repaint them white.
-            latest_slot_seq = ui.latest_slot_seq;
-            decoded_fp = (decoded_snapshot.len(), latest_slot_seq);
+            // **Which rows are green is decided here, by time.** A
+            // row is heard this slot while it is younger than one slot
+            // period, so a slot that decodes nothing turns the last
+            // one's stations white by itself. The mask is in the
+            // fingerprint for that reason: the rows do not change when
+            // they age, and a redraw that never fires cannot repaint
+            // them white.
+            decoded_fp = (decoded_snapshot.len(), ui.decoded_seq(), current_mask);
         }
 
         // Freeze what is underneath while the overlay is up. The
@@ -735,11 +752,11 @@ pub fn run_log_panel(
         }
 
         if decoded_fp != last_decoded_fp {
-            decoded_list::render_in(
+            decoded_list::render_in_flags(
                 &mut display,
                 &decoded_snapshot,
+                &current_snapshot,
                 None,
-                Some(latest_slot_seq),
                 SHARED_UI_WIDTH,
                 decoded_list::ORIGIN_Y,
                 if USB_PANEL {
@@ -1050,41 +1067,86 @@ fn pump_touch(
 }
 
 /// Persist what the picker committed and restart into it.
-/// The panel owns the only handle on the `"mfsk"` namespace now — one
-/// per boot, shared through `boot::BootCtx`, where two receivers used
-/// to open a second one for the same keys.
+///
+/// Through `boot_mode::commit_and_restart` / `commit_config_and_restart`,
+/// which write from a task of their own: this panel also runs on a
+/// PSRAM stack (see [`spawn_log_panel`]), and a flash write aborts from
+/// one. From `main` the hand-off costs nothing and changes nothing.
 fn apply_commit(nvs: &Arc<Mutex<EspNvs<NvsDefault>>>, commit: mode_picker::Commit) {
-    let Ok(nvs) = nvs.lock() else {
-        log::error!("NVS mutex poisoned — not committing, not restarting");
-        return;
-    };
-    let nvs = &*nvs;
     match commit {
         mode_picker::Commit::Mode(target) => {
             log::warn!("boot_mode -> {} (touch), restarting", target.label());
-            if let Err(e) = boot_mode::write(nvs, target) {
-                log::error!("boot_mode write failed: {e} — not restarting");
-                return;
-            }
+            boot_mode::commit_and_restart(nvs.clone(), target);
         }
         mode_picker::Commit::Grid(src) => {
             log::warn!("grid source -> {} (touch), restarting", src.label());
-            if let Err(e) = mfsk_app_shared::grid_src::write(nvs, src) {
-                log::error!("grid source write failed: {e} — not restarting");
-                return;
-            }
+            crate::commit_config_and_restart(nvs.clone(), crate::ConfigChoice::Grid(src));
         }
         mode_picker::Commit::Wifi(pref) => {
             log::warn!("wifi -> {} (touch), restarting", pref.label());
-            if let Err(e) = mfsk_app_shared::wifi_pref::write(nvs, pref) {
-                log::error!("wifi pref write failed: {e} — not restarting");
-                return;
-            }
+            crate::commit_config_and_restart(nvs.clone(), crate::ConfigChoice::Wifi(pref));
         }
     }
-    // Let the line reach the log sink; in UAC mode that is the only
-    // channel off this board.
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    // SAFETY: no arguments, does not return.
-    unsafe { esp_idf_svc::sys::esp_restart() };
+}
+
+/// Run [`run_log_panel`] on its own core-1 task, stack in PSRAM, for a
+/// receiver whose decode keeps core 0 busy.
+///
+/// **One panel for every mode.** WSPR and FST4 used to draw a spot-list
+/// screen of their own (`spot_panel`); they now show exactly what FT8
+/// and FT4 do — the same waterfall, decode list, status and link bars,
+/// and mode picker — and feed it through `ui::state::UI` the way FT4
+/// does. What still differs is *where* the panel runs. FT8 and FT4 call
+/// it from `main` (core 0, priority 1); WSPR's scan task holds core 0
+/// at priority 5 for ~100 s of every 120, which would freeze the panel
+/// and its touch polling — and the mode picker is the only way out of a
+/// receiver. So those two start it here, on core 1, at their own
+/// display priority, as the spot-list task did.
+///
+/// The stack is in PSRAM for the reason the spot-list task's was: the
+/// USB host's endpoint buffers need DMA-capable internal DRAM, and with
+/// a display stack there the IC-705's hub enumerated but its CDC and
+/// audio interfaces did not. Nothing on this panel writes flash itself
+/// ([`apply_commit`]).
+pub fn spawn_log_panel(
+    display: crate::boot::Display,
+    nvs: Arc<Mutex<EspNvs<NvsDefault>>>,
+    mode: BootMode,
+    stack: u32,
+    priority: u32,
+) {
+    struct Ctx {
+        display: crate::boot::Display,
+        nvs: Arc<Mutex<EspNvs<NvsDefault>>>,
+        mode: BootMode,
+    }
+    extern "C" fn entry(arg: *mut core::ffi::c_void) {
+        // SAFETY: `spawn_log_panel` leaked exactly this box.
+        let ctx = unsafe { Box::from_raw(arg as *mut Ctx) };
+        let Ctx { display, nvs, mode } = *ctx;
+        run_log_panel(
+            display.i2c0,
+            display.spi2,
+            display.pins,
+            &crate::FANOUT,
+            nvs,
+            mode,
+        )
+    }
+    let ptr = Box::into_raw(Box::new(Ctx { display, nvs, mode })) as *mut core::ffi::c_void;
+    let created = unsafe {
+        esp_idf_svc::sys::xTaskCreatePinnedToCoreWithCaps(
+            Some(entry),
+            c"display".as_ptr(),
+            stack,
+            ptr,
+            priority,
+            core::ptr::null_mut(),
+            1,
+            esp_idf_svc::sys::MALLOC_CAP_SPIRAM,
+        )
+    };
+    if created != 1 {
+        log::error!("display: failed to create the panel task ({stack} B PSRAM stack)");
+    }
 }
