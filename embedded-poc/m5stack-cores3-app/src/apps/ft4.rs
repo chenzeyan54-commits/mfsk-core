@@ -187,12 +187,11 @@ impl Receiver for Ft4Rx {
     fn net_config(_ctx: &BootCtx) -> Option<crate::net::Config> {
         Some(crate::net::Config {
             name: "ft4_app::net",
-            // FT4's decode budget is 1 750 ms from window close to
-            // key-up, and the WiFi task runs at FreeRTOS priority 23 —
-            // an association campaign preempting the decoder is a
-            // missed QSO, not a slow log. `crate::net` carries the
-            // numbers behind both of these.
-            policy: crate::net::DECODE_FIRST,
+            // Modem power save, for the reason `crate::net` records:
+            // an associated but fully-awake STA hands every broadcast
+            // frame on the LAN to a priority-23 driver task, and FT4's
+            // decode budget is 1 750 ms from the capture window
+            // closing to key-up.
             power_save: true,
             ntp: true,
             without: "no NTP, no UDP log, no config page",

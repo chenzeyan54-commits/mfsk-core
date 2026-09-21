@@ -140,7 +140,6 @@ fn main() -> ! {
             nvs.clone(),
             Some(app::net::Config {
                 name: "ft4-demo::net",
-                policy: app::net::DECODE_FIRST,
                 power_save: true,
                 ntp: true,
                 without: "no NTP, no UDP log, no config page",

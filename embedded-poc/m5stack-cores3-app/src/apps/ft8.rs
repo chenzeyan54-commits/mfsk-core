@@ -70,13 +70,6 @@ impl Receiver for Ft8Controller {
         }
         Some(crate::net::Config {
             name: "ft8_app::net",
-            // **`Once`, not `Campaign`.** What `connect_sta` did before
-            // this moved to `net`: four attempts and then nothing. The
-            // other receivers re-campaign after three minutes of quiet;
-            // this one carries a QSO, and a priority-23 driver waking
-            // up mid-sequence to look for an AP that was not there
-            // three minutes ago is a cost with no prospect.
-            policy: crate::net::Policy::Once { attempts: 4 },
             // **Unmeasured, so unchanged.** `MIN_MODEM` is what cost
             // `fst4_app` nothing and bought it 33 → 53 s; whether the
             // FT8 controller pays the same price with an associated

@@ -9,13 +9,14 @@
 //! `Drop`s would tear all of it down. The copies had drifted in three
 //! ways that turned out to be real, and one that was not:
 //!
-//! - **Retry policy.** `wspr_app` retries association forever;
-//!   `fst4_app` tries four times and then leaves the radio alone for
-//!   three minutes. That is not a style difference: while the driver
+//! - **Retry policy.** `wspr_app` retried association forever;
+//!   `fst4_app` tried four times and then left the radio alone for
+//!   three minutes. That was not a style difference: while the driver
 //!   is trying to reach an AP it cannot find, the decoder loses ~40 %
 //!   of its throughput (measured 2026-08-22, `fst4_sync_search`
 //!   711 → 1 395 ms per candidate), because the WiFi task runs at
 //!   FreeRTOS priority 23, above anything an application creates.
+//!   It is not a parameter any more either — see `CONNECT_ATTEMPTS`.
 //! - **Modem power save.** `fst4_app` sets `WIFI_PS_MIN_MODEM` because
 //!   an *associated but idle* STA cost its candidate loop 33 → 53 s;
 //!   `wspr_app` never set it. Whether WSPR pays the same price has not
@@ -24,12 +25,12 @@
 //! - **Where the NTP result goes.** Each app's own UI status line.
 //! - The fourth difference was the log prefix.
 //!
-//! So the policy is a parameter and the sequence is not. FT4 is why
-//! this got written rather than copied a third time: its decode budget
-//! is 1 750 ms from the capture window closing to key-up
+//! FT4 is why this got written rather than copied a third time: its
+//! decode budget is 1 750 ms from the capture window closing to key-up
 //! (`ft4_rx::TX_TURNAROUND_BUDGET_MS`), so an association campaign
-//! preempting the decoder is not a slow log — it is a missed QSO.
-//! Every mode here gets [`Policy::Campaign`] and power save.
+//! preempting the decoder is not a slow log — it is a missed QSO. That
+//! argument turned out to apply to all four receivers, which is why
+//! the retry policy stopped being a parameter.
 //!
 //! ## Everything, including the driver and the decision
 //!
@@ -69,26 +70,34 @@ const NETWORK_PRIORITY: u32 = 2;
 /// home network.
 const NTP_SYNC_TIMEOUT_MS: u32 = 20_000;
 
-/// How hard to chase an AP that is not answering.
-#[derive(Clone, Copy)]
-pub enum Policy {
-    /// Retry forever. What `wspr_app` needs on its own test AP, and
-    /// what costs decode throughput while it runs.
-    Unbounded,
-    /// `attempts` tries, then leave the radio alone for `idle_ms`.
-    /// Four is what `wifi.rs`'s bisection found beats the AP
-    /// comeback-time coin-flip; more costs decode throughput.
-    Campaign { attempts: u32, idle_ms: u32 },
-    /// `attempts` tries, then stop trying for this boot.
-    ///
-    /// What the FT8 controller did before it came here: `connect_sta`
-    /// gives up after `CONNECT_MAX_ATTEMPTS` and its caller had no
-    /// retry around it. Kept as its own variant rather than folded
-    /// into a long `idle_ms`, because the two say different things to
-    /// the next reader — this one is "there is no AP here", and the
-    /// board will not spend priority-23 time discovering that again.
-    Once { attempts: u32 },
-}
+/// How hard to chase an AP that is not answering: four tries, then
+/// stop for this boot.
+///
+/// **This used to be a per-receiver `Policy`** with three shapes —
+/// `Unbounded` for WSPR, whose test AP needed it; `Campaign` for FT4
+/// and FST4, four tries then three minutes of quiet; `Once` for the FT8
+/// controller, which is what `connect_sta` had always done. The
+/// parameter is gone and everything is `Once`, because the thing the
+/// three shapes were trading against is the same for all of them and
+/// only one of them was paying attention to it: a retry loop costs the
+/// decoder ~40 % of its throughput while it runs (measured 2026-08-22,
+/// `fst4_sync_search` 711 → 1 380 ms per candidate, the candidate loop
+/// 33 → 54 s), because the driver's task runs at FreeRTOS priority 23.
+/// A board that failed four times has an AP problem, and discovering
+/// that again three minutes later — or forever — buys nothing a reboot
+/// does not.
+///
+/// Four is what `wifi.rs`'s bisection found beats the AP
+/// comeback-time coin-flip; more costs throughput without finding an
+/// AP that is not there.
+///
+/// **What this costs, said plainly.** A receiver that loses its
+/// association mid-session does not get it back without a reboot, and
+/// a WSPR receiver that never associates uploads nothing to wsprnet
+/// and runs its slot grid off the RTC. That is the trade as chosen:
+/// the decode is what the board is for, and an operator who wants the
+/// network back has the panel.
+const CONNECT_ATTEMPTS: u32 = 4;
 
 /// **The radio stays up, and stopping it was tried.** An earlier
 /// version of this module could `esp_wifi_stop` once NTP had set the
@@ -109,12 +118,6 @@ pub enum Policy {
 /// without the network, and the whole stop/resync mechanism had
 /// nothing left to buy.
 
-/// The FT4/FST4 default: four attempts, then three minutes of quiet.
-pub const DECODE_FIRST: Policy = Policy::Campaign {
-    attempts: 4,
-    idle_ms: 180_000,
-};
-
 /// How far [`bring_up`] takes the radio. Anything but [`Bringup::Connect`]
 /// is a diagnostic build.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -134,7 +137,6 @@ pub enum Bringup {
 pub struct Config {
     /// FreeRTOS task name, and the log prefix.
     pub name: &'static str,
-    pub policy: Policy,
     /// `WIFI_PS_MIN_MODEM`. Off only for a build measuring what the
     /// association costs, and for the FT8 controller, which has never
     /// been measured with it (see this module's `power_save` note).
@@ -290,49 +292,26 @@ pub fn spawn(
 
 fn run(mut ctx: Ctx) -> ! {
     let tag = ctx.cfg.name;
-    let info = loop {
-        let attempts = match ctx.cfg.policy {
-            Policy::Unbounded => None,
-            Policy::Campaign { attempts, .. } | Policy::Once { attempts } => Some(attempts),
-        };
-        match wifi::connect_with_retry(
-            &mut ctx.driver,
-            crate::WIFI_SSID,
-            crate::WIFI_PSK,
-            attempts,
-        ) {
-            Ok(i) => break i,
-            Err(e) => match ctx.cfg.policy {
-                // `connect_with_retry` only returns `Err` on a
-                // malformed SSID/PSK when it was told to retry
-                // forever — checked once, not worth retrying.
-                Policy::Unbounded => {
-                    log::error!("{tag}: WiFi setup failed permanently: {e:#}");
-                    loop {
-                        FreeRtos::delay_ms(60_000);
-                    }
-                }
-                Policy::Campaign { attempts, idle_ms } => {
-                    log::warn!(
-                        "{tag}: no association after {attempts} attempts ({e:#}) — leaving \
-                         the radio alone for {} s so it stops preempting the decode",
-                        idle_ms / 1000,
-                    );
-                    FreeRtos::delay_ms(idle_ms);
-                }
-                Policy::Once { attempts } => {
-                    // No log sink, so this line only reaches a serial
-                    // console — which in UAC mode does not exist. The
-                    // panel is what is left, and it says `wifi` is down.
-                    log::warn!(
-                        "{tag}: no association after {attempts} attempts ({e:#}) — not \
-                         trying again this boot"
-                    );
-                    loop {
-                        FreeRtos::delay_ms(60_000);
-                    }
-                }
-            },
+    let info = match wifi::connect_with_retry(
+        &mut ctx.driver,
+        crate::WIFI_SSID,
+        crate::WIFI_PSK,
+        Some(CONNECT_ATTEMPTS),
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            // In UAC mode there is no log sink yet and no serial
+            // console either, so this line may reach nobody. The panel
+            // is what is left, and it shows the link as down.
+            log::warn!(
+                "{tag}: no association after {CONNECT_ATTEMPTS} attempts ({e:#}) — not trying \
+                 again this boot, so it stops preempting the decode"
+            );
+            // The driver must outlive this task — `Drop` tears the
+            // whole thing down — so park rather than return.
+            loop {
+                FreeRtos::delay_ms(60_000);
+            }
         }
     };
     log::info!("{tag}: WiFi up, ip {}", info.ip);

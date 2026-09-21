@@ -23,6 +23,24 @@
   from 546 lines to 166, and the FT8 controller becomes
   `apps::ft8::Ft8Controller` beside the other three.
 
+  **One retry policy, `Once`, for all four.** The per-receiver
+  `net::Policy` is gone: WSPR retried association forever (its test AP
+  needed it), FT4 and FST4 tried four times and re-campaigned after
+  three minutes of quiet, and the FT8 controller stopped after four.
+  All four now stop after four, because the thing the three shapes
+  traded against is the same for each of them — a retry loop costs the
+  decoder ~40 % of its throughput while it runs (`fst4_sync_search`
+  711 → 1 380 ms per candidate, the candidate loop 33 → 54 s, measured
+  2026-08-22), since the driver's task sits at FreeRTOS priority 23. A
+  board that failed four times has an AP problem, and finding that out
+  again three minutes later buys nothing a reboot does not.
+
+  **What that costs**: a receiver that never associates, or that loses
+  its association mid-session, does not get the network back without a
+  reboot — no wsprnet upload for WSPR, no NTP, no UDP log, no config
+  page. That is the trade as chosen: the decode is what the board is
+  for.
+
   **Behaviour preserved on purpose, where it differed for a reason.**
   The FT8 controller keeps its watchdog (its `task_wdt(IDLE0)` lines
   during a cold acquisition are a watched symptom), keeps

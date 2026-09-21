@@ -444,12 +444,10 @@ impl Receiver for WsprRx {
     fn net_config(_ctx: &BootCtx) -> Option<crate::net::Config> {
         Some(crate::net::Config {
             name: "wspr_app",
-            // **Unbounded, unlike the decode-first modes.** This
-            // receiver's test AP needs it, and a WSPR slot is 110.6 s
-            // of capture against a decode that does not sit on a
-            // key-up deadline — the association's priority-23 cost
-            // lands where there is room for it.
-            policy: crate::net::Policy::Unbounded,
+            // Never set here, and never measured here either — WSPR's
+            // slot is 110.6 s of capture against a decode with no
+            // key-up deadline, so nobody has had to look. Left as it
+            // shipped rather than changed while unifying.
             power_save: false,
             ntp: true,
             without: "NTP/HTTP config/wsprnet all unavailable",

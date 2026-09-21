@@ -172,10 +172,12 @@ const CAPTURE_SLOTS: usize = {
 ///
 /// Diagnostic. The WiFi driver's own task runs at FreeRTOS priority 23,
 /// far above anything this app creates, so an association that keeps
-/// retrying preempts the decode at will — and this app's AP is exactly
-/// the one `wifi::connect_with_retry` documents needing unbounded
-/// retry. This switch is what separates "the decode is slow" from "the
-/// radio is eating the decode".
+/// retrying preempts the decode at will. This switch is what separates
+/// "the decode is slow" from "the radio is eating the decode".
+///
+/// It is less load-bearing than it was: retrying stops after
+/// `net::CONNECT_ATTEMPTS` for every receiver now, so the worst case
+/// this measures is bounded at four tries rather than forever.
 const NO_WIFI: bool = match option_env!("MFSK_FST4_APP_NO_WIFI") {
     Some(v) => matches!(v.as_bytes(), [b'1']),
     None => false,
@@ -367,11 +369,9 @@ impl Receiver for Fst4Rx {
         }
         Some(crate::net::Config {
             name: "fst4_app::net",
-            // Bounded campaigns and modem power save, both for the same
-            // measured reason: an associating or fully-awake radio
-            // preempts this decoder at FreeRTOS priority 23.
-            // `crate::net` carries the numbers.
-            policy: crate::net::DECODE_FIRST,
+            // Measured here first: an associated but idle STA cost
+            // this receiver's candidate loop 33 → 53 s until it set
+            // `WIFI_PS_MIN_MODEM`.
             power_save: true,
             ntp: true,
             without: "NTP and HTTP config unavailable",
