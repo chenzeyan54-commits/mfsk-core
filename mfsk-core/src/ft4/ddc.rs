@@ -505,6 +505,16 @@ pub fn candidate_baseband(audio: &[i16], f0_hz: f32) -> Vec<Complex<f32>> {
 /// [`Ft4SavgBuilder`]: crate::engine::ft4_coarse::Ft4SavgBuilder
 pub struct SlotDecimator {
     stage: FirStage,
+    /// The `i16 -> f32` staging chunk, owned rather than built per
+    /// call. A receiver hands this one UAC block at a time — ~318 of
+    /// them a slot — and the `Vec` it used to allocate each time was
+    /// 4 KB of allocator traffic per block, taken from the audio task
+    /// while the decode task is working through the *previous* slot's
+    /// candidates on the other core. Both then queue on one IDF heap
+    /// lock, which `engine::sync2d`'s own scratch note names as what
+    /// took FT4's dual-core scaling from 1.48x to 1.37x.
+    /// `CandidateDdc::push_samples` already owns its equivalents.
+    buf: Vec<f32>,
 }
 
 impl Default for SlotDecimator {
@@ -522,17 +532,17 @@ impl SlotDecimator {
                 SHARED_FC_HZ / INPUT_RATE_HZ,
                 HIST_MARGIN_SHARED,
             ),
+            buf: Vec::with_capacity(MIX_CHUNK),
         }
     }
 
     /// Push a block of 12 kHz PCM, appending the half-rate samples it
     /// completes.
     pub fn push_i16(&mut self, audio: &[i16], out: &mut Vec<f32>) {
-        let mut buf: Vec<f32> = Vec::with_capacity(MIX_CHUNK);
         for chunk in audio.chunks(MIX_CHUNK) {
-            buf.clear();
-            buf.extend(chunk.iter().map(|&s| s as f32));
-            self.stage.push_block_real(&buf, out);
+            self.buf.clear();
+            self.buf.extend(chunk.iter().map(|&s| s as f32));
+            self.stage.push_block_real(&self.buf, out);
         }
     }
 }
