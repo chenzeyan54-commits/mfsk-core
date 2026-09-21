@@ -202,15 +202,22 @@ impl FlatRef {
     /// had spent it on WiFi and task stacks. Filling in place removes
     /// the question.
     fn with_len(n: usize) -> Self {
+        Self::with_len_min_alloc(n, 0)
+    }
+
+    /// [`Self::with_len`] with every buffer allocated at no less than
+    /// `min_bytes` — same contents, placed past an allocator's
+    /// internal-DRAM threshold. See [`Ft4SweepScratch::new_with_min_alloc`].
+    fn with_len_min_alloc(n: usize, min_bytes: usize) -> Self {
         Self {
             n,
-            plain: AlignedF32::new(n * 2),
-            swapped: AlignedF32::new(n * 2),
+            plain: AlignedF32::with_min_alloc(n * 2, min_bytes),
+            swapped: AlignedF32::with_min_alloc(n * 2, min_bytes),
             // Two leading zeros, then the same `n * 2` samples.
             #[cfg(feature = "dotprod-extern")]
-            plain_odd: AlignedF32::new(n * 2 + 2),
+            plain_odd: AlignedF32::with_min_alloc(n * 2 + 2, min_bytes),
             #[cfg(feature = "dotprod-extern")]
-            swapped_odd: AlignedF32::new(n * 2 + 2),
+            swapped_odd: AlignedF32::with_min_alloc(n * 2 + 2, min_bytes),
         }
     }
 
@@ -965,6 +972,335 @@ pub fn ft4_sync_search_window_with<P: Protocol>(
         i0: best_i0,
         score: best_score,
     }
+}
+
+/// The references and scratch one worker needs to run
+/// [`Ft4CoarseSweep`]s: the four Costas blocks, and four carrier-shifted
+/// copies refilled per `df`.
+///
+/// Separate from the sweep because a receiver holds one sweep per
+/// candidate at once and a worker only ever scores one of them at a
+/// time: the twiddled copies are ~16 KB of small allocations, and
+/// twelve sets of them would sit in internal DRAM on an ESP32-S3.
+pub struct Ft4SweepScratch {
+    flat_blocks: Vec<(i32, Vec<Complex<f32>>)>,
+    twiddled: Vec<(i32, FlatRef)>,
+    table: Vec<Complex<f32>>,
+    ds_rate: f32,
+}
+
+impl Ft4SweepScratch {
+    pub fn new<P: Protocol>() -> Self {
+        Self::new_with_min_alloc::<P>(0)
+    }
+
+    /// [`Self::new`] with every buffer at least `min_alloc_bytes`.
+    ///
+    /// On the host mirror one scratch is ~10 KB of allocations under
+    /// the CoreS3's 2 048-byte internal-DRAM threshold, and a receiver
+    /// running the sweep during capture holds one per worker — beside
+    /// WiFi, whose floor at the slot boundary is ~16 KB. Past the
+    /// threshold they go to PSRAM instead; ~9 KB a worker, read in a
+    /// tight loop, which the data cache holds.
+    pub fn new_with_min_alloc<P: Protocol>(min_alloc_bytes: usize) -> Self {
+        let d = SyncDims::of::<P>(12_000.0);
+        let min_elems = min_alloc_bytes.div_ceil(core::mem::size_of::<Complex<f32>>());
+        let flat_blocks: Vec<(i32, Vec<Complex<f32>>)> = P::SYNC_MODE
+            .blocks()
+            .iter()
+            .map(|b| {
+                let off = b.start_symbol as i32 * d.ds_spb as i32;
+                let src = cached_costas_ref_continuous(b.pattern, d.ds_spb);
+                let mut v = Vec::with_capacity(src.len().max(min_elems));
+                v.extend_from_slice(&src);
+                (off, v)
+            })
+            .collect();
+        let twiddled = flat_blocks
+            .iter()
+            .map(|(off, flat)| {
+                (
+                    *off,
+                    FlatRef::with_len_min_alloc(flat.len(), min_alloc_bytes),
+                )
+            })
+            .collect();
+        let n = flat_blocks.iter().map(|(_, b)| b.len()).max().unwrap_or(0);
+        let mut table = Vec::with_capacity(n.max(min_elems));
+        table.resize(n, Complex::new(0.0, 0.0));
+        Self {
+            flat_blocks,
+            twiddled,
+            table,
+            ds_rate: d.ds_rate,
+        }
+    }
+}
+
+/// [`ft4_sync_search_window_with`]'s coarse sweep, run **while `cd0` is
+/// still being built**, then its fine pass at the end.
+///
+/// A cell's coarse score is the sum of four Costas-block correlations,
+/// and block `k` of cell `i0` reads `cd0[i0 + off_k ..][..128]` and
+/// nothing else — so it can be scored the moment those samples exist.
+/// [`advance`](Self::advance) scores every block that has become
+/// readable since the last call, in the order the one-shot sweep adds
+/// them (A, B, C, D per cell), so each cell's partial sum is formed in
+/// the same order. On a 5.04 s frame the last block of the latest cell
+/// the ±1.0 s window reaches ends ~0.2 s before the capture closes, so
+/// the whole sweep can be done before the slot ends.
+///
+/// **One difference from the one-shot search, and where it can show.**
+/// That search runs on the RMS-normalised `cd0`, and the normalisation
+/// needs the whole slot. This sweep scores the raw one. A cell's score
+/// is `|Σ cd0·conj(ref)|`, linear in the scale, so the ranking is the
+/// same except where two cells tie to within rounding; the fine pass,
+/// which produces the score and position the decoder uses, runs on the
+/// normalised `cd0` exactly as before
+/// (`ft4_incremental_sweep_matches_the_one_shot_search`).
+///
+/// [`complete`](Self::complete) then [`fine`](Self::fine) at the close.
+pub struct Ft4CoarseSweep {
+    ib_min: i32,
+    n_i0: usize,
+    /// `n_df × n_i0` partial sums, `df`-major — the one-shot sweep's
+    /// visiting order.
+    partial: Vec<f32>,
+    /// Per block, how many `i0` cells (from `ib_min`) have had that
+    /// block added. Never ahead of the block before it.
+    done: [usize; 4],
+    /// The raw `cd0` so far, 16-byte aligned for `dot_f32`'s PIE path.
+    cd0: crate::engine::dsp::dotprod::AlignedF32,
+    /// Complex samples copied into `cd0`.
+    have: usize,
+}
+
+const N_COARSE_DF: usize = ((COARSE_DF_MAX - COARSE_DF_MIN) / COARSE_DF_STEP + 1) as usize;
+
+impl Ft4CoarseSweep {
+    /// A sweep over `[ib_min, ib_max]` of a `cd0` that will end up
+    /// `cd0_len` samples long. Allocations are at least `min_alloc_bytes`
+    /// each — see `CandidateDdc::new_half_rate_with_min_alloc`.
+    pub fn new(ib_min: i32, ib_max: i32, cd0_len: usize, min_alloc_bytes: usize) -> Self {
+        let n_i0 = ((ib_max - ib_min) / COARSE_DT_STEP + 1).max(0) as usize;
+        let mut partial = Vec::with_capacity(
+            (N_COARSE_DF * n_i0).max(min_alloc_bytes.div_ceil(core::mem::size_of::<f32>())),
+        );
+        partial.resize(N_COARSE_DF * n_i0, 0.0);
+        Self {
+            ib_min,
+            n_i0,
+            partial,
+            done: [0; 4],
+            cd0: crate::engine::dsp::dotprod::AlignedF32::with_min_alloc(
+                cd0_len * 2,
+                min_alloc_bytes,
+            ),
+            have: 0,
+        }
+    }
+
+    /// Coarse cells scored so far, over all blocks, out of
+    /// `4 × n_df × n_i0` — for a receiver to report how much of the
+    /// sweep the capture paid for.
+    pub fn progress(&self) -> (usize, usize) {
+        (
+            self.done.iter().sum::<usize>() * N_COARSE_DF,
+            4 * N_COARSE_DF * self.n_i0,
+        )
+    }
+
+    /// Take `cd0`'s samples so far — a prefix of the final baseband; any
+    /// samples already taken must be unchanged — and score every block
+    /// that has become readable. `max_cells` bounds the block-cells
+    /// scored in this call (one block of one cell at one `df` each), so
+    /// a caller can stay responsive; `usize::MAX` for no bound. Returns
+    /// whether anything readable is still unscored.
+    pub fn advance<P: Protocol>(
+        &mut self,
+        cd0: &[Complex<f32>],
+        final_len: usize,
+        scratch: &mut Ft4SweepScratch,
+        refs: &P::SyncPhasors,
+        max_cells: usize,
+    ) -> bool {
+        let cap = self.cd0.as_slice().len() / 2;
+        let take = cd0.len().min(cap);
+        if take > self.have {
+            // SAFETY: `Complex<f32>` is `repr(C)` over two `f32`.
+            let src = unsafe {
+                core::slice::from_raw_parts(
+                    cd0[self.have..take].as_ptr() as *const f32,
+                    (take - self.have) * 2,
+                )
+            };
+            self.cd0.as_mut_slice()[self.have * 2..take * 2].copy_from_slice(src);
+            self.have = take;
+        }
+        let have = self.have;
+        let mut budget = max_cells;
+        for k in 0..scratch.flat_blocks.len().min(4) {
+            let (off, ref_len) = (
+                scratch.flat_blocks[k].0,
+                scratch.flat_blocks[k].1.len() as i32,
+            );
+            // Cells whose block `k` window is final: it ends inside
+            // what has arrived, or starts past where `cd0` will end (so
+            // it scores 0 however long we wait). Never past block `k-1`.
+            let limit = if k == 0 { self.n_i0 } else { self.done[k - 1] };
+            let mut upto = self.done[k];
+            while upto < limit {
+                let start = self.ib_min + upto as i32 * COARSE_DT_STEP + off;
+                // Four samples of margin: `score_flat_coherent`'s
+                // odd-offset path needs up to two more than the window
+                // and tests them against the slice it is given, so a
+                // block at the edge of what has arrived would otherwise
+                // take the other path than it takes against the whole
+                // `cd0` — making the result depend on how the input
+                // was chunked.
+                let end = start + ref_len;
+                let readable =
+                    end + 4 <= have as i32 || have == final_len || end > final_len as i32;
+                if !readable {
+                    break;
+                }
+                upto += 1;
+            }
+            if upto <= self.done[k] {
+                continue;
+            }
+            let n = (upto - self.done[k]).min((budget / N_COARSE_DF).max(1));
+            let from = self.done[k];
+            let view_len = if have == final_len { final_len } else { have };
+            for idf in 0..N_COARSE_DF {
+                let df = (COARSE_DF_MIN + idf as i32 * COARSE_DF_STEP) as f32;
+                twiddle_one::<P>(scratch, k, refs, df);
+                let flat = &scratch.twiddled[k].1;
+                // The one-shot sweep's range test is against the final
+                // length; a window past `have` but inside `final_len`
+                // was excluded by `readable` above.
+                // SAFETY: `AlignedF32` is contiguous `f32` and
+                // `Complex<f32>` is `repr(C)` over two of them;
+                // `view_len <= have` complex samples were copied.
+                let cd0v = unsafe {
+                    core::slice::from_raw_parts(
+                        self.cd0.as_slice().as_ptr() as *const Complex<f32>,
+                        view_len,
+                    )
+                };
+                for c in from..from + n {
+                    let i0 = self.ib_min + c as i32 * COARSE_DT_STEP;
+                    let st = i0 + off;
+                    let v = if st + ref_len > final_len as i32 {
+                        0.0
+                    } else {
+                        score_flat_coherent(cd0v, flat, st)
+                    };
+                    let cell = &mut self.partial[idf * self.n_i0 + c];
+                    // `Iterator::sum` over the four blocks, spelled out:
+                    // it starts from -0.0 and adds in block order.
+                    *cell = if k == 0 { -0.0 + v } else { *cell + v };
+                }
+            }
+            self.done[k] = from + n;
+            budget = budget.saturating_sub(n * N_COARSE_DF);
+            if budget == 0 {
+                break;
+            }
+        }
+        self.done.iter().any(|&d| d < self.n_i0)
+    }
+
+    /// Score whatever is left against the whole raw `cd0` — the
+    /// baseband including its flushed tail.
+    pub fn complete<P: Protocol>(
+        &mut self,
+        cd0_raw: &[Complex<f32>],
+        scratch: &mut Ft4SweepScratch,
+        refs: &P::SyncPhasors,
+    ) {
+        self.advance::<P>(cd0_raw, cd0_raw.len(), scratch, refs, usize::MAX);
+        debug_assert!(self.done.iter().all(|&d| d == self.n_i0));
+    }
+
+    /// Pick the coarse winner in the one-shot sweep's order and run the
+    /// fine pass on `cd0_normalised`. Call [`complete`](Self::complete)
+    /// first; split from it so a caller can normalise its one `cd0` in
+    /// place between the two rather than keep a copy.
+    pub fn fine<P: Protocol>(
+        self,
+        cd0_normalised: &[Complex<f32>],
+        candidate: &SyncCandidate,
+        scratch: &mut Ft4SweepScratch,
+        refs: &P::SyncPhasors,
+    ) -> Sync2dResult {
+        let mut best_score = f32::NEG_INFINITY;
+        let mut best_df = 0.0f32;
+        let mut best_i0 = 0i32;
+        for idf in 0..N_COARSE_DF {
+            let df = (COARSE_DF_MIN + idf as i32 * COARSE_DF_STEP) as f32;
+            for c in 0..self.n_i0 {
+                let s = self.partial[idf * self.n_i0 + c];
+                if s > best_score {
+                    best_score = s;
+                    best_df = df;
+                    best_i0 = self.ib_min + c as i32 * COARSE_DT_STEP;
+                }
+            }
+        }
+        let aligned = AlignedCd0::new(cd0_normalised);
+        let cd0n = aligned.get(cd0_normalised);
+        let Ft4SweepScratch {
+            flat_blocks,
+            twiddled,
+            table,
+            ds_rate,
+        } = scratch;
+        let (best_score, best_df, best_i0) = ft4_fine_pass::<P>(
+            cd0n,
+            flat_blocks,
+            twiddled,
+            table,
+            refs,
+            *ds_rate,
+            best_df,
+            best_i0,
+        );
+        Sync2dResult {
+            freq_hz: candidate.freq_hz + best_df,
+            i0: best_i0,
+            score: best_score,
+        }
+    }
+}
+
+/// [`twiddle_all`] for one block.
+fn twiddle_one<P: Protocol>(
+    scratch: &mut Ft4SweepScratch,
+    k: usize,
+    refs: &P::SyncPhasors,
+    df: f32,
+) {
+    let Ft4SweepScratch {
+        flat_blocks,
+        twiddled,
+        table,
+        ds_rate,
+    } = scratch;
+    let n = flat_blocks[k].1.len();
+    let t: &[Complex<f32>] = if df.abs() < f32::EPSILON {
+        &[]
+    } else if let Some(t) = refs.table_for(df) {
+        t
+    } else {
+        let omega = 2.0 * PI * df / *ds_rate;
+        for (i, slot) in table[..n].iter_mut().enumerate() {
+            let p = omega * i as f32;
+            *slot = Complex::new(p.cos(), p.sin());
+        }
+        &table[..n]
+    };
+    twiddled[k].1.fill_with(&flat_blocks[k].1, df, t);
 }
 
 /// **Experimental**: the coarse sweep over tone-demodulated bins.

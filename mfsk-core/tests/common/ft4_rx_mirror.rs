@@ -264,6 +264,16 @@ pub fn decode_from_cd0(
     } else {
         ft4_sync_search_window_with::<Ft4>(&cd0, cand, WSJTX_WINDOW.0, WSJTX_WINDOW.1, refs)
     };
+    decode_after_search(cd0, cand, s2)
+}
+
+/// The decode after the Δt/Δf search: LLR, BP, unpack, from a
+/// normalised `cd0` and the search's result.
+pub fn decode_after_search(
+    cd0: Vec<Complex<f32>>,
+    cand: &SyncCandidate,
+    s2: mfsk_core::engine::sync2d::Sync2dResult,
+) -> Option<String> {
     let r: Option<DecodeResult> = process_candidate_precomputed::<Ft4>(
         cand,
         // FT4's `snr_db` reads the coarse candidate score, not a
@@ -343,6 +353,10 @@ pub struct PipelineStats {
     pub fresh: usize,
     /// Provisional basebands the final list did not ask for.
     pub wasted: usize,
+    /// Coarse block-cells the capture-time sweeps had scored by the
+    /// close, and how many there are in all.
+    pub sweep_done: usize,
+    pub sweep_total: usize,
 }
 
 /// The receiver with its per-candidate DDC moved into capture time.
@@ -360,6 +374,19 @@ pub struct PipelineStats {
 /// block-independent, so feeding the backlog and then the tail is the
 /// same filter over the same samples as feeding them at once.
 pub fn run_slot_pipelined(audio: &[i16], prov_samples: usize) -> (Vec<String>, PipelineStats) {
+    run_slot_pipelined_with(audio, prov_samples, false)
+}
+
+/// [`run_slot_pipelined`], optionally with each candidate's coarse
+/// Δt/Δf sweep also run during capture (`Ft4CoarseSweep`) as its
+/// baseband grows, leaving only the rest of it and the fine pass for
+/// after the close.
+pub fn run_slot_pipelined_with(
+    audio: &[i16],
+    prov_samples: usize,
+    sweep_in_capture: bool,
+) -> (Vec<String>, PipelineStats) {
+    use mfsk_core::engine::sync2d::{Ft4CoarseSweep, Ft4SweepScratch};
     use mfsk_core::ft4::ddc::{CD0_LEN, CandidateDdc};
 
     let bin_of = |f: f32| (f / COARSE_BIN_HZ).round() as i32;
@@ -375,9 +402,15 @@ pub fn run_slot_pipelined(audio: &[i16], prov_samples: usize) -> (Vec<String>, P
         out: Vec<Complex<f32>>,
         /// Half-rate samples already fed.
         fed: usize,
+        sweep: Option<Ft4CoarseSweep>,
     }
     let mut pipes: Vec<Pipe> = Vec::new();
     let mut started = false;
+    let refs = Ft4CoarsePhasors::new::<Ft4>();
+    // Only when sweeping: a receiver holds one per worker, and the
+    // DDC-only arrangement has none.
+    let mut scratch = sweep_in_capture
+        .then(|| Ft4SweepScratch::new_with_min_alloc::<Ft4>(PIPELINED_MIN_ALLOC_BYTES));
 
     let mut fed = 0usize;
     while fed < close {
@@ -403,18 +436,36 @@ pub fn run_slot_pipelined(audio: &[i16], prov_samples: usize) -> (Vec<String>, P
                     ddc: CandidateDdc::new_half_rate_with_min_alloc(f, PIPELINED_MIN_ALLOC_BYTES),
                     out: Vec::with_capacity(CD0_LEN),
                     fed: 0,
+                    sweep: sweep_in_capture.then(|| {
+                        Ft4CoarseSweep::new(
+                            WSJTX_WINDOW.0,
+                            WSJTX_WINDOW.1,
+                            CD0_LEN,
+                            PIPELINED_MIN_ALLOC_BYTES,
+                        )
+                    }),
                 });
             }
         }
         for p in pipes.iter_mut() {
             p.ddc.push_f32(&half[p.fed..], &mut p.out);
             p.fed = half.len();
+            if let Some(sw) = p.sweep.as_mut() {
+                let scratch = scratch.as_mut().expect("sweeping implies a scratch");
+                sw.advance::<Ft4>(&p.out, CD0_LEN, scratch, &refs, usize::MAX);
+            }
         }
     }
 
     let finals = coarse(&savg.finish());
-    let refs = Ft4CoarsePhasors::new::<Ft4>();
     let mut stats = PipelineStats::default();
+    for p in &pipes {
+        if let Some(sw) = &p.sweep {
+            let (d, t) = sw.progress();
+            stats.sweep_done += d;
+            stats.sweep_total += t;
+        }
+    }
     let mut used = vec![false; pipes.len()];
     let mut messages: Vec<String> = Vec::new();
     for cand in &finals {
@@ -423,6 +474,7 @@ pub fn run_slot_pipelined(audio: &[i16], prov_samples: usize) -> (Vec<String>, P
             freq_hz: f,
             ..*cand
         };
+        let mut sweep = None;
         let cd0 = if let Some(k) = pipes.iter().position(|p| p.bin == bin_of(f)) {
             used[k] = true;
             stats.reused += 1;
@@ -430,12 +482,25 @@ pub fn run_slot_pipelined(audio: &[i16], prov_samples: usize) -> (Vec<String>, P
             let mut cd0 = core::mem::take(&mut p.out);
             p.ddc.flush_to(CD0_LEN, &mut cd0);
             cd0.resize(CD0_LEN, Complex::new(0.0, 0.0));
+            sweep = p.sweep.take();
             cd0
         } else {
             stats.fresh += 1;
             candidate_baseband_half(&half, f)
         };
-        if let Some(text) = decode_from_cd0(cd0, &snapped, &refs, false)
+        let decoded = match sweep {
+            Some(sw) => {
+                let mut sw = sw;
+                let mut cd0 = cd0;
+                let scratch = scratch.as_mut().expect("sweeping implies a scratch");
+                sw.complete::<Ft4>(&cd0, scratch, &refs);
+                rms_normalise(&mut cd0);
+                let s2 = sw.fine::<Ft4>(&cd0, &snapped, scratch, &refs);
+                decode_after_search(cd0, &snapped, s2)
+            }
+            None => decode_from_cd0(cd0, &snapped, &refs, false),
+        };
+        if let Some(text) = decoded
             && !messages.contains(&text)
         {
             messages.push(text);

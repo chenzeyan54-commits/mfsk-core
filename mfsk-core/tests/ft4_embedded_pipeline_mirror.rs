@@ -743,6 +743,96 @@ fn pipelined_ddc_decodes_exactly_what_the_snapped_receiver_does() {
     eprintln!();
 }
 
+/// The coarse sweep run incrementally lands where the one-shot search
+/// does, on every golden candidate and however the baseband arrives.
+///
+/// The one place it can differ is the scale: it scores the raw `cd0`
+/// and the one-shot search the normalised one, so a coarse tie inside
+/// rounding could go the other way. The fine pass runs on the
+/// normalised `cd0` either way, so matching coarse winners means a
+/// bit-identical result — which is what this asserts, score included.
+#[test]
+fn ft4_incremental_sweep_matches_the_one_shot_search() {
+    use mfsk_core::engine::sync2d::{Ft4CoarseSweep, Ft4SweepScratch, ft4_sync_search_window_with};
+    use mfsk_core::ft4::ddc::{CD0_LEN, candidate_baseband_half};
+    let Some(audio) = slot_audio() else {
+        assert!(
+            !require_corpus(),
+            "MFSK_REQUIRE_CORPUS=1 but the golden is missing"
+        );
+        return;
+    };
+    let (savg, half) = rx::capture(&audio);
+    let refs = Ft4CoarsePhasors::new::<Ft4>();
+    let mut scratch = Ft4SweepScratch::new::<Ft4>();
+    let cands = rx::coarse(&savg);
+    assert!(!cands.is_empty());
+    for c in &cands {
+        let cand = SyncCandidate {
+            freq_hz: rx::snap_to_bin(c.freq_hz),
+            ..*c
+        };
+        let raw = candidate_baseband_half(&half, cand.freq_hz);
+        let mut norm = raw.clone();
+        rx::rms_normalise(&mut norm);
+        let want = ft4_sync_search_window_with::<Ft4>(
+            &norm,
+            &cand,
+            rx::WSJTX_WINDOW.0,
+            rx::WSJTX_WINDOW.1,
+            &refs,
+        );
+        // 1: every sample its own call; 29: roughly one UAC block's
+        // worth of `cd0`; the whole: the one-shot shape.
+        for chunk in [1usize, 29, CD0_LEN] {
+            let mut sw = Ft4CoarseSweep::new(rx::WSJTX_WINDOW.0, rx::WSJTX_WINDOW.1, CD0_LEN, 0);
+            let mut n = 0;
+            // Stop short of the flush, as the board does at the close.
+            while n < 4_300 {
+                n = (n + chunk).min(4_300);
+                sw.advance::<Ft4>(&raw[..n], CD0_LEN, &mut scratch, &refs, usize::MAX);
+            }
+            sw.complete::<Ft4>(&raw, &mut scratch, &refs);
+            let got = sw.fine::<Ft4>(&norm, &cand, &mut scratch, &refs);
+            assert_eq!(
+                (got.i0, got.freq_hz.to_bits(), got.score.to_bits()),
+                (want.i0, want.freq_hz.to_bits(), want.score.to_bits()),
+                "{:.1} Hz, chunk {chunk}",
+                cand.freq_hz
+            );
+        }
+    }
+}
+
+/// The pipelined receiver with the coarse sweep moved into capture too
+/// decodes exactly what the snapped receiver does, and says how much of
+/// the sweep the capture can have paid for by the close.
+#[test]
+fn pipelined_sweep_decodes_exactly_what_the_snapped_receiver_does() {
+    let Some(audio) = slot_audio() else {
+        assert!(
+            !require_corpus(),
+            "MFSK_REQUIRE_CORPUS=1 but the golden is missing"
+        );
+        return;
+    };
+    let mut want = rx::run_slot_with(&audio, rx::Variant::SNAPPED);
+    want.sort();
+    let (mut got, st) = rx::run_slot_pipelined_with(&audio, rx::provisional_samples(), true);
+    got.sort();
+    eprintln!(
+        "\nft4 golden, DDC + coarse sweep in capture: reused {}, fresh {}, \
+         sweep readable by the close {} of {} block-cells ({:.1} %), decodes {}\n",
+        st.reused,
+        st.fresh,
+        st.sweep_done,
+        st.sweep_total,
+        100.0 * st.sweep_done as f64 / st.sweep_total.max(1) as f64,
+        got.len()
+    );
+    assert_eq!(got, want);
+}
+
 /// How much internal DRAM the pipelined receiver would ask for.
 ///
 /// Building every candidate's baseband during capture keeps twelve
@@ -777,10 +867,14 @@ fn what_the_pipelined_receiver_asks_of_internal_dram() {
     reset();
     let _ = rx::run_slot_pipelined(&audio, rx::provisional_samples());
     let piped_peak = SMALL_PEAK.with(|c| c.get());
+    reset();
+    let _ = rx::run_slot_pipelined_with(&audio, rx::provisional_samples(), true);
+    let swept_peak = SMALL_PEAK.with(|c| c.get());
     eprintln!(
         "\nft4 small-allocation (<= {INTERNAL_THRESHOLD} B) peak live bytes:\n  \
          candidates one at a time  {serial_peak:>8} B\n  \
-         all built during capture  {piped_peak:>8} B\n"
+         all built during capture  {piped_peak:>8} B\n  \
+         + coarse sweep in capture {swept_peak:>8} B (one worker's scratch)\n"
     );
 }
 

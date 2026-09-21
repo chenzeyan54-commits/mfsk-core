@@ -36,6 +36,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -44,7 +45,8 @@ use mfsk_core::engine::equalize::EqMode;
 use mfsk_core::engine::ft4_coarse::{ft4_coarse_sync_from_savg, Ft4SavgBuilder};
 use mfsk_core::engine::pipeline::{process_candidate_precomputed, DecodeDepth, DecodeStrictness};
 use mfsk_core::engine::sync2d::{
-    Ft4CoarsePhasors, ft4_sync_search_window_binned, ft4_sync_search_window_with,
+    Ft4CoarsePhasors, Ft4CoarseSweep, Ft4SweepScratch, ft4_sync_search_window_binned,
+    ft4_sync_search_window_with,
 };
 use mfsk_core::engine::{FrameLayout, ModulationParams};
 use mfsk_core::ft4::ddc::{
@@ -537,24 +539,33 @@ impl SlotAccum {
 /// bit-identical; only the placement moves.
 const PIPELINED_MIN_ALLOC_BYTES: usize = 2_049;
 
-/// Half-rate samples the early worker feeds one baseband per step:
+/// Half-rate samples a capture-time worker feeds one baseband per step:
 /// ~2 ms of DDC on a CoreS3 (83 ms for the 40 609 of a whole window).
-/// Bounds how long the decode waits for the worker to let go at the
-/// close, and is large enough that `push_f32`'s per-call scratch is not
-/// the cost.
+/// With [`SWEEP_SLICE`] it bounds how long the decode waits for the
+/// workers to let go at the close, and it is large enough that
+/// `push_f32`'s per-call scratch is not the cost.
 const EARLY_CHUNK: usize = 2_048;
 
-/// Stack for the early worker — same code shape as the candidate
-/// worker (the buffers are heap), so the same measured 8 KB.
+/// Coarse block-cells a worker scores per step — 16 `i0` positions at
+/// each of the nine `df`, ~1.3 ms at the Δt search's measured 2.18
+/// cycles per multiply-add (§47). The same bound as [`EARLY_CHUNK`],
+/// for the same reason.
+const SWEEP_SLICE: usize = 144;
+
+/// Stack for each capture-time worker — the candidate worker's shape
+/// (the buffers are heap), so its measured 8 KB.
 const EARLY_STACK: u32 = 8 * 1024;
 
-/// One candidate baseband, built while the slot is still arriving.
+/// One candidate's baseband and coarse sweep, built while the slot is
+/// still arriving.
 struct Pipe {
     bin: i32,
     ddc: CandidateDdc,
     out: Vec<Complex<f32>>,
     /// Half-rate samples already fed.
     fed: usize,
+    /// Taken by the decode, which finishes it.
+    sweep: Option<Ft4CoarseSweep>,
 }
 
 impl Pipe {
@@ -573,49 +584,75 @@ impl Pipe {
     }
 }
 
+/// Where each capture-time worker runs: `(core, priority)`.
+///
+/// Core 1 has nothing else to do during capture but the `net` task (2).
+/// Core 0 carries the capture itself — the UAC reader (6) and the slot
+/// task draining it (5) — and above those WiFi and the timers. Neither
+/// worker can delay the audio.
+///
+/// **The core-0 worker is level with the slot task, not under it.** At
+/// 2 it could not run once the slot task started decoding, so it could
+/// not release the pipe it held until the join slept a whole tick —
+/// measured at ~10 ms a slot, every slot. Level, the join yields to it
+/// and it lets go within one slice. During capture the slot task only
+/// drains a UAC read and sleeps, so sharing its level costs it at most
+/// a slice, against a 4 s staging buffer.
+const EARLY_WORKERS: [(i32, u32); 2] = [(1, 4), (0, 5)];
+
 struct EarlyShared {
     stream: Arc<HalfStream>,
-    /// Touched only by the worker until `done`, then only by the
-    /// decode — never both.
+    /// Handed between workers by `claimed` — a worker touches pipe `i`
+    /// only while it holds `claimed[i]` — and to the decode once every
+    /// worker has exited. Never resized after construction.
     pipes: UnsafeCell<Vec<Pipe>>,
+    claimed: Vec<AtomicBool>,
+    refs: Ft4CoarsePhasors,
     stop: AtomicBool,
-    done: AtomicBool,
-    stack_hw_bytes: AtomicU32,
+    /// Workers still running; the decode waits for zero.
+    running: AtomicU32,
+    stack_hw_bytes: [AtomicU32; 2],
     started_us: i64,
 }
-// SAFETY: `pipes` is handed from the worker to the decode through
-// `done`'s Release/Acquire and never accessed by both; everything else
+// SAFETY: each pipe is touched by one worker at a time, under its
+// `claimed` flag (Acquire on take, Release on give), and by the decode
+// only after `running` reaches zero (Release/Acquire). Everything else
 // is atomics or immutable.
 unsafe impl Sync for EarlyShared {}
 unsafe impl Send for EarlyShared {}
 
-/// The per-candidate DDCs, run on core 1 while the slot is still
-/// arriving.
+/// The per-candidate DDCs **and coarse Δt/Δf sweeps**, run on both
+/// cores while the slot is still arriving.
 ///
-/// **Why.** Measured on the board, the DDC is ~83 ms of each
-/// candidate's post-close time, and a slot's twelve are about the
-/// amount by which decodes miss [`REPLY_DEADLINE_MS`]. Core 1 has
-/// nothing to do during capture. Every `FirStage` carries its own
-/// history, so a baseband fed in pieces is bit-identical to one fed the
-/// whole window — which is what makes building it early a pure
-/// scheduling change rather than a decoder change.
+/// **Why.** Measured on the board, a candidate after the close was
+/// ~83 ms of DDC and ~120 ms of Δt search, and a slot's twelve are what
+/// made decodes miss [`REPLY_DEADLINE_MS`]. The capture leaves both
+/// cores mostly idle. Every `FirStage` carries its own history, so a
+/// baseband fed in pieces is bit-identical to one fed the whole window,
+/// and each coarse cell reads only the samples under its Costas blocks,
+/// so it can be scored as soon as they exist — all of the ±1.0 s
+/// window's cells are readable before the close on a 5.04 s frame
+/// (`pipelined_sweep_decodes_exactly_what_the_snapped_receiver_does`).
+/// What is left after the close is each baseband's last few percent and
+/// flush, and the fine pass.
 ///
 /// Started by the capture side at [`provisional_samples`] from
 /// [`SlotAccum::take_provisional`]'s carriers; handed to
-/// [`decode_slot_with`], which stops the worker (it lets go within one
-/// [`EARLY_CHUNK`]), finishes whichever basebands the final list asks
-/// for, and builds the rest from scratch as before.
+/// [`decode_slot_with`], which stops the workers (they let go within one
+/// [`EARLY_CHUNK`] or [`SWEEP_SLICE`]), finishes whatever the final list
+/// asks for, and builds the rest from scratch as before.
 ///
-/// Dropping it without decoding just tells the worker to stop; the
-/// worker holds its own reference and frees the state when it exits.
+/// Dropping it without decoding just tells the workers to stop; each
+/// holds its own reference and the last one out frees the state.
 pub struct EarlyBasebands {
     shared: Arc<EarlyShared>,
+    workers: u32,
 }
 
 impl EarlyBasebands {
-    /// Allocate one baseband per carrier and start the worker, or
-    /// `None` if its task cannot be created — in which case the slot
-    /// simply decodes the way it did before.
+    /// Allocate one baseband and sweep per carrier and start the
+    /// workers, or `None` if none can be created — in which case the
+    /// slot simply decodes the way it did before.
     pub fn start(stream: Arc<HalfStream>, carriers: &[f32]) -> Option<Self> {
         let pipes: Vec<Pipe> = carriers
             .iter()
@@ -624,46 +661,68 @@ impl EarlyBasebands {
                 ddc: CandidateDdc::new_half_rate_with_min_alloc(f, PIPELINED_MIN_ALLOC_BYTES),
                 out: Vec::with_capacity(CD0_LEN),
                 fed: 0,
+                sweep: Some(Ft4CoarseSweep::new(
+                    WSJTX_WINDOW.0,
+                    WSJTX_WINDOW.1,
+                    CD0_LEN,
+                    PIPELINED_MIN_ALLOC_BYTES,
+                )),
             })
             .collect();
+        let claimed = (0..pipes.len()).map(|_| AtomicBool::new(false)).collect();
         let shared = Arc::new(EarlyShared {
             stream,
             pipes: UnsafeCell::new(pipes),
+            claimed,
+            refs: Ft4CoarsePhasors::new::<Ft4>(),
             stop: AtomicBool::new(false),
-            done: AtomicBool::new(false),
-            stack_hw_bytes: AtomicU32::new(0),
+            running: AtomicU32::new(0),
+            stack_hw_bytes: [AtomicU32::new(0), AtomicU32::new(0)],
             started_us: now_us(),
         });
-        let arg = Arc::into_raw(shared.clone());
-        // Below the candidate worker's 5: nothing on core 1 during
-        // capture should wait for this.
-        let created = unsafe {
-            esp_idf_svc::sys::xTaskCreatePinnedToCore(
-                Some(early_worker),
-                c"ft4_early".as_ptr(),
-                EARLY_STACK,
-                arg as *mut core::ffi::c_void,
-                4,
-                core::ptr::null_mut(),
-                1,
-            )
-        } == 1;
-        if !created {
-            // SAFETY: the task never ran, so the reference is still ours.
-            drop(unsafe { Arc::from_raw(arg) });
-            log::warn!("ft4_rx: early DDC worker not created ({EARLY_STACK} B stack) — building basebands after the close");
+        let mut workers = 0u32;
+        for (w, &(core, prio)) in EARLY_WORKERS.iter().enumerate() {
+            let arg = Box::into_raw(Box::new((shared.clone(), w)));
+            shared.running.fetch_add(1, Ordering::AcqRel);
+            let created = unsafe {
+                esp_idf_svc::sys::xTaskCreatePinnedToCore(
+                    Some(early_worker),
+                    c"ft4_early".as_ptr(),
+                    EARLY_STACK,
+                    arg as *mut core::ffi::c_void,
+                    prio,
+                    core::ptr::null_mut(),
+                    core,
+                )
+            } == 1;
+            if created {
+                workers += 1;
+            } else {
+                shared.running.fetch_sub(1, Ordering::AcqRel);
+                // SAFETY: the task never ran, so the box is still ours.
+                drop(unsafe { Box::from_raw(arg) });
+                log::warn!("ft4_rx: capture-time worker on core {core} not created ({EARLY_STACK} B stack)");
+            }
+        }
+        if workers == 0 {
             return None;
         }
-        Some(Self { shared })
+        Some(Self { shared, workers })
     }
 
-    /// Stop the worker and wait for it to let go of the basebands.
+    /// Stop the workers and wait for them to let go of the pipes.
     /// Returns the microseconds spent waiting.
     fn join(&self) -> i64 {
         let t0 = now_us();
         self.shared.stop.store(true, Ordering::Release);
-        while !self.shared.done.load(Ordering::Acquire) {
-            unsafe { esp_idf_svc::sys::vTaskDelay(1) };
+        // Yield rather than sleep: the core-0 worker shares this task's
+        // priority (see `EARLY_WORKERS`), and a tick is ~10 ms against
+        // a slice of ~2.
+        while self.shared.running.load(Ordering::Acquire) != 0 {
+            unsafe {
+                esp_idf_svc::sys::vPortYield();
+                esp_idf_svc::sys::esp_rom_delay_us(50);
+            }
         }
         now_us() - t0
     }
@@ -675,42 +734,88 @@ impl Drop for EarlyBasebands {
     }
 }
 
-extern "C" fn early_worker(arg: *mut core::ffi::c_void) {
-    // SAFETY: `start` leaked exactly one reference for this task.
-    let shared: Arc<EarlyShared> = unsafe { Arc::from_raw(arg as *const EarlyShared) };
-    {
-        // SAFETY: the decode does not touch `pipes` until `done`.
-        let pipes = unsafe { &mut *shared.pipes.get() };
-        'run: loop {
-            let closed = shared.stream.is_closed();
-            let half = shared.stream.as_slice();
-            let mut progressed = false;
-            // Depth-first: each baseband catches up before the next
-            // starts, so the strongest candidates are the complete ones
-            // and a baseband's state stays in cache while it runs.
-            for p in pipes.iter_mut() {
-                while p.fed < half.len() {
-                    if shared.stop.load(Ordering::Acquire) {
-                        break 'run;
-                    }
-                    let end = (p.fed + EARLY_CHUNK).min(half.len());
-                    p.ddc.push_f32(&half[p.fed..end], &mut p.out);
-                    p.fed = end;
-                    progressed = true;
-                }
-            }
-            if shared.stop.load(Ordering::Acquire) || (closed && !progressed) {
+/// One worker's pass over the pipes. Returns whether it did anything.
+/// `None` when told to stop.
+fn early_pass(shared: &EarlyShared, scratch: &mut Ft4SweepScratch) -> Option<bool> {
+    let half = shared.stream.as_slice();
+    // SAFETY: the Vec is never resized; each element is touched only
+    // under its `claimed` flag, taken below.
+    let base = unsafe { (*shared.pipes.get()).as_mut_ptr() };
+    let mut progressed = false;
+    for (i, flag) in shared.claimed.iter().enumerate() {
+        if shared.stop.load(Ordering::Acquire) {
+            return None;
+        }
+        if flag
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            continue;
+        }
+        // SAFETY: claimed above; released below on every path.
+        let p = unsafe { &mut *base.add(i) };
+        let mut stopped = false;
+        // Depth-first: the baseband catches up, then its sweep, before
+        // the next pipe — so the strongest candidates finish first and
+        // the state stays in cache.
+        while p.fed < half.len() {
+            if shared.stop.load(Ordering::Acquire) {
+                stopped = true;
                 break;
             }
-            if !progressed {
-                // Caught up with the capture: one UAC read is ~21 ms.
-                unsafe { esp_idf_svc::sys::vTaskDelay(1) };
+            let end = (p.fed + EARLY_CHUNK).min(half.len());
+            p.ddc.push_f32(&half[p.fed..end], &mut p.out);
+            p.fed = end;
+            progressed = true;
+        }
+        while let (false, Some(sw)) = (stopped, p.sweep.as_mut()) {
+            if shared.stop.load(Ordering::Acquire) {
+                stopped = true;
+                break;
+            }
+            let before = sw.progress().0;
+            sw.advance::<Ft4>(&p.out, CD0_LEN, scratch, &shared.refs, SWEEP_SLICE);
+            if sw.progress().0 == before {
+                break;
+            }
+            progressed = true;
+        }
+        flag.store(false, Ordering::Release);
+        if stopped {
+            return None;
+        }
+    }
+    Some(progressed)
+}
+
+extern "C" fn early_worker(arg: *mut core::ffi::c_void) {
+    // SAFETY: `start` leaked exactly one box for this task.
+    let (shared, w) = *unsafe { Box::from_raw(arg as *mut (Arc<EarlyShared>, usize)) };
+    {
+        // **In internal DRAM**, unlike the pipes. Placed in PSRAM the
+        // first time, the post-close search stage still cost ~115 ms a
+        // candidate with only a third of its cells left — the one-shot
+        // search's figure for all of them — because every dot product
+        // reads these references. The one-shot search holds the same
+        // set per core in internal DRAM, so this asks no more than the
+        // receiver did.
+        let mut scratch = Ft4SweepScratch::new::<Ft4>();
+        loop {
+            let closed = shared.stream.is_closed();
+            match early_pass(&shared, &mut scratch) {
+                None => break,
+                Some(true) => {}
+                Some(false) if closed => break,
+                Some(false) => {
+                    // Caught up with the capture: one UAC read is ~21 ms.
+                    unsafe { esp_idf_svc::sys::vTaskDelay(1) };
+                }
             }
         }
     }
     let hw = unsafe { esp_idf_svc::sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut()) };
-    shared.stack_hw_bytes.store(hw, Ordering::Relaxed);
-    shared.done.store(true, Ordering::Release);
+    shared.stack_hw_bytes[w].store(hw, Ordering::Relaxed);
+    shared.running.fetch_sub(1, Ordering::AcqRel);
     // Dropped before the task deletes itself — `vTaskDelete` does not
     // unwind, so anything still live here would leak.
     drop(shared);
@@ -1008,6 +1113,9 @@ fn run_candidates(s: &ParShared) {
     let mut busy = 0i64;
     let mut took = 0usize;
     let mut stage = [0i64; 3];
+    // The fine pass's references, built on first use by a candidate
+    // whose coarse sweep ran during capture, then kept for the slot.
+    let mut scratch: Option<Ft4SweepScratch> = None;
     loop {
         if now_us() >= s.deadline {
             break;
@@ -1024,7 +1132,7 @@ fn run_candidates(s: &ParShared) {
         // exited before either core starts.
         let pipe = unsafe { (*s.pipe_of.add(i)).map(|k| &mut *s.pipes.add(k)) };
         let t0 = now_us();
-        let d = decode_candidate(half, &cands[i], refs, pipe, &mut stage);
+        let d = decode_candidate(half, &cands[i], refs, pipe, &mut scratch, &mut stage);
         let t1 = now_us();
         busy += t1 - t0;
         took += 1;
@@ -1082,9 +1190,50 @@ fn decode_candidate(
     cand: &SyncCandidate,
     refs: &Ft4CoarsePhasors,
     pipe: Option<&mut Pipe>,
+    scratch: &mut Option<Ft4SweepScratch>,
     stage: &mut [i64; 3],
 ) -> Option<Ft4Decode> {
     let t_ddc = now_us();
+    // A candidate built during capture: its baseband needs its last few
+    // percent and its flush, and its coarse sweep whatever cells were
+    // not yet readable — against the raw baseband, the one the rest of
+    // the sweep scored. Then normalise in place and run the fine pass,
+    // which is where the score and position the decoder uses come from.
+    if let Some(p) = pipe {
+        let mut cd0 = p.finish(half);
+        let t1 = now_us();
+        // Internal DRAM — see `early_worker`.
+        let scratch = scratch.get_or_insert_with(Ft4SweepScratch::new::<Ft4>);
+        let s2 = match p.sweep.take() {
+            Some(mut sw) => {
+                sw.complete::<Ft4>(&cd0, scratch, refs);
+                let t2 = now_us();
+                rms_normalise(&mut cd0);
+                let t3 = now_us();
+                let s2 = sw.fine::<Ft4>(&cd0, cand, scratch, refs);
+                stage[0] += (t1 - t_ddc) + (t3 - t2);
+                stage[1] += (t2 - t1) + (now_us() - t3);
+                s2
+            }
+            None => {
+                rms_normalise(&mut cd0);
+                let t2 = now_us();
+                let s2 = ft4_sync_search_window_with::<Ft4>(
+                    &cd0,
+                    cand,
+                    WSJTX_WINDOW.0,
+                    WSJTX_WINDOW.1,
+                    refs,
+                );
+                stage[0] += t2 - t_ddc;
+                stage[1] += now_us() - t2;
+                s2
+            }
+        };
+        let t_tail = now_us();
+        let _tail = TailTimer { stage, t_tail };
+        return tail_decode(cand, cd0, s2);
+    }
     // `MFSK_FT4_BOXCAR=1` swaps the 101 + 263-tap chain for a mix and
     // a nine-sample boxcar. Measured on the host it costs 0.29 dB of
     // threshold alone and 0.50 dB against a +20 dB neighbour folding
@@ -1092,9 +1241,7 @@ fn decode_candidate(
     // for a seventh of the time *there*, on a machine with no PIE dot
     // product. This knob is what turns that into a number from the
     // board, which is the only one the budget can be spent against.
-    let mut cd0 = if let Some(p) = pipe {
-        p.finish(half)
-    } else if option_env!("MFSK_FT4_BOXCAR").is_some() {
+    let mut cd0 = if option_env!("MFSK_FT4_BOXCAR").is_some() {
         candidate_baseband_boxcar(half, cand.freq_hz)
     } else {
         candidate_baseband_half(half, cand.freq_hz)
@@ -1117,6 +1264,15 @@ fn decode_candidate(
     let t_tail = now_us();
     stage[1] += t_tail - t_search;
     let _tail = TailTimer { stage, t_tail };
+    tail_decode(cand, cd0, s2)
+}
+
+/// LLR, BP, unpack — everything after the Δt/Δf search.
+fn tail_decode(
+    cand: &SyncCandidate,
+    cd0: Vec<Complex<f32>>,
+    s2: mfsk_core::engine::sync2d::Sync2dResult,
+) -> Option<Ft4Decode> {
     let r = process_candidate_precomputed::<Ft4>(
         cand,
         &[],
@@ -1196,8 +1352,12 @@ pub fn decode_slot_with(
         Some(e) => unsafe { &mut *e.shared.pipes.get() },
         None => &mut no_pipes,
     };
-    // How far the worker got, before the decode takes the rest.
+    // How far the workers got, before the decode takes the rest.
     let early_fed: usize = pipes.iter().map(|p| p.fed).sum();
+    let (sweep_done, sweep_total) = pipes
+        .iter()
+        .filter_map(|p| p.sweep.as_ref().map(|s| s.progress()))
+        .fold((0, 0), |(a, b), (d, t)| (a + d, b + t));
     let mut used = alloc::vec![false; pipes.len()];
     let pipe_of: Vec<Option<usize>> = cands
         .iter()
@@ -1405,15 +1565,20 @@ pub fn decode_slot_with(
         // `fed` is how much of the DDC work was done before the close:
         // the pipes' samples over what the reused ones needed in all.
         log::info!(
-            "ft4_rx: early DDC — {} built from {} ms before close, reused {reused} fresh {} wasted {} \
-             | {}% fed at close | wait {} us | stack {} B free of {EARLY_STACK} | internal largest {internal} B",
+            "ft4_rx: early DDC — {} built from {} ms before close ({} workers), reused {reused} fresh {} wasted {} \
+             | {}% fed, sweep {}% at close | wait {} us | stack {:?} B free of {EARLY_STACK} | internal largest {internal} B",
             pipes.len(),
             (slot.closed_us - e.shared.started_us) / 1_000,
+            e.workers,
             cands.len() - reused,
             used.iter().filter(|u| !**u).count(),
             early_fed * 100 / (pipes.len() * half.len()).max(1),
+            sweep_done * 100 / sweep_total.max(1),
             early_wait_us,
-            e.shared.stack_hw_bytes.load(Ordering::Relaxed),
+            [
+                e.shared.stack_hw_bytes[0].load(Ordering::Relaxed),
+                e.shared.stack_hw_bytes[1].load(Ordering::Relaxed),
+            ],
         );
     }
 
