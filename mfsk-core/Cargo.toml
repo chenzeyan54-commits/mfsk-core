@@ -370,6 +370,24 @@ rustfft = "6"
 # us expose feature-gated items with visible "available on crate
 # feature …" badges (this build passes it; gate any such annotation
 # on `#[cfg(docsrs)]` if we ever add one).
+#
+# **`features`, not `all-features`.** This crate has a mutually
+# exclusive pair -- `wspr-ddc` and `wspr-ddc-cascade` select different
+# WSPR channelizers and `wspr::decode` refuses both with a
+# `compile_error!` -- so `all-features = true` cannot build. It did not
+# fail locally because no local command enables both either: the
+# pre-commit hook and CI's `docs` job document `--features full`, and
+# the feature matrix builds each of them alone. docs.rs was the one
+# builder that asked for everything, and v0.11.0's documentation build
+# failed there with exactly that `compile_error!` while every gate in
+# this repository stayed green.
+#
+# `full` is the right surface anyway: it is every protocol plus
+# `uvpacket`, `packet-bytes`, `serde`, `parallel` and the host FFT --
+# the API a crates.io consumer sees. What it leaves out are build-shape
+# knobs rather than API (`fixed-point`, `fft-extern`,
+# `dotprod-extern`, the two channelizers, `internal-testing`), each
+# documented in the feature table above.
 [package.metadata.docs.rs]
-all-features = true
+features = ["full"]
 rustdoc-args = ["--cfg", "docsrs"]
