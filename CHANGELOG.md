@@ -18,6 +18,29 @@
   as WSJT-X, whose `pack77` never had the gap. `pack77_type1` routes
   through `pack77`, so it gains the same.
 
+- **CoreS3: the CQ-side QSO state machine for portable activations
+  (`mfsk-app-shared::activator`), host-tested, not yet wired.** SOTA /
+  POTA operation wants the board to call CQ, answer whoever calls, log
+  each contact and stop at a target count, unattended. The older
+  `qso.rs` could not: fixed resend counts, no notion of a caller who
+  went quiet, and a reply chosen by state rather than by what was
+  received. The new machine is pure — the board calls `decide` once
+  per own period at the reply deadline — and follows WSJT-X
+  `mainwindow.cpp` where it matters: the reply is a function of the
+  caller's latest message (5820-5990), so a caller who repeats `R-12`
+  gets `RR73` again without a second log entry; the contact is logged
+  when `RR73` is sent (4951-4965); a caller finishing an earlier
+  exchange is served before new callers (4208-4209). Two deliberate
+  divergences, both commented: a silent partner is dropped after two
+  periods (configurable) rather than after WSJT-X's six-minute
+  watchdog, and among new callers the strongest is answered. A partner
+  dropped and heard again is logged with the grid and reports of the
+  first attempt. 19 scenario tests run in `hosttest/mfsk-app-shared`,
+  including every message the machine can emit going through
+  `pack77`/`unpack77` and back for both `JL1NIE` and `JL1NIE/P` — the
+  test that found the entry above. Logging to flash, the board wiring
+  and actual transmission are the next stages.
+
 - **CoreS3: the four receivers share one boot sequence
   (`boot::Receiver`).** This crate carried four `main`s: one per app,
   plus the FT8 controller's, inline in `main.rs`. Each opened with its

@@ -63,6 +63,12 @@ pub mod grid_fix;
 #[path = "../../../embedded-poc/mfsk-app-shared/src/grid_state.rs"]
 pub mod grid_state;
 
+/// The CQ-side QSO state machine for portable activations — pure, by
+/// design, so that every exchange it can get into is a test here
+/// rather than an afternoon on a summit.
+#[path = "../../../embedded-poc/mfsk-app-shared/src/activator.rs"]
+pub mod activator;
+
 /// The FT8/FT4 decoded-row list. Pulled in as a `ui` module tree so
 /// the file's own `crate::ui::state::...` paths resolve unchanged.
 ///
@@ -125,5 +131,58 @@ mod decoded_row_tests {
     fn the_prefix_is_wsjtx_column_order() {
         let t = row_text(&row("CQ JA1XXN PM96"));
         assert!(t.starts_with("-11 +0.0 1891 "), "prefix changed: {t:?}");
+    }
+}
+
+/// Every message the activator can emit, through the packer the board
+/// will hand it to, and back.
+#[cfg(test)]
+mod activator_pack_tests {
+    use super::activator::{Config, CqModifier, TxMsg};
+    use mfsk_core::msg::wsjt77::{pack77, pack77_free_text, unpack77};
+
+    fn round_trip(cfg: &Config, m: &TxMsg) -> Option<String> {
+        let (a, b, c) = m.fields(cfg);
+        let bits = if b.is_empty() {
+            pack77_free_text(&a)?
+        } else {
+            pack77(&a, &b, &c)?
+        };
+        unpack77(&bits)
+    }
+
+    fn std(to: &str, ex: &str) -> TxMsg {
+        TxMsg::Std {
+            to: to.try_into().unwrap(),
+            exchange: ex.try_into().unwrap(),
+        }
+    }
+
+    #[test]
+    fn every_message_packs_and_reads_back_as_sent() {
+        for my in ["JL1NIE", "JL1NIE/P"] {
+            let mut cfg = Config::new(my, "PM95");
+            let mut msgs = vec![TxMsg::Cq];
+            for ex in ["-07", "R-15", "+03", "RR73", "73"] {
+                msgs.push(std("W1AW", ex));
+            }
+            for cq in [
+                CqModifier::None,
+                CqModifier::Token("SOTA".try_into().unwrap()),
+                CqModifier::Token("DX".try_into().unwrap()),
+                CqModifier::Number(7),
+                CqModifier::FreeText("QRV JA-1234".try_into().unwrap()),
+            ] {
+                cfg.cq = cq;
+                for m in &msgs {
+                    let want = m.text(&cfg);
+                    assert_eq!(
+                        round_trip(&cfg, m).as_deref(),
+                        Some(want.as_str()),
+                        "{my}: {want}"
+                    );
+                }
+            }
+        }
     }
 }

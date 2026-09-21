@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+pub mod activator;
 pub mod adif;
 pub mod boot_mode;
 pub mod grid_src;
