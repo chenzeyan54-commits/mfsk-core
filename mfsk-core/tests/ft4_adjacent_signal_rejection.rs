@@ -111,20 +111,26 @@ fn add_signal(mix: &mut [f32], msg: &[u8; 77], freq_hz: f32, amp: f32) {
 /// Costas arrays on top of the wanted ones — and it is the case a
 /// selectivity claim has to survive.
 fn slot(interferer: Option<(f32, f32)>) -> Vec<i16> {
+    slot_at(WANTED_SNR_DB, interferer, 0x5EED_1234)
+}
+
+/// [`slot`] with the wanted signal's SNR and the noise seed chosen —
+/// what the threshold sweep varies.
+fn slot_at(snr_db: f32, interferer: Option<(f32, f32)>, seed: u64) -> Vec<i16> {
     let mut mix = vec![0.0f32; rx::SLOT_SAMPLES];
-    add_signal(&mut mix, &wanted(), WANTED_HZ, amp_for(WANTED_SNR_DB));
+    add_signal(&mut mix, &wanted(), WANTED_HZ, amp_for(snr_db));
     if let Some((offset_hz, level_db)) = interferer {
         add_signal(
             &mut mix,
             &other(),
             WANTED_HZ + offset_hz,
-            amp_for(WANTED_SNR_DB + level_db),
+            amp_for(snr_db + level_db),
         );
     }
     // Deterministic noise, not a silent slot: a noiseless synthetic
     // fixture flatters every decoder and has misled this repository
     // before.
-    AwgnChannel::new(1.0, 0x5EED_1234).apply(&mut mix);
+    AwgnChannel::new(1.0, seed).apply(&mut mix);
     let peak = mix.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-6);
     let scale = 29_000.0 / peak;
     mix.iter()
@@ -157,12 +163,27 @@ fn cases() -> Vec<(&'static str, f32)> {
             BAND_CENTRE_HZ + DS_RATE_HZ / 2.0,
         ),
         (
-            "fold k=1  +697.9 Hz    — folds onto the wanted band",
+            "fold k=1  +697.9 Hz    — folds to band centre, ON the boxcar null",
             BAND_CENTRE_HZ + DS_RATE_HZ,
         ),
         (
-            "fold k=2  +1364.6 Hz   — the second image",
+            "fold k=2  +1364.6 Hz   — the second image, also on a null",
             BAND_CENTRE_HZ + 2.0 * DS_RATE_HZ,
+        ),
+        // **The worst case, and the one the first version of this file
+        // missed.** `k * 666.667` is exactly where a 9-sample boxcar's
+        // sinc null sits, so an interferer placed there is the one it
+        // rejects *best* — the fold rows above pass for a reason that
+        // has nothing to do with selectivity. Sliding the carrier down
+        // by the frame's own width keeps every folded tone inside the
+        // wanted band while moving it as far off the null as it can go.
+        (
+            "fold k=1 off-null low   +635.4 Hz — folds in band, worst rejection",
+            BAND_CENTRE_HZ + DS_RATE_HZ - 62.5,
+        ),
+        (
+            "fold k=1 off-null high  +760.4 Hz — folds onto the top tones",
+            BAND_CENTRE_HZ + DS_RATE_HZ + 62.5,
         ),
     ]
 }
@@ -221,6 +242,165 @@ fn ft4_front_end_rejects_a_neighbour_off_the_wanted_band() {
     assert_eq!(
         lost, expected_lost,
         "the rejection baseline moved — see the table above"
+    );
+}
+
+/// What the boxcar front end costs on the same table.
+///
+/// This is the question the file was built to answer. The FIR arm
+/// above survives a +20 dB neighbour everywhere; the proposal is to
+/// replace its 101 + 263 taps with a mix-and-bin pass costing a
+/// sixteenth of the arithmetic, and `the_fold_offsets_really_do_fold`
+/// measures that such a pass admits 44 dB more at the fold offsets.
+/// Whether 44 dB matters depends on whether the coherent Costas
+/// correlation and the LLR stage can absorb it, which is not something
+/// to reason about — so this runs it.
+///
+/// Diagnostic rather than a gate: it prints both arms side by side. The
+/// FIR arm's assertions live in the test above and are the contract.
+#[test]
+fn what_the_boxcar_front_end_costs_against_a_neighbour() {
+    let wanted = mfsk_core::msg::wsjt77::unpack77(&wanted()).expect("wanted unpacks");
+
+    let alone_fir = rx::run_slot_with(&slot(None), rx::fir_producer);
+    let alone_box = rx::run_slot_with(&slot(None), rx::boxcar_producer);
+    eprintln!("\nFT4 adjacent-signal rejection — FIR against boxcar/9");
+    eprintln!(
+        "  alone: FIR {}, boxcar {}",
+        alone_fir.contains(&wanted),
+        alone_box.contains(&wanted)
+    );
+
+    eprintln!(
+        "  {:<62} {:>15} {:>15}",
+        "case", "FIR +0/+10/+20", "box +0/+10/+20"
+    );
+    for (name, offset) in cases() {
+        let mut fir = String::new();
+        let mut boxcar = String::new();
+        for level in [0.0f32, 10.0, 20.0] {
+            let audio = slot(Some((offset, level)));
+            fir.push_str(
+                if rx::run_slot_with(&audio, rx::fir_producer).contains(&wanted) {
+                    " ok "
+                } else {
+                    "LOST"
+                },
+            );
+            boxcar.push_str(
+                if rx::run_slot_with(&audio, rx::boxcar_producer).contains(&wanted) {
+                    " ok "
+                } else {
+                    "LOST"
+                },
+            );
+        }
+        eprintln!("  {name:<62} {fir:>15} {boxcar:>15}");
+    }
+    eprintln!();
+}
+
+/// **The number that decides the cheaper front end**: how much
+/// threshold does it cost?
+///
+/// The tables above are taken at −8 dB, where the wanted signal has
+/// margin to spare, and they say the boxcar loses nothing. That is not
+/// the same as saying it costs nothing: a blunter filter admits more
+/// noise and more of a neighbour, and what that buys is paid at
+/// threshold, not in the middle of the range. So this sweeps the wanted
+/// signal down until it stops decoding, with and without the worst
+/// neighbour, and reports where each arm crosses 50 %.
+///
+/// `#[ignore]` — a few seconds rather than the milliseconds the rest of
+/// this file costs:
+///
+/// ```sh
+/// cargo test -p mfsk-core --features full,internal-testing --release \
+///     --test ft4_adjacent_signal_rejection -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "sweep — seconds, not milliseconds; run with --ignored"]
+fn what_the_boxcar_front_end_costs_at_threshold() {
+    const SEEDS: u64 = 32;
+    let wanted = mfsk_core::msg::wsjt77::unpack77(&wanted()).expect("wanted unpacks");
+    // The worst geometry the table above found: folds into the band,
+    // as far off the boxcar's null as it can get.
+    let worst = BAND_CENTRE_HZ + DS_RATE_HZ - 62.5;
+
+    // Coarse above threshold, half-decibel through it: a 1 dB grid
+    // cannot resolve a difference this file expects to be under 1 dB.
+    let snrs: Vec<f32> = (0..=16).map(|i| -14.0 - i as f32 * 0.5).collect();
+    let arms: [(&str, Option<(f32, f32)>); 2] =
+        [("alone", None), ("+20 dB fold", Some((worst, 20.0)))];
+
+    eprintln!("\nFT4 threshold, by front end — {SEEDS} seeds per point");
+    eprintln!("  {:<14} {:>28} {:>28}", "", "FIR 101+263", "boxcar /9");
+    eprintln!(
+        "  {:<14} {:>28} {:>28}",
+        "SNR", "alone   +20 dB fold", "alone   +20 dB fold"
+    );
+
+    let mut crossings = [[f32::NAN; 2]; 2];
+    let mut curves = [[Vec::new(), Vec::new()], [Vec::new(), Vec::new()]];
+    for &snr in &snrs {
+        let mut cells = Vec::new();
+        for (ai, (_, interferer)) in arms.iter().enumerate() {
+            for (pi, produce) in [rx::fir_producer, rx::boxcar_producer].iter().enumerate() {
+                let mut hits = 0;
+                for seed in 0..SEEDS {
+                    let audio = slot_at(snr, *interferer, 0x5EED_0000 + seed);
+                    if rx::run_slot_with(&audio, *produce).contains(&wanted) {
+                        hits += 1;
+                    }
+                }
+                let rate = hits as f32 / SEEDS as f32;
+                curves[pi][ai].push((snr, rate));
+                cells.push((pi, ai, rate));
+            }
+        }
+        let g = |pi: usize, ai: usize| {
+            cells
+                .iter()
+                .find(|(p, a, _)| *p == pi && *a == ai)
+                .map(|(_, _, r)| *r)
+                .unwrap_or(f32::NAN)
+        };
+        eprintln!(
+            "  {snr:<14.1} {:>12.0}% {:>14.0}% {:>12.0}% {:>14.0}%",
+            g(0, 0) * 100.0,
+            g(0, 1) * 100.0,
+            g(1, 0) * 100.0,
+            g(1, 1) * 100.0,
+        );
+    }
+
+    // Linear interpolation of the 50 % crossing, walking down from the
+    // top — the same shape `sweep-regression-check.py` uses on the
+    // tier-C CSVs.
+    for pi in 0..2 {
+        for ai in 0..2 {
+            let c = &curves[pi][ai];
+            for w in c.windows(2) {
+                if w[0].1 >= 0.5 && w[1].1 < 0.5 {
+                    let t = (w[0].1 - 0.5) / (w[0].1 - w[1].1);
+                    crossings[pi][ai] = w[0].0 + t * (w[1].0 - w[0].0);
+                    break;
+                }
+            }
+        }
+    }
+    eprintln!(
+        "\n  50 %% crossing (dB)   FIR alone {:.1}   FIR fold {:.1}   box alone {:.1}   box fold {:.1}",
+        crossings[0][0], crossings[0][1], crossings[1][0], crossings[1][1]
+    );
+    // Positive = the boxcar needs a stronger signal, i.e. it costs
+    // sensitivity. Spelled out because the subtraction reads either way
+    // and a sign error here would invert the conclusion.
+    eprintln!(
+        "  boxcar costs {:.2} dB alone, {:.2} dB against the fold \
+         (positive = worse)\n",
+        crossings[1][0] - crossings[0][0],
+        crossings[1][1] - crossings[0][1],
     );
 }
 

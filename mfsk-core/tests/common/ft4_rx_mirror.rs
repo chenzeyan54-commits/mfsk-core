@@ -90,13 +90,77 @@ pub fn rms_normalise(cd0: &mut [Complex<f32>]) {
     }
 }
 
+/// How a candidate's baseband gets built.
+///
+/// The receiver has exactly one of these today — `ft4::ddc`'s 101 + 263
+/// taps — and the whole question behind the cheaper front ends is what
+/// a blunter one would cost. Taking it as a parameter lets one test
+/// answer that without a second copy of the pipeline.
+pub type Producer = fn(&[f32], f32) -> Vec<Complex<f32>>;
+
+/// What ships: mixer -> 101-tap ÷9 -> 263-tap ÷1 -> derotate.
+pub fn fir_producer(half: &[f32], f0_hz: f32) -> Vec<Complex<f32>> {
+    candidate_baseband_half(half, f0_hz)
+}
+
+/// Mix and boxcar-decimate by nine — the cheapest producer anyone would
+/// reach for, and the shape FT8's `fine_sync_12k` bins its mixing pass
+/// into.
+///
+/// Same contract as [`fir_producer`]: `CD0_LEN` samples at 666.667 Hz
+/// with `f0` at DC, and **the same alignment** — `ft4::ddc` starts its
+/// FIR output counter at `group_delay + 1` so `cd0[0]` is centred on
+/// `half[0]`, so bin `j` here is centred on `half[9j]` rather than
+/// starting there. Get that wrong and every `dt` shifts by a constant,
+/// which reads as a sensitivity regression rather than as a bug.
+///
+/// Written for clarity, not speed: a real one would carry a rotator
+/// rather than calling `cos`/`sin` per sample. It exists to answer
+/// whether the *numbers* survive, which is the question that decides
+/// whether the fast version is worth writing.
+pub fn boxcar_producer(half: &[f32], f0_hz: f32) -> Vec<Complex<f32>> {
+    use core::f32::consts::TAU;
+    const DECIM: i64 = 9;
+    let in_rate = 6_000.0f32;
+    let out_rate = in_rate / DECIM as f32;
+    // `ft4::ddc` mixes the band centre to DC and rotates the output
+    // back by the same amount, so `f0` — not the centre — lands at DC.
+    let centre = f0_hz + 31.25;
+    let mut out = Vec::with_capacity(mfsk_core::ft4::ddc::CD0_LEN);
+    for j in 0..mfsk_core::ft4::ddc::CD0_LEN {
+        let c = j as i64 * DECIM;
+        let mut acc = Complex::new(0.0f32, 0.0);
+        for k in -(DECIM / 2)..=(DECIM / 2) {
+            let n = c + k;
+            if n < 0 || n as usize >= half.len() {
+                continue;
+            }
+            let phi = -TAU * centre * n as f32 / in_rate;
+            acc += Complex::new(phi.cos(), phi.sin()) * half[n as usize];
+        }
+        let psi = TAU * 31.25 * j as f32 / out_rate;
+        out.push(acc / DECIM as f32 * Complex::new(psi.cos(), psi.sin()));
+    }
+    out
+}
+
 /// `ft4_rx::decode_candidate`, call for call.
 pub fn decode_candidate(
     half: &[f32],
     cand: &SyncCandidate,
     refs: &Ft4CoarsePhasors,
 ) -> Option<String> {
-    let mut cd0 = candidate_baseband_half(half, cand.freq_hz);
+    decode_candidate_with(half, cand, refs, fir_producer)
+}
+
+/// [`decode_candidate`] over a chosen baseband producer.
+pub fn decode_candidate_with(
+    half: &[f32],
+    cand: &SyncCandidate,
+    refs: &Ft4CoarsePhasors,
+    produce: Producer,
+) -> Option<String> {
+    let mut cd0 = produce(half, cand.freq_hz);
     rms_normalise(&mut cd0);
     let s2 = ft4_sync_search_window_with::<Ft4>(&cd0, cand, WSJTX_WINDOW.0, WSJTX_WINDOW.1, refs);
     let r: Option<DecodeResult> = process_candidate_precomputed::<Ft4>(
@@ -122,12 +186,17 @@ pub fn decode_candidate(
 /// One whole slot in, its distinct messages out, in candidate order —
 /// which is descending coarse score, the order the receiver dedups in.
 pub fn run_slot(audio: &[i16]) -> Vec<String> {
+    run_slot_with(audio, fir_producer)
+}
+
+/// [`run_slot`] over a chosen baseband producer.
+pub fn run_slot_with(audio: &[i16], produce: Producer) -> Vec<String> {
     let (savg, half) = capture(audio);
     let cands = coarse(&savg);
     let refs = Ft4CoarsePhasors::new::<Ft4>();
     let mut out: Vec<String> = Vec::new();
     for cand in &cands {
-        if let Some(text) = decode_candidate(&half, cand, &refs)
+        if let Some(text) = decode_candidate_with(&half, cand, &refs, produce)
             && !out.contains(&text)
         {
             out.push(text);

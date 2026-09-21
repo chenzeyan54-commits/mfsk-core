@@ -384,6 +384,55 @@ fn mirror_tail_allocation_breakdown() {
     assert_eq!(llr.llra.len(), 174);
 }
 
+/// What would a boxcar front end decode on the real recording?
+///
+/// The per-candidate DDC is 83 ms of the board's 221 ms candidate and
+/// the proposal on the table is to replace its 101 + 263 taps with a
+/// mix-and-bin pass costing a sixteenth of the arithmetic. Whether that
+/// is worth designing depends on one number — what it decodes — and
+/// the WSJT-X golden is the closest thing this crate has to a real
+/// band: fourteen signals at the frequencies a real slot put them at.
+///
+/// Diagnostic, not a gate. It prints both sides and asserts only that
+/// the FIR arm is unchanged, because the boxcar arm is the thing being
+/// decided rather than a contract.
+#[test]
+fn what_a_boxcar_front_end_would_decode_on_the_golden() {
+    let Some(audio) = slot_audio() else {
+        assert!(
+            !require_corpus(),
+            "MFSK_REQUIRE_CORPUS=1 but the golden is missing"
+        );
+        return;
+    };
+
+    let fir = rx::run_slot_with(&audio, rx::fir_producer);
+    let boxcar = rx::run_slot_with(&audio, rx::boxcar_producer);
+
+    let mut only_fir: Vec<&String> = fir.iter().filter(|m| !boxcar.contains(m)).collect();
+    let mut only_box: Vec<&String> = boxcar.iter().filter(|m| !fir.contains(m)).collect();
+    only_fir.sort();
+    only_box.sort();
+
+    eprintln!(
+        "\nft4 golden, front ends compared:\n  \
+         FIR 101+263 : {} decodes\n  \
+         boxcar /9   : {} decodes\n  \
+         lost by boxcar : {:?}\n  \
+         gained by boxcar: {:?}",
+        fir.len(),
+        boxcar.len(),
+        only_fir,
+        only_box,
+    );
+
+    assert_eq!(
+        fir.len(),
+        11,
+        "the FIR arm is the control and must not move"
+    );
+}
+
 /// The constants above are a copy of `ft4_rx.rs`'s, and a copy rots.
 ///
 /// This cannot import them — `embedded-shared` is outside this
