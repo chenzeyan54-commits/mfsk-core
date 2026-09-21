@@ -737,6 +737,34 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
         // With no clock (`MFSK_SIM_NO_CLOCK`) there is no boundary to
         // aim at, which is its own experiment: the receiver has to find
         // the phase without one.
+        //
+        // **And aim at the clock the receiver will use, not whatever
+        // is in the system clock at the moment.** `utc_now_ms` calls a
+        // clock plausible by its value, and after a reflash the
+        // system time survives the reset with the previous session's
+        // stale reading — so this aligned to it, and the BM8563 read
+        // then replaced it a moment later, while the receiver anchored
+        // to the replacement. The feed's phase against the grid was
+        // therefore whatever the stale clock's error was. Measured
+        // 2026-09-21: every boot whose "waiting N ms" line came before
+        // `rtc: system clock set` and anchored far from a boundary
+        // (4 916, 5 787 ms) decoded **zero** of 13 candidates, on
+        // unchanged decoder code — read at the time as a flaky grid.
+        // Bounded: a board with no RTC and no network still feeds.
+        if option_env!("MFSK_SIM_NO_CLOCK").is_none() {
+            let t_wait = unsafe { sys::esp_timer_get_time() };
+            while mfsk_app_shared::time_sync::clock_source()
+                == mfsk_app_shared::time_sync::ClockSource::Unset
+                && unsafe { sys::esp_timer_get_time() } - t_wait < 10_000_000
+            {
+                unsafe { sys::vTaskDelay(1) };
+            }
+            log::warn!(
+                "uac SIM: clock source {:?} after {} ms — aligning to it",
+                mfsk_app_shared::time_sync::clock_source(),
+                (unsafe { sys::esp_timer_get_time() } - t_wait) / 1_000,
+            );
+        }
         let align = mfsk_app_shared::time_sync::samples_to_next_slot_12k_ms(
             (slot_samples / 12) as u64,
         );
