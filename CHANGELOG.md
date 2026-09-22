@@ -141,21 +141,32 @@
     nor its channel is made on the requester's stack**, which is a
     decoder's: made there, FT4's `ft4_slot` fell to 444-464 B free of
     8 KB. The channel is made at boot, the task by the panel loop.
-  - **`all.txt` is written 4 KB at a time.** LittleFS cannot program
-    into a block after `sync` committed it, so each synced append
-    copied the tail block to a fresh one: a 448 B slot cost one erase
-    and 512-4 096 B of programming, and about one sync in ten also
-    compacted the metadata log (538 reads, 69 KB, 147 ms) — traced
-    with counting `--wrap`pers on the three `esp_partition_*` calls
-    (`MFSK_STORAGE_TRACE=1`). Batched, one 4 480 B write programs
-    7 168 B in 72 ms every ~10 FT8 slots. A power cut loses the
-    unwritten ~2 minutes of `all.txt`; `qso.adi` is unaffected.
-  - **The write waits for mid-slot**, the point furthest from every
-    deadline.
-
-  **Not yet measured**: whether a flush's cache-off time drops audio
-  on a live UAC capture (48 ms of queued isochronous audio); the SIM
-  build feeds from a WAV and cannot show it.
+    The task is spawned after the first request is sent, not when the
+    channel exists (which is from boot).
+  - **Lines and contacts are held in PSRAM and written only at chosen
+    moments**, because a LittleFS write stops the cache on both cores
+    and with it everything, whatever its priority: on an IC-705 a
+    mid-slot `all.txt` flush cost a skipped USB audio packet. The
+    flash's auto-suspend would avoid that, but IDF detects this
+    board's chip as `generic`, outside what it supports. So the write
+    points are: a **quiet window** the transmit side hands over with
+    `storage::quiet_window` — the tail of our own transmit slot, after
+    its audio (nothing calls it until transmission exists);
+    **receive-only**, once 48 KB of `all.txt` is held (~45 min of a
+    busy FT8 band), at the point in the slot after every station's
+    transmission has ended and before the decode starts — 13.3 s for
+    FT8, 5.8 s for FT4, 112 s for WSPR — 16 KB per slot; before a
+    **download**; and before a **restart** from the panel. On air the
+    receive-only writes started at +13 308-13 319 ms, took 48-83 ms
+    per 4 KB and cost at most one packet, in audio no signal was in;
+    a mode change wrote 586 B in 16 ms before restarting. `all.txt`
+    is written a block (4 KB) per `sync`: LittleFS cannot program into
+    a block a `sync` has committed, so smaller synced appends
+    re-wrote the tail block every time (traced with
+    `MFSK_STORAGE_TRACE=1`: one erase plus 512-4 096 B of programming
+    per 448 B slot, and a 147 ms metadata compaction about one sync in
+    ten). A power cut loses what is held — up to 48 KB of `all.txt`,
+    and the contacts since the last window, normally none.
 
 - **CoreS3: the CQ-side QSO state machine for portable activations
   (`mfsk-app-shared::activator`), host-tested, not yet wired.** SOTA /

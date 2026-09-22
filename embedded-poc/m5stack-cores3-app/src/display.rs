@@ -1260,6 +1260,12 @@ fn pump_touch(
 /// PSRAM stack (see [`spawn_log_panel`]), and a flash write aborts from
 /// one. From `main` the hand-off costs nothing and changes nothing.
 fn apply_commit(nvs: &Arc<Mutex<EspNvs<NvsDefault>>>, commit: mode_picker::Commit) {
+    // Every branch restarts the board, and `all.txt` and `qso.adi` are
+    // held in PSRAM until a write point (`storage`) — put them on flash
+    // first. A deliberate restart takes the stall.
+    if !crate::storage::flush_blocking(std::time::Duration::from_secs(5)) {
+        log::warn!("storage: held logs not confirmed written before restart");
+    }
     match commit {
         mode_picker::Commit::Mode(target) => {
             log::warn!("boot_mode -> {} (touch), restarting", target.label());

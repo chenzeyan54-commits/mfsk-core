@@ -20,12 +20,35 @@
 //! through an internal bounce buffer when the source or destination is
 //! external, so that costs speed, not correctness.
 //!
-//! **Not yet measured**: what a sector erase (~45 ms typical on this
-//! class of flash, one per 4 KB appended) does to the UAC capture, whose
-//! isochronous URBs hold 48 ms of audio (`embedded-poc/CLAUDE.md`, "The
-//! isochronous URB budget"). The cache is off for the erase on both
-//! cores, and the URB resubmit runs from flash. Check the delivered
-//! sample rate with logging on before trusting a long session.
+//! **When the flash is written — the one thing priorities cannot
+//! arrange.** A LittleFS write stops the cache on both cores, and with
+//! it every task and every interrupt not in IRAM, whatever their
+//! priority: this priority-2 task's write stops the priority-8 USB
+//! audio path, the decoder and a transmission alike. On an IC-705 an
+//! `all.txt` flush mid-slot cost a skipped isochronous packet (3 ms of
+//! receive audio, `logs/live_ft8_62e0bee6_2026-09-22.log`); a USB
+//! transmit stream would lose the same. The flash's auto-suspend
+//! (`SPI_FLASH_AUTO_SUSPEND`) would let the cache through, but IDF
+//! detects this board's chip as `generic`, outside what it supports.
+//!
+//! So lines and records are held in PSRAM and written only at moments
+//! chosen for it (see [`serve`] and [`next_rx_quiet_point`]):
+//!
+//! - a **quiet window** the transmit side hands over with
+//!   [`quiet_window`] — the tail of our own transmit slot, after the
+//!   audio has ended and before the next slot, when nothing on the
+//!   board is doing anything a stall could cost. Nothing calls it
+//!   until transmission exists;
+//! - **receive-only**, when the buffer passes [`ALL_HIGH_WATER`], at the
+//!   point in a slot after every station's transmission has ended and
+//!   before the decode starts, [`ALL_RX_CHUNK`] at a time;
+//! - just before a **read** (a download is a deliberate act; it takes
+//!   what it costs).
+//!
+//! A power cut loses what is held: up to [`ALL_HIGH_WATER`] of
+//! `all.txt` (~45 min of a busy FT8 band), and at most the contacts
+//! since the last window — one, normally, since a contact is logged in
+//! the transmit slot whose tail is the next window.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -85,9 +108,13 @@ impl File {
 }
 
 enum Req {
-    /// Lines for `all.txt`, and the slot period they came from — the
-    /// write waits for the middle of the current slot (see [`serve`]).
+    /// Lines for `all.txt`, and the slot period they came from — which
+    /// decides where the receive-only write point falls.
     AppendAll { text: String, period_ms: u64 },
+    /// Write what is held, finishing by this `esp_timer` time (µs).
+    Quiet { until_us: i64 },
+    /// Write everything held, then answer — before a restart.
+    Flush { reply: SyncSender<()> },
     /// A record, and the header to write first if the file is new.
     AppendQso { record: String, header: String },
     Read {
@@ -116,6 +143,11 @@ pub fn mounted() -> bool {
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+/// Something has been sent. The task is spawned only after this — the
+/// channel exists from boot ([`enable`]), so its existence cannot be
+/// the trigger, and was for a while (spawning on the panel's first
+/// frame, ahead of the decoder's allocations).
+static REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Allow the storage task to exist; it is spawned after the first
 /// request, by [`start_if_requested`].
@@ -163,7 +195,7 @@ fn ensure_channel() -> Option<&'static SyncSender<Req>> {
 /// spawn wait in the channel, [`QUEUE`] deep.
 pub fn start_if_requested() {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    if ONCE.is_completed() || TX.get().is_none() {
+    if ONCE.is_completed() || !REQUESTED.load(Ordering::Acquire) {
         return;
     }
     ONCE.call_once(|| {
@@ -203,13 +235,34 @@ fn spawn(rx: Receiver<Req>) {
             if mount() {
                 MOUNTED.store(true, Ordering::Release);
             }
-            let mut all = AllTxt::default();
+            let mut st = Held::default();
             let ok = mounted();
-            for req in rx.iter() {
-                if ok {
-                    serve(req, &mut all);
-                } else {
-                    DROPPED.fetch_add(1, Ordering::Relaxed);
+            loop {
+                // Wake for a request, or for the receive-only write
+                // point when one is due.
+                let req = match st.next_due_us() {
+                    Some(due) => {
+                        let wait = (due - now_us()).max(0) as u64;
+                        match rx.recv_timeout(Duration::from_micros(wait)) {
+                            Ok(r) => Some(r),
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                            Err(_) => break,
+                        }
+                    }
+                    None => match rx.recv() {
+                        Ok(r) => Some(r),
+                        Err(_) => break,
+                    },
+                };
+                if !ok {
+                    if req.is_some() {
+                        DROPPED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+                match req {
+                    Some(r) => serve(r, &mut st),
+                    None => st.rx_quiet_point(),
                 }
             }
         });
@@ -245,129 +298,279 @@ fn mount() -> bool {
     true
 }
 
-fn serve(req: Req, all: &mut AllTxt) {
+fn now_us() -> i64 {
+    // SAFETY: no arguments.
+    unsafe { esp_idf_svc::sys::esp_timer_get_time() }
+}
+
+fn serve(req: Req, st: &mut Held) {
     match req {
         Req::AppendAll { text, period_ms } => {
-            // Only a write that will reach the flash needs a quiet moment.
-            if all.pending.len() + text.len() >= ALL_FLUSH_BYTES {
-                wait_for_mid_slot(period_ms);
-            }
-            let t0 = std::time::Instant::now();
-            match all.append(&text) {
-                Ok((0, _)) => {}
-                Ok((written, size)) => {
-                    // What an append costs, erase included: the number
-                    // that decides whether the flash stall is safe for
-                    // the UAC capture's 48 ms of queued audio.
-                    let ms = t0.elapsed().as_millis() as u32;
-                    let (w, s) = all.last_split_us;
-                    // Where in the UTC slot the flash was busy: a write
-                    // stops the cache, and with it the USB host's
-                    // resubmissions (`uac::RX_DONE_GAP_MAX_US`).
-                    let at = mfsk_app_shared::time_sync::utc_now_ms()
-                        .map_or(-1, |t| (t % (period_ms.max(1))) as i64 - ms as i64);
-                    log::info!(
-                        "storage: all.txt +{} B in {ms} ms (write {} ms, sync {} ms) from slot +{at} ms, now {} KB",
-                        written,
-                        w / 1000,
-                        s / 1000,
-                        size / 1024
-                    );
-                }
-                Err(e) => log::warn!("storage: all.txt append failed: {e}"),
-            }
+            st.all.hold(&text);
+            st.period_ms = period_ms;
+            st.schedule();
         }
-        Req::AppendQso { record, header } => match write_qso(&record, &header) {
-            Ok(()) => log::info!("storage: qso.adi += {}", record.trim_end()),
-            // Loud: this is the contact log, not a convenience.
-            Err(e) => log::error!(
-                "storage: qso.adi append FAILED: {e} — {}",
-                record.trim_end()
-            ),
-        },
+        Req::AppendQso { record, header } => {
+            log::info!("storage: qso.adi held: {}", record.trim_end());
+            if st.qso.is_empty() {
+                st.qso_since_us = now_us();
+            }
+            st.qso.push((record, header));
+            st.schedule();
+        }
+        Req::Quiet { until_us } => st.write_until(until_us, usize::MAX, "window"),
+        Req::Flush { reply } => {
+            st.write_until(i64::MAX, usize::MAX, "flush");
+            let _ = reply.send(());
+        }
         Req::Read {
             file,
             offset,
             len,
             reply,
         } => {
-            if matches!(file, File::All) {
-                if let Err(e) = all.flush() {
-                    log::warn!("storage: all.txt flush before read failed: {e}");
-                }
-            }
+            // A download is a deliberate act; it takes what it costs.
+            st.write_until(i64::MAX, usize::MAX, "read");
             let _ = reply.send(read(file, offset, len).ok());
         }
     }
 }
 
-/// Sleep until the middle of the current slot.
-///
-/// **Why.** A flash write stalls both cores while the cache is off.
-/// Issued the moment a slot's decodes were published — ~0.4 s after the
-/// slot ended — it lands in the stretch where the next slot's first
-/// pass is racing key-up, and the A/B on 2026-09-22 (FT8 SIM, 18 slots
-/// each, `logs/storage_off_ft8sim_2026-09-22.log` against
-/// `logs/storage_ft8sim_http_2026-09-22.log`) put a number on it: with
-/// the writes, 9-12 of 18 slots finished 21-117 ms past key-up and
-/// `post_slotend` rose ~100 ms; without them, none did. Mid-slot is
-/// the point furthest from every deadline — capture is running, and
-/// capture is buffered.
-fn wait_for_mid_slot(period_ms: u64) {
-    let Some(now) = mfsk_app_shared::time_sync::utc_now_ms() else {
-        return;
-    };
-    if period_ms == 0 {
-        return;
-    }
-    let target = period_ms / 2;
-    let phase = now % period_ms;
-    let wait = (target + period_ms - phase) % period_ms;
-    std::thread::sleep(Duration::from_millis(wait));
+/// What is held in PSRAM, and when the receive-only write is next due.
+#[derive(Default)]
+struct Held {
+    all: AllTxt,
+    /// ADIF records and the header each wants if the file is new.
+    qso: Vec<(String, String)>,
+    /// `esp_timer` µs the oldest held record arrived.
+    qso_since_us: i64,
+    /// The slot period the latest lines came from.
+    period_ms: u64,
+    /// `esp_timer` µs of the next wake, and whether it is a
+    /// receive-only write point (`true`) or only a time to decide again
+    /// (`false`: a held contact reaching [`QSO_MAX_HOLD_US`]).
+    due: Option<(i64, bool)>,
 }
 
-/// Bytes of `all.txt` lines held in memory before they are written.
-///
-/// **Why batch.** LittleFS cannot program more into a block after a
-/// `sync` has committed it, so every synced append copies the file's
-/// tail block to a freshly erased one — the bytes already in that block
-/// are written again each time. Traced on the CoreS3 (2026-09-22,
-/// `MFSK_STORAGE_TRACE`, `logs/storage_trace_ft8sim_2026-09-22.log`),
-/// a 448 B slot append cost one 4 KB erase plus 512 B to 4 096 B of
-/// programming, growing with the block (7-37 ms), and roughly one
-/// `sync` in ten also compacted the metadata log: 538 reads, 69 KB,
-/// one erase, **147 ms**. One block's worth per write bounds the copy
-/// at one block, and one `sync` per ~9 FT8 slots makes the compaction
-/// that much rarer. The price is what a power cut takes: the unwritten
-/// ~2 minutes of `all.txt`. `qso.adi` is still synced per record.
-const ALL_FLUSH_BYTES: usize = 4096;
+impl Held {
+    fn next_due_us(&self) -> Option<i64> {
+        self.due.map(|(t, _)| t)
+    }
 
-/// `all.txt`: lines buffered until [`ALL_FLUSH_BYTES`], then appended
-/// through a handle held open between writes.
+    /// Decide whether a receive-only write is wanted, and when.
+    fn schedule(&mut self) {
+        let now = now_us();
+        let qso_expired = !self.qso.is_empty() && now - self.qso_since_us >= QSO_MAX_HOLD_US;
+        self.due = if self.all.pending.len() >= ALL_HIGH_WATER || qso_expired {
+            next_rx_quiet_point(self.period_ms).map(|t| (t, true))
+        } else if !self.qso.is_empty() {
+            Some((self.qso_since_us + QSO_MAX_HOLD_US, false))
+        } else {
+            None
+        };
+    }
+
+    /// A wake has come: write if it was a write point, then decide again.
+    fn rx_quiet_point(&mut self) {
+        if let Some((_, true)) = self.due {
+            // Past the point by the time the flash is done is fine; this
+            // is only where to *start*.
+            self.write_until(i64::MAX, ALL_RX_CHUNK, "rx");
+        }
+        self.due = None;
+        self.schedule();
+    }
+
+    /// Contacts first, then `all.txt` 4 KB at a time while there is
+    /// time before `until_us` for another and no more than `budget`
+    /// bytes have gone.
+    fn write_until(&mut self, until_us: i64, budget: usize, why: &str) {
+        let t0 = now_us();
+        let at = slot_ms(self.period_ms);
+        for (record, header) in self.qso.drain(..) {
+            match write_qso(&record, &header) {
+                Ok(()) => log::info!("storage: qso.adi += {}", record.trim_end()),
+                // Loud: this is the contact log, not a convenience.
+                Err(e) => log::error!(
+                    "storage: qso.adi append FAILED: {e} — {}",
+                    record.trim_end()
+                ),
+            }
+        }
+        let mut written = 0usize;
+        while !self.all.pending.is_empty()
+            && written < budget
+            && until_us.saturating_sub(now_us()) > WRITE_BLOCK_WORST_US
+        {
+            match self.all.write_some(ALL_WRITE_BLOCK) {
+                Ok(n) => written += n,
+                Err(e) => {
+                    log::warn!("storage: all.txt write failed: {e}");
+                    break;
+                }
+            }
+        }
+        if written > 0 {
+            let ms = (now_us() - t0) / 1_000;
+            log::info!(
+                "storage: [{why}] all.txt +{written} B in {ms} ms from slot +{at} ms, {} B still held, now {} KB",
+                self.all.pending.len(),
+                self.all.size() / 1024,
+            );
+        }
+    }
+}
+
+/// Milliseconds into the current UTC slot, or -1 without a clock.
+fn slot_ms(period_ms: u64) -> i64 {
+    mfsk_app_shared::time_sync::utc_now_ms().map_or(-1, |t| (t % period_ms.max(1)) as i64)
+}
+
+/// The next point, as `esp_timer` µs, at which a receive-only write
+/// stops no audio anything needs: every station's transmission in the
+/// slot has ended and the decode has not started.
+///
+/// FT8: transmissions are 0.5 + 12.64 s, the decode starts at 14.0 s,
+/// so 13.3 s leaves a station 0.16 s late its whole frame. FT4: 0.5 +
+/// 5.04 s, capture closes at 6.775 s, so 5.8 s. WSPR: 1 + 110.6 s of a
+/// 120 s slot, so 112 s. Anything else, 90 % of the way through. Now,
+/// without a clock — there is no slot to place it in.
+fn next_rx_quiet_point(period_ms: u64) -> Option<i64> {
+    let offset_ms = match period_ms {
+        15_000 => 13_300,
+        7_500 => 5_800,
+        120_000 => 112_000,
+        p => p * 9 / 10,
+    };
+    let Some(now_ms) = mfsk_app_shared::time_sync::utc_now_ms() else {
+        return Some(now_us());
+    };
+    let p = period_ms.max(1);
+    let phase = now_ms % p;
+    let wait_ms = (offset_ms + p - phase) % p;
+    Some(now_us() + wait_ms as i64 * 1_000)
+}
+
+/// Put everything held on flash and wait for it, up to `timeout` —
+/// before a restart, which would otherwise lose it. `false` if the task
+/// did not answer in time (or storage is off).
+pub fn flush_blocking(timeout: Duration) -> bool {
+    // Nothing ever sent: nothing held, and no task to ask.
+    if !REQUESTED.load(Ordering::Acquire) {
+        return true;
+    }
+    let Some(tx) = ensure_channel() else {
+        return false;
+    };
+    let (reply, rx) = sync_channel(1);
+    if tx.send(Req::Flush { reply }).is_err() {
+        return false;
+    }
+    rx.recv_timeout(timeout).is_ok()
+}
+
+/// Mark the next `until_us` (`esp_timer` µs) as free to write in: the
+/// transmit side calls this once its audio for the slot has ended, with
+/// the moment the next slot begins. What is held goes out then.
+pub fn quiet_window(until_us: i64) {
+    send(Req::Quiet { until_us });
+}
+
+/// Receive-only: write once `all.txt` holds this much. ~45 min of a
+/// busy FT8 band (~65 B a line, ~15 lines a slot).
+///
+/// `MFSK_STORAGE_HIGH_WATER_KB=N` overrides it at build time — a bench
+/// knob, so the receive-only write point can be seen in minutes rather
+/// than most of an hour.
+const ALL_HIGH_WATER: usize = match option_env!("MFSK_STORAGE_HIGH_WATER_KB") {
+    Some(v) => parse_kb(v) * 1024,
+    None => 48 * 1024,
+};
+
+const fn parse_kb(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut n = 0usize;
+    while i < b.len() {
+        n = n * 10 + (b[i] - b'0') as usize;
+        i += 1;
+    }
+    n
+}
+
+/// Receive-only: at most this much per write point — four erase blocks,
+/// ~120-450 ms at the 30-110 ms per 4 KB measured on 2026-09-22, inside
+/// the 0.7 s between FT8's last symbol and its decode. The rest waits
+/// for the next slot's point.
+const ALL_RX_CHUNK: usize = 16 * 1024;
+
+/// One write: one erase block's worth, so every `sync` commits whole
+/// blocks (see [`ALL_WRITE_BLOCK`]'s history below).
+const ALL_WRITE_BLOCK: usize = 4096;
+
+/// Don't start another block with less than this before a window
+/// closes: the slowest 4 KB flush measured, 146 ms, with a metadata
+/// compaction in it.
+const WRITE_BLOCK_WORST_US: i64 = 160_000;
+
+/// A contact held longer than this with no window gets written at the
+/// next receive-only point. The window follows the contact in the same
+/// transmit slot, so this is a guard, not the path.
+const QSO_MAX_HOLD_US: i64 = 30_000_000;
+
+/// `all.txt` in memory and on flash.
+///
+/// **Written a block at a time.** LittleFS cannot program more into a
+/// block after a `sync` has committed it, so every synced append copies
+/// the file's tail block to a freshly erased one — the bytes already in
+/// that block are written again each time. Traced on the CoreS3
+/// (2026-09-22, `MFSK_STORAGE_TRACE`,
+/// `logs/storage_trace_ft8sim_2026-09-22.log`), a 448 B slot append
+/// cost one 4 KB erase plus 512 B to 4 096 B of programming, and roughly
+/// one `sync` in ten also compacted the metadata log: 538 reads, 69 KB,
+/// one erase, **147 ms**. [`ALL_WRITE_BLOCK`] per `sync` bounds the copy.
 #[derive(Default)]
 struct AllTxt {
     open: Option<(std::fs::File, u64)>,
+    /// Lines not yet on flash. Reserved at [`ALL_HOLD_CAPACITY`] on
+    /// first use, which puts it in PSRAM (anything over
+    /// `SPIRAM_MALLOC_ALWAYSINTERNAL` goes there).
     pending: String,
-    /// `(write, sync)` of the last flush, µs — where the time goes.
-    last_split_us: (u32, u32),
 }
 
+/// Room reserved for held lines: the high-water mark plus a slot of
+/// headroom, so holding never reallocates on the way up to it.
+const ALL_HOLD_CAPACITY: usize = ALL_HIGH_WATER + 16 * 1024;
+
+/// Most ever held: only reached if writes keep failing.
+const ALL_HOLD_MAX: usize = 256 * 1024;
+
 impl AllTxt {
-    /// Buffer `text`; write if a block's worth is waiting. Returns the
-    /// bytes written now (0 if only buffered) and the file size after.
-    fn append(&mut self, text: &str) -> std::io::Result<(usize, u64)> {
-        self.pending.push_str(text);
-        if self.pending.len() < ALL_FLUSH_BYTES {
-            return Ok((0, self.open.as_ref().map_or(0, |(_, n)| *n)));
+    fn hold(&mut self, text: &str) {
+        if self.pending.capacity() == 0 {
+            self.pending.reserve(ALL_HOLD_CAPACITY);
         }
-        self.flush()
+        self.pending.push_str(text);
+        // Writes keep failing (a full or broken partition): drop the
+        // oldest whole lines rather than grow without bound.
+        if self.pending.len() > ALL_HOLD_MAX {
+            let excess = self.pending.len() - ALL_HOLD_MAX;
+            let cut = self.pending[excess..].find('\n').map_or(self.pending.len(), |i| excess + i + 1);
+            self.pending.drain(..cut);
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            log::warn!("storage: all.txt held past {ALL_HOLD_MAX} B — dropped the oldest {cut} B");
+        }
     }
 
-    /// Write whatever is buffered — before a read, so a download is
-    /// current.
-    fn flush(&mut self) -> std::io::Result<(usize, u64)> {
+    fn size(&self) -> u64 {
+        self.open.as_ref().map_or(0, |(_, n)| *n)
+    }
+
+    /// Write up to `max` bytes of what is held (cut at a line end), and
+    /// `sync`. Returns the bytes written.
+    fn write_some(&mut self, max: usize) -> std::io::Result<usize> {
         if self.pending.is_empty() {
-            return Ok((0, self.open.as_ref().map_or(0, |(_, n)| *n)));
+            return Ok(0);
         }
         let path = File::All.path();
         if self.open.is_none() {
@@ -378,45 +581,39 @@ impl AllTxt {
                 .open(&path)?;
             self.open = Some((f, size));
         }
-        let size = self.open.as_ref().map_or(0, |(_, n)| *n);
-        if size + self.pending.len() as u64 > ALL_MAX_BYTES {
+        let cut = if self.pending.len() <= max {
+            self.pending.len()
+        } else {
+            // Whole lines only, so a file cut short by a power failure
+            // still parses line by line.
+            self.pending[..max].rfind('\n').map_or(max, |i| i + 1)
+        };
+        let size = self.size();
+        if size + cut as u64 > ALL_MAX_BYTES {
             self.open = None; // close before the rename
             let old = File::AllOld.path();
             let _ = std::fs::remove_file(&old);
             std::fs::rename(&path, &old)?;
             log::info!("storage: all.txt rotated at {size} B");
-            return self.flush();
+            return self.write_some(max);
         }
-        let text = core::mem::take(&mut self.pending);
         let (f, n) = self.open.as_mut().expect("opened above");
-        let t0 = std::time::Instant::now();
         #[cfg(storage_trace)]
         let s0 = trace::snapshot();
-        let r = f.write_all(text.as_bytes()).and_then(|()| {
-            let t1 = std::time::Instant::now();
-            #[cfg(storage_trace)]
-            let s1 = trace::snapshot();
-            let r = f.sync_all();
-            #[cfg(storage_trace)]
-            log::info!(
-                "storage: trace write: {}| sync: {}",
-                trace::delta(s0, s1),
-                trace::delta(s1, trace::snapshot())
-            );
-            self.last_split_us = (
-                (t1 - t0).as_micros() as u32,
-                t1.elapsed().as_micros() as u32,
-            );
-            r
-        });
+        let r = f
+            .write_all(self.pending[..cut].as_bytes())
+            .and_then(|()| f.sync_all());
+        #[cfg(storage_trace)]
+        log::info!("storage: trace write+sync: {}", trace::delta(s0, trace::snapshot()));
         if let Err(e) = r {
             // Reopen next time rather than keep writing through a handle
-            // in an unknown state; the lines are lost, and said so.
+            // in an unknown state. The lines stay held.
             self.open = None;
             return Err(e);
         }
-        *n += text.len() as u64;
-        Ok((text.len(), *n))
+        *n += cut as u64;
+        self.pending.drain(..cut);
+        Ok(cut)
     }
 }
 
@@ -455,6 +652,9 @@ fn send(req: Req) -> bool {
     // Queued even before the task exists: it mounts first and then
     // drains, and drops (and counts) what it cannot write.
     let ok = ensure_channel().is_some_and(|tx| tx.try_send(req).is_ok());
+    if ok {
+        REQUESTED.store(true, Ordering::Release);
+    }
     if !ok {
         DROPPED.fetch_add(1, Ordering::Relaxed);
     }
@@ -490,6 +690,7 @@ pub fn read_chunk(file: File, offset: u64, len: usize) -> Option<Vec<u8>> {
         reply,
     })
     .ok()?;
+    REQUESTED.store(true, Ordering::Release);
     rx.recv_timeout(Duration::from_secs(5)).ok().flatten()
 }
 
