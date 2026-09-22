@@ -33,6 +33,11 @@ pub mod capture_window;
 #[path = "../../../embedded-poc/mfsk-app-shared/src/wspr_bands.rs"]
 pub mod wspr_bands;
 
+/// CONFIG > FREQ tables and their paging — pure data; the NVS half is
+/// `#[cfg(espidf)]`.
+#[path = "../../../embedded-poc/mfsk-app-shared/src/freq_presets.rs"]
+pub mod freq_presets;
+
 /// Slot parity — pure arithmetic; `time_sync` needs it.
 #[path = "../../../embedded-poc/mfsk-app-shared/src/parity.rs"]
 pub mod parity;

@@ -3585,7 +3585,7 @@ pub fn start_host_when_ready() {
         HOST_RESULT.store(msg.as_str());
     }
     if started.is_ok() {
-        crate::civ_usb::start_probe();
+        crate::civ_usb::start();
     }
     crate::log_free_internal("post-uac-host-install");
 }

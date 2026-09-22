@@ -53,6 +53,10 @@
 //! restart the board, so both are worth a confirmation, and neither is
 //! reachable by a single stray touch.
 //!
+//! **FREQ** is the exception on both counts: it lists the running
+//! receiver's dial presets, and its commit goes to the rig over CAT
+//! without a restart — a wrong dial costs one more tap, not a reboot.
+//!
 //! The pages share one geometry: rows are drawn from the top and the
 //! commit bar stays where it was, so the widget does not move under
 //! the finger when the page changes. Unused rows are painted out.
@@ -69,6 +73,7 @@ use embedded_graphics::{
 };
 
 use crate::boot_mode::BootMode;
+use crate::freq_presets::{self, FreqPreset};
 use crate::grid_src::GridSource;
 use crate::wifi_pref::WifiPref;
 
@@ -78,23 +83,37 @@ enum Page {
     Root,
     Mode,
     Config,
+    /// The running receiver's dial presets, paged ([`freq_presets::page`]).
+    Freq,
     Demo,
 }
 
 /// The root's rows, in draw order.
-const ROOT: [(Page, &str); 3] = [
+///
+/// FREQ is here rather than under CONFIG: CONFIG already fills all four
+/// rows, and a dial change is the one setting an operator makes in the
+/// field, so it earns the shorter path.
+const ROOT: [(Page, &str); 4] = [
     (Page::Mode, "MODE"),
     (Page::Config, "CONFIG"),
+    (Page::Freq, "FREQ"),
     (Page::Demo, "DEMO"),
 ];
 
+/// The FREQ page's paging row.
+const NEXT_LABEL: &str = "NEXT >";
+
 /// What [`ModePicker::update`] hands back when the commit bar fires.
-/// Both restart the board; the caller writes the one it is given.
+/// All but `Freq` restart the board; the caller writes the one it is
+/// given.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Commit {
     Mode(BootMode),
     Grid(GridSource),
     Wifi(WifiPref),
+    /// A dial in Hz, for the rig over CAT. No restart: the overlay
+    /// closes and the receiver carries on.
+    Freq(u32),
 }
 
 /// One row on the CONFIG page.
@@ -317,8 +336,15 @@ pub struct ModePicker {
     /// until it arrives, the bar says so rather than sitting there
     /// looking unpressed.
     committing: bool,
-    drawn: Option<(Page, Option<usize>)>,
+    drawn: Option<(Page, Option<usize>, usize)>,
     needs_draw: bool,
+    /// The running receiver's dial presets ([`Self::set_freq_presets`]).
+    presets: &'static [FreqPreset],
+    /// Which page of them FREQ shows.
+    freq_page: usize,
+    /// The rig's dial as last rendered, so opening FREQ lands on the
+    /// page that holds it.
+    rig_hz: Option<u32>,
 }
 
 impl ModePicker {
@@ -337,7 +363,27 @@ impl ModePicker {
             committing: false,
             drawn: None,
             needs_draw: false,
+            presets: &[],
+            freq_page: 0,
+            rig_hz: None,
         }
+    }
+
+    /// The table FREQ offers — the running receiver's
+    /// ([`freq_presets::for_mode`]).
+    pub fn set_freq_presets(&mut self, presets: &'static [FreqPreset]) {
+        self.presets = presets;
+        self.freq_page = 0;
+    }
+
+    fn freq_view(&self) -> freq_presets::Page {
+        freq_presets::page(self.presets.len(), ROWS, self.freq_page)
+    }
+
+    /// The preset behind row `i` of the FREQ page, `None` for NEXT.
+    fn freq_row(&self, i: usize) -> Option<&'static FreqPreset> {
+        let v = self.freq_view();
+        (i < v.count).then(|| &self.presets[v.start + i])
     }
 
     pub fn is_open(&self) -> bool {
@@ -362,6 +408,10 @@ impl ModePicker {
             Page::Root => ROOT.len(),
             Page::Mode => MODES.len(),
             Page::Config => CONFIG_ROWS.len(),
+            Page::Freq => {
+                let v = self.freq_view();
+                v.count + usize::from(v.has_next)
+            }
             Page::Demo => DEMOS.len(),
         }
     }
@@ -372,6 +422,7 @@ impl ModePicker {
             Page::Root => ROOT[i].1,
             Page::Mode => MODES[i].1,
             Page::Config => CONFIG_ROWS[i].label(),
+            Page::Freq => self.freq_row(i).map_or(NEXT_LABEL, |p| p.label),
             Page::Demo => DEMOS[i].1,
         }
     }
@@ -417,6 +468,21 @@ impl ModePicker {
                             self.page = ROOT[idx].0;
                             self.armed = None;
                             self.needs_draw = true;
+                            if self.page == Page::Freq {
+                                // Open on the page that holds the
+                                // rig's dial, if it is a preset.
+                                let per = ROWS - 1;
+                                self.freq_page = self
+                                    .rig_hz
+                                    .and_then(|hz| self.presets.iter().position(|p| p.hz == hz))
+                                    .filter(|_| self.presets.len() > ROWS)
+                                    .map_or(0, |i| i / per);
+                            }
+                        } else if self.page == Page::Freq && self.freq_row(idx).is_none() {
+                            // NEXT pages; it is not a selection.
+                            self.freq_page += 1;
+                            self.armed = None;
+                            self.needs_draw = true;
                         } else {
                             // Selecting only selects. The label stays
                             // readable; the commit bar below says what
@@ -430,6 +496,15 @@ impl ModePicker {
                             // Nothing on the root can be committed;
                             // the bar says so.
                             log::info!("picker: commit pressed on the root page");
+                        } else if let (Page::Freq, Some((idx, _))) = (self.page, self.armed) {
+                            // Nothing to wait for: the dial goes out
+                            // over CAT and the overlay gets out of the
+                            // way of the waterfall it is about to move.
+                            let hz = self.freq_row(idx).map(|p| p.hz);
+                            self.close();
+                            if let Some(hz) = hz {
+                                return Some(Commit::Freq(hz));
+                            }
                         } else if let Some((idx, _)) = self.armed {
                             self.committing = true;
                             self.needs_draw = true;
@@ -440,7 +515,7 @@ impl ModePicker {
                                     ConfigRow::Grid(src) => Commit::Grid(src),
                                     ConfigRow::Wifi(pref) => Commit::Wifi(pref),
                                 },
-                                Page::Root => unreachable!("handled above"),
+                                Page::Root | Page::Freq => unreachable!("handled above"),
                             });
                         } else {
                             // Pressing commit with nothing selected is
@@ -509,10 +584,12 @@ impl ModePicker {
         current: BootMode,
         current_grid: GridSource,
         current_wifi: WifiPref,
+        rig_hz: Option<u32>,
     ) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = Rgb565>,
     {
+        self.rig_hz = rig_hz;
         if !self.open {
             return self.render_hold(display);
         }
@@ -535,7 +612,7 @@ impl ModePicker {
         // neither changes `armed_idx`, so gating on the selection alone
         // is exactly what made a press invisible. The page is in the
         // same key because navigating changes neither.
-        if !self.needs_draw && self.drawn == Some((self.page, armed_idx)) {
+        if !self.needs_draw && self.drawn == Some((self.page, armed_idx, self.freq_page)) {
             return Ok(());
         }
         let text = |fg: Rgb565, bg: Rgb565| {
@@ -569,6 +646,9 @@ impl ModePicker {
                     ConfigRow::Grid(src) => src == current_grid,
                     ConfigRow::Wifi(pref) => pref == current_wifi,
                 },
+                Page::Freq => {
+                    rig_hz.is_some() && self.freq_row(i).map(|p| p.hz) == rig_hz
+                }
             };
             let selected = armed_idx == Some(i);
             // Palette borrowed whole from `decoded_list`, which is
@@ -644,6 +724,17 @@ impl ModePicker {
             (Page::Config, None) => {
                 let _ = line.push_str("pick a setting above");
             }
+            (Page::Freq, None) => {
+                use core::fmt::Write as _;
+                let v = self.freq_view();
+                let _ = if self.presets.is_empty() {
+                    write!(&mut line, "no presets for this mode")
+                } else if v.of > 1 {
+                    write!(&mut line, "pick a dial  {}/{}", v.number, v.of)
+                } else {
+                    write!(&mut line, "pick a dial above")
+                };
+            }
         }
         Text::with_baseline(
             line.as_str(),
@@ -653,7 +744,7 @@ impl ModePicker {
         )
         .draw(display)?;
 
-        self.drawn = Some((self.page, armed_idx));
+        self.drawn = Some((self.page, armed_idx, self.freq_page));
         self.needs_draw = false;
         Ok(())
     }

@@ -4,29 +4,37 @@
 //! `0036`, carrying **two** CDC-ACM functions — control interfaces 0
 //! and 2 (data 1 and 3) — beside the PCM2901 audio behind the same
 //! internal hub (descriptor dump, `logs/udp_enumdump2_2026-09-20.log`).
-//! Which of the two is CI-V is not in the descriptors; the radio's
-//! manual calls them "USB (A)" and "USB (B)", and (B) is the one whose
-//! function the operator chooses (RTTY decode / DV data / GPS out).
+//! CI-V is the first, "USB (A)": probed 2026-09-23
+//! (`logs/udp_civ_probe_2026-09-23.log`), data interface 1 answered
+//! `03` with 7.041 MHz and `26 00` with USB-D FIL1, and sent transceive
+//! `00` frames as the dial turned. The radio's USB echo-back was off.
 //!
-//! This first step is a **probe**, gated at build time
-//! (`MFSK_CORES3_CIV_PROBE=1`): it opens each port in turn, sends only
-//! *reads* — `03` (frequency) and `26 00` (mode) — and logs every
-//! frame that comes back, so one session answers which port talks
-//! CI-V and whether transceive frames arrive when the dial turns.
+//! What this task does with it:
+//!
+//! - reads the dial and mode on connect, and keeps the status bar's
+//!   `rig_freq_hz` on whatever transceive reports after that — which
+//!   is what `all.txt` and the ADIF log take their frequency from;
+//! - sends a dial chosen on the FREQ page ([`request_freq`]) as `05`
+//!   plus `26 00 01 01 01` (USB, data on, FIL1), and saves it so the
+//!   next boot sends it again;
+//! - closes on unplug and waits for the radio to come back.
 //!
 //! It never touches DTR or RTS. The IC-705's "USB SEND" / "USB Keying"
 //! settings can map either line to PTT or CW keying, and
 //! `cdc_acm_host_open` leaves both alone unless asked; so does this.
 
+use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use esp_idf_svc::sys;
 use esp_idf_svc::sys::cdc_acm as cdc;
-use mfsk_app_shared::civ_frame::{self, IC705_ADDR};
-use std::sync::Mutex;
+use mfsk_app_shared::civ_frame::{self, Event, IC705_ADDR};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const IC705_VID: u16 = 0x0c26;
 const IC705_PID: u16 = 0x0036;
-/// The two CDC **data** interfaces in the descriptor dump, opened
-/// directly rather than through their control interfaces (0 and 2).
+
+/// USB (A)'s **data** interface, opened directly rather than through
+/// its control interface (0).
 ///
 /// The ESP32-S3's host controller has eight channels
 /// (`OTG_NUM_HOST_CHAN`), one per open pipe. The IC-705 already takes
@@ -41,12 +49,7 @@ const IC705_PID: u16 = 0x0036;
 /// bulk pipes are allocated. The cost is that the driver offers no
 /// line-coding / control-line calls on the handle — which this does
 /// not want anyway (see the module doc on DTR/RTS).
-const PORTS: [u8; 2] = [1, 3];
-
-/// Build-time gate, as `MFSK_CORES3_TX_PROBE` is for the audio OUT
-/// probe: the normal image carries no CDC client until the port is
-/// known.
-pub const PROBE_ENABLED: bool = option_env!("MFSK_CORES3_CIV_PROBE").is_some();
+const CAT_IFACE: u8 = 1;
 
 /// Below the audio path (`uac.rs` runs it at 8) — a CI-V reply that
 /// waits a few milliseconds costs nothing, a missed isochronous frame
@@ -55,21 +58,38 @@ const DRIVER_TASK_PRIORITY: u32 = 5;
 const DRIVER_TASK_STACK: usize = 4096;
 const DRIVER_TASK_CORE: i32 = 1;
 
-/// One frame reassembler per port: a bulk transfer is not promised to
-/// carry exactly one frame.
-/// Set by the RX callback when a frame from the radio parses.
-static ANSWERED: [core::sync::atomic::AtomicBool; 2] =
-    [core::sync::atomic::AtomicBool::new(false), core::sync::atomic::AtomicBool::new(false)];
+/// How often the task looks at its flags. A dial change waits at most
+/// this long to go out; the status bar, at most this long to follow.
+const POLL_MS: u64 = 200;
 
-static READERS: [Mutex<civ_frame::Reader>; 2] =
-    [Mutex::new(civ_frame::Reader::new()), Mutex::new(civ_frame::Reader::new())];
+/// The dial the RX callback last parsed; 0 for none yet. The callback
+/// runs in the class driver's task and only stores — the CAT task
+/// carries it to the UI, so the driver never waits on the UI lock.
+static RIG_HZ: AtomicU32 = AtomicU32::new(0);
+/// A dial from the FREQ page, not yet sent; 0 for none. Latest wins.
+static PENDING_HZ: AtomicU32 = AtomicU32::new(0);
+/// The dial held in NVS, so an unchanged one is not written again.
+static SAVED_HZ: AtomicU32 = AtomicU32::new(0);
+static DISCONNECTED: AtomicBool = AtomicBool::new(false);
+static NVS: OnceLock<Arc<Mutex<EspNvs<NvsDefault>>>> = OnceLock::new();
 
-/// Install the CDC-ACM class driver and start the probe. Call after
+static READER: Mutex<civ_frame::Reader> = Mutex::new(civ_frame::Reader::new());
+
+/// Hand over the NVS handle before the host starts; the saved dial is
+/// read from it once the radio connects.
+pub fn set_nvs(nvs: Arc<Mutex<EspNvs<NvsDefault>>>) {
+    let _ = NVS.set(nvs);
+}
+
+/// Send `hz` to the rig — the FREQ page's commit. Returns at once; the
+/// CAT task sends it within [`POLL_MS`], or when the radio connects.
+pub fn request_freq(hz: u32) {
+    PENDING_HZ.store(hz, Ordering::Release);
+}
+
+/// Install the CDC-ACM class driver and start the CAT task. Call after
 /// `usb_host_install` (i.e. after `uac::start_host` succeeds).
-pub fn start_probe() {
-    if !PROBE_ENABLED {
-        return;
-    }
+pub fn start() {
     let cfg = cdc::cdc_acm_host_driver_config_t {
         driver_task_stack_size: DRIVER_TASK_STACK,
         driver_task_priority: DRIVER_TASK_PRIORITY,
@@ -79,118 +99,168 @@ pub fn start_probe() {
     // SAFETY: the host library is installed; `cfg` outlives the call.
     let err = unsafe { cdc::cdc_acm_host_install(&cfg) };
     if err != sys::ESP_OK {
-        log::warn!("civ: cdc_acm_host_install failed err={err:#x}");
+        log::warn!("cat: cdc_acm_host_install failed err={err:#x}");
         return;
     }
-    log::warn!("civ: CDC-ACM driver installed — probing IC-705 ports {PORTS:?}");
-    let spawned = crate::uac::spawn_psram_thread(c"civ_probe", 4096, Some(4), None, probe_task);
-    if let Err(e) = spawned {
-        log::warn!("civ: probe thread spawn failed: {e}");
+    // The saved dial, read off this (possibly PSRAM) stack.
+    with_nvs(|nvs| {
+        if let Some(hz) = mfsk_app_shared::freq_presets::read(nvs) {
+            SAVED_HZ.store(hz, Ordering::Release);
+            // A dial picked before the read landed stands.
+            let _ = PENDING_HZ.compare_exchange(0, hz, Ordering::AcqRel, Ordering::Acquire);
+            log::info!("cat: saved dial {hz} Hz — will send it on connect");
+        }
+    });
+    if let Err(e) = crate::uac::spawn_psram_thread(c"cat", 4096, Some(4), None, cat_task) {
+        log::warn!("cat: task spawn failed: {e}");
     }
 }
 
-unsafe extern "C" fn on_data(data: *const u8, len: usize, arg: *mut core::ffi::c_void) -> bool {
-    let port = arg as usize;
+/// Run `f` against NVS on a short-lived task with an internal-DRAM
+/// stack. An NVS access stops the flash cache, which a PSRAM stack —
+/// this task's, and the panel's — must not be holding; same reason as
+/// `commit_config_and_restart`.
+fn with_nvs(f: impl FnOnce(&EspNvs<NvsDefault>) + Send + 'static) {
+    let Some(nvs) = NVS.get().cloned() else {
+        log::warn!("cat: no NVS handle");
+        return;
+    };
+    type Job = Box<dyn FnOnce() + Send>;
+    let job: Job = Box::new(move || match nvs.lock() {
+        Ok(nvs) => f(&nvs),
+        Err(e) => log::warn!("cat: NVS lock poisoned: {e}"),
+    });
+    extern "C" fn entry(arg: *mut core::ffi::c_void) {
+        // SAFETY: `with_nvs` leaked exactly this pointer.
+        let job = unsafe { Box::from_raw(arg as *mut Job) };
+        job();
+        // SAFETY: deletes the calling task; nothing runs after it.
+        unsafe { sys::vTaskDelete(core::ptr::null_mut()) };
+    }
+    let ptr = Box::into_raw(Box::new(job)) as *mut core::ffi::c_void;
+    // SAFETY: `entry` takes ownership of `ptr` and frees it.
+    let created = unsafe {
+        sys::xTaskCreatePinnedToCore(Some(entry), c"cat_nvs".as_ptr(), 4096, ptr, 3, core::ptr::null_mut(), 1)
+    };
+    if created != 1 {
+        // SAFETY: the task was not created, so `ptr` is still ours.
+        drop(unsafe { Box::from_raw(ptr as *mut Job) });
+        log::warn!("cat: NVS task not created");
+    }
+}
+
+unsafe extern "C" fn on_data(data: *const u8, len: usize, _arg: *mut core::ffi::c_void) -> bool {
     // SAFETY: the driver hands a buffer of `len` bytes valid for the
     // duration of the callback.
     let bytes = unsafe { core::slice::from_raw_parts(data, len) };
-    let Some(reader) = READERS.get(port) else {
-        return true;
-    };
-    let Ok(mut reader) = reader.lock() else {
+    let Ok(mut reader) = READER.lock() else {
         return true;
     };
     for &b in bytes {
-        if let Some(frame) = reader.push(b) {
-            let mut hex: heapless::String<{ civ_frame::MAX_FRAME * 3 }> = heapless::String::new();
-            for x in frame.iter() {
-                use core::fmt::Write as _;
-                let _ = write!(&mut hex, "{x:02X} ");
+        let Some(frame) = reader.push(b) else { continue };
+        // Our own frames come back only with echo-back on; `parse`
+        // drops them either way (they are from E0, not the radio).
+        match civ_frame::parse(&frame, IC705_ADDR) {
+            Some(Event::Freq(hz)) => RIG_HZ.store(hz, Ordering::Release),
+            Some(Event::Ng) => log::warn!("cat: rig refused a command (NG)"),
+            Some(Event::Mode { mode, data, filter }) => {
+                log::info!("cat: mode {mode:#04x} data={data:?} fil{filter}")
             }
-            // The radio echoes what the controller sent on USB, so a
-            // frame from E0 is our own and `parse` returns None for it.
-            let ev = civ_frame::parse(&frame, IC705_ADDR);
-            if ev.is_some() {
-                ANSWERED[port].store(true, core::sync::atomic::Ordering::Relaxed);
-            }
-            log::warn!("civ: port {} rx [{}] -> {:?}", PORTS[port], hex.trim_end(), ev);
+            _ => {}
         }
     }
     true
 }
 
-unsafe extern "C" fn on_event(ev: *const cdc::cdc_acm_host_dev_event_data_t, arg: *mut core::ffi::c_void) {
-    let port = PORTS.get(arg as usize).copied().unwrap_or(0xff);
+unsafe extern "C" fn on_event(ev: *const cdc::cdc_acm_host_dev_event_data_t, _arg: *mut core::ffi::c_void) {
     // SAFETY: the driver passes a valid event for the callback's span.
     let ty = unsafe { (*ev).type_ };
-    log::warn!("civ: port {port} event {ty}");
+    if ty == cdc::cdc_acm_host_dev_event_t_CDC_ACM_HOST_DEVICE_DISCONNECTED {
+        DISCONNECTED.store(true, Ordering::Release);
+    } else {
+        log::warn!("cat: device event {ty}");
+    }
 }
 
-fn open(idx: usize) -> Option<cdc::cdc_acm_dev_hdl_t> {
+fn open() -> Option<cdc::cdc_acm_dev_hdl_t> {
     let cfg = cdc::cdc_acm_host_open_config_t {
         vid: IC705_VID,
         pid: IC705_PID,
-        interface_idx: PORTS[idx],
+        interface_idx: CAT_IFACE,
         dev_addr: 0,
         connection_timeout_ms: 10_000,
         out_buffer_size: 64,
         in_buffer_size: 0,
         event_cb: Some(on_event),
         data_cb: Some(on_data),
-        user_arg: idx as *mut core::ffi::c_void,
+        user_arg: core::ptr::null_mut(),
     };
     let mut hdl: cdc::cdc_acm_dev_hdl_t = core::ptr::null_mut();
     // SAFETY: `cfg` outlives the call; `hdl` is written on success.
     let err = unsafe { cdc::cdc_acm_host_open_v2(&cfg, &mut hdl) };
-    if err != sys::ESP_OK {
-        log::warn!("civ: open iface {} failed err={err:#x}", PORTS[idx]);
-        return None;
-    }
-    log::warn!("civ: opened iface {}", PORTS[idx]);
-    Some(hdl)
+    (err == sys::ESP_OK).then_some(hdl)
 }
 
-fn send(hdl: cdc::cdc_acm_dev_hdl_t, port: u8, frame: &[u8]) {
+fn send(hdl: cdc::cdc_acm_dev_hdl_t, frame: &[u8]) {
     // SAFETY: `hdl` is open; `frame` outlives the blocking call.
     let err = unsafe { cdc::cdc_acm_host_data_tx_blocking(hdl, frame.as_ptr(), frame.len(), 200) };
     if err != sys::ESP_OK {
-        log::warn!("civ: port {port} tx failed err={err:#x}");
+        log::warn!("cat: tx failed err={err:#x}");
     }
 }
 
-fn probe_task() {
+fn cat_task() {
     // Audio first: open only once the PCM2901's IN stream has
-    // enumerated, so a channel shortage can fail this probe and never
-    // the receiver.
+    // enumerated, so a channel shortage can cost CAT and never the
+    // receiver.
     let mut waited = 0u32;
-    while crate::uac::RX_IFACE_SEEN.load(core::sync::atomic::Ordering::Relaxed) < 0 {
-        if waited >= 60 {
-            log::warn!("civ: no audio IN after {waited} s — probing anyway");
-            break;
-        }
+    while crate::uac::RX_IFACE_SEEN.load(Ordering::Relaxed) < 0 && waited < 60 {
         std::thread::sleep(std::time::Duration::from_secs(1));
         waited += 1;
     }
-    // One port at a time, so at most two bulk pipes are ever held.
-    for idx in 0..PORTS.len() {
-        let Some(h) = open(idx) else { continue };
-        // Six polls 5 s apart, then keep the port that answered.
-        for round in 0..6 {
-            log::warn!("civ: round {round} port {} tx read_freq + read_mode", PORTS[idx]);
-            send(h, PORTS[idx], &civ_frame::read_freq(IC705_ADDR));
-            send(h, PORTS[idx], &civ_frame::read_mode(IC705_ADDR));
-            std::thread::sleep(std::time::Duration::from_secs(5));
+    let mut shown_hz = 0u32;
+    loop {
+        let Some(h) = open() else {
+            // `open` already waited `connection_timeout_ms`.
+            continue;
+        };
+        DISCONNECTED.store(false, Ordering::Release);
+        log::warn!("cat: IC-705 CI-V open (USB A)");
+        send(h, &civ_frame::read_freq(IC705_ADDR));
+        send(h, &civ_frame::read_mode(IC705_ADDR));
+        while !DISCONNECTED.load(Ordering::Acquire) {
+            let want = PENDING_HZ.swap(0, Ordering::AcqRel);
+            if want != 0 {
+                log::warn!("cat: set dial {want} Hz, USB-D FIL1");
+                send(h, &civ_frame::set_freq(IC705_ADDR, want));
+                send(h, &civ_frame::set_mode_usb_data(IC705_ADDR));
+                // Transceive reports a dial the rig *moved* to; ask, so
+                // a refused `05` shows as the old dial rather than the
+                // requested one.
+                send(h, &civ_frame::read_freq(IC705_ADDR));
+                if SAVED_HZ.swap(want, Ordering::AcqRel) != want {
+                    with_nvs(move |nvs| {
+                        if let Err(e) = mfsk_app_shared::freq_presets::write(nvs, want) {
+                            log::warn!("cat: saving dial failed: {e}");
+                        }
+                    });
+                }
+            }
+            let hz = RIG_HZ.load(Ordering::Acquire);
+            if hz != 0 && hz != shown_hz {
+                shown_hz = hz;
+                if let Ok(mut ui) = mfsk_app_shared::ui::state::UI.lock() {
+                    ui.update_status(|st| st.rig_freq_hz = Some(hz));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         }
-        if ANSWERED[idx].load(core::sync::atomic::Ordering::Relaxed) {
-            log::warn!("civ: port {} answers CI-V; listening for transceive frames", PORTS[idx]);
-            return;
-        }
-        log::warn!("civ: port {} never answered; closing", PORTS[idx]);
-        // SAFETY: opened above, not used after this.
+        log::warn!("cat: IC-705 unplugged — waiting for it");
+        // SAFETY: opened above; the driver wants a close after a
+        // disconnect to free the handle.
         let err = unsafe { cdc::cdc_acm_host_close(h) };
         if err != sys::ESP_OK {
-            log::warn!("civ: close port {} failed err={err:#x}", PORTS[idx]);
+            log::warn!("cat: close failed err={err:#x}");
         }
     }
-    log::warn!("civ: no port answered");
 }

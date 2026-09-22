@@ -467,6 +467,7 @@ pub fn run_log_panel(
             .draw(&mut display)
             .ok();
         }
+        crate::civ_usb::set_nvs(nvs.clone());
         crate::uac::start_host_when_ready();
     }
 
@@ -523,6 +524,9 @@ pub fn run_log_panel(
         ),
         Size::new(crate::board::CANVAS_W as u32, crate::board::CANVAS_H as u32),
     );
+    picker.set_freq_presets(mfsk_app_shared::freq_presets::for_mode(
+        mode_picker::mode_name(mode).unwrap_or(""),
+    ));
     let mut touch_read_failed = false;
     let mut last_wf_seq: u32 = u32::MAX;
     let mut last_decoded_fp: (usize, u32, u16) = (usize::MAX, u32::MAX, u16::MAX);
@@ -683,7 +687,7 @@ pub fn run_log_panel(
             apply_commit(&nvs, commit);
         }
         picker
-            .render(&mut display, mode, crate::grid_source(), crate::wifi_pref())
+            .render(&mut display, mode, crate::grid_source(), crate::wifi_pref(), rig_hz())
             .ok();
         if picker.take_just_closed() {
             // The overlay covered the panel; force everything back.
@@ -834,7 +838,7 @@ pub fn run_log_panel(
         // vanished a moment after opening.
         if picker.is_open() {
             picker
-            .render(&mut display, mode, crate::grid_source(), crate::wifi_pref())
+            .render(&mut display, mode, crate::grid_source(), crate::wifi_pref(), rig_hz())
             .ok();
             // The overlay is the one screen that is nothing but input;
             // spend its idle time sampling rather than sleeping.
@@ -1259,7 +1263,20 @@ fn pump_touch(
 /// which write from a task of their own: this panel also runs on a
 /// PSRAM stack (see [`spawn_log_panel`]), and a flash write aborts from
 /// one. From `main` the hand-off costs nothing and changes nothing.
+/// The rig's dial as the status bar has it — CAT's latest reading.
+/// `try_lock`: the picker's `*` can wait a frame, the panel cannot.
+fn rig_hz() -> Option<u32> {
+    UI.try_lock().ok().and_then(|ui| ui.status.rig_freq_hz)
+}
+
 fn apply_commit(nvs: &Arc<Mutex<EspNvs<NvsDefault>>>, commit: mode_picker::Commit) {
+    // A dial change is not a restart: nothing to flush, nothing to
+    // write from here (the CAT task saves it, off this PSRAM stack).
+    if let mode_picker::Commit::Freq(hz) = commit {
+        log::warn!("freq -> {hz} Hz (touch)");
+        crate::civ_usb::request_freq(hz);
+        return;
+    }
     // Every branch restarts the board, and `all.txt` and `qso.adi` are
     // held in PSRAM until a write point (`storage`) — put them on flash
     // first. A deliberate restart takes the stall.
@@ -1279,6 +1296,7 @@ fn apply_commit(nvs: &Arc<Mutex<EspNvs<NvsDefault>>>, commit: mode_picker::Commi
             log::warn!("wifi -> {} (touch), restarting", pref.label());
             crate::commit_config_and_restart(nvs.clone(), crate::ConfigChoice::Wifi(pref));
         }
+        mode_picker::Commit::Freq(_) => unreachable!("handled above"),
     }
 }
 

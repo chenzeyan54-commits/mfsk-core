@@ -15,6 +15,7 @@ pub mod capture_window;
 pub mod civ_frame;
 pub mod civil_time;
 pub mod flash_log;
+pub mod freq_presets;
 pub mod grid_fix;
 pub mod grid_state;
 pub mod http_config;

@@ -18,6 +18,32 @@
   as WSJT-X, whose `pack77` never had the gap. `pack77_type1` routes
   through `pack77`, so it gains the same.
 
+- **CoreS3: CAT over the IC-705's USB, and a FREQ page to set the
+  dial.** The IC-705 is one composite device (VID `0c26` PID `0036`)
+  with two CDC-ACM functions beside its audio; CI-V is "USB (A)",
+  probed on the radio 2026-09-23: `03` answered 7.041 MHz, `26 00`
+  USB-D FIL1, and transceive `00` frames followed the dial. A CAT task
+  (`civ_usb.rs`, over `espressif/usb_host_cdc_acm`) reads dial and mode
+  on connect, keeps the status bar's `rig_freq_hz` — which `all.txt`
+  and the ADIF log take their frequency from — on what transceive
+  reports, and reopens after an unplug. It never touches DTR/RTS,
+  which the radio can map to PTT.
+  - **The port is opened by its data interface.** The S3's USB host has
+    eight channels, one per pipe, and the IC-705 already holds seven.
+    Opening the control interface added a notification pipe, the
+    PCM2901 then failed to enumerate ("No more HCD channels
+    available") and the board restarted every ~33 s. On the data
+    interface the driver allocates only the two bulk pipes; audio held
+    0 err and FT8 7 decodes/slot with it open.
+  - **FREQ** on the menu's root lists the running receiver's presets
+    (`mfsk_app_shared::freq_presets`): FT8's IARU channels plus the JA
+    ones (1.908 / 3.531 / 7.041 / 144.460), FT4 as WSJT-X lists them,
+    WSPR from `WSPR_BANDS`; FST4 has none yet. Three rows and NEXT per
+    page; `*` marks the rig's dial. APPLY sends `05` and `26 00 01 01 01`
+    (USB, data, FIL1) without a restart and saves the dial to NVS
+    (`rig_hz`), which is sent again on the next connect.
+  - The probe (reads only, `dc6ecc96`) was measured on the radio; the
+    CAT task and the FREQ page have not been run against it yet.
 - **CoreS3: NTP sets the clock once per boot, then stops.** SNTP was
   kept running and lwIP re-synced every hour
   (`CONFIG_LWIP_SNTP_UPDATE_DELAY`), *stepping* the clock by whatever
