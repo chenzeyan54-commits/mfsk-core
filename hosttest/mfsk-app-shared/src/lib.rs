@@ -77,6 +77,12 @@ pub mod adif;
 #[path = "../../../embedded-poc/mfsk-app-shared/src/all_txt.rs"]
 pub mod all_txt;
 
+/// Icom CI-V framing — the bytes both the StickS3 (BLE) and the CoreS3
+/// (USB CDC) exchange with an IC-705, tested where tests run rather
+/// than on a radio.
+#[path = "../../../embedded-poc/mfsk-app-shared/src/civ_frame.rs"]
+pub mod civ_frame;
+
 /// The FT8/FT4 decoded-row list. Pulled in as a `ui` module tree so
 /// the file's own `crate::ui::state::...` paths resolve unchanged.
 ///

@@ -66,14 +66,15 @@ const IC705_SERVICE_UUID: esp32_nimble::utilities::BleUuid =
 const IC705_CHAR_UUID: esp32_nimble::utilities::BleUuid =
     uuid128!("14cf8002-1ec2-d408-1b04-2eb270f14203");
 
-/// CI-V controller address (we are the controller).
-const CIV_CTRL_ADDR: u8 = 0xE0;
+// CI-V controller address (we are the controller); frames come from
+// `mfsk_app_shared::civ_frame`, shared with the CoreS3's USB path.
+use mfsk_app_shared::civ_frame::{self, CTRL_ADDR as CIV_CTRL_ADDR};
 /// IC-705 default CI-V transceiver address. **Not** 0x94 (that's the
 /// IC-7300 default and was confused with IC-705 in the K7MDL2 docstring;
 /// WebFT8's `rig-profiles.json` correctly lists ic705 as `civAddr =
 /// 0xA4`). Sending to the wrong address makes the radio silently
 /// ignore commands (e.g. PTT TX-on never engages).
-const CIV_IC705_ADDR: u8 = 0xA4;
+const CIV_IC705_ADDR: u8 = civ_frame::IC705_ADDR;
 
 /// Pairing UUID literal (36 ASCII bytes) — derived from the standard
 /// SPP service UUID per K7MDL2 reference. Sent as data in pairing
@@ -91,9 +92,8 @@ const PAIR_NAME_PADDED: &[u8; 16] = b"WebFT8 BLE\0\0\0\0\0\0";
 /// engineering work. Same value sent by the WASM app.
 const PAIR_TOKEN: [u8; 4] = [0xEE, 0x39, 0x09, 0x10];
 
-/// CI-V framing bytes.
-const PRE: u8 = 0xFE;
-const POST: u8 = 0xFD;
+// CI-V framing bytes (the BLE pairing frames are built by hand).
+use civ_frame::{POST, PRE};
 
 // ── Shared command/status state (cross-thread) ───────────────────────
 
@@ -126,7 +126,7 @@ pub static FREQ_TARGET_HZ: AtomicU32 = AtomicU32::new(0);
 
 /// Pending IC-705 mode selector. Encoded as a small enum:
 ///   0xFF = no pending change
-///   0x01 = USB-DATA narrow (cmd 0x06 0x01 0x01 0x02)
+///   0x01 = USB-DATA, filter 1 (`civ_frame::set_mode_usb_data`)
 /// Extend with more variants as needed. Mode is sticky in the radio
 /// so we typically set this once per session start.
 pub static MODE_TARGET: AtomicU8 = AtomicU8::new(0xFF);
@@ -195,8 +195,8 @@ pub fn set_freq_hz(hz: u32) {
     FREQ_TARGET_HZ.store(hz, Ordering::Release);
 }
 
-/// Set the IC-705 mode + filter (USB-DATA narrow for FT8). Sends
-/// CI-V cmd 0x06 0x01 0x01 0x02. Idempotent — sent once when the
+/// Set the IC-705 mode + filter (USB-DATA for FT8). Sends
+/// CI-V `26 00 01 01 01` (see `civ_frame`). Idempotent — sent once when the
 /// target differs from the last-sent value. Safe from any thread.
 pub fn set_mode_data_usb() {
     MODE_TARGET.store(MODE_USB_DATA, Ordering::Release);
@@ -391,16 +391,7 @@ async fn run_session() -> Result<()> {
         // PTT — track edges and send the corresponding CI-V command.
         let target = PTT_TARGET.load(Ordering::Acquire);
         if last_ptt_sent != Some(target) {
-            let frame = [
-                PRE,
-                PRE,
-                CIV_IC705_ADDR,
-                CIV_CTRL_ADDR,
-                0x1C,
-                0x00,
-                if target { 0x01 } else { 0x00 },
-                POST,
-            ];
+            let frame = civ_frame::ptt(CIV_IC705_ADDR, target);
             if let Err(e) = characteristic.write_value(&frame, false).await {
                 log::warn!("civ: PTT write failed: {e:?}");
             } else {
@@ -414,20 +405,7 @@ async fn run_session() -> Result<()> {
         // 0 = sentinel "no pending", skip until menu pushes a value.
         let freq_target = FREQ_TARGET_HZ.load(Ordering::Acquire);
         if freq_target != 0 && last_freq_sent != Some(freq_target) {
-            let bcd = freq_to_bcd_le(freq_target);
-            let frame = [
-                PRE,
-                PRE,
-                CIV_IC705_ADDR,
-                CIV_CTRL_ADDR,
-                0x05,
-                bcd[0],
-                bcd[1],
-                bcd[2],
-                bcd[3],
-                bcd[4],
-                POST,
-            ];
+            let frame = civ_frame::set_freq(CIV_IC705_ADDR, freq_target);
             if let Err(e) = characteristic.write_value(&frame, false).await {
                 log::warn!("civ: set_freq write failed: {e:?}");
             } else {
@@ -440,20 +418,10 @@ async fn run_session() -> Result<()> {
         // Sentinel 0xFF = no pending; we only support USB-DATA for now.
         let mode_target = MODE_TARGET.load(Ordering::Acquire);
         if mode_target != 0xFF && last_mode_sent != Some(mode_target) {
-            // Only USB-DATA narrow is implemented; future variants add
-            // their own subcommand bytes here.
+            // Only USB-DATA is implemented; future variants add
+            // their own builders to `civ_frame`.
             let frame = if mode_target == MODE_USB_DATA {
-                [
-                    PRE,
-                    PRE,
-                    CIV_IC705_ADDR,
-                    CIV_CTRL_ADDR,
-                    0x06,
-                    0x01,
-                    0x01,
-                    0x02,
-                    POST,
-                ]
+                civ_frame::set_mode_usb_data(CIV_IC705_ADDR)
             } else {
                 log::warn!("civ: unknown MODE_TARGET 0x{mode_target:02X}, skipping");
                 last_mode_sent = Some(mode_target);
@@ -462,7 +430,7 @@ async fn run_session() -> Result<()> {
             if let Err(e) = characteristic.write_value(&frame, false).await {
                 log::warn!("civ: set_mode write failed: {e:?}");
             } else {
-                log::info!("civ: set_mode → USB-DATA narrow");
+                log::info!("civ: set_mode → USB-DATA");
                 last_mode_sent = Some(mode_target);
             }
         }
@@ -471,7 +439,7 @@ async fn run_session() -> Result<()> {
         // a supplementary time source — `time_sync` still falls back
         // on self-sync from coarse_sync DT median).
         if last_gps_query.elapsed() >= Duration::from_secs(30) {
-            let frame = [PRE, PRE, CIV_IC705_ADDR, CIV_CTRL_ADDR, 0x23, 0x00, POST];
+            let frame = civ_frame::gps_query(CIV_IC705_ADDR);
             if let Err(e) = characteristic.write_value(&frame, false).await {
                 log::warn!("civ: GPS query write failed: {e:?}");
             }
@@ -531,48 +499,6 @@ fn notify_handler(data: &[u8]) {
         if data[4] == 0x1C && data[5] == 0x00 && data.len() == 8 {
             PTT_ACTUAL.store(data[6] != 0, Ordering::Release);
         }
-    }
-}
-
-/// Encode a frequency in Hz as IC-705 CI-V cmd-0x05 5-byte
-/// little-endian BCD (Binary-Coded Decimal). Each byte packs two
-/// decimal digits as `(hi << 4) | lo`; byte 0 is the lowest-order
-/// digit pair (1s + 10s), byte 4 is the highest (100M + 1G Hz).
-/// Algorithm matches `rs-ft8n/ft8-web/www/cat.js:340-350` verbatim.
-fn freq_to_bcd_le(hz: u32) -> [u8; 5] {
-    let mut bcd = [0u8; 5];
-    let mut f = hz;
-    for byte in &mut bcd {
-        let lo = (f % 10) as u8;
-        f /= 10;
-        let hi = (f % 10) as u8;
-        f /= 10;
-        *byte = (hi << 4) | lo;
-    }
-    bcd
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn freq_bcd_20m_ft8() {
-        // 14_074_000 Hz → byte 0 = 1s + 10s = 00, byte 1 = 100s + 1k = 40,
-        // byte 2 = 10k + 100k = 07, byte 3 = 1M + 10M = 14, byte 4 = 100M+1G = 00.
-        assert_eq!(freq_to_bcd_le(14_074_000), [0x00, 0x40, 0x07, 0x14, 0x00]);
-    }
-
-    #[test]
-    fn freq_bcd_40m_ft8() {
-        // 7_074_000 Hz
-        assert_eq!(freq_to_bcd_le(7_074_000), [0x00, 0x40, 0x07, 0x07, 0x00]);
-    }
-
-    #[test]
-    fn freq_bcd_2m_ft8() {
-        // 144_174_000 Hz
-        assert_eq!(freq_to_bcd_le(144_174_000), [0x00, 0x40, 0x17, 0x44, 0x01]);
     }
 }
 
