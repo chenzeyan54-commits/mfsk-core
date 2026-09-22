@@ -394,7 +394,7 @@ fn run(mut ctx: Ctx) -> ! {
         let g = ctx.nvs.lock().expect("settings NVS mutex poisoned");
         settings::load(&g)
     };
-    let (ntp_synced, _sntp_keepalive) = if !ctx.cfg.ntp {
+    let (ntp_synced, mut sntp_handle) = if !ctx.cfg.ntp {
         // `GridSource::AirDt`: the phase comes from the band, so a
         // sync would spend its timeout and then discipline a clock the
         // grid is not following. The RTC still holds the minute for the
@@ -418,6 +418,8 @@ fn run(mut ctx: Ctx) -> ! {
     };
     if !ntp_synced {
         log::warn!("{tag}: NTP never synced");
+    } else {
+        stop_sntp(tag, &mut sntp_handle);
     }
     (ctx.cfg.on_ntp)(ntp_synced);
     // **Keep watching, because the 20 s window is not the answer.**
@@ -432,7 +434,7 @@ fn run(mut ctx: Ctx) -> ! {
     // to nothing, from a board whose RTC had been set from NTP minutes
     // earlier. The same SNTP handle keeps retrying underneath; nothing
     // was reading it.
-    let mut watching_ntp = !ntp_synced && _sntp_keepalive.is_some();
+    let mut watching_ntp = !ntp_synced && sntp_handle.is_some();
     if watching_ntp {
         log::info!("{tag}: NTP still retrying underneath — watching for it");
     }
@@ -460,7 +462,7 @@ fn run(mut ctx: Ctx) -> ! {
         if !watching_ntp {
             continue;
         }
-        let Some(sntp) = _sntp_keepalive.as_ref() else {
+        let Some(sntp) = sntp_handle.as_ref() else {
             watching_ntp = false;
             continue;
         };
@@ -473,6 +475,25 @@ fn run(mut ctx: Ctx) -> ! {
             watching_ntp = false;
             log::info!("{tag}: NTP synced on a later attempt — UTC now owns the slot phase");
             (ctx.cfg.on_ntp)(true);
+            stop_sntp(tag, &mut sntp_handle);
         }
+    }
+}
+
+/// **One sync per boot.** Stop SNTP once it has set the clock.
+///
+/// Kept running, lwIP re-syncs every `CONFIG_LWIP_SNTP_UPDATE_DELAY`
+/// (3 600 000 ms here) and *steps* the clock by whatever it has drifted,
+/// and every step is a jump in the reference the slot grid holds to
+/// (`uac::Ft8ChunkSink`'s re-anchor). After the first sync the clock
+/// runs on the 40 MHz crystal through `esp_timer`, which is steadier
+/// between those steps than the steps are; the RTC was set from the
+/// same sync (`rtc::write_from_system_clock`) for the next boot. What
+/// this gives up is correction of the crystal's own error over a long
+/// session — not yet measured on this board.
+fn stop_sntp(tag: &str, handle: &mut Option<esp_idf_svc::sntp::EspSntp<'static>>) {
+    if handle.take().is_some() {
+        // `EspSntp`'s `Drop` is `sntp_stop()`.
+        log::info!("{tag}: NTP stopped after the first sync — the crystal keeps time from here");
     }
 }

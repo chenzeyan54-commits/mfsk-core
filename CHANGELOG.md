@@ -18,6 +18,26 @@
   as WSJT-X, whose `pack77` never had the gap. `pack77_type1` routes
   through `pack77`, so it gains the same.
 
+- **CoreS3: NTP sets the clock once per boot, then stops.** SNTP was
+  kept running and lwIP re-synced every hour
+  (`CONFIG_LWIP_SNTP_UPDATE_DELAY`), *stepping* the clock by whatever
+  it had drifted — a jump in the reference the slot grid holds to. The
+  handle is now dropped after the first sync (or after a later retry
+  lands), the RTC is written from that sync as before, and the crystal
+  keeps time for the rest of the session. The crystal's own error over
+  a long session is no longer corrected; it has not been measured on
+  this board. `TIME: AIR DT` remains the explicit choice where there
+  is no network.
+- **CoreS3 FT8: an NTP sync inside a slot no longer hides the grid's
+  error for two slots.** `GridPhase` estimates the grid against UTC as
+  the minimum over a slot's blocks; when NTP landed mid-slot, blocks
+  read on the RTC clock and on the NTP clock were minimised together.
+  On an IC-705 (2026-09-23) the RTC blocks read −20 samples and won,
+  and the real +972 (+81 ms) stood until the next slot measured it —
+  the same shape as 2026-09-22's +61.6 / +94.8 ms. A new
+  `time_sync::clock_epoch()` counts clock-source transitions, and a
+  block on a new epoch restarts the window. Host-tested; not yet
+  confirmed on the board.
 - **CoreS3 FT8: the slot boundary falls on the sample, not on a
   100 ms chunk.** `Ft8ChunkSink` ended a slot only after a whole
   1 200-sample chunk, so every boundary was rounded up to the stream's
