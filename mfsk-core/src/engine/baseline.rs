@@ -129,7 +129,7 @@ pub fn fit_baseline_with(
             continue;
         }
         let mut sorted: Vec<f32> = s_db[ja..jb].to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let pct_idx = (npct * sorted.len()) / 100;
         let base = sorted[pct_idx.min(sorted.len() - 1)];
 
@@ -144,7 +144,7 @@ pub fn fit_baseline_with(
     if xs.len() < nterms {
         // Not enough points; fall back to flat baseline = median of s_db.
         let mut flat = s_db.clone();
-        flat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        flat.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let med = flat[flat.len() / 2];
         return vec![med + offset_db; n];
     }

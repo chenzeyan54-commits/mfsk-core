@@ -117,13 +117,31 @@ const FT4_DT_REPORT_MIN_SAMPLES: u32 = 288;
 
 /// Stack for the decode task.
 ///
-/// **8 KB, measured** — the same code in `ft4-demo`'s feed thread used
-/// 2 584 B of 32 KB (2026-09-01, `board::log_task_stacks`). Everything
-/// large is heap: a slot of audio, one `cd0` per candidate. The 32 KB
-/// this used to ask for came from the FT8 path and cost internal DRAM
-/// the decoder's own allocations needed more (`ft4_rx::WORKER_STACK`
-/// carries the argument).
-const DECODE_STACK: u32 = 8 * 1024;
+/// **10 KB, measured by stage** (2026-09-22, FT4 SIM through the real
+/// sink, `uxTaskGetStackHighWaterMark` after each step of `slot_loop`,
+/// `logs/ft4sim_stackprobe*_2026-09-22.log`):
+///
+/// | after | free of 8 KB |
+/// |---|---|
+/// | `slot_loop`'s setup | ~4 970 B |
+/// | `take_provisional` (before the fix below) | ~1 050 B |
+/// | `decode_slot_with` | 1 136 B (with the fix) / 664 B (without) |
+///
+/// This task runs the per-candidate decode itself (`run_candidates`)
+/// on top of `slot_loop`'s ~3 KB, so it needs the candidate worker's
+/// ~5 KB *plus* that. 8 KB left 444-732 B across runs — the board's
+/// own `[stacks]` line calls anything under 2 048 B tight. 10 KB puts
+/// the measured peak ~3.1 KB clear.
+///
+/// The provisional coarse pass had been taking 3.6-3.9 KB of it on its
+/// own: `engine::baseline` sorted with the stable `sort_by`, whose
+/// driftsort scratch is a 4 KB stack array. It picks a percentile, so
+/// stability buys nothing; it is `sort_unstable_by` now.
+///
+/// The old figure, 8 KB from `ft4-demo`'s feed thread using 2 584 B
+/// (2026-09-01), was measured on that thread, which never ran this
+/// loop's setup or the provisional pass.
+const DECODE_STACK: u32 = 10 * 1024;
 
 /// Raw 12 kHz samples between the audio callback and the slot task.
 ///

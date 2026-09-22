@@ -543,9 +543,15 @@ const EARLY_CHUNK: usize = 2_048;
 /// for the same reason.
 const SWEEP_SLICE: usize = 144;
 
-/// Stack for each capture-time worker — the candidate worker's shape
-/// (the buffers are heap), so its measured 8 KB.
-const EARLY_STACK: u32 = 8 * 1024;
+/// Stack for each capture-time worker.
+///
+/// **4 KB, measured.** It was 8 KB on the reasoning that it has the
+/// candidate worker's shape; measured, it is not that deep — the early
+/// DDC log's `stack [..] B free of 8192` read 6 688-6 836 B free on
+/// both workers over every FT4 SIM run on 2026-09-22
+/// (`logs/ft4sim_*_2026-09-22.log`), i.e. ~1.5 KB used. 4 KB keeps
+/// ~2.5 KB of headroom and hands 8 KB of internal DRAM back.
+const EARLY_STACK: u32 = 4 * 1024;
 
 /// One candidate's baseband and coarse sweep, built while the slot is
 /// still arriving.
@@ -997,6 +1003,11 @@ pub struct SlotOutcome {
 /// what costs, and at 12 candidates it is ~900 ms of a 1 960 ms budget.
 /// Revisit when the budget has room, not before.
 /// Stack for the core-1 candidate worker.
+///
+/// **Re-measured 2026-09-22: 5 088 B used** (`ft4_rx: core-1 worker
+/// stack 3104 B free of 8192`, FT4 SIM through the real sink), twice
+/// the 2 584 B below — the per-candidate path has grown since. 3 KB of
+/// headroom; re-measure before shrinking it.
 ///
 /// **8 KB, from a measurement rather than a guess.** The first version
 /// asked for 32 KB because the app's decode task did; then

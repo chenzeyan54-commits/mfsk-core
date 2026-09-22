@@ -18,6 +18,20 @@
   as WSJT-X, whose `pack77` never had the gap. `pack77_type1` routes
   through `pack77`, so it gains the same.
 
+- **`engine::baseline` no longer takes 4 KB of the caller's stack.**
+  Its percentile and median sorts used the stable `sort_by`, whose
+  driftsort scratch is a 4 KB array on the stack; neither needs
+  stability (equal `f32`s are the same value), so both are
+  `sort_unstable_by` and the output is unchanged. On the CoreS3 this
+  was 3.6-3.9 KB of FT4's 8 KB slot task by itself, in the
+  provisional coarse pass. The board's FT4 stacks were re-sized from
+  a per-stage measurement at the same time: the slot task to 10 KB
+  (1 136 B free of 8 KB even after the sort fix; 3 244 B free of
+  10 KB now), the two capture-time workers to 4 KB (they used ~1.5 KB
+  of 8), the candidate worker left at 8 KB (3.1 KB free) — 6 KB of
+  internal DRAM back overall, and every FT4 task above the 2 KB the
+  board's own stack report calls tight.
+
 - **CoreS3: `qso.adi` and `all.txt` on flash.** The activator's
   contacts and every decode now have somewhere to go that survives a
   power cut. `littlefs` moves to the unused tail of the 16 MB flash
