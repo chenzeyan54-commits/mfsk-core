@@ -18,6 +18,23 @@
   as WSJT-X, whose `pack77` never had the gap. `pack77_type1` routes
   through `pack77`, so it gains the same.
 
+- **CoreS3 FT8: the slot boundary falls on the sample, not on a
+  100 ms chunk.** `Ft8ChunkSink` ended a slot only after a whole
+  1 200-sample chunk, so every boundary was rounded up to the stream's
+  next chunk edge — anywhere from 0 to 100 ms late, set by where the
+  stream happened to start and then kept for the whole session, since
+  every later slot is exactly 150 chunks and the NTP re-anchor leaves
+  anything inside ±200 ms alone. Every station's DT read that much
+  low, and on the SIM that was one weak station of seven missing the
+  reply deadline on most boots. The sink now cuts the chunk at the
+  boundary. Measured without the clock — the SIM logs where each slot
+  boundary falls against its recording's own first sample: before,
+  +100, +0/+46/+100 and +100 ms over three boots; after, −9 to +2 ms
+  over five, with all seven stations decoded by key-up on four of
+  them. What is left is the one-time anchor's own timing (the 10 ms
+  scheduler tick), and it applies to radio audio through the same
+  sink.
+
 - **`engine::baseline` no longer takes 4 KB of the caller's stack.**
   Its percentile and median sorts used the stable `sort_by`, whose
   driftsort scratch is a 4 KB array on the stack; neither needs

@@ -833,6 +833,10 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
         let mut src = 0usize; // index into pcm, after the lead is done
         let mut lead_left = lead;
         let silence = [0i16; BLK];
+        // Samples pushed into the sink so far, and where the previous
+        // block started in the recording — for `SIM_PASS_START`.
+        let mut pushed_total: u32 = 0;
+        let mut last_src_start = usize::MAX;
         loop {
             let block: &[i16] = if lead_left >= BLK {
                 lead_left -= BLK;
@@ -898,6 +902,16 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
                 }
                 let end = (src + BLK).min(loop_len);
                 let s = &pcm[src..end];
+                if src < last_src_start || pushed_total == 0 {
+                    // A new pass (or a re-alignment that skipped into
+                    // one): its sample 0 is `src` samples before this
+                    // block, whether or not it was actually pushed.
+                    SIM_PASS_START.store(
+                        pushed_total.wrapping_sub(src as u32),
+                        core::sync::atomic::Ordering::Release,
+                    );
+                }
+                last_src_start = src;
                 src = if end == loop_len { 0 } else { end };
                 s
             };
@@ -907,6 +921,7 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
                 }
             }
             crate::waterfall_feed::push(block);
+            pushed_total = pushed_total.wrapping_add(block.len() as u32);
             fed += block.len() as u64;
             let due = (fed * 1_000_000 / 12_000) as i64;
             let now = unsafe { sys::esp_timer_get_time() } - t0;
@@ -925,7 +940,12 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
         sys::xTaskCreatePinnedToCore(
             Some(entry),
             c"uac_sim".as_ptr(),
-            4096,
+            // 8 KB: at 4 KB the `[stacks]` line read 104-1 728 B free,
+            // and the task overflowed (canary watchpoint, `uac_sim`)
+            // logging its NTP re-alignment through the UDP sink — three
+            // of six SIM boots on 2026-09-22 (`logs/sim_gridprobe_*`).
+            // SIM builds only; nothing ships with this task.
+            8192,
             cfg,
             AUDIO_TASK_PRIORITY as u32,
             core::ptr::null_mut(),
@@ -1092,6 +1112,37 @@ pub fn set_audio_sink<S: AudioSink>(sink: S) {
 /// (100 ms) blocks and emits `ChunkMsg::SlotEnd` every
 /// [`SLOT_SAMPLES_12K`] (15 s, one FT8 slot), publishing the new slot
 /// index via `time_sync::publish_capture_slot`.
+/// Where the SIM feed began its current pass over the recording, as an
+/// index into the stream it has pushed through the sink (wrapping u32,
+/// ~99 h at 12 kHz; only differences are used). `u32::MAX`
+/// until the first pass, and forever off the SIM.
+pub(crate) static SIM_PASS_START: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// **The grid against the recording, in samples — no clock involved.**
+///
+/// On the SIM the recording's sample 0 is where its slot begins, so the
+/// distance from there to the boundary the sink declared is the grid's
+/// true error. Every other reading of the grid on this board goes
+/// through `utc_now_ms()`, at the time a chunk happens to be delivered,
+/// which is the thing under suspicion. Positive: the boundary is later
+/// than the recording's start, so every DT reads that much low.
+fn grid_vs_sim_log(slot: usize, boundary_at: u32) {
+    let p = SIM_PASS_START.load(Ordering::Acquire);
+    if p == u32::MAX {
+        return;
+    }
+    let slot_len = SLOT_SAMPLES_12K as i64;
+    let d = (boundary_at.wrapping_sub(p) as i32 as i64).rem_euclid(slot_len);
+    let d = if d > slot_len / 2 { d - slot_len } else { d };
+    log::info!(
+        "uac: slot {} boundary {:+} samples ({:+.1} ms) from the SIM recording's start",
+        slot + 1,
+        d,
+        d as f32 / 12.0,
+    );
+}
+
 struct Ft8ChunkSink {
     chunk_q: sys::QueueHandle_t,
     chunk: Vec<i16>,
@@ -1111,6 +1162,10 @@ struct Ft8ChunkSink {
     /// One line has been logged saying NTP disciplined the clock and
     /// air-sync stood down — not one per slot.
     utc_owns_phase_logged: bool,
+    /// Samples handed downstream since this sink was created. A slot
+    /// boundary's index in the stream, for [`SIM_PASS_START`] to be
+    /// compared against without either side reading a clock.
+    sent_total: u32,
 }
 // SAFETY: `QueueHandle_t` is a raw pointer into IDF-owned state; the
 // IDF queue API is thread-safe by design (that's the whole point of a
@@ -1175,6 +1230,7 @@ impl Ft8ChunkSink {
             coarse_anchored: false,
             utc_owns_phase_logged: false,
             wav_idx: 0,
+            sent_total: 0,
         }
     }
 }
@@ -1293,11 +1349,30 @@ impl AudioSink for Ft8ChunkSink {
         }
         for &s in samples {
             self.chunk.push(s);
-            if self.chunk.len() >= CHUNK_LEN {
+            // **The boundary falls on the sample, not on a chunk.** The
+            // chunk used to be sent only when full, and the slot could
+            // end only after a whole chunk: every boundary was rounded
+            // up to the next 1 200 samples (100 ms) of the stream. Every
+            // later slot is 150 chunks long, so whatever the first
+            // rounding was — anything in 0-100 ms, set by where the
+            // stream happened to start — stayed for the whole session,
+            // and the NTP re-anchor's ±200 ms dead zone never took it
+            // out. Measured against the SIM recording's own start
+            // (`grid_vs_sim_log`, no clock involved; 2026-09-22,
+            // `logs/sim_gridprobe_*`): rounded, three boots put the
+            // boundary +100, +0/+46/+100 and +100 ms late, W1FC read
+            // DT +0.12 instead of +0.22 and one station of 7 missed
+            // key-up; split here, five boots put it at -9 to +2 ms and
+            // four of them decoded all 7 by key-up.
+            let at_boundary = self.slot_samples + self.chunk.len() >= self.slot_target;
+            if self.chunk.len() >= CHUNK_LEN || at_boundary {
+                let n = self.chunk.len();
                 let to_send = core::mem::replace(&mut self.chunk, Vec::with_capacity(CHUNK_LEN));
                 send_chunk_timed(self.chunk_q, Box::new(ChunkMsg::Samples(to_send)));
-                self.slot_samples += CHUNK_LEN;
+                self.slot_samples += n;
+                self.sent_total = self.sent_total.wrapping_add(n as u32);
                 if self.slot_samples >= self.slot_target {
+                    grid_vs_sim_log(self.wav_idx, self.sent_total);
                     send_chunk_timed(
                         self.chunk_q,
                         Box::new(ChunkMsg::SlotEnd {
