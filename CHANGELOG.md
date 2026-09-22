@@ -55,6 +55,18 @@
   tick woke it, and it hands a block over after the block's time has
   passed, as a radio does, instead of before.
 
+- **CoreS3: the USB audio path runs above the panel.** The panel went
+  to priority 7 on 2026-09-21 so the screen would not stop during a
+  decode, and that put it above the UAC class driver and the reader
+  (6) on the same core. The check at the time ran on the SIM, where a
+  starved feeder only lags; on a radio, a class driver that cannot
+  resubmit its isochronous transfers within their 48 ms drops the
+  frames, and nothing counts them. On an IC-705 the reader went up to
+  102 ms between reads against an 85 ms ring, and the slot grid showed
+  steps of 30 ms of audio that never arrived. The driver, the USB
+  event task, the reader and the SIM feeder are at 8 now: the longest
+  gap over the next 251 s was 14 ms.
+
 - **`engine::baseline` no longer takes 4 KB of the caller's stack.**
   Its percentile and median sorts used the stable `sort_by`, whose
   driftsort scratch is a 4 KB array on the stack; neither needs

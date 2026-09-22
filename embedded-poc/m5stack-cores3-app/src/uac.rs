@@ -182,7 +182,7 @@ const USB_EVENTS_TASK_STACK: usize = 4096;
 /// `tskNO_AFFINITY` but pinning to core 0 (PRO_CPU) matches the upstream
 /// audio_player example and keeps the decoder's core 1 (APP_CPU) free.
 const UAC_DRIVER_TASK_STACK: usize = 4096;
-/// **6, the same as [`AUDIO_TASK_PRIORITY`] and for the same reason.**
+/// **The same as [`AUDIO_TASK_PRIORITY`] and for the same reason.**
 ///
 /// This was 5 while the reader was raised to 6 on 2026-09-19, which
 /// raised one half of the audio path and left the half feeding it
@@ -191,7 +191,21 @@ const UAC_DRIVER_TASK_STACK: usize = 4096;
 /// as a decode ran. That is visible in the honest priority argument the
 /// reader's constant already makes: a 16 KB ring is 85 ms of audio, and
 /// nothing in the path may stall longer than that.
-const UAC_DRIVER_TASK_PRIORITY: usize = 6;
+///
+/// **8 since 2026-09-22, above the panel's 7.** `display::PANEL_PRIORITY`
+/// went to 7 on 2026-09-21 so the screen would not stop for a decode,
+/// which put it above this task on the same core; that was checked on
+/// the SIM, where a starved feeder only lags. On a radio a class driver
+/// that cannot resubmit its isochronous URBs within their 48 ms loses
+/// the frames, uncounted. Measured on air the same day
+/// (`logs/live_ft8_fea56c84_2026-09-22.log`): reader gaps up to 102 ms
+/// against an 85 ms ring, and slot-grid steps of +350 and +380 samples
+/// — audio that never arrived. The audio path is short bursts of work,
+/// so above everything the app runs costs the panel nothing. At 8, on
+/// the same radio and band 20 minutes later, the longest reader gap was
+/// 14 ms over 251 s, none reached 50 ms, and the 12 kHz rate read
+/// 12 002.0 sa/s where it had read 11 996.8 with the losses in it.
+const UAC_DRIVER_TASK_PRIORITY: usize = 8;
 const UAC_DRIVER_TASK_CORE: sys::BaseType_t = 0;
 
 /// `uac_app` task stack. Just runs `recv()` → device_open/start →
@@ -212,7 +226,7 @@ const APP_TASK_STACK: usize = 8192;
 /// Priority of whichever task is feeding the [`AudioSink`] — the USB
 /// reader on a radio, the `MFSK_CORES3_SIM` feeder without one.
 ///
-/// **6, above the decode thread's 5**, for the reason `stage1_inc`
+/// **Above the decode thread**, for the reason `stage1_inc`
 /// takes 6 above `dsp_worker`'s 5: the audio path must be able to
 /// preempt the decoder, because its work cannot be deferred and then
 /// caught up on.
@@ -235,7 +249,10 @@ const APP_TASK_STACK: usize = 8192;
 /// starved reader stops reading and the ring overruns. That is the
 /// case a busy band brings on — more candidates, a longer decode —
 /// and it is why this is a priority rather than a tuning knob.
-const AUDIO_TASK_PRIORITY: u8 = 6;
+///
+/// **8 since 2026-09-22**, above the panel (7) as well — see
+/// [`UAC_DRIVER_TASK_PRIORITY`] for the loss that caused it.
+const AUDIO_TASK_PRIORITY: u8 = 8;
 
 /// `uac_reader` task stack.
 ///
@@ -1112,7 +1129,8 @@ pub fn set_audio_sink<S: AudioSink>(sink: S) {
 /// is due is audio from the future. Late by up to a tick is fine: that
 /// is what a radio's delivery looks like too, and `GridPhase` takes the
 /// minimum over a slot of blocks precisely so that lateness drops out.
-/// No spin: this task shares core 0 and priority 6 with the decoder.
+/// No spin: this task sits on core 0 above the decoder and the panel,
+/// and a spin there would take their time.
 fn sleep_until_esp_us(at_us: i64) {
     let tick_us = 1_000_000 / sys::configTICK_RATE_HZ as i64;
     loop {
@@ -1954,8 +1972,8 @@ fn handle_rx_connected(addr: u8, iface_num: u8) -> Result<()> {
         Some(AUDIO_TASK_PRIORITY),
         // **PRO_CPU, with the rest of the capture path.**
         //
-        // Left unpinned it shares whichever core has room, and at
-        // priority 6 that means it can land on APP_CPU beside
+        // Left unpinned it shares whichever core has room, and (at the
+        // priority 6 it had then) it could land on APP_CPU beside
         // `stage1_inc` — also 6, and the task whose lateness the whole
         // slot grid rides on. Equal priority there is round-robin, so
         // the reader's resampling takes half of stage1_inc's core

@@ -124,7 +124,8 @@ fn slot_end_hint() -> Option<i64> {
 /// costs the acquisition only the time the display actually uses —
 /// that loop sleeps between frames rather than spinning.
 ///
-/// The audio path is untouched at priority 6 and keeps its core.
+/// The audio path is untouched — it runs above this and the panel
+/// (`uac::AUDIO_TASK_PRIORITY`) and keeps its core.
 struct LowPriorityWhile(u32);
 
 impl LowPriorityWhile {
