@@ -577,7 +577,14 @@ pub fn run_log_panel(
                 bars_us = 0;
                 list_us = 0;
                 pre_us = 0;
-                crate::board::log_task_cpu();
+                // The per-task walk stops the USB host's interrupt for
+                // milliseconds and drops isochronous packets
+                // (`board::log_task_cpu`); on a radio, idle only.
+                if host_mode {
+                    crate::board::log_idle_cpu();
+                } else {
+                    crate::board::log_task_cpu();
+                }
                 frame_gap_max_us = 0;
                 frame_count = 0;
                 busy_us = 0;
@@ -725,7 +732,13 @@ pub fn run_log_panel(
             // high-water mark is monotonic, so this is not sampling —
             // one late reading is the whole answer. See
             // `board::log_task_stacks`.
-            if tick % 300 == 0 {
+            //
+            // **Not while a radio's audio streams**: the same kernel
+            // walk as `[cpu]`, under a critical section, and it drops
+            // USB audio packets (`board::log_task_cpu`). Tick 0 still
+            // reports: that is before any audio can stream, since the
+            // radio's enumeration alone takes seconds.
+            if tick % 300 == 0 && (!host_mode || tick == 0) {
                 crate::board::log_task_stacks();
             }
         }

@@ -226,6 +226,19 @@ pub fn log_stack_hw(tag: &str) {
 /// call it from a task with room — a display loop, not an audio
 /// reader. It reports its own caller's headroom too, so if that ever
 /// stops being true it says so.
+/// **Not while a radio's USB audio is streaming** — use
+/// [`log_idle_cpu`] then. `uxTaskGetSystemState` runs under
+/// `taskENTER_CRITICAL` on a multi-core IDF (`freertos_idf_additions_priv.h`:
+/// `prvENTER_CRITICAL_OR_SUSPEND_ALL`) and calls `vTaskGetInfo(…, pdTRUE, …)`
+/// for every task, which walks each stack byte by byte for its
+/// high-water mark. For those milliseconds core 0's USB interrupt waits,
+/// the host controller's next isochronous buffer goes in late, and its
+/// first 1-4 packets come back `USB_TRANSFER_STATUS_SKIPPED` — audio that
+/// is never counted. Measured on an IC-705 (2026-09-22,
+/// `logs/live_ft8_62e0bee6_2026-09-22.log`): every `Bad RX Isoc packet …
+/// status 6` burst followed a `[cpu]` line, and the FT8 slot grid fell
+/// 36 samples behind UTC per burst. [`log_task_stacks`] is the same call.
+///
 /// Each task's CPU since the last call, as a percentage of one core —
 /// from FreeRTOS's run-time counters (`CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS`,
 /// esp_timer microseconds). The busiest ten, one line.
@@ -234,6 +247,39 @@ pub fn log_stack_hw(tag: &str) {
 /// that task sleeps on DMA or is preempted: how much of a core it
 /// actually used. Added for the FT4 panel (2026-09-21), whose drawing
 /// is DMA it sleeps through, so its own timers read wall time.
+/// Idle share of each core since the last call — the two numbers
+/// `log_task_cpu` can give without `uxTaskGetSystemState`: one counter
+/// read per core under the kernel lock, no task walk, no stack scan.
+/// What the panel prints while USB audio streams.
+pub fn log_idle_cpu() {
+    use esp_idf_svc::sys;
+    use std::sync::Mutex;
+    static PREV: Mutex<(i64, u32, u32)> = Mutex::new((0, 0, 0));
+    // SAFETY: core ids 0 and 1 exist on the ESP32-S3.
+    let (i0, i1) = unsafe {
+        (
+            sys::ulTaskGetIdleRunTimeCounterForCore(0),
+            sys::ulTaskGetIdleRunTimeCounterForCore(1),
+        )
+    };
+    let now = unsafe { sys::esp_timer_get_time() };
+    let Ok(mut prev) = PREV.lock() else {
+        return;
+    };
+    let (t, p0, p1) = *prev;
+    *prev = (now, i0, i1);
+    drop(prev);
+    let wall = now - t;
+    if t == 0 || wall <= 0 {
+        return;
+    }
+    log::info!(
+        "[cpu] IDLE0:{}% IDLE1:{}% (per-task off while USB audio streams)",
+        (i0.wrapping_sub(p0) as i64) * 100 / wall,
+        (i1.wrapping_sub(p1) as i64) * 100 / wall,
+    );
+}
+
 pub fn log_task_cpu() {
     use esp_idf_svc::sys;
     use std::sync::Mutex;
