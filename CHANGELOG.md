@@ -42,8 +42,12 @@
   the clock's (read in microseconds, `utc_now_us`), and keeps the
   minimum over the slot: delivery delay only ever adds, so the minimum
   is the grid's error plus the path's smallest delay. With NTP owning
-  the phase, the sink takes that out of the next slot whenever it is
-  0.5 ms or more. The estimate agreed with the SIM's clock-free
+  the phase, the sink puts the grid on UTC once it is 0.5 ms or more
+  out, and after that *holds* it, moving it again only past 10 ms —
+  on air a correction every slot was moving the grid 3-6 ms at a time,
+  and on this board that is enough to trade one weak station for
+  another. Held, the grid drifts 3-4 samples a slot (an IC-705's
+  48 kHz against the ESP32's crystal, ~20 ppm). The estimate agreed with the SIM's clock-free
   measurement to within 0.3 ms on every slot, and the grid settled at
   −0.3 to +0.2 ms within two slots of NTP on each of five boots; a
   five-minute run then held −3 samples with all seven stations by
@@ -54,6 +58,27 @@
   starts at the boundary to the microsecond rather than wherever the
   tick woke it, and it hands a block over after the block's time has
   passed, as a radio does, instead of before.
+
+- **CoreS3: no task-list walk while a radio's USB audio streams.**
+  The panel printed a per-task CPU line every 10 s and a stack
+  high-water table every 30 s, both through `uxTaskGetSystemState`,
+  which on a dual-core IDF holds a critical section while it scans
+  every task's stack byte by byte. For those milliseconds core 0's USB
+  interrupt waited, the host controller's next isochronous buffer went
+  in late, and its first 1-4 packets came back SKIPPED — about 3 ms of
+  audio, uncounted, roughly every 10 s. Found by logging the class
+  driver's own packet drops (`uac-host` at DEBUG) beside a clock-free
+  measure of the slot grid on an IC-705: every drop followed a `[cpu]`
+  line, and each cost the grid 36 samples. In USB host mode the panel
+  now prints only each core's idle share (one counter read per core),
+  and the stack table once at boot; after the change the grid moved
+  3-4 samples a slot and nothing else, bar one drop during an
+  `all.txt` flash write — the flash still stops everything while it
+  writes, which is the next thing to schedule around. Each slot now
+  logs one summary line (grid estimate, the next slot's length, the
+  longest read wait and between-read gap and when they fell), and
+  WiFi and lwIP moved to core 1 — whether that move helped on its own
+  was not measured.
 
 - **CoreS3: the USB audio path runs above the panel.** The panel went
   to priority 7 on 2026-09-21 so the screen would not stop during a

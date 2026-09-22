@@ -261,8 +261,13 @@ fn serve(req: Req, all: &mut AllTxt) {
                     // the UAC capture's 48 ms of queued audio.
                     let ms = t0.elapsed().as_millis() as u32;
                     let (w, s) = all.last_split_us;
+                    // Where in the UTC slot the flash was busy: a write
+                    // stops the cache, and with it the USB host's
+                    // resubmissions (`uac::RX_DONE_GAP_MAX_US`).
+                    let at = mfsk_app_shared::time_sync::utc_now_ms()
+                        .map_or(-1, |t| (t % (period_ms.max(1))) as i64 - ms as i64);
                     log::info!(
-                        "storage: all.txt +{} B in {ms} ms (write {} ms, sync {} ms), now {} KB",
+                        "storage: all.txt +{} B in {ms} ms (write {} ms, sync {} ms) from slot +{at} ms, now {} KB",
                         written,
                         w / 1000,
                         s / 1000,

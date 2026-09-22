@@ -1198,6 +1198,9 @@ struct Ft8ChunkSink {
     sent_total: u32,
     /// This slot's blocks against UTC — see `time_sync::GridPhase`.
     phase: mfsk_app_shared::time_sync::GridPhase,
+    /// The grid has been put on UTC once under NTP; from here it is
+    /// held, and moved again only past [`HOLD_REANCHOR_SAMPLES`].
+    fine_locked: bool,
 }
 // SAFETY: `QueueHandle_t` is a raw pointer into IDF-owned state; the
 // IDF queue API is thread-safe by design (that's the whole point of a
@@ -1264,6 +1267,7 @@ impl Ft8ChunkSink {
             wav_idx: 0,
             sent_total: 0,
             phase: mfsk_app_shared::time_sync::GridPhase::new(),
+            fine_locked: false,
         }
     }
 }
@@ -1435,6 +1439,27 @@ impl AudioSink for Ft8ChunkSink {
                 if self.slot_samples >= self.slot_target {
                     grid_vs_sim_log(self.wav_idx, self.sent_total);
                     let phase_est = self.phase.take();
+                    // This slot's USB timing, kept for the one summary line
+                    // below. One datagram per slot: the UDP log drops
+                    // lines, and an estimate whose correction line went
+                    // missing reads as a step that never happened.
+                    let usb_summary = {
+                        let n = READS_IN_SLOT.swap(0, Ordering::Relaxed);
+                        let wait = READ_WAIT_MAX_US.swap(0, Ordering::Relaxed);
+                        let at = READ_WAIT_MAX_AT_MS.swap(u32::MAX, Ordering::Relaxed);
+                        let over = READ_WAITS_OVER.swap(0, Ordering::Relaxed);
+                        let gap = READ_GAP_SLOT_MAX_US.swap(0, Ordering::Relaxed);
+                        let gap_at = READ_GAP_SLOT_MAX_AT_MS.swap(u32::MAX, Ordering::Relaxed);
+                        let ms = |a: u32| if a == u32::MAX { -1 } else { a as i64 };
+                        format!(
+                            "reads={n} wait={:.1}@{} over{}={over} gap={:.1}@{}",
+                            wait as f32 / 1_000.0,
+                            ms(at),
+                            READ_WAIT_WARN_US / 1_000,
+                            gap as f32 / 1_000.0,
+                            ms(gap_at),
+                        )
+                    };
                     if let Some(e) = phase_est {
                         log::info!(
                             "uac: slot {} grid {:+} samples ({:+.1} ms) against UTC, min over the slot's blocks",
@@ -1565,8 +1590,14 @@ impl AudioSink for Ft8ChunkSink {
                                 // an error inside ±200 ms stayed for the
                                 // session — up to 100 ms of it from the
                                 // chunk rounding, ~10 ms from the anchor.
+                                let min = if self.fine_locked {
+                                    HOLD_REANCHOR_SAMPLES
+                                } else {
+                                    FINE_PHASE_MIN_SAMPLES
+                                };
                                 match phase_est {
-                                    Some(e) if e.unsigned_abs() >= FINE_PHASE_MIN_SAMPLES => {
+                                    Some(e) if e.unsigned_abs() >= min => {
+                                        self.fine_locked = true;
                                         let e = e.clamp(
                                             -(DEAD_ZONE_SAMPLES as i64),
                                             DEAD_ZONE_SAMPLES as i64,
@@ -1592,6 +1623,12 @@ impl AudioSink for Ft8ChunkSink {
                                 );
                             }
                             self.slot_target = target;
+                            log::info!(
+                                "uac: slot {} summary est={} next={} {usb_summary}",
+                                self.wav_idx,
+                                phase_est.map_or(String::from("-"), |e| format!("{e:+}")),
+                                target,
+                            );
                         }
                     } else {
                         let acq = mfsk_app_shared::time_sync::take_acquisition_shift_12k();
@@ -1766,6 +1803,20 @@ const DEAD_ZONE_SAMPLES: usize = 2_400;
 /// noise.
 const FINE_PHASE_MIN_SAMPLES: u64 = 6;
 
+/// **Once on UTC, hold.** After the first fine correction the grid is
+/// moved again only when `GridPhase` says it is 10 ms out.
+///
+/// Correcting every slot past [`FINE_PHASE_MIN_SAMPLES`] moved the grid
+/// 3-6 ms on most slots on air (2026-09-22,
+/// `logs/live_ft8_62e0bee6_2026-09-22.log`), and this board's FT8 gains
+/// or loses a weak station on 5 ms of phase — so the correction was
+/// reshuffling the station list. Held, the grid showed two things: a
+/// drift of 3-4 samples a slot (the IC-705's 48 kHz against the
+/// ESP32's crystal, ~20 ppm), and 36-sample steps that were isochronous
+/// packets skipped while `board::log_task_cpu` held a critical section.
+/// With that gone the drift alone reaches this in ~30 slots.
+const HOLD_REANCHOR_SAMPLES: u64 = 120;
+
 /// Floor for a cold-acquisition slot, in samples. `acq` is bounded by
 /// ±90 000, so the shortening branch cannot go below 90 000 on its own;
 /// this is the guard for a future wider bound rather than a live one.
@@ -1835,6 +1886,36 @@ extern "C" fn driver_event_cb(
 /// so the first three are logged and nothing else; `DISCONNECTED`
 /// sets [`READER_STOP_REQUESTED`], which is how the reader learns to
 /// stop and to skip the cleanup the IDF driver has already done.
+/// **How long each read waited for its 4 096 bytes**, per slot.
+///
+/// `uac_host_device_read` blocks until the whole request is in the
+/// ring (`_ring_buffer_pop` loops to the full size or the timeout), and
+/// the ring fills only as the class driver completes isochronous URBs.
+/// So a read normally takes ~21 ms — 4 096 B at 192 kB/s — and a lapse
+/// in URB completions lengthens the one read it falls in by the lapse.
+/// The IDF host keeps two 8 ms DMA buffers in flight and restarts a
+/// drained isochronous schedule `XFER_LIST_ISOC_MARGIN` (3) frames late
+/// (`hcd_dwc.c`), so a lapse costs at least 3 ms of audio — the
+/// 36-sample steps the slot grid showed on air (2026-09-22). A step in
+/// a slot whose longest read stayed ~21 ms is the other case: packets
+/// dropped individually inside a steady flow (`uac-host` at DEBUG then
+/// names them). `READ_GAP_MAX_US` does not answer this: it times the
+/// reader's own work *between* reads. Written by the reader; read and
+/// reset once a slot by the sink. Times in µs.
+static READ_WAIT_MAX_US: AtomicU32 = AtomicU32::new(0);
+/// Milliseconds into the 15 s UTC slot at which the longest wait ended.
+static READ_WAIT_MAX_AT_MS: AtomicU32 = AtomicU32::new(u32::MAX);
+static READ_WAITS_OVER: AtomicU32 = AtomicU32::new(0);
+static READS_IN_SLOT: AtomicU32 = AtomicU32::new(0);
+/// The other half: the longest stretch *between* reads this slot, and
+/// when it ended. A stall that stops the reader too shows here rather
+/// than in the wait if it caught the reader outside a read.
+static READ_GAP_SLOT_MAX_US: AtomicU32 = AtomicU32::new(0);
+static READ_GAP_SLOT_MAX_AT_MS: AtomicU32 = AtomicU32::new(u32::MAX);
+/// A read this long has waited through more than half a read's worth
+/// of missing URB completions.
+const READ_WAIT_WARN_US: u32 = 30_000;
+
 extern "C" fn device_event_cb(
     _handle: sys::uac::uac_host_device_handle_t,
     event: sys::uac::uac_host_device_event_t,
@@ -2548,7 +2629,14 @@ fn reader_thread(handle: DeviceHandle, addr: u8, iface_num: u8) {
         if last_read_done > 0 {
             let gap = (t_read_start - last_read_done).clamp(0, u32::MAX as i64) as u32;
             READ_GAP_MAX_US.fetch_max(gap, Ordering::Relaxed);
+            if gap > READ_GAP_SLOT_MAX_US.load(Ordering::Relaxed) {
+                READ_GAP_SLOT_MAX_US.store(gap, Ordering::Relaxed);
+                let at = mfsk_app_shared::time_sync::utc_now_ms()
+                    .map_or(u32::MAX, |ms| (ms % (SLOT_SECS as u64 * 1_000)) as u32);
+                READ_GAP_SLOT_MAX_AT_MS.store(at, Ordering::Relaxed);
+            }
         }
+        let t_read = unsafe { sys::esp_timer_get_time() };
         let err = unsafe {
             sys::uac::uac_host_device_read(
                 handle.0,
@@ -2582,6 +2670,19 @@ fn reader_thread(handle: DeviceHandle, addr: u8, iface_num: u8) {
             break;
         }
         last_read_done = unsafe { sys::esp_timer_get_time() };
+        {
+            let waited = (last_read_done - t_read).clamp(0, u32::MAX as i64) as u32;
+            READS_IN_SLOT.fetch_add(1, Ordering::Relaxed);
+            if waited > READ_WAIT_MAX_US.load(Ordering::Relaxed) {
+                READ_WAIT_MAX_US.store(waited, Ordering::Relaxed);
+                let at = mfsk_app_shared::time_sync::utc_now_ms()
+                    .map_or(u32::MAX, |ms| (ms % (SLOT_SECS as u64 * 1_000)) as u32);
+                READ_WAIT_MAX_AT_MS.store(at, Ordering::Relaxed);
+            }
+            if waited > READ_WAIT_WARN_US {
+                READ_WAITS_OVER.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if bytes_read > 0 {
             last_data = std::time::Instant::now();
         }
@@ -3436,6 +3537,19 @@ pub fn start_host_when_ready() {
     unsafe {
         esp_idf_svc::sys::esp_log_level_set(
             c"ENUM".as_ptr(),
+            esp_idf_svc::sys::esp_log_level_t_ESP_LOG_DEBUG,
+        );
+    }
+    // `uac-host` at DEBUG: in the streaming path it logs only on loss —
+    // "Bad RX Isoc packet", "RX Ringbuffer overflow", "push failed" —
+    // each silently dropping audio otherwise (`stream_rx_xfer_done`).
+    // Its other DEBUG lines are one-off descriptor details at open. The
+    // line is printed from the class-driver task before it resubmits,
+    // so a burst of them costs time on the path being measured; one
+    // line per dropped packet is the price of knowing. 2026-09-22.
+    unsafe {
+        esp_idf_svc::sys::esp_log_level_set(
+            c"uac-host".as_ptr(),
             esp_idf_svc::sys::esp_log_level_t_ESP_LOG_DEBUG,
         );
     }

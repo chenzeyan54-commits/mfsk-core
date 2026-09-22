@@ -131,6 +131,20 @@ CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_RX_BA_WIN=6
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
 
+# WiFi and lwIP on core 1, off the USB audio path's core (2026-09-22).
+#
+# The UAC class driver (priority 8) and the USB host interrupt are on
+# core 0; WiFi's task is priority 23 and was pinned there too, and
+# lwIP's tiT (18) had no affinity. Moved while chasing audio lost on
+# an IC-705 — that loss turned out to be `board::log_task_cpu`'s
+# critical section, not WiFi (see there). Whether this move helped on
+# its own was not measured: the step rate fell from every slot to
+# about half in the one run that had it, which the `[cpu]` period
+# (10 s against a 15 s slot) explains as well. Kept because nothing
+# above priority 8 has a reason to run on the audio core.
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_1=y
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y
+
 # ── PSRAM (Quad 8 MB) ─────────────────────────────────────────────────
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_QUAD=y
