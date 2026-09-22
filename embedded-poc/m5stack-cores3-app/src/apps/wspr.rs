@@ -671,26 +671,20 @@ fn run_one_slot(
     if let Ok(mut ui) = UI.lock() {
         ui.update_status(|st| st.rig_freq_hz = Some((band.dial_mhz * 1e6).round() as u32));
         let texts: Vec<String> = results.iter().map(|r| r.message.to_string()).collect();
-        ui.publish_slot(results.iter().zip(&texts).map(|(r, text)| SlotDecode {
-            freq_hz: r.freq_hz,
-            snr_db: r.snr_db,
-            dt_sec: r.dt_sec,
-            text,
-            // Fano, not BP: no hard-error count to mark rows by.
-            hard_errors: 0,
-        }));
-    }
-    let texts: Vec<String> = results.iter().map(|r| r.message.to_string()).collect();
-    crate::storage::record_slot(
-        slot_start_unix_s,
-        120_000,
-        Some((band.dial_mhz * 1e6).round() as u64),
-        "WSPR",
-        results
+        let rows: Vec<SlotDecode> = results
             .iter()
             .zip(&texts)
-            .map(|(r, text)| (r.snr_db, r.dt_sec, r.freq_hz, text.as_str())),
-    );
+            .map(|(r, text)| SlotDecode {
+                freq_hz: r.freq_hz,
+                snr_db: r.snr_db,
+                dt_sec: r.dt_sec,
+                text,
+                // Fano, not BP: no hard-error count to mark rows by.
+                hard_errors: 0,
+            })
+            .collect();
+        crate::storage::publish_slot(&mut ui, BootMode::Wspr, slot_start_unix_s, &rows);
+    }
 
     let ntp_synced = NTP_SYNCED.load(Ordering::Acquire);
     if is_synthetic_source {

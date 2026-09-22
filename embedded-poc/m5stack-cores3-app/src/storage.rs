@@ -29,9 +29,13 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Duration;
+
+use mfsk_app_shared::boot_mode::BootMode;
+use mfsk_app_shared::ui::state::{SlotDecode, UiState};
 
 const MOUNT: &str = "/littlefs";
 const PARTITION: &core::ffi::CStr = c"littlefs";
@@ -95,6 +99,9 @@ enum Req {
 }
 
 static TX: OnceLock<SyncSender<Req>> = OnceLock::new();
+/// The receiving end, from the first request until
+/// [`start_if_requested`] hands it to the task.
+static PENDING_RX: Mutex<Option<Receiver<Req>>> = Mutex::new(None);
 static MOUNTED: AtomicBool = AtomicBool::new(false);
 static DROPPED: AtomicU32 = AtomicU32::new(0);
 
@@ -110,7 +117,8 @@ pub fn mounted() -> bool {
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Allow the storage task to exist; it is spawned by the first request.
+/// Allow the storage task to exist; it is spawned after the first
+/// request, by [`start_if_requested`].
 ///
 /// **Why lazily.** Spawned from `boot::run`, its 5 KB internal stack
 /// was carved out of the block the decoder allocates from next: the
@@ -120,15 +128,50 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 /// against `logs/storage_midslot_ft8sim_*`). The first request comes
 /// from the first published slot, by which time the decoder has what
 /// it needs.
+///
+/// The channel is made here, on the booting task, and not by the first
+/// request: building an `mpsc` channel assembles its state on the
+/// caller's stack before boxing it, and the first caller is a decoder.
+/// Made by the first request, it left `ft4_slot` (8 KB) 444-464 B free in
+/// FT4 SIM runs against 732 B with storage off (2026-09-22,
+/// `logs/ft4sim_storage_*_2026-09-22.log`).
 pub fn enable() {
     ENABLED.store(true, Ordering::Release);
+    let _ = ensure_channel();
 }
 
-fn ensure_started() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    if ENABLED.load(Ordering::Acquire) {
-        ONCE.call_once(spawn);
+/// The channel: made once, by [`enable`].
+fn ensure_channel() -> Option<&'static SyncSender<Req>> {
+    if !ENABLED.load(Ordering::Acquire) {
+        return None;
     }
+    Some(TX.get_or_init(|| {
+        let (tx, rx) = sync_channel::<Req>(QUEUE);
+        if let Ok(mut p) = PENDING_RX.lock() {
+            *p = Some(rx);
+        }
+        tx
+    }))
+}
+
+/// Spawn the storage task once something has asked for it. Called by
+/// the panel loop every frame; a no-op after the first spawn.
+///
+/// **Not from the requester**, which is a decoder: a thread spawn is
+/// not a shallow call, and a decoder's stack is sized to its decode.
+/// The panel's `main` task has ~10 KB free. Requests made before the
+/// spawn wait in the channel, [`QUEUE`] deep.
+pub fn start_if_requested() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if ONCE.is_completed() || TX.get().is_none() {
+        return;
+    }
+    ONCE.call_once(|| {
+        let rx = PENDING_RX.lock().ok().and_then(|mut p| p.take());
+        if let Some(rx) = rx {
+            spawn(rx);
+        }
+    });
 }
 
 /// Spawn the storage task; it mounts the partition (formatting it the
@@ -137,14 +180,10 @@ fn ensure_started() {
 /// A `std::thread` with its stack caps set to internal DRAM explicitly
 /// — `uac::spawn_psram_thread`'s mechanism with the opposite caps — so
 /// the channel below parks a pthread, as `std` expects.
-fn spawn() {
+fn spawn(rx: Receiver<Req>) {
     use esp_idf_svc::hal::cpu::Core;
     use esp_idf_svc::hal::task::thread::{MallocCap, ThreadSpawnConfiguration};
 
-    let (tx, rx) = sync_channel::<Req>(QUEUE);
-    if TX.set(tx).is_err() {
-        return;
-    }
     let d = ThreadSpawnConfiguration::default();
     let cfg = ThreadSpawnConfiguration {
         name: Some(TASK_NAME),
@@ -408,10 +447,9 @@ fn read(file: File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
 }
 
 fn send(req: Req) -> bool {
-    ensure_started();
-    // Queued even before the mount finishes: the task mounts first and
-    // then drains, and drops (and counts) what it cannot write.
-    let ok = TX.get().is_some_and(|tx| tx.try_send(req).is_ok());
+    // Queued even before the task exists: it mounts first and then
+    // drains, and drops (and counts) what it cannot write.
+    let ok = ensure_channel().is_some_and(|tx| tx.try_send(req).is_ok());
     if !ok {
         DROPPED.fetch_add(1, Ordering::Relaxed);
     }
@@ -438,8 +476,7 @@ pub fn append_qso(record: String, header: String) -> bool {
 /// HTTP download handlers, which run on a PSRAM stack and so must not
 /// read the flash themselves.
 pub fn read_chunk(file: File, offset: u64, len: usize) -> Option<Vec<u8>> {
-    ensure_started();
-    let tx = TX.get()?;
+    let tx = ensure_channel()?;
     let (reply, rx) = sync_channel(1);
     tx.send(Req::Read {
         file,
@@ -468,34 +505,53 @@ pub fn decoded_slot_unix(period_ms: u64) -> Option<i64> {
     Some((start_ms / 1000) as i64)
 }
 
-/// One slot's decodes, as `ALL.TXT` lines: `(snr_db, dt_sec, df_hz,
-/// text)` each. `dial_hz` is `None` where the board does not know it.
-pub fn record_slot<'a>(
+/// Publish one slot — **the one call every receiver makes**: the rows
+/// go to the station list and, from the same values, to `ALL.TXT`.
+///
+/// FT8, FT4, WSPR and FST4 each used to call `UiState::publish_slot`
+/// and then build their own `ALL.TXT` tuples beside it, four times
+/// over. The mode name and slot period come from the boot mode, and
+/// the dial frequency from the status bar's `rig_freq_hz`, so what the
+/// panel shows and what the log records cannot disagree — and a CAT
+/// link that sets the status field puts the frequency into every
+/// mode's log at once.
+///
+/// Takes the locked [`UiState`] because FT8 publishes from inside the
+/// lock it decodes under. The `ALL.TXT` half only formats and queues;
+/// the flash write happens on the storage task.
+///
+/// `slot_unix` is the UTC second the slot began, `None` while the
+/// clock is unset (the log is skipped: a line stamped 1970 is worse
+/// than no line). [`decoded_slot_unix`] gives it for receivers that
+/// publish in the slot after the one decoded.
+pub fn publish_slot(
+    ui: &mut UiState,
+    mode: BootMode,
     slot_unix: Option<i64>,
-    period_ms: u64,
-    dial_hz: Option<u64>,
-    mode: &str,
-    decodes: impl IntoIterator<Item = (f32, f32, f32, &'a str)>,
+    decodes: &[SlotDecode<'_>],
 ) {
+    ui.publish_slot(decodes.iter().copied());
     let Some(t) = slot_unix else { return };
+    let name = mfsk_app_shared::ui::mode_picker::mode_name(mode).unwrap_or("?");
+    let dial_hz = ui.status.rig_freq_hz.map(u64::from);
     let mut text = String::new();
-    for (snr, dt, df, msg) in decodes {
-        let snr = if snr.is_finite() {
-            snr.round() as i32
+    for d in decodes {
+        let snr = if d.snr_db.is_finite() {
+            d.snr_db.round() as i32
         } else {
             0
         };
         text.push_str(&mfsk_app_shared::all_txt::rx_line(
             t,
             dial_hz,
-            mode,
+            name,
             snr,
-            dt,
-            df.round() as i32,
-            msg,
+            d.dt_sec,
+            d.freq_hz.round() as i32,
+            d.text,
         ));
     }
-    append_all_txt(text, period_ms);
+    append_all_txt(text, mode.slot_period_ms() as u64);
 }
 
 /// Counting wrappers around the flash calls LittleFS makes

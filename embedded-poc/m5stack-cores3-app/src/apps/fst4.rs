@@ -791,28 +791,18 @@ fn scan_loop() -> ! {
 
         // Onto FT8's panel, the way FT4 feeds it.
         if let Ok(mut ui) = UI.lock() {
-            ui.publish_slot(decoded.iter().map(|h| SlotDecode {
-                freq_hz: h.refined_hz,
-                snr_db: h.snr_db,
-                dt_sec: h.dt_sec,
-                text: h.msg.as_deref().unwrap_or(""),
-                hard_errors: 0,
-            }));
+            let rows: Vec<SlotDecode> = decoded
+                .iter()
+                .map(|h| SlotDecode {
+                    freq_hz: h.refined_hz,
+                    snr_db: h.snr_db,
+                    dt_sec: h.dt_sec,
+                    text: h.msg.as_deref().unwrap_or(""),
+                    hard_errors: 0,
+                })
+                .collect();
+            crate::storage::publish_slot(&mut ui, BootMode::Fst4, slot_unix, &rows);
         }
-        crate::storage::record_slot(
-            slot_unix,
-            60_000,
-            None,
-            "FST4",
-            decoded.iter().map(|h| {
-                (
-                    h.snr_db,
-                    h.dt_sec,
-                    h.refined_hz,
-                    h.msg.as_deref().unwrap_or(""),
-                )
-            }),
-        );
         log_heap("post-slot");
         slot_num = slot_num.wrapping_add(1);
     }

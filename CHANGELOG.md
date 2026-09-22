@@ -25,8 +25,10 @@
   mounting it, so nothing is lost) and is mounted through
   `joltwallet/littlefs`, formatted on first boot. `all.txt` is
   WSJT-X's `ALL.TXT` line for line (`MainWindow::write_all`), written
-  for every mode from each receiver's `publish_slot` site and rotated
-  to `all.1.txt` at 2 MiB; `qso.adi` follows `LogBook::QSOToADIF`
+  for every mode through the one call that also fills the station list
+  (`storage::publish_slot` — mode and period from the boot mode, dial
+  frequency from the status bar's field, so a CAT link will reach every
+  mode's log at once) and rotated to `all.1.txt` at 2 MiB; `qso.adi` follows `LogBook::QSOToADIF`
   field for field, plus `MY_SOTA_REF` / `MY_POTA_REF`, and is
   `fsync`ed per record. Both formatters are pure and tested against
   the WSJT-X layout in `hosttest/mfsk-app-shared`. `http_config` can
@@ -47,7 +49,10 @@
     list. Lazily spawned: 0 of 18, 7 decodes every slot. A resident
     httpd costs the same way (~4.3 KB), which is why the FT8
     controller still has none; the logs are to be fetched from a
-    server started on demand, or over Web Serial.
+    server started on demand, or over Web Serial. **Neither the task
+    nor its channel is made on the requester's stack**, which is a
+    decoder's: made there, FT4's `ft4_slot` fell to 444-464 B free of
+    8 KB. The channel is made at boot, the task by the panel loop.
   - **`all.txt` is written 4 KB at a time.** LittleFS cannot program
     into a block after `sync` committed it, so each synced append
     copied the tail block to a fresh one: a 448 B slot cost one erase

@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use embedded_shared::apps::ft4_rx as rx;
 use crate::boot::{BootCtx, Display, Panel, Receiver};
 use mfsk_app_shared::ui::state::{SlotDecode, UI};
+use mfsk_app_shared::boot_mode::BootMode;
 
 /// The deadline the candidate loop is held to, from slot close.
 ///
@@ -529,21 +530,22 @@ fn slot_loop() -> ! {
                 st.free_heap_kb = free_heap_kb();
             });
             // The station list's one entry point, as every mode.
-            ui.publish_slot(o.decodes.iter().map(|d| SlotDecode {
-                freq_hz: d.freq_hz,
-                snr_db: d.snr_db,
-                dt_sec: d.dt_sec,
-                text: &d.msg,
-                hard_errors: d.hard_errors,
-            }));
-            crate::storage::record_slot(
+            let rows: Vec<SlotDecode> = o
+                .decodes
+                .iter()
+                .map(|d| SlotDecode {
+                    freq_hz: d.freq_hz,
+                    snr_db: d.snr_db,
+                    dt_sec: d.dt_sec,
+                    text: &d.msg,
+                    hard_errors: d.hard_errors,
+                })
+                .collect();
+            crate::storage::publish_slot(
+                &mut ui,
+                BootMode::Ft4,
                 crate::storage::decoded_slot_unix(7_500),
-                7_500,
-                None,
-                "FT4",
-                o.decodes
-                    .iter()
-                    .map(|d| (d.snr_db, d.dt_sec, d.freq_hz, d.msg.as_str())),
+                &rows,
             );
             for d in &o.decodes {
                 log::info!(

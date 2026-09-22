@@ -547,6 +547,9 @@ pub fn run_log_panel(
     let mut pre_us: i64 = 0;
     let mut frame_top_us: i64;
     loop {
+        // The storage task is spawned here, on this task's stack, not
+        // on the decoder's that made the first request (`storage.rs`).
+        crate::storage::start_if_requested();
         {
             let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
             frame_gap_max_us = frame_gap_max_us.max(now - frame_prev_us);

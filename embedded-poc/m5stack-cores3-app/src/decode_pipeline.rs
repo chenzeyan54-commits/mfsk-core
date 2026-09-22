@@ -2030,26 +2030,21 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
             }
             // Every slot, decoded or not — an empty slot costs nothing
             // and keeps the list's own slot count honest.
-            ui.publish_slot(published.iter().map(|(text, freq_hz, snr_db, dt_sec, hard)| {
-                SlotDecode {
+            let rows: Vec<SlotDecode> = published
+                .iter()
+                .map(|(text, freq_hz, snr_db, dt_sec, hard)| SlotDecode {
                     freq_hz: *freq_hz,
                     snr_db: *snr_db,
                     dt_sec: *dt_sec,
                     text,
                     hard_errors: *hard,
-                }
-            }));
-            // ALL.TXT beside the panel, from the same rows. Dial
-            // frequency unknown (no CAT) until the activator's settings
-            // carry one.
-            crate::storage::record_slot(
+                })
+                .collect();
+            crate::storage::publish_slot(
+                &mut ui,
+                mfsk_app_shared::boot_mode::BootMode::Uac,
                 crate::storage::decoded_slot_unix(15_000),
-                15_000,
-                None,
-                "FT8",
-                published
-                    .iter()
-                    .map(|(text, f, snr, dt, _)| (*snr, *dt, *f, text.as_str())),
+                &rows,
             );
         }
 
