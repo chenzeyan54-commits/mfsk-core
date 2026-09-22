@@ -251,6 +251,8 @@ pub fn run_log_panel(
                 continue;
             };
             ui.status.free_heap_kb = (heap / 1024) as u32;
+            // Core2 runs the FT8 pipeline only.
+            ui.status.mode = Some("FT8");
             status_snapshot = ui.status.clone();
             decoded_snapshot = ui
                 .decoded_iter()

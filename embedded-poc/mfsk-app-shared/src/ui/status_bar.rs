@@ -57,12 +57,14 @@ where
     //
     // The 22-char core below was sized for the M5StickS3's 135 px, and
     // on that panel there is no room. The CoreS3 and the Core2 have
-    // 240 and 320, and on the CoreS3 the omission actually mattered:
-    // one binary boots into one of four receivers, WSPR and FST4 name
-    // themselves on their own status lines, and the FT8 screen did not.
-    let named = cols >= 26;
+    // 240 and 320. On the CoreS3 one binary boots into one of four
+    // receivers that all share this screen, so the name comes from the
+    // boot mode (`StatusInfo::mode`) — it was a literal "FT8" until
+    // FT4, WSPR and FST4 lost their own status lines to the shared
+    // panel, after which nothing on screen said which one was running.
+    let named = cols >= 27;
     if named {
-        let _ = s.push_str("FT8 ");
+        let _ = write!(&mut s, "{:<4} ", status.mode.unwrap_or("----"));
     }
     // Freq: kHz, 4-5 digits ("7074", "14074", "144174").
     match status.rig_freq_hz {
@@ -92,7 +94,7 @@ where
     let _ = write!(&mut s, " {:>4}", status.free_heap_kb);
 
     // Drop chars the panel cannot show, if formatting overflowed.
-    let budget = if named { 26 } else { 22 };
+    let budget = if named { 27 } else { 22 };
     let visible = s.as_str();
     let visible = &visible[..visible.len().min(budget)];
 

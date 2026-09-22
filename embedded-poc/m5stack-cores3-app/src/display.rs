@@ -736,6 +736,7 @@ pub fn run_log_panel(
                 continue;
             };
             ui.status.free_heap_kb = (heap / 1024) as u32;
+            ui.status.mode = mode_picker::mode_name(mode);
             // The UTC field has existed in `StatusInfo` since the bar
             // was written and nothing ever wrote it, so the panel read
             // `--:--:--` whatever the clock was doing. That mattered

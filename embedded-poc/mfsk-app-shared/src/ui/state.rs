@@ -67,6 +67,11 @@ pub struct SlotDecode<'a> {
 /// before peripherals are up.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StatusInfo {
+    /// The receiver this boot is running ("FT8", "FT4", "WSPR", "FST4").
+    /// Set by the board from its boot mode. `None` draws `----`, never
+    /// a guess: the bar used to hard-code "FT8", which was right only
+    /// until one CoreS3 image carried four receivers on one screen.
+    pub mode: Option<&'static str>,
     /// Rig audio band centre (Hz). e.g. 7_074_000 for FT8 40 m.
     pub rig_freq_hz: Option<u32>,
     /// "USB" / "USB-D" / "FM" — IC-705 mode string.
@@ -218,6 +223,7 @@ impl UiState {
             waterfall: heapless::Deque::new(),
             wf_slot_start: heapless::Deque::new(),
             status: StatusInfo {
+                mode: None,
                 rig_freq_hz: None,
                 rig_mode: None,
                 utc_sod: None,

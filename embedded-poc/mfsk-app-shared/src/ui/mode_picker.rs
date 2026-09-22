@@ -151,6 +151,16 @@ pub const MODES: [(BootMode, &str); 4] = [
     (BootMode::Fst4, "FST4"),
 ];
 
+/// The name the screen shows for a boot mode — the picker's own label
+/// for a receiver, and "FT8" for the WAV replay, which runs the FT8
+/// pipeline. `None` for modes that are not receivers.
+pub fn mode_name(mode: BootMode) -> Option<&'static str> {
+    match mode {
+        BootMode::Decode => Some("FT8"),
+        m => MODES.iter().find(|(b, _)| *b == m).map(|(_, name)| *name),
+    }
+}
+
 /// Not a receiver — a fixed recording, decoded on a loop.
 ///
 /// It lived among the modes as "DECODE (wav)", where the one thing it
