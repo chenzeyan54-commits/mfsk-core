@@ -125,7 +125,7 @@ use mfsk_core::engine::dsp::resample::LinearResamplerI16To12k;
 /// config immediately after spawning — the calling thread's own
 /// stack, and anything it spawns later without going through this
 /// helper, is unaffected.
-fn spawn_psram_thread<F>(
+pub(crate) fn spawn_psram_thread<F>(
     name: &'static core::ffi::CStr,
     stack_size: usize,
     priority: Option<u8>,
@@ -3341,7 +3341,7 @@ static TX_FRAME_MS: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI3
 /// yet — see the call site.
 static DUMPED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-static RX_IFACE_SEEN: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+pub(crate) static RX_IFACE_SEEN: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
 /// See [`RX_IFACE_SEEN`]. **`-1` here is the answer to "does the
 /// IC-705 offer a USB audio OUT interface at all"**, which nothing has
 /// established yet.
@@ -3574,7 +3574,8 @@ pub fn start_host_when_ready() {
     // output somewhere that survives (see `esp_log_bridge`).
     crate::esp_log_bridge::install();
 
-    if let Err(e) = start_host() {
+    let started = start_host();
+    if let Err(e) = &started {
         log::error!("UAC host start failed: {e:#}");
         let mut msg: heapless::String<96> = heapless::String::new();
         {
@@ -3582,6 +3583,9 @@ pub fn start_host_when_ready() {
             let _ = write!(&mut msg, "start_host FAILED: {e:#}");
         }
         HOST_RESULT.store(msg.as_str());
+    }
+    if started.is_ok() {
+        crate::civ_usb::start_probe();
     }
     crate::log_free_internal("post-uac-host-install");
 }

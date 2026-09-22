@@ -301,6 +301,14 @@ remote_component = { name = "espressif/usb_host_uac", version = "^1.4" }
 bindings_header = "../bindings_uac.h"
 bindings_module = "uac"
 
+# CAT: the IC-705's CI-V port is a CDC-ACM function on the same
+# composite device as its audio (VID 0c26 PID 0036, interfaces 0/1 and
+# 2/3 — the descriptor dump of 2026-09-20). `src/civ_usb.rs`.
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/usb_host_cdc_acm", version = "^2" }
+bindings_header = "../bindings_cdc_acm.h"
+bindings_module = "cdc_acm"
+
 # The activator's contact log and ALL.TXT (`src/storage.rs`). LittleFS
 # rather than NVS, which is a 24 KB key-value store, and rather than
 # FAT, whose allocation table is one power cut from losing the file

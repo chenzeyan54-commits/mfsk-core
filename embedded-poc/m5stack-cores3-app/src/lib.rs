@@ -15,6 +15,7 @@ pub mod apps;
 pub mod audio_out;
 pub mod board;
 pub mod boot;
+pub mod civ_usb;
 pub mod coredump;
 pub mod decode_pipeline;
 pub mod display;
