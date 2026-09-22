@@ -553,6 +553,8 @@ pub fn samples_to_next_slot_12k_from_us(now_us: u64, period_ms: u64) -> i64 {
 pub struct GridPhase {
     min: Option<i64>,
     n: u32,
+    /// The [`clock_epoch`] this window's blocks were read on.
+    epoch: Option<u32>,
 }
 
 impl GridPhase {
@@ -562,13 +564,33 @@ impl GridPhase {
     pub const MIN_BLOCKS: u32 = 32;
 
     pub const fn new() -> Self {
-        Self { min: None, n: 0 }
+        Self {
+            min: None,
+            n: 0,
+            epoch: None,
+        }
     }
 
     /// One block. Both arguments in samples; `slot_len` the grid's
     /// period in samples. The difference is taken modulo the period,
     /// so a block straddling a boundary reads the same as any other.
-    pub fn observe(&mut self, grid_remain: i64, clock_remain: i64, slot_len: i64) {
+    ///
+    /// `epoch` is [`clock_epoch`] at the read. **A block on a new
+    /// epoch restarts the window**: the minimum would otherwise keep
+    /// whichever clock read lower. Measured on the CoreS3 with an
+    /// IC-705, 2026-09-23 (`logs/udp_civ_probe_2026-09-23.log`): NTP
+    /// landed inside slot 2, its RTC-clock blocks read −20 and won the
+    /// minimum over the NTP ones, the grid was "corrected" by −20, and
+    /// the real +972 (+81 ms) stood until slot 3 had measured it
+    /// cleanly — two slots decoded 81 ms late. The same shape is in
+    /// 2026-09-22's `live_ft8_fea56c84` (+61.6, +94.8 ms, then +1.6).
+    pub fn observe(&mut self, epoch: u32, grid_remain: i64, clock_remain: i64, slot_len: i64) {
+        if self.epoch != Some(epoch) {
+            *self = Self {
+                epoch: Some(epoch),
+                ..Self::new()
+            };
+        }
         let d = (grid_remain - clock_remain).rem_euclid(slot_len);
         let d = if d > slot_len / 2 { d - slot_len } else { d };
         self.min = Some(self.min.map_or(d, |m| m.min(d)));
@@ -666,15 +688,38 @@ pub enum ClockSource {
 
 static CLOCK_SOURCE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
+/// Bumped each time the clock's source changes — the moments it can
+/// step. See [`clock_epoch`].
+static CLOCK_EPOCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// The system clock now holds a value read out of the RTC.
 pub fn note_clock_from_rtc() {
     // Never demote a disciplined clock: NTP may already have run.
-    let _ = CLOCK_SOURCE.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+    if CLOCK_SOURCE
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        CLOCK_EPOCH.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 /// The system clock has been disciplined by NTP.
 pub fn note_clock_from_ntp() {
-    CLOCK_SOURCE.store(2, Ordering::Release);
+    // Polled (`ntp::note_sync_completed`), so only the transition
+    // counts as a step.
+    if CLOCK_SOURCE.swap(2, Ordering::AcqRel) != 2 {
+        CLOCK_EPOCH.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Which clock a measurement against [`utc_now_us`] was taken on.
+///
+/// Changes when the source does: RTC → NTP is a step of up to a few
+/// hundred ms (the RTC holds whole seconds and is written back within
+/// ~50 ms), and a comparison that spans it compares two clocks.
+/// [`GridPhase`] uses it to drop the blocks read before a step.
+pub fn clock_epoch() -> u32 {
+    CLOCK_EPOCH.load(Ordering::Acquire)
 }
 
 /// What last set the system clock.
@@ -1027,7 +1072,7 @@ mod grid_phase_tests {
             let delay = (k * 37) % 120; // 0-10 ms of jitter, in samples
             let clock_remain = 90_000 - k * 256;
             let grid_remain = clock_remain + err + delay;
-            g.observe(grid_remain, clock_remain, SLOT);
+            g.observe(0, grid_remain, clock_remain, SLOT);
         }
         assert_eq!(g.take(), Some(err));
         // The window is fresh afterwards.
@@ -1040,7 +1085,7 @@ mod grid_phase_tests {
     fn straddling_a_boundary_wraps() {
         let mut g = GridPhase::new();
         for _ in 0..GridPhase::MIN_BLOCKS {
-            g.observe(-50, SLOT - 60, SLOT);
+            g.observe(0, -50, SLOT - 60, SLOT);
         }
         assert_eq!(g.take(), Some(10));
     }
@@ -1049,7 +1094,37 @@ mod grid_phase_tests {
     fn too_few_blocks_is_no_answer() {
         let mut g = GridPhase::new();
         for _ in 0..GridPhase::MIN_BLOCKS - 1 {
-            g.observe(0, 0, SLOT);
+            g.observe(0, 0, 0, SLOT);
+        }
+        assert_eq!(g.take(), None);
+    }
+
+    /// Blocks read before a clock step are dropped, not minimised
+    /// against the ones after it — the RTC→NTP handover of 2026-09-23.
+    #[test]
+    fn a_clock_step_restarts_the_window() {
+        let mut g = GridPhase::new();
+        for k in 0..400i64 {
+            let clock_remain = 90_000 - k * 256;
+            g.observe(1, clock_remain - 20, clock_remain, SLOT); // RTC clock
+        }
+        for k in 400..700i64 {
+            let clock_remain = 90_000 - k * 256;
+            g.observe(2, clock_remain + 972, clock_remain, SLOT); // NTP
+        }
+        assert_eq!(g.take(), Some(972));
+    }
+
+    /// A step too late in the slot leaves too few blocks to answer:
+    /// no correction beats a wrong one.
+    #[test]
+    fn a_late_clock_step_is_no_answer() {
+        let mut g = GridPhase::new();
+        for _ in 0..600 {
+            g.observe(1, -20, 0, SLOT);
+        }
+        for _ in 0..GridPhase::MIN_BLOCKS - 1 {
+            g.observe(2, 972, 0, SLOT);
         }
         assert_eq!(g.take(), None);
     }

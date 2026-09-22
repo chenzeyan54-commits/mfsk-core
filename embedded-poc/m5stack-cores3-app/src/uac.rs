@@ -1403,6 +1403,7 @@ impl AudioSink for Ft8ChunkSink {
             if let Some(u) = mfsk_app_shared::time_sync::utc_now_us() {
                 let at_end = (self.slot_samples + self.chunk.len() + samples.len()) as i64;
                 self.phase.observe(
+                    mfsk_app_shared::time_sync::clock_epoch(),
                     self.slot_target as i64 - at_end,
                     mfsk_app_shared::time_sync::samples_to_next_slot_12k_from_us(
                         u,
