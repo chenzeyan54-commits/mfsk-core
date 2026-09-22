@@ -31,9 +31,29 @@
   boundary falls against its recording's own first sample: before,
   +100, +0/+46/+100 and +100 ms over three boots; after, −9 to +2 ms
   over five, with all seven stations decoded by key-up on four of
-  them. What is left is the one-time anchor's own timing (the 10 ms
-  scheduler tick), and it applies to radio audio through the same
-  sink.
+  them.
+
+  **And then held to the sample against NTP.** The one-time anchor
+  read the clock when a block arrived, so it carried that block's
+  delivery delay — a scheduler tick on the SIM, the USB transfer on a
+  radio — and the NTP re-anchor left anything inside ±200 ms alone.
+  `time_sync::GridPhase` now takes, for every block, the grid's
+  distance to its next boundary (from the block's last sample) against
+  the clock's (read in microseconds, `utc_now_us`), and keeps the
+  minimum over the slot: delivery delay only ever adds, so the minimum
+  is the grid's error plus the path's smallest delay. With NTP owning
+  the phase, the sink takes that out of the next slot whenever it is
+  0.5 ms or more. The estimate agreed with the SIM's clock-free
+  measurement to within 0.3 ms on every slot, and the grid settled at
+  −0.3 to +0.2 ms within two slots of NTP on each of five boots; a
+  five-minute run then held −3 samples with all seven stations by
+  key-up for 16 slots running — the same seven on every boot, where
+  the phase error had been choosing which seven. Without NTP the grid
+  stays where the anchor put it (the air owns the phase then). The
+  SIM feed was brought into line for the measurement: its recording
+  starts at the boundary to the microsecond rather than wherever the
+  tick woke it, and it hands a block over after the block's time has
+  passed, as a radio does, instead of before.
 
 - **`engine::baseline` no longer takes 4 KB of the caller's stack.**
   Its percentile and median sorts used the stable `sort_by`, whose

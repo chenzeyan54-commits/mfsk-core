@@ -504,6 +504,86 @@ pub fn utc_now_ms() -> Option<u64> {
     (d.as_secs() >= PLAUSIBLE_UNIX_SECS).then_some(d.as_millis() as u64)
 }
 
+/// Wall-clock UTC in microseconds, or `None` while the clock is unset.
+///
+/// [`utc_now_ms`]'s floor to the millisecond is 12 samples of phase at
+/// 12 kHz — as large as the error the slot grid is now held to. Only
+/// [`GridPhase`]'s measurement needs this; everything that asks "is it
+/// a new slot yet" is fine with milliseconds.
+pub fn utc_now_us() -> Option<u64> {
+    if SIM_SUPPRESS_CLOCK.load(Ordering::Acquire) {
+        return None;
+    }
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    (d.as_secs() >= PLAUSIBLE_UNIX_SECS).then_some(d.as_micros() as u64)
+}
+
+/// 12 kHz samples from `now_us` to the next boundary of a
+/// `period_ms`-millisecond grid, to the microsecond (floored to the
+/// sample). A whole period exactly on a boundary, as
+/// [`samples_to_next_slot_12k_from`].
+pub fn samples_to_next_slot_12k_from_us(now_us: u64, period_ms: u64) -> i64 {
+    let period_us = period_ms * 1_000;
+    let remain_us = period_us - now_us % period_us;
+    (remain_us * 12 / 1_000) as i64
+}
+
+/// **Where a sample-counted slot grid sits against UTC**, from the
+/// blocks of audio that arrive — not from one clock read.
+///
+/// A grid anchored by reading the clock when a block arrives inherits
+/// that block's delivery delay: the tick the reader woke on, the USB
+/// transfer it came in. Measured on the CoreS3 SIM (2026-09-22,
+/// `logs/sim_gridprobe_exact_*`), one-shot anchors landed −9 to +2 ms
+/// from the audio's true start, and a weak FT8 station can hang on
+/// 5 ms of phase.
+///
+/// Each block gives `grid_remain − clock_remain`: samples to the grid's
+/// next boundary counted from the block's **last** sample, minus
+/// samples to UTC's next boundary counted from *now*. The block's last
+/// sample was captured some delay `L ≥ 0` before now, so that
+/// difference is the grid's error plus `12·L`. Its minimum over a slot's
+/// worth of blocks is the error plus the *smallest* delay seen — the
+/// jitter falls out, and what is left is the path's fixed latency,
+/// which no receiver can see without a reference and WSJT-X does not
+/// correct either. Positive: the grid's boundary is later than UTC's.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GridPhase {
+    min: Option<i64>,
+    n: u32,
+}
+
+impl GridPhase {
+    /// Blocks needed before [`GridPhase::take`] answers. A slot is
+    /// ~700 blocks of radio audio; this only stops a slot cut short by
+    /// a re-anchor from reporting on a handful.
+    pub const MIN_BLOCKS: u32 = 32;
+
+    pub const fn new() -> Self {
+        Self { min: None, n: 0 }
+    }
+
+    /// One block. Both arguments in samples; `slot_len` the grid's
+    /// period in samples. The difference is taken modulo the period,
+    /// so a block straddling a boundary reads the same as any other.
+    pub fn observe(&mut self, grid_remain: i64, clock_remain: i64, slot_len: i64) {
+        let d = (grid_remain - clock_remain).rem_euclid(slot_len);
+        let d = if d > slot_len / 2 { d - slot_len } else { d };
+        self.min = Some(self.min.map_or(d, |m| m.min(d)));
+        self.n += 1;
+    }
+
+    /// The estimate, and a fresh window. `None` below
+    /// [`GridPhase::MIN_BLOCKS`].
+    pub fn take(&mut self) -> Option<i64> {
+        let out = (self.n >= Self::MIN_BLOCKS).then_some(self.min).flatten();
+        *self = Self::new();
+        out
+    }
+}
+
 /// The modular arithmetic behind [`samples_to_next_slot_12k`] and
 /// [`samples_to_next_slot_12k_ms`], with the clock read passed in.
 ///
@@ -919,5 +999,58 @@ mod capture_slot_end_tests {
             Some((8, 0, None))
         );
         reset_capture_slot_for_test();
+    }
+}
+
+#[cfg(test)]
+mod grid_phase_tests {
+    use super::{GridPhase, samples_to_next_slot_12k_from_us};
+
+    const SLOT: i64 = 180_000;
+
+    #[test]
+    fn microsecond_remain_is_sample_exact() {
+        // 10.000 s into a 15 s slot: 5 s = 60 000 samples.
+        assert_eq!(samples_to_next_slot_12k_from_us(10_000_000, 15_000), 60_000);
+        // 84 µs later: 4 999 916 µs = 59 998.99 samples, floored.
+        assert_eq!(samples_to_next_slot_12k_from_us(10_000_084, 15_000), 59_998);
+        // Exactly on a boundary: a whole period.
+        assert_eq!(samples_to_next_slot_12k_from_us(15_000_000, 15_000), SLOT);
+    }
+
+    /// Delivery delay only ever adds; the minimum recovers the error.
+    #[test]
+    fn minimum_over_blocks_strips_delivery_jitter() {
+        let err = -108; // grid 9 ms early
+        let mut g = GridPhase::new();
+        for k in 0..700i64 {
+            let delay = (k * 37) % 120; // 0-10 ms of jitter, in samples
+            let clock_remain = 90_000 - k * 256;
+            let grid_remain = clock_remain + err + delay;
+            g.observe(grid_remain, clock_remain, SLOT);
+        }
+        assert_eq!(g.take(), Some(err));
+        // The window is fresh afterwards.
+        assert_eq!(g.take(), None);
+    }
+
+    /// A block whose grid boundary has just passed while UTC's is a
+    /// whole slot away reads the same small error, not ±SLOT.
+    #[test]
+    fn straddling_a_boundary_wraps() {
+        let mut g = GridPhase::new();
+        for _ in 0..GridPhase::MIN_BLOCKS {
+            g.observe(-50, SLOT - 60, SLOT);
+        }
+        assert_eq!(g.take(), Some(10));
+    }
+
+    #[test]
+    fn too_few_blocks_is_no_answer() {
+        let mut g = GridPhase::new();
+        for _ in 0..GridPhase::MIN_BLOCKS - 1 {
+            g.observe(0, 0, SLOT);
+        }
+        assert_eq!(g.take(), None);
     }
 }

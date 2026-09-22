@@ -765,60 +765,46 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
                 (unsafe { sys::esp_timer_get_time() } - t_wait) / 1_000,
             );
         }
-        let align = mfsk_app_shared::time_sync::samples_to_next_slot_12k_ms(
-            (slot_samples / 12) as u64,
-        );
-        // **Wait for the boundary; do not feed silence up to it.**
-        //
-        // The first cut of this pushed the lead through the sink as
-        // zero samples, which is what a radio would do. A radio also
-        // has a consumer running: here the slot task has not started
-        // draining yet, so several seconds of silence piled up in
-        // `STAGING`, and `apps::ft4`'s anchor — which adds the staged
-        // backlog to the clock's "distance to the next boundary",
-        // deliberately (`remain += block.len()`) — then corrected by
-        // that backlog. Measured 2026-09-21: 5 961 ms of lead produced
-        // `slot grid -2500 ms off the clock — trimmed`, 13 candidates
-        // and **zero decodes** from slot 4 on, while a 4 792 ms lead in
-        // the previous run trimmed 263 ms and decoded fine. A harness
-        // whose result depends on when the board happened to boot is
-        // not an instrument.
-        //
-        // Sleeping is also what the thing being simulated does: audio
-        // starts arriving at a boundary, it does not arrive as silence
-        // beforehand. `MFSK_SIM_OFFSET_MS` is served the same way, so a
-        // deliberate grid error is a late *start*, not a fed gap.
-        let wait_samples = match align {
-            Some(to_boundary) => {
+        // **The recording's timeline starts at the boundary to the
+        // microsecond** (`t0 = start_at` below), whenever the task
+        // actually wakes: this feed is the reference the receiver's
+        // grid is measured against (`grid_vs_sim_log`). It used to
+        // start from the moment `vTaskDelay` returned, so the
+        // recording itself sat wherever the 10 ms tick put it.
+        let now_esp = unsafe { sys::esp_timer_get_time() };
+        let align_us: Option<i64> = mfsk_app_shared::time_sync::utc_now_us().map(|u| {
+            let period_us = (slot_samples / 12) as u64 * 1_000;
+            (period_us - u % period_us) as i64
+        });
+        let start_at = match align_us {
+            Some(to_boundary_us) => {
                 log::warn!(
                     "uac SIM: waiting {} ms for the next {} ms boundary, then {} ms of \
                      deliberate offset — nothing is fed until then",
-                    to_boundary / 12,
+                    to_boundary_us / 1_000,
                     slot_samples / 12,
                     lead / 12,
                 );
-                to_boundary + lead
+                now_esp + to_boundary_us + (lead as i64 * 1_000 / 12)
             }
             None => {
                 log::warn!(
                     "uac SIM: no clock — feeding from now, after {} ms of deliberate offset",
                     lead / 12
                 );
-                lead
+                now_esp + (lead as i64 * 1_000 / 12)
             }
         };
-        if wait_samples > 0 {
-            let ms = (wait_samples / 12) as u32;
-            unsafe { sys::vTaskDelay(ms / (1_000 / sys::configTICK_RATE_HZ).max(1)) };
-        }
+        sleep_until_esp_us(start_at);
         // The deliberate offset, kept for the re-alignment below before
         // `lead` is reused for the (now always empty) silence prefix.
         let offset_samples = lead % slot_samples.max(1);
         let lead = 0usize;
         const BLK: usize = 256;
-        /// 20 ms: past the jitter of one UAC-sized block and far below
-        /// anything the decoder would notice.
-        const REALIGN_SAMPLES: u64 = 240;
+        /// 1 ms. It was 20 ms while the error was read from the moment
+        /// the task woke — a tick of jitter; read from the block's due
+        /// time it is the clock's own difference.
+        const REALIGN_SAMPLES: u64 = 12;
         const NO_CLOCK_SIM: bool = option_env!("MFSK_SIM_NO_CLOCK").is_some();
         // `MFSK_SIM_CLOCK_STEP_MS=N`: step the system clock by N ms once,
         // 90 s into the feed — what an NTP correction does to a board
@@ -828,7 +814,9 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
         let clock_step_ms: Option<i64> =
             option_env!("MFSK_SIM_CLOCK_STEP_MS").and_then(|v| v.parse().ok());
         let mut clock_stepped = false;
-        let t0 = unsafe { sys::esp_timer_get_time() };
+        // The recording's first sample is *at* `start_at`, whatever
+        // moment the task actually woke.
+        let t0 = start_at;
         let mut fed: u64 = 0;
         let mut src = 0usize; // index into pcm, after the lead is done
         let mut lead_left = lead;
@@ -873,9 +861,18 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
                     }
                 }
                 if src == 0 && !NO_CLOCK_SIM && loop_len == slot_samples {
-                    if let Some(to_b) = mfsk_app_shared::time_sync::samples_to_next_slot_12k_ms(
-                        (slot_samples / 12) as u64,
-                    ) {
+                    // Measured from when this block's first sample is
+                    // *due*, not from when the task got round to it: a
+                    // tick-late wake would otherwise read as a phase
+                    // error and be "corrected" into one.
+                    let due_esp = t0 + (fed * 1_000_000 / 12_000) as i64;
+                    let lag_us = unsafe { sys::esp_timer_get_time() } - due_esp;
+                    if let Some(to_b) = mfsk_app_shared::time_sync::utc_now_us().map(|u| {
+                        mfsk_app_shared::time_sync::samples_to_next_slot_12k_from_us(
+                            u.saturating_sub(lag_us.max(0) as u64),
+                            (slot_samples / 12) as u64,
+                        ) as usize
+                    }) {
                         // To the *target* — the boundary plus any
                         // deliberate `MFSK_SIM_OFFSET_MS` — not the
                         // boundary. Positive: still ahead (early).
@@ -894,8 +891,8 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
                                 src = ((-err) as usize).min(loop_len - 1);
                             }
                             log::info!(
-                                "uac SIM: re-aligned to the clock by {:+} ms",
-                                err * 1_000 / 12_000
+                                "uac SIM: re-aligned to the clock by {:+} samples",
+                                err
                             );
                         }
                     }
@@ -915,6 +912,14 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
                 src = if end == loop_len { 0 } else { end };
                 s
             };
+            // **Handed over once it has been "recorded"**, as a radio's
+            // audio is: a block covering [t, t + 21 ms) arrives after
+            // t + 21 ms, never before. This used to push first and sleep
+            // after, so the sink was handed audio from the future and
+            // its clock-read anchor was off by a block the other way
+            // from a radio's.
+            fed += block.len() as u64;
+            sleep_until_esp_us(t0 + (fed * 1_000_000 / 12_000) as i64);
             if let Ok(mut g) = AUDIO_SINK.lock() {
                 if let Some(sink) = g.as_mut() {
                     sink.push_samples(block);
@@ -922,17 +927,6 @@ pub fn spawn_sim_feed(src: SimSource, slot_samples: usize, lead_silence: usize) 
             }
             crate::waterfall_feed::push(block);
             pushed_total = pushed_total.wrapping_add(block.len() as u32);
-            fed += block.len() as u64;
-            let due = (fed * 1_000_000 / 12_000) as i64;
-            let now = unsafe { sys::esp_timer_get_time() } - t0;
-            if due > now {
-                unsafe {
-                    sys::vTaskDelay(
-                        (((due - now) / 1_000).max(1) as u32)
-                            / (1_000 / sys::configTICK_RATE_HZ).max(1),
-                    )
-                };
-            }
         }
     }
 
@@ -1112,6 +1106,24 @@ pub fn set_audio_sink<S: AudioSink>(sink: S) {
 /// (100 ms) blocks and emits `ChunkMsg::SlotEnd` every
 /// [`SLOT_SAMPLES_12K`] (15 s, one FT8 slot), publishing the new slot
 /// index via `time_sync::publish_capture_slot`.
+/// Sleep until `esp_timer` reads at least `at_us`, in whole ticks,
+/// rounded **up**. Never early — `vTaskDelay` of a truncated count wakes
+/// before the deadline, and a block handed over before its last sample
+/// is due is audio from the future. Late by up to a tick is fine: that
+/// is what a radio's delivery looks like too, and `GridPhase` takes the
+/// minimum over a slot of blocks precisely so that lateness drops out.
+/// No spin: this task shares core 0 and priority 6 with the decoder.
+fn sleep_until_esp_us(at_us: i64) {
+    let tick_us = 1_000_000 / sys::configTICK_RATE_HZ as i64;
+    loop {
+        let left = at_us - unsafe { sys::esp_timer_get_time() };
+        if left <= 0 {
+            return;
+        }
+        unsafe { sys::vTaskDelay(((left + tick_us - 1) / tick_us) as u32) };
+    }
+}
+
 /// Where the SIM feed began its current pass over the recording, as an
 /// index into the stream it has pushed through the sink (wrapping u32,
 /// ~99 h at 12 kHz; only differences are used). `u32::MAX`
@@ -1166,6 +1178,8 @@ struct Ft8ChunkSink {
     /// boundary's index in the stream, for [`SIM_PASS_START`] to be
     /// compared against without either side reading a clock.
     sent_total: u32,
+    /// This slot's blocks against UTC — see `time_sync::GridPhase`.
+    phase: mfsk_app_shared::time_sync::GridPhase,
 }
 // SAFETY: `QueueHandle_t` is a raw pointer into IDF-owned state; the
 // IDF queue API is thread-safe by design (that's the whole point of a
@@ -1231,6 +1245,7 @@ impl Ft8ChunkSink {
             utc_owns_phase_logged: false,
             wav_idx: 0,
             sent_total: 0,
+            phase: mfsk_app_shared::time_sync::GridPhase::new(),
         }
     }
 }
@@ -1326,7 +1341,19 @@ impl AudioSink for Ft8ChunkSink {
                 // `audio_fill=168000 != reported total 180756` and, in
                 // NTP mode where the drift re-anchor fires often, as
                 // every other slot decoding nothing (2026-09-19).
-                self.slot_target = remain;
+                // **From the block's last sample, not its first.** The
+                // clock was read now, and what arrives now is audio
+                // that has already happened — a radio's block ends
+                // about now; its first sample is a block older. So the
+                // boundary is `remain` past the *end* of this block,
+                // and if the block itself spans the boundary, inside
+                // it (the per-sample split below lands it exactly).
+                let before = self.slot_samples + self.chunk.len();
+                let mut target = before + samples.len() + remain;
+                if target > SLOT_SAMPLES_12K && target - SLOT_SAMPLES_12K >= before {
+                    target -= SLOT_SAMPLES_12K;
+                }
+                self.slot_target = target;
                 self.coarse_anchored = true;
                 // Grid lock state (#356b): a plausible clock, disciplined
                 // or not. `decode_pipeline`'s air-sync raises this to
@@ -1344,6 +1371,22 @@ impl AudioSink for Ft8ChunkSink {
                     remain / 12,
                     mfsk_app_shared::time_sync::utc_now_ms().map_or(-1, |ms| (ms % 1000) as i64),
                     self.slot_samples,
+                );
+            }
+        }
+        // One observation of the grid against UTC per block, taken
+        // before the block is split: samples from this block's last
+        // sample to the grid's next boundary, against the clock's.
+        if self.coarse_anchored {
+            if let Some(u) = mfsk_app_shared::time_sync::utc_now_us() {
+                let at_end = (self.slot_samples + self.chunk.len() + samples.len()) as i64;
+                self.phase.observe(
+                    self.slot_target as i64 - at_end,
+                    mfsk_app_shared::time_sync::samples_to_next_slot_12k_from_us(
+                        u,
+                        SLOT_SECS as u64 * 1_000,
+                    ),
+                    SLOT_SAMPLES_12K as i64,
                 );
             }
         }
@@ -1373,6 +1416,15 @@ impl AudioSink for Ft8ChunkSink {
                 self.sent_total = self.sent_total.wrapping_add(n as u32);
                 if self.slot_samples >= self.slot_target {
                     grid_vs_sim_log(self.wav_idx, self.sent_total);
+                    let phase_est = self.phase.take();
+                    if let Some(e) = phase_est {
+                        log::info!(
+                            "uac: slot {} grid {:+} samples ({:+.1} ms) against UTC, min over the slot's blocks",
+                            self.wav_idx + 1,
+                            e,
+                            e as f32 / 12.0,
+                        );
+                    }
                     send_chunk_timed(
                         self.chunk_q,
                         Box::new(ChunkMsg::SlotEnd {
@@ -1487,9 +1539,28 @@ impl AudioSink for Ft8ChunkSink {
                             let target = if remain <= DEAD_ZONE_SAMPLES
                                 || remain >= SLOT_SAMPLES_12K - DEAD_ZONE_SAMPLES
                             {
-                                // Already on the grid, either side of
-                                // it. Leave the slot alone.
-                                SLOT_SAMPLES_12K
+                                // On the grid to within the dead zone,
+                                // which is as close as one clock read at
+                                // a chunk's delivery can say. The slot's
+                                // blocks say better (`GridPhase`): take
+                                // that out, to the sample. Before this,
+                                // an error inside ±200 ms stayed for the
+                                // session — up to 100 ms of it from the
+                                // chunk rounding, ~10 ms from the anchor.
+                                match phase_est {
+                                    Some(e) if e.unsigned_abs() >= FINE_PHASE_MIN_SAMPLES => {
+                                        let e = e.clamp(
+                                            -(DEAD_ZONE_SAMPLES as i64),
+                                            DEAD_ZONE_SAMPLES as i64,
+                                        );
+                                        log::info!(
+                                            "uac: grid {e:+} samples off UTC — next slot {} samples",
+                                            SLOT_SAMPLES_12K as i64 - e
+                                        );
+                                        (SLOT_SAMPLES_12K as i64 - e) as usize
+                                    }
+                                    _ => SLOT_SAMPLES_12K,
+                                }
                             } else {
                                 // End this slot on the next UTC
                                 // boundary. Exact, and done in one
@@ -1670,6 +1741,12 @@ const SLOT_DRIFT_REANCHOR_MS: u32 = 250;
 /// that costs a slot must not trigger on that. 200 ms, a fifth of the
 /// ±1.0 s the coarse search covers.
 const DEAD_ZONE_SAMPLES: usize = 2_400;
+
+/// The smallest `GridPhase` error the NTP path corrects: 6 samples,
+/// 0.5 ms. Below that the estimate is the clock's microsecond read and
+/// the minimum's own spread; moving the grid for it would only chase
+/// noise.
+const FINE_PHASE_MIN_SAMPLES: u64 = 6;
 
 /// Floor for a cold-acquisition slot, in samples. `acq` is bounded by
 /// ±90 000, so the shortening branch cannot go below 90 000 on its own;
