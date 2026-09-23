@@ -30,7 +30,7 @@
 //!
 //! Built as the JT9 counterpart to `tests/jt65_sweep.rs`, itself the
 //! closing step of the JT65 decode-chain bug hunt (#24, fixed in
-//! #168). Cross-checked `decode_scan_default` against a freshly
+//! #168). Cross-checked `DecodeRequest::new(..).decode()` against a freshly
 //! `jt9sim`-generated signal ("CQ JL1NIE PM95" @ 1400 Hz, jt9sim's
 //! hardcoded center frequency) as an independent-reference sanity
 //! check beyond the existing golden-WAV test
@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 #[allow(dead_code)]
 mod common;
 use common::load_wav_f32_opt;
-use mfsk_core::jt9::decode_scan_default;
+use mfsk_core::jt9::DecodeRequest;
 
 const GOLDEN_CALL1: &str = "CQ";
 const GOLDEN_CALL2: &str = "JL1NIE";
@@ -85,7 +85,7 @@ fn parse_snr_tag(tag: &str) -> Option<i32> {
 }
 
 fn decode_wav_jt9(audio: &[f32]) -> bool {
-    decode_scan_default(audio, 12_000).iter().any(|d| {
+    DecodeRequest::new(audio, 12_000).decode().iter().any(|d| {
         matches!(
             &d.message,
             mfsk_core::msg::Jt72Message::Standard { call1, call2, grid_or_report }
