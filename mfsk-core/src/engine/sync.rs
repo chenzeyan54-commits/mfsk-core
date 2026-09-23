@@ -35,6 +35,22 @@ pub struct SyncCandidate {
     pub score: f32,
 }
 
+/// Move the `top_k` highest-scoring candidates to the front of `refs`
+/// (in no particular order) and return how many that is: `top_k`, or
+/// fewer when `refs` is shorter. O(N) via `select_nth_unstable_by`.
+/// NaN scores compare as equal. Shared by the three DT estimators below.
+fn partition_top_k_by_score(refs: &mut [&SyncCandidate], top_k: usize) -> usize {
+    let k = top_k.min(refs.len());
+    if k > 0 && k < refs.len() {
+        refs.select_nth_unstable_by(k - 1, |a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(core::cmp::Ordering::Equal)
+        });
+    }
+    k
+}
+
 /// DT median of the top-`top_k` highest-score coarse-sync candidates.
 ///
 /// Used to bootstrap slot alignment when zero confirmed decodes are
@@ -70,14 +86,7 @@ pub fn bootstrap_dt_median(cands: &[SyncCandidate], top_k: usize) -> Option<f32>
     // sort; for N≈200 / K=5 / one call per slot the saving is sub-µs,
     // but the cost is identical to the naïve approach so we take it.
     let mut refs: Vec<&SyncCandidate> = cands.iter().collect();
-    let k = top_k.min(refs.len());
-    if k < refs.len() {
-        refs.select_nth_unstable_by(k - 1, |a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(core::cmp::Ordering::Equal)
-        });
-    }
+    let k = partition_top_k_by_score(&mut refs, top_k);
     let mut dts: Vec<f32> = refs[..k].iter().map(|c| c.dt_sec).collect();
     dts.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
     let n = dts.len();
@@ -232,14 +241,7 @@ pub fn circular_dt_medoid(
     if refs.is_empty() {
         return None;
     }
-    let k = top_k.min(refs.len());
-    if k < refs.len() {
-        refs.select_nth_unstable_by(k - 1, |a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(core::cmp::Ordering::Equal)
-        });
-    }
+    let k = partition_top_k_by_score(&mut refs, top_k);
     let picked = &refs[..k];
     let half = 0.5 * period_s;
     let wrap = |mut d: f32| -> f32 {
@@ -292,14 +294,7 @@ pub fn circular_dt_estimate(
         return None;
     }
     let mut refs: Vec<&SyncCandidate> = cands.iter().collect();
-    let k = top_k.min(refs.len());
-    if k < refs.len() {
-        refs.select_nth_unstable_by(k - 1, |a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(core::cmp::Ordering::Equal)
-        });
-    }
+    let k = partition_top_k_by_score(&mut refs, top_k);
     let w = 2.0 * PI / period_s;
     let (mut sum_c, mut sum_s, mut sum_w) = (0.0f32, 0.0f32, 0.0f32);
     for c in &refs[..k] {

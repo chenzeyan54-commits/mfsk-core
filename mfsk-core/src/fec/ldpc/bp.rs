@@ -56,6 +56,24 @@ pub fn crc14(data: &[u8]) -> u16 {
     crc
 }
 
+/// Append CRC-14 to a 77-bit message, producing the 91 info bits the
+/// (174,91) encoder takes. The inverse of [`check_crc14`]: bits packed
+/// MSB-first into 12 bytes, CRC over them, CRC bits appended MSB-first.
+/// WSJT-X `get_crc14` in `lib/crc.f90` via `genft8.f90` / `genft4.f90`.
+pub fn append_crc14(message77: &[u8; 77]) -> [u8; 91] {
+    let mut bytes = [0u8; 12];
+    for (i, &bit) in message77.iter().enumerate() {
+        bytes[i / 8] |= (bit & 1) << (7 - i % 8);
+    }
+    let crc = crc14(&bytes);
+    let mut info = [0u8; 91];
+    info[..77].copy_from_slice(message77);
+    for i in 0..14 {
+        info[77 + i] = ((crc >> (13 - i)) & 1) as u8;
+    }
+    info
+}
+
 /// Verify CRC-14 for a 91-bit decoded word (77 msg + 14 CRC).
 /// Packs bits into 12 bytes (big-endian, MSB first), zeros the CRC field,
 /// computes CRC-14, then compares with the stored CRC bits.

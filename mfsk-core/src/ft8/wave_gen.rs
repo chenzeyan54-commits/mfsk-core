@@ -34,29 +34,15 @@ use alloc::vec::Vec;
 use super::Ft8;
 use super::{
     ldpc::osd::ldpc_encode,
-    params::{LDPC_K, MSG_BITS, NN},
+    params::{MSG_BITS, NN},
 };
-
-/// Append 14 CRC bits to a 77-bit message, producing 91 info bits. Uses the
-/// shared CRC-14 implementation from mfsk-fec.
-fn append_crc14(message77: &[u8]) -> [u8; LDPC_K] {
-    let mut bytes = [0u8; 12];
-    for (i, &bit) in message77.iter().enumerate() {
-        bytes[i / 8] |= (bit & 1) << (7 - i % 8);
-    }
-    let crc = crate::fec::ldpc::crc14(&bytes);
-
-    let mut info = [0u8; LDPC_K];
-    info[..MSG_BITS].copy_from_slice(message77);
-    for i in 0..14 {
-        info[MSG_BITS + i] = ((crc >> (13 - i)) & 1) as u8;
-    }
-    info
-}
 
 /// Encode a 77-bit message into a 79-symbol FT8 tone sequence.
 pub fn message_to_tones(message77: &[u8]) -> [u8; NN] {
-    let info = append_crc14(message77);
+    let message77: &[u8; MSG_BITS] = message77
+        .try_into()
+        .expect("message_to_tones: message77 must be 77 bits");
+    let info = crate::fec::ldpc::append_crc14(message77);
     let cw = ldpc_encode(&info);
     let generic = crate::engine::tx::codeword_to_itone::<Ft8>(&cw);
     let mut out = [0u8; NN];

@@ -16,12 +16,9 @@
 //! The burst envelope *is* ramped — see [`synthesize_audio_into`].
 
 use alloc::vec::Vec;
-use core::f32::consts::TAU;
-#[cfg(not(feature = "std"))]
-use num_traits::Float;
 
 use crate::engine::ModulationParams;
-use crate::engine::dsp::envelope;
+use crate::engine::dsp::cpfsk;
 
 use super::Wspr;
 
@@ -31,7 +28,7 @@ use super::Wspr;
 /// samples and pass them as `out`.
 #[inline]
 pub fn synthesize_audio_len(sample_rate: u32) -> usize {
-    let nsps = (sample_rate as f32 * <Wspr as ModulationParams>::SYMBOL_DT).round() as usize;
+    let nsps = cpfsk::nsps(sample_rate, <Wspr as ModulationParams>::SYMBOL_DT);
     nsps * 162
 }
 
@@ -57,37 +54,27 @@ pub fn synthesize_audio_into(
     amplitude: f32,
 ) {
     // NSPS scales by the sample rate — the trait constant is for 12 kHz.
-    let nsps = (sample_rate as f32 * <Wspr as ModulationParams>::SYMBOL_DT).round() as usize;
+    let nsps = cpfsk::nsps(sample_rate, <Wspr as ModulationParams>::SYMBOL_DT);
     assert_eq!(
         out.len(),
         nsps * 162,
         "synthesize_audio_into: out.len() must equal synthesize_audio_len()"
     );
-    let tone_spacing = <Wspr as ModulationParams>::TONE_SPACING_HZ;
-    let mut phase = 0.0f32;
-    let mut idx = 0usize;
     for &sym in symbols {
         assert!(sym < 4, "WSPR channel symbol must be in 0..=3");
-        let freq = base_freq_hz + sym as f32 * tone_spacing;
-        let dphi = TAU * freq / sample_rate as f32;
-        for _ in 0..nsps {
-            out[idx] = amplitude * phase.cos();
-            idx += 1;
-            phase += dphi;
-            if phase > TAU {
-                phase -= TAU;
-            } else if phase < -TAU {
-                phase += TAU;
-            }
-        }
     }
-
-    // Transmit-envelope ramp (issue #259). Without it the burst starts
-    // and ends on a step discontinuity — a broadband click at both
-    // edges, independent of symbol-transition shaping. See
+    // Plain CPFSK plus the transmit-envelope ramp (issue #259). See
     // `engine::dsp::envelope` for why WSPR gets an envelope ramp but
     // deliberately no GFSK symbol shaping.
-    crate::engine::dsp::envelope::apply_ramp(out, envelope::ramp_samples(sample_rate, nsps));
+    cpfsk::synth_f32_into(
+        out,
+        symbols,
+        nsps,
+        base_freq_hz,
+        <Wspr as ModulationParams>::TONE_SPACING_HZ,
+        sample_rate,
+        amplitude,
+    );
 }
 
 /// Synthesize a WSPR transmission as mono `f32` audio samples.

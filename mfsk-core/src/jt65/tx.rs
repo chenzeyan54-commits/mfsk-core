@@ -10,10 +10,8 @@
 //!    data positions emit `gray(sent[k]) + 2`.
 //! 6. Emit CPFSK audio at the JT65A baud (≈ 2.69 Hz tone spacing).
 
-use core::f32::consts::TAU;
-
 use crate::engine::ModulationParams;
-use crate::engine::dsp::envelope;
+use crate::engine::dsp::cpfsk;
 use crate::fec::Rs63_12;
 
 use super::Jt65;
@@ -55,32 +53,20 @@ pub fn synthesize_audio(
     base_freq_hz: f32,
     amplitude: f32,
 ) -> Vec<f32> {
-    let nsps = (sample_rate as f32 * <Jt65 as ModulationParams>::SYMBOL_DT).round() as usize;
-    let tone_spacing = <Jt65 as ModulationParams>::TONE_SPACING_HZ;
-    let mut out: Vec<f32> = Vec::with_capacity(nsps * 126);
-    let mut phase = 0.0f32;
     for &sym in tones {
         assert!(sym <= 65, "JT65 tone must be in 0..=65");
-        let freq = base_freq_hz + sym as f32 * tone_spacing;
-        let dphi = TAU * freq / sample_rate as f32;
-        for _ in 0..nsps {
-            out.push(amplitude * phase.cos());
-            phase += dphi;
-            if phase > TAU {
-                phase -= TAU;
-            } else if phase < -TAU {
-                phase += TAU;
-            }
-        }
     }
-
-    // Transmit-envelope ramp (issue #259): without it the burst starts
-    // and ends on a step discontinuity — a broadband click at both
-    // edges. WSJT-X's modulator fades this path out; see
-    // `engine::dsp::envelope` for why both ends are ramped here and
-    // why this protocol deliberately gets no symbol shaping.
-    envelope::apply_ramp(&mut out, envelope::ramp_samples(sample_rate, nsps));
-    out
+    // Plain CPFSK plus the transmit-envelope ramp (issue #259); see
+    // `engine::dsp::envelope` for why this protocol deliberately gets
+    // no symbol shaping.
+    cpfsk::synth_f32(
+        tones,
+        cpfsk::nsps(sample_rate, <Jt65 as ModulationParams>::SYMBOL_DT),
+        base_freq_hz,
+        <Jt65 as ModulationParams>::TONE_SPACING_HZ,
+        sample_rate,
+        amplitude,
+    )
 }
 
 /// Convenience: pack a standard message via `Jt72` and synthesize.
