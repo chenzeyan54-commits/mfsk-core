@@ -21,12 +21,7 @@ use crate::fec::ConvFano232;
 use super::Jt9;
 use super::interleave::interleave;
 use super::sync_pattern::JT9_ISYNC;
-
-/// Gray-map a 3-bit value: `n ^ (n >> 1)`.
-#[inline]
-fn gray3(n: u8) -> u8 {
-    (n ^ (n >> 1)) & 0x7
-}
+use crate::engine::gray::gray;
 
 /// Encode 72 info bits into 85 channel tones (values 0..=8, with the
 /// 16 sync positions carrying tone 0 and data symbols carrying
@@ -54,7 +49,7 @@ pub fn encode_channel_symbols(info_bits: &[u8; 72]) -> [u8; 85] {
         let b1 = bits207[3 * i + 1];
         let b2 = bits207[3 * i + 2];
         let raw = (b0 << 2) | (b1 << 1) | b2;
-        data_symbols[i] = gray3(raw);
+        data_symbols[i] = gray(raw, 3);
     }
 
     // Step 6: splice sync (tone 0) and data (tone = gray+1) into 85 slots.

@@ -110,7 +110,6 @@ use crate::msg::Jt72Codec;
 pub mod chase;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod decode_request;
-pub mod gray;
 pub mod interleave;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod rx;
@@ -123,7 +122,6 @@ pub mod tx;
 pub use chase::ChaseParams;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub use decode_request::{DecodeRequest, SniperRequest};
-pub use gray::{gray6, inv_gray6};
 pub use interleave::{deinterleave, interleave};
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub use rx::{Jt65Demod, demodulate_aligned};
@@ -401,7 +399,7 @@ impl ModulationParams for Jt65 {
     const SYMBOL_DT: f32 = 4460.0 / 12_000.0;
     const TONE_SPACING_HZ: f32 = 12_000.0 / 4460.0; // ≈ 2.6906 Hz
     /// No Gray map here — Gray is applied at the *symbol* level
-    /// (6-bit) in [`gray::gray6`], not at the FSK-tone level. A
+    /// (6-bit) in [`crate::engine::gray::gray`], not at the FSK-tone level. A
     /// minimal identity map satisfies the trait's `GRAY_MAP.len()
     /// == NTONES` invariant.
     const GRAY_MAP: &'static [u8] = &IDENTITY_66;

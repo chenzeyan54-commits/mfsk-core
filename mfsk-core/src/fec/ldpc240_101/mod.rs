@@ -71,6 +71,24 @@ pub fn crc24(bits: &[u8]) -> u32 {
     v
 }
 
+/// Append CRC-24 to a 77-bit message, producing the 101 info bits the
+/// (240,101) encoder takes. The inverse of [`check_crc24`]: CRC over the
+/// 101-bit word with the CRC slot zeroed, bits appended MSB-first —
+/// WSJT-X `get_crc24` via `lib/fst4/genfst4.f90`. The CRC-24 sibling of
+/// [`crate::fec::ldpc::append_crc14`]; lived privately in `fst4::encode`
+/// until #391.
+pub fn append_crc24(message77: &[u8; 77]) -> [u8; LDPC_K] {
+    let mut info = [0u8; LDPC_K];
+    info[..77].copy_from_slice(message77);
+    // `info`'s CRC slot is still zero here, which is the word
+    // `get_crc24` is defined over.
+    let crc = crc24(&info);
+    for i in 0..24 {
+        info[77 + i] = ((crc >> (23 - i)) & 1) as u8;
+    }
+    info
+}
+
 /// Verify CRC-24 for a 101-bit decoded word (77 msg + 24 CRC).
 ///
 /// Accepts any `&[u8]` slice; lengths other than [`LDPC_K`] (= 101) are
@@ -362,6 +380,24 @@ mod tests {
     use super::*;
     use crate::fec::ldpc::bp::bp_decode_generic;
     use crate::fec::ldpc::osd::ldpc_encode_generic;
+
+    /// `append_crc24` produces what `check_crc24` accepts, and a single
+    /// flipped message bit breaks it.
+    #[test]
+    fn append_crc24_roundtrips_through_check() {
+        for seed in 0..32u32 {
+            let mut m = [0u8; 77];
+            for (i, b) in m.iter_mut().enumerate() {
+                *b = ((seed.wrapping_mul(2_654_435_761) >> (i % 29)) & 1) as u8;
+            }
+            let info = append_crc24(&m);
+            assert_eq!(&info[..77], &m[..]);
+            assert!(check_crc24(&info), "seed={seed}");
+            let mut bad = info;
+            bad[(seed as usize) % 77] ^= 1;
+            assert!(!check_crc24(&bad), "seed={seed}: flipped bit passed");
+        }
+    }
 
     /// Round-trip: encode a 101-bit info word, feed perfect LLRs,
     /// decoder should recover the original info. Exercises the full

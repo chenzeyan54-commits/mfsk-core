@@ -19,9 +19,9 @@ use crate::engine::dsp::symbol_fft::SymbolFft;
 use num_complex::Complex;
 
 use super::Jt65;
-use super::gray::inv_gray6;
 use super::interleave::deinterleave;
 use super::sync_pattern::JT65_NPRC;
+use crate::engine::gray::inv_gray;
 
 /// Everything one pass of the JT65 demodulator produces.
 ///
@@ -183,8 +183,8 @@ pub fn demodulate_aligned(
                 second_tone = tone;
             }
         }
-        symbols[k] = inv_gray6(best_tone);
-        second_tone_sym[k] = inv_gray6(second_tone);
+        symbols[k] = inv_gray(best_tone, 6);
+        second_tone_sym[k] = inv_gray(second_tone, 6);
         conf[k] = if best_pwr > 0.0 {
             ((best_pwr - second_pwr.max(0.0)) / best_pwr).clamp(0.0, 1.0)
         } else {

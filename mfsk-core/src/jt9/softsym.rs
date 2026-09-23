@@ -827,15 +827,9 @@ mod tests {
         use crate::jt9::sync_pattern::JT9_ISYNC;
         use crate::msg::jt72::pack_standard;
 
-        // Same forward-gray as production:
-        let fwd_gray3 = |n: u8| -> u8 { (n ^ (n >> 1)) & 0x7 };
-        // Inverse:
-        let inv_gray3 = |g: u8| -> u8 {
-            let mut n = g & 0x7;
-            n ^= n >> 1;
-            n ^= n >> 2;
-            n & 0x7
-        };
+        // Same Gray code as production.
+        let fwd_gray3 = |n: u8| crate::engine::gray::gray(n, 3);
+        let inv_gray3 = |g: u8| crate::engine::gray::inv_gray(g, 3);
 
         let words = pack_standard(c1, c2, grid).expect("pack");
         let mut info = [0u8; 72];
