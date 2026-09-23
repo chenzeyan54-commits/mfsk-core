@@ -50,29 +50,10 @@ pub struct WsprResult {
     /// decode — same `10·log10(smspec) − 26.3` formula wsprd itself
     /// reports next to a spot (`wsprd.c:1093`, see
     /// [`super::coarse_baseband::BasebandCandidate::snr_db`]). Set by
-    /// [`decode_scan`] / [`decode_scan_subtract`], which always go
-    /// through the coarse search; direct [`decode_at`] /
-    /// [`decode_at_baseband`] / [`decode_at_baseband_nblocks`] calls
-    /// have no coarse candidate to derive it from and leave this `0.0`.
+    /// [`super::DecodeRequest`], which always goes through the coarse
+    /// search; [`super::SniperRequest`] has no coarse candidate to
+    /// derive it from and leaves this `0.0`.
     pub snr_db: f32,
-}
-
-/// Decode one WSPR frame at a known (freq, start_sample). Returns `None`
-/// if the Fano decoder fails to converge or the message doesn't unpack.
-///
-/// Routes through the new 375 Hz baseband demod path
-/// ([`super::demod::bit_metrics_from_audio`]) — port of WSJT-X
-/// `wsprd.c::noncoherent_sequence_detection` at `nblock=1`. Per-symbol
-/// explicit 4-tone Goertzel on the decimated baseband. Closes the
-/// W5BIT and NM7J gaps that the previous 12 kHz / 8192-pt-FFT path
-/// couldn't reach.
-pub fn decode_at(
-    audio: &[f32],
-    sample_rate: u32,
-    start_sample: usize,
-    freq_hz: f32,
-) -> Option<WsprResult> {
-    decode_at_with_drift(audio, sample_rate, start_sample, freq_hz, 0.0)
 }
 
 /// Callsigns confirmed by a **Fano** decode earlier in the same scan.
@@ -212,96 +193,6 @@ mod callsign_table_tests {
     }
 }
 
-/// Same as [`decode_at`] but with an explicit drift estimate
-/// (`drift_hz` is total drift across the 110.6 s frame; matches
-/// wsprd's `drift1`). The caller supplies the drift for now; a
-/// future drift-search slice will sweep it inside the decode loop
-/// like wsprd does.
-/// Decode at known alignment using a pre-decimated baseband. Avoids
-/// the O(NFFT1) decimation cost when many candidates share the same
-/// audio (e.g. inside `decode_scan` / `decode_scan_subtract`).
-///
-/// `idat`, `qdat`: 46080-sample 375 Hz baseband from
-/// [`super::baseband::decimate_to_baseband`].
-/// `freq_hz`: tone-0 frequency in audio Hz (matches our coarse-search
-/// convention; converted to wsprd's tone-center via `+1.5·df` inside).
-/// `start_sample`: audio-rate sample where symbol 0 starts.
-pub fn decode_at_baseband(
-    idat: &[f32],
-    qdat: &[f32],
-    sample_rate: u32,
-    start_sample: usize,
-    freq_hz: f32,
-    drift_hz: f32,
-) -> Option<WsprResult> {
-    decode_at_baseband_nblocks(
-        idat,
-        qdat,
-        sample_rate,
-        start_sample,
-        freq_hz,
-        drift_hz,
-        &[1],
-    )
-}
-
-/// Variant of [`decode_at_baseband`] that tries multiple `nblock`
-/// values (e.g. `&[1, 2, 3]`) for coherent block detection. The hot
-/// loop scales O(`nblocks.len()`); used by pass 2 of `decode_scan`
-/// where the noise-floor reduction makes the extra cost worth it.
-pub fn decode_at_baseband_nblocks(
-    idat: &[f32],
-    qdat: &[f32],
-    sample_rate: u32,
-    start_sample: usize,
-    freq_hz: f32,
-    drift_hz: f32,
-    nblocks: &[usize],
-) -> Option<WsprResult> {
-    decode_at_baseband_nblocks_gated(
-        idat,
-        qdat,
-        sample_rate,
-        start_sample,
-        freq_hz,
-        drift_hz,
-        nblocks,
-        None,
-    )
-}
-
-/// [`decode_at_baseband_nblocks`] with an explicit OSD gate.
-///
-/// `confirmed` is the set of callsigns an earlier Fano decode already
-/// established (see [`WsprCallsignTable`]). `None` — what the
-/// un-gated wrappers pass — rejects every OSD result outright, which
-/// is the only safe default for a caller with no scan-level context:
-/// OSD synthesises a valid codeword for any input, so ungated it is a
-/// phantom generator, not a sensitivity feature.
-#[allow(clippy::too_many_arguments)]
-pub fn decode_at_baseband_nblocks_gated(
-    idat: &[f32],
-    qdat: &[f32],
-    sample_rate: u32,
-    start_sample: usize,
-    freq_hz: f32,
-    drift_hz: f32,
-    nblocks: &[usize],
-    confirmed: Option<&WsprCallsignTable>,
-) -> Option<WsprResult> {
-    decode_at_baseband_nblocks_gated_drift(
-        idat,
-        qdat,
-        sample_rate,
-        start_sample,
-        freq_hz,
-        drift_hz,
-        nblocks,
-        confirmed,
-        true,
-    )
-}
-
 /// wsprd's refine cascade (`wsprd.c:1221-1277`), in full. Each stage is
 /// `sync_and_demodulate` in mode 0 (search lag, freq fixed) or mode 1
 /// (search freq, lag fixed), keeping whichever cell scores highest on
@@ -320,7 +211,7 @@ pub fn decode_at_baseband_nblocks_gated(
 /// ±4 Hz coarse grid got wrong, and without stages 4-5 the alignment
 /// stays a coarse-grid cell away from the true one.
 ///
-/// Extracted out of [`decode_at_baseband_nblocks_gated_drift`] so
+/// Extracted out of [`decode_at_baseband_inner`] so
 /// [`debug_refined_sync`] can call it without duplicating the cascade
 /// — the two need to agree on the exact value `minsync2` is compared
 /// against, or a diagnostic built against a near-copy is answering a
@@ -434,7 +325,7 @@ fn refine_cascade(
 /// `minsync2` keeps", which needs the per-candidate refined sync, not
 /// just the aggregate pass/fail counters `wspr::instrument` tracks.
 ///
-/// `freq_hz`/`start_sample` follow [`decode_at_baseband_nblocks_gated_drift`]'s
+/// `freq_hz`/`start_sample` follow [`decode_at_baseband_inner`]'s
 /// own conventions (tone-0 audio Hz; audio-rate sample index).
 #[cfg(any(test, feature = "internal-testing"))]
 pub fn debug_refined_sync(
@@ -463,8 +354,16 @@ pub fn debug_refined_sync(
     .3
 }
 
-/// [`decode_at_baseband_nblocks_gated`] with wsprd's per-pass drift
-/// switch.
+/// Point decode at a known alignment on a pre-decimated 375 Hz
+/// baseband: wsprd's refine cascade, the `minsync2` gate, then Fano and
+/// the OSD ladder. Public through [`super::SniperRequest`], which
+/// documents each argument as a builder method.
+///
+/// `confirmed` is the set of callsigns an earlier Fano decode already
+/// established (see [`WsprCallsignTable`]). `None` rejects every OSD
+/// result outright, which is the only safe default for a caller with no
+/// scan-level context: OSD synthesises a valid codeword for any input,
+/// so ungated it is a phantom generator, not a sensitivity feature.
 ///
 /// `refine_drift` mirrors `wsprd.c:1236`'s `if (ipass < 2)`: the first
 /// two passes try `drift ± 0.5` around the coarse estimate and keep
@@ -473,7 +372,7 @@ pub fn debug_refined_sync(
 /// a lower-variance frequency estimate on the weak signals that are
 /// all that remain by then.
 #[allow(clippy::too_many_arguments)]
-pub fn decode_at_baseband_nblocks_gated_drift(
+pub(super) fn decode_at_baseband_inner(
     idat: &[f32],
     qdat: &[f32],
     sample_rate: u32,
@@ -531,7 +430,7 @@ pub fn decode_at_baseband_nblocks_gated_drift(
 
 /// Mode 2 of the refine→demod cascade: bit metrics + Fano/OSD at an
 /// *already*-refined alignment. Split out of
-/// [`decode_at_baseband_nblocks_gated_drift`] so callers that need to
+/// [`decode_at_baseband_inner`] so callers that need to
 /// **rank candidates by refined sync before deciding which ones are
 /// worth the ladder** — [`decode_pass2_top_n`]'s whole reason for
 /// existing — can call [`refine_cascade`] once per candidate, sort,
@@ -540,7 +439,7 @@ pub fn decode_at_baseband_nblocks_gated_drift(
 /// when the two were one function.
 ///
 /// `nblocks`/`confirmed` and the return value are unchanged from
-/// [`decode_at_baseband_nblocks_gated_drift`]'s own contract; this is
+/// [`decode_at_baseband_inner`]'s own contract; this is
 /// a pure extraction, not a behaviour change — see that function's
 /// remaining body for the minsync2 gate this is called after.
 ///
@@ -842,23 +741,6 @@ fn decode_from_refined(
     best_type1.map(|(_, d)| d).or(best_other.map(|(_, d)| d))
 }
 
-pub fn decode_at_with_drift(
-    audio: &[f32],
-    sample_rate: u32,
-    start_sample: usize,
-    freq_hz: f32,
-    drift_hz: f32,
-) -> Option<WsprResult> {
-    let (idat, qdat) = super::baseband::decimate_to_baseband(audio);
-    decode_at_baseband(&idat, &qdat, sample_rate, start_sample, freq_hz, drift_hz)
-}
-
-/// Scan an audio buffer for any number of WSPR frames, returning all
-/// successful decodes. Runs a coarse (freq, time) search with the given
-/// [`SearchParams`], then attempts [`decode_at`] on each candidate in
-/// score-descending order. Duplicate decodes (same message within ±5 Hz
-/// and ±1 symbol) are collapsed to the single earliest-candidate hit,
-/// so each transmission appears at most once in the output.
 /// Half-window (in seconds) of front-side zero padding added before
 /// the search runs. WSPR transmissions can start up to ~2 s **before**
 /// the nominal slot anchor (wsprd reports such cases as `dt < -1.0`);
@@ -885,13 +767,16 @@ fn decode_pass1_candidate(
     // (`wsprd.c:1216`). Passing 0.0 here instead discarded that search's
     // entire output, leaving the drift axis of the coarse grid costing
     // runtime and buying nothing.
-    let mut d = decode_at_baseband(
+    let mut d = decode_at_baseband_inner(
         idat,
         qdat,
         sample_rate,
         c.start_sample,
         c.freq_hz,
         c.drift_hz,
+        &[1],
+        None,
+        true,
     )?;
     let start_refined = d.start_sample;
     d.dt_sec = (start_refined as i64 - pad as i64) as f32 / sample_rate as f32
@@ -916,7 +801,7 @@ fn decode_pass2_candidate(
     c: &super::coarse_baseband::BasebandCandidate,
     confirmed: &WsprCallsignTable,
 ) -> Option<WsprResult> {
-    let mut d = decode_at_baseband_nblocks_gated_drift(
+    let mut d = decode_at_baseband_inner(
         idat,
         qdat,
         sample_rate,
@@ -978,9 +863,9 @@ fn decode_pass2_candidate(
 pub const PASS2_DEEP_LADDER_TOP_N: usize = 2;
 
 /// `minsync2`'s final-pass threshold — matches
-/// [`decode_at_baseband_nblocks_gated_drift`]'s own, `refine_drift =
+/// [`decode_at_baseband_inner`]'s own, `refine_drift =
 /// false`. Shared by [`rank_pass2_candidates`] and
-/// [`decode_at_baseband_nblocks_gated_drift`] rather than duplicated
+/// [`decode_at_baseband_inner`] rather than duplicated
 /// as two magic-number `const`s that could drift apart.
 #[cfg(feature = "wspr-pass2-topn")]
 const MINSYNC2_FINAL: f32 = 0.10;
@@ -1188,94 +1073,14 @@ pub fn decode_pass2_top_n(
     out
 }
 
-pub fn decode_scan(
-    audio: &[f32],
-    sample_rate: u32,
-    nominal_start_sample: usize,
-    params: &SearchParams,
-) -> Vec<WsprResult> {
-    decode_scan_inner(audio, sample_rate, nominal_start_sample, params, None, None)
-}
-
-/// [`decode_scan`] with a caller-owned [`WsprCallsignTable`] that
-/// persists **across slots**.
-///
-/// This is what makes OSD worth having. Within a single slot the
-/// table can only be populated by that slot's own pass-1 Fano
-/// decodes, so a station too weak for Fano anywhere in the file is
-/// simply lost — on `150426_0918.wav` that costs W3BI at -25 dB,
-/// which real `wsprd` does report. `wsprd` gets it because its
-/// `hashtab` outlives the file: it is carried across decode passes
-/// *and* persisted to `hashtable.txt` between invocations, so a
-/// station confirmed once stays confirmable.
-///
-/// A WSPR receiver sees the same beacons every 2 minutes for hours.
-/// Feed the same table back in each slot and OSD recovers those
-/// stations in slots where Fano cannot reach them — with the phantom
-/// risk still closed, because OSD can only ever re-find a callsign
-/// some Fano decode already established.
-///
-/// The table grows by one entry per distinct station heard; a busy
-/// band is a few hundred entries over a session, so callers can hold
-/// it for the whole session without managing its size.
-pub fn decode_scan_with_table(
-    audio: &[f32],
-    sample_rate: u32,
-    nominal_start_sample: usize,
-    params: &SearchParams,
-    confirmed: &mut WsprCallsignTable,
-) -> Vec<WsprResult> {
-    decode_scan_inner(
-        audio,
-        sample_rate,
-        nominal_start_sample,
-        params,
-        None,
-        Some(confirmed),
-    )
-}
-
-/// Streaming variant of [`decode_scan`]: fires `on_result` once per
-/// candidate as it's accepted, *in addition to* (not instead of) the
-/// returned `Vec` — purely additive, same shape as
-/// [`crate::msg::decode_request::DecodeRequest::on_result`] (see that
-/// method's doc comment and `docs/reference/LIBRARY.md`'s "public
-/// decode entry point" section for the full portability rationale).
-///
-/// A `_streaming` sibling rather than a new parameter on [`decode_scan`]
-/// itself: `decode_scan` is a plain `pub fn`, not a builder, so adding
-/// a parameter would be a breaking signature change (same reasoning as
-/// `ft8::decode_block::decode_block_streaming` alongside `decode_block`).
-///
-/// **Delivery order/dedup contract**: both pass 1 and pass 2's
-/// per-candidate decode step run under `rayon::par_iter()` (feature
-/// `parallel`) — same completion-order/possible-duplicate caveat
-/// documented on
-/// [`crate::msg::decode_request::DecodeRequest::on_result`]'s parallel
-/// single-pass strategy: `cb` fires from whichever thread decoded that
-/// candidate, in completion order, *before* the dedup-then-push step
-/// that decides what lands in the returned `Vec` — a same-message
-/// duplicate found by two different candidates could fire `cb` twice
-/// even though only one survives into the batch result. `cb` must be
-/// `Sync` for this reason.
-pub fn decode_scan_streaming(
-    audio: &[f32],
-    sample_rate: u32,
-    nominal_start_sample: usize,
-    params: &SearchParams,
-    on_result: &(dyn Fn(&WsprResult) + Sync),
-) -> Vec<WsprResult> {
-    decode_scan_inner(
-        audio,
-        sample_rate,
-        nominal_start_sample,
-        params,
-        Some(on_result),
-        None,
-    )
-}
-
-fn decode_scan_inner(
+/// Scan an audio buffer for any number of WSPR frames, returning all
+/// successful decodes: the wsprd-equivalent coarse search on the 375 Hz
+/// baseband, then wsprd's three decode passes over its candidates.
+/// Duplicate decodes (same message within ±5 Hz and ±1 symbol) collapse
+/// to the earliest-candidate hit. Public through [`super::DecodeRequest`],
+/// which documents `on_result`'s delivery contract and the cross-slot
+/// table.
+pub(super) fn decode_scan_inner(
     audio: &[f32],
     sample_rate: u32,
     nominal_start_sample: usize,
@@ -1387,7 +1192,7 @@ fn decode_scan_inner(
     //   pass 2    : nblocksize = 4, maxdrift = 0, minsync2 = 0.10
     //
     // `minsync2` is applied inside
-    // `decode_at_baseband_nblocks_gated_drift`, keyed off the same
+    // `decode_at_baseband_inner`, keyed off the same
     // `refine_drift` flag this file already threads through for
     // `maxdrift` — see that function's doc comment for why the two
     // reuse one boolean rather than taking a separate parameter.
@@ -1603,16 +1408,7 @@ fn decode_scan_inner(
     seen
 }
 
-/// Convenience: scan using [`super::search::default_search_params`].
-pub fn decode_scan_default(audio: &[f32], sample_rate: u32) -> Vec<WsprResult> {
-    decode_scan(
-        audio,
-        sample_rate,
-        0,
-        &super::search::default_search_params(),
-    )
-}
-
+#[cfg(feature = "internal-testing")]
 /// WSPR subtract configuration (continuous-phase 4-FSK). Mirrors WSJT-X
 /// `subtract_signal2` in `wsprd.c`: tone spacing 1.4648 Hz, 8192
 /// samples/symbol at 12 kHz, no GFSK shaping (WSPR is plain CPFSK).
@@ -1629,16 +1425,17 @@ const WSPR_SUBTRACT: crate::engine::dsp::subtract::SubtractCfg =
         gfsk: None,
     };
 
+#[cfg(feature = "internal-testing")]
 /// LPF kernel half-width for the channel-aware subtract, in audio
 /// samples. Chosen by measuring residual suppression on the WSJT-X
-/// golden — see the call site in `decode_scan_subtract_inner`.
+/// golden — see the call site in `decode_scan_subtract`.
 const WSPR_SUBTRACT_LPF_HALF: usize = 600;
 
-/// A second SIC layer wrapped around [`decode_scan`], at 12 kHz.
+/// A second SIC layer wrapped around the scan, at 12 kHz.
+/// **`internal-testing` only since #403** — not part of the public
+/// decode API, and not part of the reference decoder.
 ///
-/// **This is not part of the reference decoder, and
-/// [`decode_scan`] is the wsprd-equivalent entry point.** The doc
-/// comment here used to claim this function "mirrors WSJT-X
+/// The doc comment here used to claim this function "mirrors WSJT-X
 /// `wsprd.c`'s `npasses=3` SIC loop (`wsprd.c:998-1438`)". That was
 /// true when it was written, and stopped being true in
 /// [#275](https://github.com/jl1nie/mfsk-core/issues/275): porting
@@ -1651,67 +1448,28 @@ const WSPR_SUBTRACT_LPF_HALF: usize = 600;
 /// twice.
 ///
 /// What it costs, measured on the WSJT-X golden
-/// (`wspr_diag_pass_ablation`, Ryzen 9 9900X): `decode_scan` 0.71 s
+/// (`wspr_diag_pass_ablation`, Ryzen 9 9900X): the plain scan 0.71 s
 /// for 9/9 goldens, this 2.38 s for the same 9/9 — **3.3× for zero
 /// marginal recall**. `WSPR_BENCHMARK.md`'s "Option C" reached the
 /// same conclusion by ablation before #275 landed.
 ///
-/// Nothing in this crate calls it: [`decode_scan_default`] and the
-/// `mfsk-ffi` C ABI both route to [`decode_scan`]. It is kept, for
-/// now, only because it is `pub` and removing it is a breaking
-/// change — prefer [`decode_scan`] in new code.
+/// It was `#[deprecated]` and public, kept only because removing it
+/// was a breaking change. #403 made that break; the function stays
+/// behind `internal-testing` because `wspr_diag_pass_ablation` and the
+/// timing probes in `tests/wspr_wsjtx_samples.rs` are the evidence for
+/// the 3.3× figure above, and evidence that no longer runs cannot be
+/// re-checked.
+///
+/// **Delivery order/dedup contract** for `on_result`: `cb` fires once
+/// per accepted decode, at this function's own SIC-pass dedup-then-push
+/// point (`all.push(d)` below) — not inside the per-pass scan each SIC
+/// round makes internally. The outer SIC accept point is the
+/// final-acceptance point, so `cb` fires exactly once per result that
+/// ends up in the returned `Vec`, in the same order.
 ///
 /// Returns deduplicated decodes from all passes.
-#[deprecated(
-    note = "not the wsprd-equivalent decoder — `decode_scan` is. This wraps a second \
-            SIC layer around it that the reference has no counterpart for, costing 3.3x \
-            for zero marginal recall on the WSJT-X golden. Use `decode_scan`."
-)]
+#[cfg(feature = "internal-testing")]
 pub fn decode_scan_subtract(
-    audio: &[f32],
-    sample_rate: u32,
-    nominal_start_sample: usize,
-    params: &SearchParams,
-) -> Vec<WsprResult> {
-    decode_scan_subtract_inner(audio, sample_rate, nominal_start_sample, params, None)
-}
-
-/// Streaming variant of [`decode_scan_subtract`], and therefore
-/// carrying the same caveat: the extra SIC layer is **not** part of
-/// the reference decoder — see [`decode_scan_subtract`]. Prefer
-/// [`decode_scan_streaming`].
-///
-/// See [`decode_scan_streaming`]'s doc comment for the general rationale
-/// (`_streaming` sibling, not a new parameter, since this is a plain
-/// `pub fn` not a builder).
-///
-/// **Delivery order/dedup contract**: `cb` fires once per accepted
-/// decode, at *this* function's own SIC-pass dedup-then-push point
-/// (`all.push(d)` below) — not inside the per-pass `decode_scan` call
-/// each SIC round makes internally, which stays a plain (non-
-/// streaming) call. This matches FT8's `.sic_rounds()` contract: the
-/// outer SIC accept point is the final-acceptance point, so `cb` fires
-/// exactly once per result that ends up in the returned `Vec`, in the
-/// same order — no divergence, unlike [`decode_scan_streaming`]'s
-/// parallel-strategy caveat.
-#[deprecated(note = "see `decode_scan_subtract` — use `decode_scan_streaming`.")]
-pub fn decode_scan_subtract_streaming(
-    audio: &[f32],
-    sample_rate: u32,
-    nominal_start_sample: usize,
-    params: &SearchParams,
-    on_result: &(dyn Fn(&WsprResult) + Sync),
-) -> Vec<WsprResult> {
-    decode_scan_subtract_inner(
-        audio,
-        sample_rate,
-        nominal_start_sample,
-        params,
-        Some(on_result),
-    )
-}
-
-fn decode_scan_subtract_inner(
     audio: &[f32],
     sample_rate: u32,
     nominal_start_sample: usize,
@@ -1740,7 +1498,14 @@ fn decode_scan_subtract_inner(
         // Re-convert residual back to f32 for decode_scan (it expects
         // unit-scale samples).
         let residual_f32: Vec<f32> = residual_i16.iter().map(|&s| s as f32 / 32_768.0).collect();
-        let new_decodes = decode_scan(&residual_f32, sample_rate, nominal_start_sample, params);
+        let new_decodes = decode_scan_inner(
+            &residual_f32,
+            sample_rate,
+            nominal_start_sample,
+            params,
+            None,
+            None,
+        );
         if new_decodes.is_empty() {
             break;
         }
@@ -1837,7 +1602,6 @@ fn deinterleave_llrs(llrs: &mut [f32; 162]) {
 mod tests {
     use super::super::search::SearchParams;
     use super::super::synthesize_type1;
-    use super::*;
     use crate::msg::WsprMessage;
 
     #[test]
@@ -1845,7 +1609,9 @@ mod tests {
         let freq = 1500.0;
         let audio =
             synthesize_type1("K1ABC", "FN42", 37, 12_000, freq, 0.3).expect("valid message");
-        let r = decode_at(&audio, 12_000, 0, freq).expect("decode");
+        let r = crate::wspr::DecodeRequest::sniper(&audio, 12_000, 0, freq)
+            .decode()
+            .expect("decode");
         assert_eq!(
             r.message,
             WsprMessage::Type1 {
@@ -1860,16 +1626,13 @@ mod tests {
     fn scan_recovers_message_without_freq_hint() {
         let freq = 1500.0;
         let audio = synthesize_type1("K1ABC", "FN42", 37, 12_000, freq, 0.3).expect("synth");
-        let decodes = decode_scan(
-            &audio,
-            12_000,
-            0,
-            &SearchParams {
+        let decodes = crate::wspr::DecodeRequest::new(&audio, 12_000)
+            .params(SearchParams {
                 freq_min_hz: 1450.0,
                 freq_max_hz: 1550.0,
                 ..crate::wspr::search::default_search_params()
-            },
-        );
+            })
+            .decode();
         assert!(!decodes.is_empty(), "at least one decode");
         let d = decodes.into_iter().next().unwrap();
         assert_eq!(
@@ -1903,7 +1666,9 @@ mod tests {
             *s += rnd + off;
         }
 
-        let r = decode_at(&audio, 12_000, 0, freq).expect("decode under noise");
+        let r = crate::wspr::DecodeRequest::sniper(&audio, 12_000, 0, freq)
+            .decode()
+            .expect("decode under noise");
         assert_eq!(
             r.message,
             WsprMessage::Type1 {

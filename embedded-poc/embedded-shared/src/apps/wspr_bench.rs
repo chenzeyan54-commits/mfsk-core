@@ -15,7 +15,7 @@
 //! #260 proposes replacing with a streaming DDC. Skipping it is what
 //! makes the measurement possible today, with no new API and no
 //! refactor: every stage below it (`coarse_baseband`,
-//! `decode_at_baseband*`, `subtract_signal_baseband`) is already `pub`.
+//! `SniperRequest::baseband`, `subtract_signal_baseband`) is already `pub`.
 //!
 //! ## What it runs
 //!

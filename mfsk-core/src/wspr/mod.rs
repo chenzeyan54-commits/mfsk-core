@@ -24,11 +24,11 @@
 //! ## Quick example
 //!
 //! ```no_run
-//! use mfsk_core::wspr::decode::decode_scan_default;
+//! use mfsk_core::wspr::DecodeRequest;
 //!
 //! # let audio: Vec<f32> = vec![];
 //! // `audio` is ~1.44M f32 samples at 12 kHz (120 s slot).
-//! for r in decode_scan_default(&audio, 12_000) {
+//! for r in DecodeRequest::new(&audio, 12_000).decode() {
 //!     println!("{:+7.1} Hz  start={:>8} sample  {}",
 //!              r.freq_hz, r.start_sample, r.message);
 //! }
@@ -67,6 +67,8 @@ pub mod ddc;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod decode;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+pub mod decode_request;
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod demod;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod instrument;
@@ -84,7 +86,9 @@ pub mod sync_vector;
 pub mod tx;
 
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-pub use decode::{WsprResult, decode_at};
+pub use decode::{WsprCallsignTable, WsprResult};
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+pub use decode_request::{DecodeRequest, SniperRequest};
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub use rx::demodulate_aligned;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]

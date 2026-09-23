@@ -76,21 +76,23 @@ let outcome = DecodeRequest::<Ft8>::new(&audio, 100.0, 3000.0, 1.5, 100)
 |----------------------|------------------------------------------------------------------------|-----------------------------------------|
 | FT8 / FT4 / FST4     | `DecodeRequest<P>` / `SniperRequest<P>` — `.on_result(cb)`             | `&(dyn Fn(&DecodeResult) + Sync)`       |
 | Q65                  | `DecodeRequest`/`SniperRequest`/`MultiPeriodRequest` — `.on_result(cb)` | `&(dyn Fn(&Q65Result) + Sync)`          |
-| WSPR                 | `decode_scan_streaming` / `decode_scan_subtract_streaming`             | `&(dyn Fn(&WsprResult) + Sync)`         |
-| JT65                 | `decode_scan_streaming`                                                | `&(dyn Fn(&Jt65Result) + Sync)`         |
-| JT9                  | `decode_scan_streaming`                                                | `&(dyn Fn(&Jt9Result) + Sync)`          |
+| WSPR                 | `wspr::DecodeRequest` — `.on_result(cb)`                               | `&(dyn Fn(&WsprResult) + Sync)`         |
+| JT65                 | `jt65::DecodeRequest` — `.on_result(cb)`                               | `&(dyn Fn(&Jt65Result) + Sync)`         |
+| JT9                  | `jt9::DecodeRequest` — `.on_result(cb)`                                | `&(dyn Fn(&Jt9Result) + Sync)`          |
 | FT8（`ft8::decode_block`） | `ft8::decode_block::decode_block_streaming`                      | `&mut dyn FnMut(&DecodeResult)`         |
 
 補足:
 
-- **ビルダ（FT8/FT4/FST4/Q65）**は `.on_result(cb)` をもう 1 つの連鎖可
-  能なメソッドとして持つ。返される `DecodeOutcome` は引き続きバッチ全体
-  を保持する。
-- **WSPR/JT65/JT9 にはビルダがない**ため、既存の `decode_scan` に対する
-  `decode_scan_streaming` *兄弟関数*が追加された（WSPR には
-  `decode_scan_subtract` に対する `decode_scan_subtract_streaming` もあ
-  る）。兄弟関数は同じ引数に末尾の `on_result` 参照を足したもので、非ス
-  トリーミング版と同じ `Vec` を返す。
+- **すべてのビルダ**は `.on_result(cb)` をもう 1 つの連鎖可能なメソッド
+  として持つ。返される `DecodeOutcome` / `Vec` は引き続きバッチ全体を
+  保持する。
+- **WSPR/JT65/JT9 にはかつてビルダがなく**、それぞれフリー関数の
+  `decode_scan_streaming` *兄弟関数*を生やしていた —— 軸が 1 つ増える
+  たびにこの形を繰り返した結果、3 モードで公開 `decode_*` 関数が 32 個に
+  なった。issue #403 でモードごとの `DecodeRequest` に置き換え、
+  ストリーミングは他と同じくメソッド 1 つになった。スキャン側だけが
+  `.on_result()` を持つ。各 `SniperRequest` は `Option` を 1 つ返すだけ
+  で、ストリーミングするものがない。
 - **`ft8::decode_block::decode_block_streaming`** は 2 つの feature 分岐
   版どちらでも `&dyn Fn + Sync` ではなく `&mut dyn FnMut` を取る:
   組込み（`not(fft-rustfft)`）の単一パスパイプラインは厳密に逐次
@@ -123,9 +125,8 @@ let outcome = DecodeRequest::<Ft8>::new(&audio, 100.0, 3000.0, 1.5, 100)
 
 対象: `.sic_rounds(n)` と `.sic_early()`（FT8/FT4 の SIC 戦略）、
 `ft8::decode_block::decode_block_streaming`（issue #243 以降、組込み・
-ホスト `fft-rustfft` 両分岐とも）、JT65 と JT9 の `decode_scan_streaming`、
-Q65 の全ビルダ、WSPR の `decode_scan_subtract_streaming`（自身の外側
-SIC パスの受理点でのみ発火）。Q65 の `MultiPeriodRequest` は逐次形の一
+ホスト `fft-rustfft` 両分岐とも）、JT65 と JT9 の `DecodeRequest`、
+Q65 の全ビルダ。Q65 の `MultiPeriodRequest` は逐次形の一
 変種で、候補ごとではなく受理デコードを生む**スロットごと**に 1 回発火
 する（複数周期 EME / 電離層散乱の平均化における自然なストリーミング単
 位）。
@@ -139,9 +140,9 @@ SIC パスの受理点でのみ発火）。Q65 の `MultiPeriodRequest` は逐�
 い呼び出し側は自分の側で `.message77()` によるデデュープを行うこと —
 クレート自身のデデュープが使うのと同じキーである。
 
-対象: デフォルトの単一パス戦略と `SniperRequest`（FT8/FT4）、WSPR の
-`decode_scan_streaming`（両方の粗探索パスが `rayon::par_iter()` 下で走
-る）。
+対象: デフォルトの単一パス戦略と `SniperRequest`（FT8/FT4）、
+`wspr::DecodeRequest`（パス 1・パス 2 の候補ループが `rayon::par_iter()`
+下で走る）。
 
 **これが並列パスのコールバックに `Sync` が必要な理由である** — 複数の
 rayon ワーカスレッドから並行して呼ばれうる。
@@ -218,12 +219,12 @@ cb(r); }` ループの直後に何も挟まず `all_results.extend(deduped)` が
 | FT8 `decode_sniper_inner`（並列/逐次のsniper） | `ft8/decode.rs:996,1016` |
 | FT4/FST4 `decode_frame`（並列/逐次の単一パス、ジェネリックエンジン） | `engine/pipeline.rs:994,1014` |
 | FT4/FST4 `decode_frame_subtract`（`.sic_rounds()`、ジェネリックエンジン） | `engine/pipeline.rs:1239` |
-| WSPR `decode_scan_streaming`（並列/逐次） / `decode_scan_subtract_streaming` | `wspr/decode.rs:493,566,717` |
+| WSPR `DecodeRequest`（`decode_scan_inner`、パス 1 / パス 2） | `wspr/decode.rs` |
 | Q65 `DecodeRequest`/`SniperRequest` | `q65/decode_request.rs:374` |
 | Q65 `MultiPeriodRequest`（`decode_multi_period_for`） | `q65/rx.rs:1345` |
 | Q65内部スキャンヘルパ（`decode_scan_fading_for`、`decode_scan_with_ap_list_for`、`decode_scan_inner`） | `q65/rx.rs:511,610,700` |
-| JT65 `decode_scan_streaming`（並列/逐次） | `jt65/mod.rs:328,426` |
-| JT9 `decode_scan_streaming` | `jt9/mod.rs:243` |
+| JT65 `DecodeRequest`（`decode_scan_inner`、#403 以降は通常と Chase で 1 本のループ） | `jt65/mod.rs` |
+| JT9 `DecodeRequest`（`decode_scan_inner`） | `jt9/mod.rs` |
 
 新しく `_streaming` 兄弟関数や `.on_result(cb)` ビルダメソッドをあるプ
 ロトコルに追加する際、そのプロトコルが `.known(...)` のようなフェーズ
@@ -454,11 +455,11 @@ while let Some(msg) = stream.next().await {
   順、一時的重複なし）が欲しければ、既定の広帯域パスではなく逐次戦略 ——
   例えば FT8 の `.sic_rounds(3)` や `.sic_early()` —— を使う。橋渡しコー
   ドは同一で、変わるのはビルダのメソッドだけ。
-- **他プロトコル。** WSPR/JT65/JT9 では、同じ `spawn_blocking` の殻の中
-  でフリー関数 `decode_scan_streaming(&audio, sample_rate,
-  nominal_start_sample, &params, &on_result)` を呼ぶ。クロージャは同じ
-  `Sender` を捕捉する。Q65 では上の FT8 とまったく同様に
-  `DecodeRequest`/`SniperRequest`/`MultiPeriodRequest` ビルダを使う。
+- **他プロトコル。** WSPR・JT65・JT9・Q65 はそれぞれ独自の
+  `DecodeRequest` を持つ（Q65 は `SniperRequest`/`MultiPeriodRequest`
+  も）。同じ `spawn_blocking` の殻の中で、上の FT8 とまったく同様に
+  `.on_result(&on_result)` を連鎖させればよい。クロージャは同じ
+  `Sender` を捕捉する。
 - **キャンセル。** `Receiver` を drop すると、クロージャ内の次の
   `blocking_send` が `Err` を返すので早期に止められる —— ただしデコード
   自体に内部キャンセル点はないため、`spawn_blocking` タスクは何であれ完
@@ -479,8 +480,8 @@ while let Some(msg) = stream.next().await {
   `decode_block_streaming` の完全一致テスト。
 - `mfsk-core/tests/ft8_decode_block_streaming_host.rs` —— ホスト
   `fft-rustfft` 版 `decode_block_streaming` の完全一致テスト（issue #243）。
-- `mfsk-core/tests/wspr_wsjtx_samples.rs` —— 実信号に対する WSPR
-  `decode_scan_streaming` / `decode_scan_subtract_streaming`。
+- `mfsk-core/tests/wspr_wsjtx_samples.rs` —— 実信号に対する WSPR の
+  `DecodeRequest::on_result`。
 - [BINDINGS.ja.md](BINDINGS.ja.md) —— C 境界越しの同じ考え方:
   `mfsk_stream_*` のリングと `mfsk_session_set_on_decode`。同じ移植性の
   理由からコールバックベースになっている。

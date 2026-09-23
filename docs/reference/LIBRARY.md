@@ -248,21 +248,24 @@ order and may show a transient duplicate that the returned `Vec` has
 already deduped.
 
 Every protocol offers the same shape through its own entry point:
-`wspr::decode::{decode_scan_streaming, decode_scan_subtract_streaming}`,
-and `.on_result(cb)` on `jt9::DecodeRequest`, `jt65::DecodeRequest`
-and `q65::{DecodeRequest, SniperRequest, MultiPeriodRequest}`.
+`.on_result(cb)` on `wspr::DecodeRequest`, `jt9::DecodeRequest`,
+`jt65::DecodeRequest` and `q65::{DecodeRequest, SniperRequest,
+MultiPeriodRequest}`. WSPR's is the parallel contract, not the exact
+one — see [`STREAMING.md`](STREAMING.md) §3b.
 
 ### 2.5 Protocols with their own entry point
 
-**WSPR** takes symbol-length FFTs directly at 12 kHz rather than
-decimating to an FT-style baseband first, so its demodulation is staged
-differently. The FEC (`ConvFano`) and message codec (`Wspr50Message`)
-are still associated types on `impl Protocol for Wspr`, so the trait
-surface stays consistent — only the slot-level decoder differs.
+**WSPR** decimates the slot to wsprd's 375 Hz baseband and runs
+wsprd's own coarse search and three decode passes there, rather than
+the shared FT-style pipeline. The FEC (`ConvFano`) and message codec
+(`Wspr50Message`) are still associated types on `impl Protocol for
+Wspr`, so the trait surface stays consistent — only the slot-level
+decoder differs. Its entry points are `wspr::DecodeRequest` and
+`wspr::SniperRequest` (issue #403), which replaced 14 free functions.
 
 ```rust
 # #[cfg(feature = "wspr")] {
-use mfsk_core::wspr::decode::decode_scan_default;
+use mfsk_core::wspr::DecodeRequest;
 use mfsk_core::wspr::tx::synthesize_type1;
 use mfsk_core::msg::WsprMessage;
 
@@ -270,7 +273,7 @@ use mfsk_core::msg::WsprMessage;
 let samples_f32 = synthesize_type1("K1ABC", "FN42", 37, 12_000, 1500.0, 0.3)
     .expect("valid message");
 
-let decodes = decode_scan_default(&samples_f32, /*sample_rate*/ 12_000);
+let decodes = DecodeRequest::new(&samples_f32, /*sample_rate*/ 12_000).decode();
 assert!(!decodes.is_empty(), "roundtrip must decode");
 for d in decodes {
     match d.message {
@@ -289,10 +292,20 @@ for d in decodes {
 # }
 ```
 
-`decode_scan_default` runs the (frequency × time) coarse search over
-the whole slot. If the frequency and start sample are already known,
-`wspr::decode::decode_at(samples, rate, start_sample, freq_hz)`
-bypasses the scan.
+`DecodeRequest::new` runs the (frequency × time × drift) coarse search
+over the whole slot. It also takes `.nominal_start()`, `.params()`,
+`.on_result()` and `.table(&mut WsprCallsignTable)`: a table carried
+from slot to slot lets OSD re-find a station a previous slot's Fano
+decode confirmed, which is how `wsprd` reaches W3BI at −25 dB on its
+own sample file.
+
+If the frequency and start sample are already known,
+`DecodeRequest::sniper(samples, rate, start_sample, freq_hz).decode()`
+bypasses the scan. `SniperRequest::baseband(idat, qdat, …)` does the
+same on a baseband the caller already decimated, and takes `.drift()`,
+`.nblocks()`, `.confirmed()` and `.refine_drift()` — the knobs the
+scan's own passes set per candidate. That is what the CoreS3 WSPR
+receiver drives from its own candidate loop.
 
 **JT9** has one builder, `jt9::DecodeRequest` (issue #403), in the
 same shape as Q65's below but not generic, since JT9 has one sub-mode.
