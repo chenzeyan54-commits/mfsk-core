@@ -23,9 +23,9 @@
     The parabolic-peak and percentile sites across FT8, uvpacket, MSK144
     and Q65 are not copies of each other: the clamp ranges, the
     epsilons and the WSJT-X index-rounding rules all differ, so merging
-    them would change decodes. A shared Gray-code helper would have
-    removed no lines, because `jt65::{gray6, inv_gray6}` are public and
-    stay.
+    them would change decodes. A shared Gray-code helper is deferred to
+    #391: it only pays off once the public `jt65::{gray6, inv_gray6}`
+    can go, which is a breaking change.
 
 - **`pack77` packs `/P` and `/R` callsigns.** It refused them: the
   suffixed call went straight to `pack28`, which takes six characters
