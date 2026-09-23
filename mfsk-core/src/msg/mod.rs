@@ -141,6 +141,21 @@ impl MessageCodec for Wsjt77Message {
         }
     }
 
+    /// Same length dispatch as [`Self::verify_info`], appending instead
+    /// of checking: CRC-14 for LDPC(174, 91), CRC-24 for LDPC(240, 101).
+    fn append_crc(info: &mut [u8]) -> bool {
+        let Some(msg77) = info.get(..77).and_then(|m| <&[u8; 77]>::try_from(m).ok()) else {
+            return false;
+        };
+        let msg77 = *msg77;
+        match info.len() {
+            91 => info.copy_from_slice(&crate::fec::ldpc::append_crc14(&msg77)),
+            101 => info.copy_from_slice(&crate::fec::ldpc240_101::append_crc24(&msg77)),
+            _ => return false,
+        }
+        true
+    }
+
     /// [`wsjt77::Wsjt77Fields::is_plausible`] — the ITU-prefix
     /// allowlist over the callsign *fields*, with free text and
     /// telemetry exempt (nothing in them to check) and the EU VHF

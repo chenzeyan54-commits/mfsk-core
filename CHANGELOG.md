@@ -2,6 +2,40 @@
 
 ## 0.11.1 — FT4 filters phantoms by default (#383), FT4 on the CoreS3 answers by the reply deadline, one screen for every mode, one boot sequence for the CoreS3's four receivers, WiFi becomes a setting of its own (#381)
 
+- **One `message_to_tones`, generic over the protocol (breaking,
+  #391).** `ft8::wave_gen`, `ft4::encode` and `fst4::encode` each had
+  their own, differing only in data the trait already carries: whether
+  to XOR the message with an RVEC first (`INFO_SCRAMBLE_RVEC`) and
+  whether the FEC wants a CRC-14 or a CRC-24. They are
+  `engine::tx::message_to_tones::<P>(&[u8; 77])` now, driven by a new
+  `MessageCodec::append_crc` — the transmit-side twin of `verify_info`,
+  with the same length dispatch in `Wsjt77Message`:
+
+  ```rust
+  ft8::wave_gen::message_to_tones(&m)  →  engine::tx::message_to_tones::<Ft8>(&m)
+  ft4::encode::message_to_tones(&m)    →  engine::tx::message_to_tones::<Ft4>(&m)
+  fst4::encode::message_to_tones(&m)   →  engine::tx::message_to_tones::<Fst4s60>(&m)
+  ```
+
+  Its tail, `engine::tx::info_to_tones::<P>`, replaces the pipeline's
+  private `encode_tones_for_snr`, which was the same three lines.
+
+  Two argument types move with it. FT8's `message_to_tones` took
+  `&[u8]` and returned `[u8; 79]` where FT4 and FST4 took `&[u8; 77]`;
+  all three take `&[u8; 77]` and return a `Vec<u8>` now, and FT8's
+  `tones_to_*` accept `&[u8]` like the others (an existing `&[u8; 79]`
+  still coerces). `DecodeResult::message77()` returns `&[u8; 77]`
+  instead of `&[u8]`: it was always 77 bits, and 29 call sites across
+  the library, its tests and the board crates were converting it back
+  with `try_into()`. Comparing against an owned
+  array needs a `*` now (`*r.message77() == m77`).
+
+  Output is unchanged: the same 130 TX fingerprints match, which also
+  confirms FT8's switch from its own `ldpc_encode` to the shared
+  `Ldpc174_91::encode` changed nothing. The three board crates
+  (`m5stack-cores3-app` with every feature, `-s3-app`, `-core2-app`)
+  are ported and `cargo check` clean on Xtensa.
+
 - **One Gray code, `engine::gray` (breaking, #391).** JT65 exposed
   `jt65::{gray6, inv_gray6}` and JT9 kept private `gray3` / `inv_gray3`
   copies, plus a third pair as closures in a test. They are one

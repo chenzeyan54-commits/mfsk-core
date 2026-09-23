@@ -21,7 +21,7 @@ use mfsk::*;
 
 fn synth_ft8_i16(call1: &str, call2: &str, report: &str, freq_hz: f32) -> Vec<i16> {
     let msg = mfsk_core::msg::wsjt77::pack77(call1, call2, report).expect("pack77");
-    let tones = mfsk_core::ft8::wave_gen::message_to_tones(&msg);
+    let tones = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft8::Ft8>(&msg);
     let wave = mfsk_core::ft8::wave_gen::tones_to_i16(&tones, freq_hz, 8_000);
     let mut slot = vec![0i16; 15 * FS as usize];
     let start = (0.5 * FS as f32) as usize;
@@ -119,7 +119,7 @@ fn clearing_the_callback_stops_delivery() {
 #[test]
 fn the_callback_is_not_ft8_only_any_more() {
     let msg = mfsk_core::msg::wsjt77::pack77("CQ", "JA1ABC", "PM95").expect("pack77");
-    let tones = mfsk_core::ft4::encode::message_to_tones(&msg);
+    let tones = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft4::Ft4>(&msg);
     let wave = mfsk_core::ft4::encode::tones_to_i16(&tones, 1500.0, 8_000);
     let mut slot = vec![0i16; (7.5 * FS as f32) as usize];
     let start = (0.5 * FS as f32) as usize;

@@ -3,7 +3,7 @@
 //! Pipeline:
 //!   text (e.g. "CQ JL1NIE PM95")
 //!   → `pack77` (msg/wsjt77.rs — 77-bit FT8 message field)
-//!   → `message_to_tones` (LDPC encode + Gray + 7 sync tones = 79 symbols)
+//!   → `engine::tx::message_to_tones` (LDPC encode + Gray + 7 sync tones = 79 symbols)
 //!   → `tones_to_i16_into` (GFSK shaping, 12 kHz mono i16, 151_680 samples)
 //!   → 4× zero-order-hold upsample → 48 kHz stereo i16 chunks
 //!   → I2S TX → ES8311 DAC → built-in speaker
@@ -56,7 +56,7 @@ pub fn synthesize_cq(callsign: &str, grid: &str, f0_hz: f32) -> Result<Vec<i16>>
 /// Synthesise an arbitrary 77-bit message at base frequency `f0_hz`.
 /// Used by the QSO FSM (Phase 1.7) once it produces non-CQ messages.
 pub fn synthesize_message77(msg77: &[u8; 77], f0_hz: f32) -> Result<Vec<i16>> {
-    let tones = mfsk_core::ft8::wave_gen::message_to_tones(msg77);
+    let tones = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft8::Ft8>(msg77);
     let mut samples = vec![0i16; TX_SAMPLES_12K];
     tones_to_i16_into(&mut samples, &tones, f0_hz, TX_AMPLITUDE);
     Ok(samples)

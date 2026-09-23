@@ -2,7 +2,7 @@
 //!
 //! Mirrors `ft4-core::encode` but for the FST4 geometry shared by
 //! every sub-mode: LDPC(240, 101) + CRC-24 over the shared 77-bit
-//! WSJT payload, GFSK with BT = 2.0. [`message_to_tones`] produces
+//! WSJT payload, GFSK with BT = 2.0. [`crate::engine::tx::message_to_tones`] produces
 //! the (period-independent) symbol-domain tone sequence; the
 //! `FST4_*_GFSK` constants plus [`tones_to_f32_with_gfsk`] /
 //! [`tones_to_i16_with_gfsk`] handle the per-sub-mode sample-domain
@@ -13,8 +13,7 @@ use alloc::vec::Vec;
 
 use super::Fst4s60;
 use crate::engine::dsp::gfsk::{GfskCfg, synth_f32, synth_f32_into, synth_i16, synth_i16_into};
-use crate::engine::{FecCodec, FrameLayout, ModulationParams};
-use crate::fec::Ldpc240_101;
+use crate::engine::{FrameLayout, ModulationParams};
 
 /// FST4-15 GFSK configuration: 12 kHz, 720 samples/symbol, BT=2.0,
 /// hmod=1.0, NSPS/8-sample cosine ramp.
@@ -70,31 +69,6 @@ pub const FST4_300_GFSK: GfskCfg = GfskCfg {
     hmod: 1.0,
     ramp_samples: 21_504 / 8,
 };
-
-/// Encode a 77-bit message into the 160-symbol FST4 tone sequence.
-///
-/// Period-independent: the tone sequence only depends on `NTONES` /
-/// `BITS_PER_SYMBOL` / `GRAY_MAP` / the frame layout, which every FST4
-/// sub-mode shares. Callers wanting a different sub-mode's *sample*
-/// waveform still call this unchanged and pass its tone sequence to
-/// [`tones_to_f32_with_gfsk`] / [`tones_to_i16_with_gfsk`] with the
-/// matching `FST4_*_GFSK` constant.
-///
-/// WSJT-X `genfst4.f90:63` XORs the message with `rvec` before CRC-24 +
-/// LDPC encode; `message_to_tones` transmits the **scrambled** message
-/// bits — same as WSJT-X, so the receive-side CRC verification stays
-/// correct (see `super::FST4_RVEC`'s doc comment).
-pub fn message_to_tones(message77: &[u8; 77]) -> Vec<u8> {
-    let mut scrambled = *message77;
-    for (b, &r) in scrambled.iter_mut().zip(super::FST4_RVEC.iter()) {
-        *b = (*b ^ r) & 1;
-    }
-    let info = crate::fec::ldpc240_101::append_crc24(&scrambled);
-    let codec = Ldpc240_101;
-    let mut cw = [0u8; 240];
-    codec.encode(&info, &mut cw);
-    crate::engine::tx::codeword_to_itone::<Fst4s60>(&cw)
-}
 
 /// Output sample count for one FST4 transmission at the geometry `cfg`
 /// describes — `N_SYMBOLS x samples_per_symbol`.

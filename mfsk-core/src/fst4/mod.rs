@@ -42,7 +42,7 @@
 //!     .decode()
 //!     .results;
 //! for r in &results {
-//!     let msg77: &[u8; 77] = r.message77().try_into().unwrap();
+//!     let msg77 = r.message77();
 //!     if let Some(text) = unpack77(msg77) {
 //!         println!("{:7.1} Hz  dt={:+.2} s  {}", r.freq_hz, r.dt_sec, text);
 //!     }

@@ -94,7 +94,7 @@ fn pack(call1: &str, call2: &str, grid: &str) -> [u8; 77] {
 }
 
 fn add_signal(mix: &mut [f32], msg: &[u8; 77], freq_hz: f32, amp: f32) {
-    let itone = encode::message_to_tones(msg);
+    let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft4::Ft4>(msg);
     let pcm = encode::tones_to_f32(&itone, freq_hz, amp);
     let start = (START_S * FS) as usize;
     for (i, &s) in pcm.iter().enumerate() {

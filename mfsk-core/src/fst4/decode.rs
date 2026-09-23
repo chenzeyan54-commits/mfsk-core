@@ -279,11 +279,11 @@ mod tests {
     ///
     #[test]
     fn synth_decode_roundtrip_cq_ja1abc() {
-        use super::super::encode::{message_to_tones, tones_to_i16};
+        use super::super::encode::tones_to_i16;
         use crate::msg::wsjt77::{pack77, unpack77};
 
         let msg77 = pack77("CQ", "JA1ABC", "PM95").expect("pack77");
-        let tones = message_to_tones(&msg77);
+        let tones = crate::engine::tx::message_to_tones::<crate::fst4::Fst4s60>(&msg77);
         let audio = tones_to_i16(&tones, 1500.0, 10_000);
 
         // Pad to a full 60-second slot with 1 s of leading silence.
@@ -302,7 +302,7 @@ mod tests {
         let texts: Vec<String> = results
             .iter()
             .filter_map(|r| {
-                let msg77: &[u8; 77] = r.message77().try_into().ok()?;
+                let msg77 = r.message77();
                 unpack77(msg77)
             })
             .collect();
@@ -363,11 +363,11 @@ mod tests {
             + crate::engine::FrameLayout
             + FrameDecodable<DecodeResult = DecodeResult>,
     {
-        use super::super::encode::{message_to_tones, tones_to_i16_with_gfsk};
+        use super::super::encode::tones_to_i16_with_gfsk;
         use crate::msg::wsjt77::{pack77, unpack77};
 
         let msg77 = pack77("CQ", "JA1ABC", "PM95").expect("pack77");
-        let tones = message_to_tones(&msg77);
+        let tones = crate::engine::tx::message_to_tones::<crate::fst4::Fst4s60>(&msg77);
         let audio = tones_to_i16_with_gfsk(&tones, (freq_min + freq_max) / 2.0, 10_000, gfsk);
 
         // Pad to a full slot with 1 s of leading silence.
@@ -387,7 +387,7 @@ mod tests {
         let texts: Vec<String> = results
             .iter()
             .filter_map(|r| {
-                let msg77: &[u8; 77] = r.message77().try_into().ok()?;
+                let msg77 = r.message77();
                 unpack77(msg77)
             })
             .collect();

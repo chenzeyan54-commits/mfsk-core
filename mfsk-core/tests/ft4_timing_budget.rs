@@ -62,7 +62,7 @@ fn pack_cq(call: &str, grid: &str) -> [u8; 77] {
 fn make_slot(msg: &[u8; 77], snr_db: f32, seed: u64) -> Vec<i16> {
     let snr_lin = 10f32.powf(snr_db / 10.0);
     let amp = (4.0 * snr_lin * REF_BW / FS).sqrt();
-    let itone = encode::message_to_tones(msg);
+    let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft4::Ft4>(msg);
     let pcm = encode::tones_to_f32(&itone, 1000.0, amp);
     let mut mix = vec![0.0f32; SLOT];
     let start = (0.5 * FS) as usize;
@@ -107,7 +107,7 @@ fn ft4_sniper_ap_wallclock() {
                 .results;
             let dt = t0.elapsed();
             times.push(dt);
-            if results.iter().any(|r| r.message77() == msg) {
+            if results.iter().any(|r| *r.message77() == msg) {
                 decoded += 1;
             }
         }

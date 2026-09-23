@@ -210,14 +210,7 @@ fn run_trial(audio: &[i16]) -> TrialOutcome {
         .decode()
         .results
         .iter()
-        .any(|r| {
-            r.message77()
-                .try_into()
-                .ok()
-                .and_then(|m: &[u8; 77]| unpack77(m))
-                .as_deref()
-                == Some(GOLDEN_MSG)
-        });
+        .any(|r| unpack77(r.message77()).as_deref() == Some(GOLDEN_MSG));
 
     let cfg = wideband_cascade(CENTER_HZ);
     let mut ddc = StreamingComplexDdc::new(&cfg);
@@ -280,12 +273,10 @@ fn run_trial(audio: &[i16]) -> TrialOutcome {
                 Some(budget_ok),
                 12_000.0,
             );
-            let decoded = out.first().and_then(|o| o.as_ref()).and_then(|r| {
-                r.message77()
-                    .try_into()
-                    .ok()
-                    .and_then(|m: &[u8; 77]| unpack77(m))
-            });
+            let decoded = out
+                .first()
+                .and_then(|o| o.as_ref())
+                .and_then(|r| unpack77(r.message77()));
             if decoded.as_deref() == Some(GOLDEN_MSG) {
                 hit = Some(rank);
                 golden_rank.get_or_insert(rank);
@@ -317,12 +308,7 @@ fn run_trial(audio: &[i16]) -> TrialOutcome {
                 true,
                 false,
             )
-            .and_then(|r| {
-                r.message77()
-                    .try_into()
-                    .ok()
-                    .and_then(|m: &[u8; 77]| unpack77(m))
-            })
+            .and_then(|r| unpack77(r.message77()))
         } else {
             STAGE_BUDGET.with(|c| c.set(TIER_TAIL_BUDGET));
             let inputs = [RungMajorCandidate {
@@ -340,12 +326,9 @@ fn run_trial(audio: &[i16]) -> TrialOutcome {
                 Some(budget_ok),
                 12_000.0,
             );
-            out.first().and_then(|o| o.as_ref()).and_then(|r| {
-                r.message77()
-                    .try_into()
-                    .ok()
-                    .and_then(|m: &[u8; 77]| unpack77(m))
-            })
+            out.first()
+                .and_then(|o| o.as_ref())
+                .and_then(|r| unpack77(r.message77()))
         };
         if hit.as_deref() == Some(GOLDEN_MSG) {
             tiered = true;

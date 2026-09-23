@@ -1287,7 +1287,7 @@ fn tail_decode(
         false,
         false,
     )?;
-    let m77: [u8; 77] = r.message77().try_into().ok()?;
+    let m77: [u8; 77] = *r.message77();
     // Still unpacked here, because a payload that cannot be rendered
     // is not a decode and this is where that is decided.
     let text = unpack77(&m77)?;

@@ -520,7 +520,8 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
     // Pure compute: no PTT, no audio interface, nothing reaches the
     // radio. `MFSK_CORES3_TX_SYNTH_BENCH=1` at build time.
     if option_env!("MFSK_CORES3_TX_SYNTH_BENCH").is_some() {
-        use mfsk_core::ft8::wave_gen::{message_to_tones, tones_to_i16_into};
+        use mfsk_core::engine::tx::message_to_tones;
+        use mfsk_core::ft8::{wave_gen::tones_to_i16_into, Ft8};
         // 79 symbols x 1920 samples at 12 kHz — the 12.64 s frame.
         const TX_SAMPLES_12K: usize = 79 * 1920;
         let t_pack0 = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
@@ -541,7 +542,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                     if run == 0 {
                         buf = alloc::vec![0i16; TX_SAMPLES_12K];
                     }
-                    let tones = message_to_tones(&msg77);
+                    let tones = message_to_tones::<Ft8>(&msg77);
                     tones_to_i16_into(&mut buf, &tones, 1_500.0, 20_000);
                     let dt = unsafe { esp_idf_svc::sys::esp_timer_get_time() } - t0;
                     if run == 0 {
@@ -567,7 +568,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                 //  * what is left of `tones_to_i16_into` after that is
                 //    exactly that round trip.
                 let t_a = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
-                let tones = message_to_tones(&msg77);
+                let tones = message_to_tones::<Ft8>(&msg77);
                 let t_b = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
                 let mut f32buf = alloc::vec![0f32; TX_SAMPLES_12K];
                 let t_c = unsafe { esp_idf_svc::sys::esp_timer_get_time() };

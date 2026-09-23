@@ -26,7 +26,6 @@ use num_traits::Float;
 use super::super::decode::{ApHint, DecodeDepth, DecodeResult, DecodeStrictness, LlrEffort};
 use super::super::llr::sync_quality;
 use super::super::params::{COSTAS, DEFAULT_BP_MAX_ITER, LDPC_N, NSPS, NTONES};
-use super::super::wave_gen::message_to_tones;
 use super::coarse_sync::coarse_sync;
 #[cfg(all(feature = "fixed-point", not(feature = "fft-rustfft")))]
 use super::fill_symbol_spectra::fill_symbol_spectra_goertzel;
@@ -647,7 +646,6 @@ fn recompute_nsync(
 /// WSJT-X / JTDX SNR reports.
 pub fn xsnr2_db_simple(spec: &Spectrogram, result: &DecodeResult, cell_scale: f32) -> f32 {
     use crate::ft8::params::NN;
-    use crate::ft8::wave_gen::message_to_tones;
 
     let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
     let tstep = NSTEP as f32 / SAMPLE_RATE_HZ;
@@ -704,7 +702,7 @@ pub fn xsnr2_db_simple(spec: &Spectrogram, result: &DecodeResult, cell_scale: f3
     }
 
     // xsig at the 79 decoded-tone (freq, m) positions.
-    let itone = message_to_tones(result.message77());
+    let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(result.message77());
     let carrier_bin_f = result.freq_hz / df;
     let t0 = (TX_START_OFFSET_S + result.dt_sec) / tstep;
     let mut xsig: f32 = 0.0;
@@ -815,7 +813,7 @@ pub(crate) fn compute_xsig_wsjtx(
     audio: &[i16],
     fft_cache: Option<&[Complex<f32>]>,
 ) -> f32 {
-    let itone = crate::ft8::wave_gen::message_to_tones(result.message77());
+    let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(result.message77());
     let mut cs: Box<[[Cmplx<f32>; 8]; 79]> = alloc::vec![[Cmplx::<f32>::default(); 8]; 79]
         .try_into()
         .unwrap();
@@ -2256,10 +2254,12 @@ pub(in crate::ft8) fn process_one_candidate_inner<Pol: MessagePolicy>(
     if !policy.accepts(codec_is_plausible(&message), FT8_FILTERS, &message) {
         return None;
     }
-    if known.iter().any(|r| r.message77() == bp.message77) {
+    if known.iter().any(|r| *r.message77() == bp.message77) {
         return None;
     }
-    let itone = message_to_tones(&bp.message77);
+    let itone: [u8; 79] = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&bp.message77)
+        .try_into()
+        .expect("FT8 has 79 symbols");
     let snr_db = super::super::llr::compute_snr_db(cs_scratch, &itone);
     Some(DecodeResult {
         info: bp.info.into_boxed_slice(),

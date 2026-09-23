@@ -59,13 +59,14 @@ mfsk-core = { version = "0.11", features = ["ft8", "ft4", "wspr"] }
 
 ```rust
 use mfsk_core::ft8::Ft8;
-use mfsk_core::ft8::wave_gen::{message_to_tones, tones_to_i16};
+use mfsk_core::engine::tx::message_to_tones;
+use mfsk_core::ft8::wave_gen::tones_to_i16;
 use mfsk_core::msg::decode_request::DecodeRequest;
 use mfsk_core::msg::wsjt77::{pack77, unpack77};
 
 // 1. FT8 フレームを合成し、15 秒スロットに詰める。
 let msg77 = pack77("CQ", "JA1ABC", "PM95").unwrap();
-let tones = message_to_tones(&msg77);
+let tones = message_to_tones::<Ft8>(&msg77);
 let frame = tones_to_i16(&tones, /* freq */ 1500.0, /* amp */ 20_000);
 
 let mut audio = vec![0i16; 180_000]; // 15 s @ 12 kHz
@@ -154,12 +155,13 @@ DecodeRequest::<P>::new(audio, freq_min, freq_max, sync_min, max_cand)
 ```rust
 use mfsk_core::ft8::Ft8;
 use mfsk_core::ft8::decode::{EqMode, ApHint};
-use mfsk_core::ft8::wave_gen::{message_to_tones, tones_to_i16};
+use mfsk_core::engine::tx::message_to_tones;
+use mfsk_core::ft8::wave_gen::tones_to_i16;
 use mfsk_core::msg::decode_request::SniperRequest;
 use mfsk_core::msg::wsjt77::{pack77, unpack77};
 
 let msg77 = pack77("CQ", "JA1ABC", "PM95").unwrap();
-let tones = message_to_tones(&msg77);
+let tones = message_to_tones::<Ft8>(&msg77);
 let frame = tones_to_i16(&tones, /* freq */ 1000.0, /* amp */ 20_000);
 let mut audio = vec![0i16; 180_000]; // 15 秒 @ 12 kHz
 let start = (0.5 * 12_000.0) as usize;

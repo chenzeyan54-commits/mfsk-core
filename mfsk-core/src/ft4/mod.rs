@@ -13,9 +13,10 @@
 //!
 //! ```
 //! # #[cfg(all(feature = "ft4", any(feature = "fft-rustfft", feature = "fft-extern")))] {
+//! use mfsk_core::engine::tx::message_to_tones;
 //! use mfsk_core::ft4::{
 //!     Ft4,
-//!     encode::{message_to_tones, tones_to_i16},
+//!     encode::tones_to_i16,
 //! };
 //! use mfsk_core::msg::decode_request::DecodeRequest;
 //! use mfsk_core::msg::wsjt77::{pack77, unpack77};
@@ -24,7 +25,7 @@
 //! //    The synth produces just the transmitted frame; pad to the full
 //! //    7.5 s slot with the signal starting at 0.5 s.
 //! let msg77 = pack77("CQ", "JA1ABC", "PM95").expect("pack");
-//! let tones = message_to_tones(&msg77);
+//! let tones = message_to_tones::<Ft4>(&msg77);
 //! let frame = tones_to_i16(&tones, /* freq */ 1500.0, /* amp */ 20_000);
 //!
 //! let mut audio = vec![0i16; 90_000]; // 7.5 s @ 12 kHz
@@ -38,7 +39,7 @@
 //!     .decode()
 //!     .results;
 //! assert!(!results.is_empty(), "roundtrip must decode");
-//! let msg77: &[u8; 77] = results[0].message77().try_into().unwrap();
+//! let msg77 = results[0].message77();
 //! let text = unpack77(msg77).expect("unpack");
 //! assert_eq!(text, "CQ JA1ABC PM95");
 //! # }

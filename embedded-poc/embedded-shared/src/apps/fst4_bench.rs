@@ -754,11 +754,7 @@ pub fn run_bench(refined_bin: &[u8]) {
         results.len(),
     );
     for r in &results {
-        let text = r
-            .message77()
-            .try_into()
-            .ok()
-            .and_then(|m77: &[u8; 77]| unpack77(m77));
+        let text = unpack77(r.message77());
         log::info!(
             // snr_db is NAN (skip_snr = true, see module doc) — not
             // logged as a number so it can't be mistaken for one.
@@ -979,11 +975,7 @@ fn run_rung_major(refined_bin: &[u8]) {
             decoded_count,
         );
         for r in results.iter().flatten() {
-            let text = r
-                .message77()
-                .try_into()
-                .ok()
-                .and_then(|m77: &[u8; 77]| unpack77(m77));
+            let text = unpack77(r.message77());
             log::info!(
                 "    {:?} | {:.1} Hz | dt {:.2} s",
                 text,
@@ -1030,11 +1022,7 @@ fn run_rung_major(refined_bin: &[u8]) {
             decoded_count,
         );
         for r in results.iter().flatten() {
-            let text = r
-                .message77()
-                .try_into()
-                .ok()
-                .and_then(|m77: &[u8; 77]| unpack77(m77));
+            let text = unpack77(r.message77());
             log::info!(
                 "    {:?} | {:.1} Hz | dt {:.2} s",
                 text,

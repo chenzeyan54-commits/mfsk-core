@@ -555,7 +555,7 @@ fn ft4_bake_golden_precomputed() {
                     EqMode::Off,
                     SYNC_Q_MIN,
                 )?;
-                let m77: &[u8; 77] = r.message77().try_into().ok()?;
+                let m77 = r.message77();
                 unpack77(m77)
             })
             .collect();
@@ -673,7 +673,7 @@ fn ft4_diag_sync_window_recall() {
                 EqMode::Off,
                 SYNC_Q_MIN,
             )?;
-            let m77: &[u8; 77] = r.message77().try_into().ok()?;
+            let m77 = r.message77();
             Some((unpack77(m77)?, r.dt_sec))
         })
         .collect();
@@ -711,7 +711,7 @@ fn ft4_diag_sync_window_recall() {
                     false,
                     false,
                 )?;
-                let m77: &[u8; 77] = r.message77().try_into().ok()?;
+                let m77 = r.message77();
                 Some((unpack77(m77)?, r.dt_sec))
             })
             .collect();

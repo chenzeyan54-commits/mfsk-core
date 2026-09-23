@@ -8,7 +8,7 @@
 use mfsk_core::ft8::Ft8;
 use mfsk_core::ft8::params::{MSG_BITS, NMAX};
 use mfsk_core::ft8::resample::{resample_f32_to_12k, resample_to_12k};
-use mfsk_core::ft8::wave_gen::{message_to_tones, tones_to_f32};
+use mfsk_core::ft8::wave_gen::tones_to_f32;
 use mfsk_core::msg::decode_request::DecodeRequest;
 use mfsk_core::msg::wsjt77::pack77;
 
@@ -24,7 +24,7 @@ fn test_msg() -> [u8; 77] {
 /// Generate a 12 kHz FT8 frame with signal + AWGN noise.
 fn make_noisy_frame(msg: &[u8; 77], freq: f32, snr_db: f32) -> Vec<i16> {
     let _ = MSG_BITS;
-    let itone = message_to_tones(msg);
+    let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft8::Ft8>(msg);
     let pcm = tones_to_f32(&itone, freq, 1.0);
 
     let pad = 6000usize;
@@ -91,7 +91,7 @@ fn resample_decode_48k_weak_signal() {
         !results.is_empty(),
         "resample 48k decode failed at -18 dB SNR"
     );
-    assert_eq!(results[0].message77(), msg);
+    assert_eq!(*results[0].message77(), msg);
 }
 
 #[test]
@@ -112,7 +112,7 @@ fn resample_f32_decode_48k_weak_signal() {
         !results.is_empty(),
         "f32 resample 48k decode failed at -18 dB SNR"
     );
-    assert_eq!(results[0].message77(), msg);
+    assert_eq!(*results[0].message77(), msg);
 }
 
 #[test]
@@ -132,5 +132,5 @@ fn resample_decode_44100_weak_signal() {
         !results.is_empty(),
         "resample 44100 decode failed at -18 dB SNR"
     );
-    assert_eq!(results[0].message77(), msg);
+    assert_eq!(*results[0].message77(), msg);
 }

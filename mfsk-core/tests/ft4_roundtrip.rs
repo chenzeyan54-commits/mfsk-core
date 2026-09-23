@@ -50,7 +50,7 @@ fn pack_cq(call: &str, grid: &str) -> [u8; 77] {
 }
 
 fn build_slot(msg77: &[u8; 77], freq_hz: f32, peak_i16: i16) -> Vec<i16> {
-    let itone = encode::message_to_tones(msg77);
+    let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft4::Ft4>(msg77);
     assert_eq!(itone.len(), NN);
     let pcm = encode::tones_to_i16(&itone, freq_hz, peak_i16);
     assert_eq!(pcm.len(), NN * NSPS);
@@ -79,10 +79,10 @@ fn encode_decode_clean_signal_1000hz() {
     // signal, so any other message is a phantom. FT4's tier-B golden
     // guards this on the real recording; without it here, a regression
     // that only shows up on synthetic audio would pass unnoticed.
-    let phantoms: Vec<&[u8]> = results
+    let phantoms: Vec<&[u8; 77]> = results
         .iter()
         .map(|r| r.message77())
-        .filter(|m| *m != &msg[..])
+        .filter(|m| **m != msg)
         .collect();
     assert!(
         phantoms.is_empty(),
@@ -91,7 +91,7 @@ fn encode_decode_clean_signal_1000hz() {
     );
     let got = results
         .iter()
-        .find(|r| r.message77() == msg)
+        .find(|r| *r.message77() == msg)
         .expect("no result matches transmitted payload");
     // Verify the decoded payload also unpacks to the expected human-readable
     // text — confirms the full trait chain (FEC → MessageCodec::unpack).
@@ -115,15 +115,15 @@ fn encode_decode_mid_band_1500hz() {
             .decode()
             .results;
     assert!(!results.is_empty());
-    assert!(results.iter().any(|r| r.message77() == msg));
+    assert!(results.iter().any(|r| *r.message77() == msg));
     // Precision, not just recall: a clean synth slot carries exactly one
     // signal, so any other message is a phantom. FT4's tier-B golden
     // guards this on the real recording; without it here, a regression
     // that only shows up on synthetic audio would pass unnoticed.
-    let phantoms: Vec<&[u8]> = results
+    let phantoms: Vec<&[u8; 77]> = results
         .iter()
         .map(|r| r.message77())
-        .filter(|m| *m != &msg[..])
+        .filter(|m| **m != msg)
         .collect();
     assert!(
         phantoms.is_empty(),
@@ -135,7 +135,7 @@ fn encode_decode_mid_band_1500hz() {
 #[test]
 fn tone_sequence_length_matches_frame() {
     let msg = pack_cq("JA1ABC", "PM95");
-    let itone = encode::message_to_tones(&msg);
+    let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft4::Ft4>(&msg);
     assert_eq!(itone.len(), NN);
     for &t in itone.iter() {
         assert!(t < 4, "FT4 tone {t} must be 0..=3");
@@ -145,7 +145,7 @@ fn tone_sequence_length_matches_frame() {
 #[test]
 fn costas_patterns_correct_in_emitted_tones() {
     let msg = pack_cq("JA1ABC", "PM95");
-    let itone = encode::message_to_tones(&msg);
+    let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft4::Ft4>(&msg);
     let cases = [
         (0usize, [0u8, 1, 3, 2]),
         (33, [1, 0, 2, 3]),

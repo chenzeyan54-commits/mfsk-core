@@ -67,7 +67,7 @@ impl Lcg {
 fn make_slot(msg77: &[u8; 77], freq_hz: f32, snr_db: f32, seed: u64) -> Vec<i16> {
     let mut mix = vec![0.0f32; SLOT];
     let amp = (4.0 * 10f32.powf(snr_db / 10.0) * REF_BW / FS).sqrt();
-    let itone = encode::message_to_tones(msg77);
+    let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft4::Ft4>(msg77);
     let pcm = encode::tones_to_f32(&itone, freq_hz, amp);
     let start = (0.5 * FS) as usize;
     for (i, s) in pcm.iter().take(SLOT - start).enumerate() {
@@ -151,7 +151,7 @@ fn a_hint_for_a_silent_station_does_not_conjure_it() {
                 .decode()
                 .results;
             assert!(
-                !got.iter().any(|r| r.message77() == absent_msg),
+                !got.iter().any(|r| *r.message77() == absent_msg),
                 "AP conjured the hinted-but-silent station at {snr} dB, seed {seed}"
             );
             for r in &got {

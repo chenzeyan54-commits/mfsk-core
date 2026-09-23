@@ -33,7 +33,7 @@ fn pack_msg(call1: &str, call2: &str, grid: &str) -> [u8; 77] {
 }
 
 fn synth_slot(msg77: &[u8; 77], freq_hz: f32, peak_i16: i16) -> Vec<i16> {
-    let itone = encode::message_to_tones(msg77);
+    let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft4::Ft4>(msg77);
     assert_eq!(itone.len(), NN);
     let pcm = encode::tones_to_i16(&itone, freq_hz, peak_i16);
     let mut audio = vec![0i16; SLOT_SAMPLES];
@@ -56,7 +56,7 @@ fn every_depth_decodes_clean_signal() {
             .results;
         let hit = results
             .iter()
-            .find(|r| r.message77() == msg)
+            .find(|r| *r.message77() == msg)
             .unwrap_or_else(|| {
                 panic!(
                     "no clean-signal decode for osd={:?} (got {} results)",
@@ -66,8 +66,7 @@ fn every_depth_decodes_clean_signal() {
             });
         // Every rung on a clean signal should produce a CRC-valid
         // payload that unpacks to the input string.
-        let m77: [u8; 77] = hit.message77().try_into().expect("message77 is 77 bits");
-        let text = wsjt77::unpack77(&m77).unwrap_or_default();
+        let text = wsjt77::unpack77(hit.message77()).unwrap_or_default();
         if decoded_text.is_none() {
             decoded_text = Some(text.clone());
         }

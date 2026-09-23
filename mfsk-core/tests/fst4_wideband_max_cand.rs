@@ -156,14 +156,7 @@ fn run_trial(audio: &[i16]) -> Trial {
         .decode()
         .results
         .iter()
-        .any(|r| {
-            r.message77()
-                .try_into()
-                .ok()
-                .and_then(|m: &[u8; 77]| unpack77(m))
-                .as_deref()
-                == Some(GOLDEN_MSG)
-        });
+        .any(|r| unpack77(r.message77()).as_deref() == Some(GOLDEN_MSG));
 
     let cfg = wideband_cascade(CENTER_HZ);
     let mut ddc = mfsk_core::engine::dsp::ddc::StreamingComplexDdc::new(&cfg);
@@ -198,12 +191,10 @@ fn run_trial(audio: &[i16]) -> Trial {
         // `fst4_monitor_cap_sensitivity` already covers the latter.
         let (out, _) =
             decode_phase_split_timed::<Fst4s60>(&inputs, false, false, &[0], None, None, 12_000.0);
-        let decoded = out.first().and_then(|o| o.as_ref()).and_then(|r| {
-            r.message77()
-                .try_into()
-                .ok()
-                .and_then(|m: &[u8; 77]| unpack77(m))
-        });
+        let decoded = out
+            .first()
+            .and_then(|o| o.as_ref())
+            .and_then(|r| unpack77(r.message77()));
         if decoded.as_deref() == Some(GOLDEN_MSG) {
             golden_rank = Some(rank);
             break;

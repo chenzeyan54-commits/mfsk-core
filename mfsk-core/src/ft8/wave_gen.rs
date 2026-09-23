@@ -20,35 +20,19 @@
 //!
 //! ```
 //! # #[cfg(feature = "ft8")] {
-//! use mfsk_core::ft8::wave_gen::{message_to_tones, tones_to_i16};
+//! use mfsk_core::engine::tx::message_to_tones;
+//! use mfsk_core::ft8::{Ft8, wave_gen::tones_to_i16};
 //! use mfsk_core::msg::wsjt77::pack77;
 //!
 //! let msg77 = pack77("CQ", "JA1ABC", "PM95").expect("pack");
-//! let tones = message_to_tones(&msg77); // 79 Costas + data symbols
+//! let tones = message_to_tones::<Ft8>(&msg77); // 79 Costas + data symbols
 //! let pcm = tones_to_i16(&tones, /* freq */ 1500.0, /* amp */ 20_000);
 //! assert_eq!(pcm.len(), tones.len() * 1920); // NSPS samples/symbol @ 12 kHz
 //! # }
 //! ```
 use alloc::vec::Vec;
 
-use super::Ft8;
-use super::{
-    ldpc::osd::ldpc_encode,
-    params::{MSG_BITS, NN},
-};
-
-/// Encode a 77-bit message into a 79-symbol FT8 tone sequence.
-pub fn message_to_tones(message77: &[u8]) -> [u8; NN] {
-    let message77: &[u8; MSG_BITS] = message77
-        .try_into()
-        .expect("message_to_tones: message77 must be 77 bits");
-    let info = crate::fec::ldpc::append_crc14(message77);
-    let cw = ldpc_encode(&info);
-    let generic = crate::engine::tx::codeword_to_itone::<Ft8>(&cw);
-    let mut out = [0u8; NN];
-    out.copy_from_slice(&generic);
-    out
-}
+use super::params::NN;
 
 /// FT8 GFSK configuration: 12 kHz sample rate, 1920 samples/symbol (= 6.25 Hz
 /// tone spacing), BT=2.0, modulation index 1.0, 240-sample raised-cosine ramp.
@@ -80,14 +64,16 @@ pub const TONES_OUTPUT_LEN: usize = NN * 1920;
 ///
 /// Panics if `out.len() != TONES_OUTPUT_LEN`.
 #[inline]
-pub fn tones_to_f32_into(out: &mut [f32], itone: &[u8; NN], f0: f32, amplitude: f32) {
+pub fn tones_to_f32_into(out: &mut [f32], itone: &[u8], f0: f32, amplitude: f32) {
+    assert_eq!(itone.len(), NN, "FT8 takes {NN} tones");
     crate::engine::dsp::gfsk::synth_f32_into(out, itone, f0, amplitude, &FT8_GFSK)
 }
 
 /// Synthesise a 12 000 Hz f32 PCM waveform from an FT8 tone sequence.
 /// Vec-returning convenience wrapper for [`tones_to_f32_into`].
 #[inline]
-pub fn tones_to_f32(itone: &[u8; NN], f0: f32, amplitude: f32) -> Vec<f32> {
+pub fn tones_to_f32(itone: &[u8], f0: f32, amplitude: f32) -> Vec<f32> {
+    assert_eq!(itone.len(), NN, "FT8 takes {NN} tones");
     crate::engine::dsp::gfsk::synth_f32(itone, f0, amplitude, &FT8_GFSK)
 }
 
@@ -95,7 +81,8 @@ pub fn tones_to_f32(itone: &[u8; NN], f0: f32, amplitude: f32) -> Vec<f32> {
 /// written equals `amplitude_i16` (0..32767). `out.len()` must equal
 /// [`TONES_OUTPUT_LEN`].
 #[inline]
-pub fn tones_to_i16_into(out: &mut [i16], itone: &[u8; NN], f0: f32, amplitude_i16: i16) {
+pub fn tones_to_i16_into(out: &mut [i16], itone: &[u8], f0: f32, amplitude_i16: i16) {
+    assert_eq!(itone.len(), NN, "FT8 takes {NN} tones");
     crate::engine::dsp::gfsk::synth_i16_into(out, itone, f0, amplitude_i16, &FT8_GFSK)
 }
 
@@ -103,7 +90,8 @@ pub fn tones_to_i16_into(out: &mut [i16], itone: &[u8; NN], f0: f32, amplitude_i
 /// signal equals `amplitude_i16` (0..32767). Vec-returning convenience
 /// wrapper for [`tones_to_i16_into`].
 #[inline]
-pub fn tones_to_i16(itone: &[u8; NN], f0: f32, amplitude_i16: i16) -> Vec<i16> {
+pub fn tones_to_i16(itone: &[u8], f0: f32, amplitude_i16: i16) -> Vec<i16> {
+    assert_eq!(itone.len(), NN, "FT8 takes {NN} tones");
     crate::engine::dsp::gfsk::synth_i16(itone, f0, amplitude_i16, &FT8_GFSK)
 }
 
@@ -118,15 +106,15 @@ mod tests {
     /// tone sequence (structural smoke-test only — no full decode).
     #[test]
     fn tone_sequence_length() {
-        let msg = [0u8; MSG_BITS];
-        let itone = message_to_tones(&msg);
+        let msg = [0u8; 77];
+        let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg);
         assert_eq!(itone.len(), NN);
     }
 
     #[test]
     fn all_tones_in_range() {
-        let msg = [1u8; MSG_BITS]; // arbitrary non-zero message
-        let itone = message_to_tones(&msg);
+        let msg = [1u8; 77]; // arbitrary non-zero message
+        let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg);
         for &t in itone.iter() {
             assert!(t < 8, "tone {t} out of range");
         }
@@ -135,8 +123,8 @@ mod tests {
     #[test]
     fn costas_positions_correct() {
         use super::super::params::COSTAS;
-        let msg = [0u8; MSG_BITS];
-        let itone = message_to_tones(&msg);
+        let msg = [0u8; 77];
+        let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg);
         for offset in [0usize, 36, 72] {
             for (i, &c) in COSTAS.iter().enumerate() {
                 assert_eq!(
@@ -151,8 +139,8 @@ mod tests {
 
     #[test]
     fn waveform_length() {
-        let msg = [0u8; MSG_BITS];
-        let itone = message_to_tones(&msg);
+        let msg = [0u8; 77];
+        let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg);
         let pcm = tones_to_f32(&itone, 1000.0, 1.0);
         assert_eq!(pcm.len(), NN * NSPS);
     }
@@ -173,7 +161,7 @@ mod tests {
 
         // Build a valid FT8 standard message ("CQ JA1ABC PM95").
         let msg = pack77("CQ", "JA1ABC", "PM95").expect("pack77");
-        let itone = message_to_tones(&msg);
+        let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg);
 
         // Strong noiseless signal at 1000 Hz.
         let pcm_f32 = tones_to_f32(&itone, 1000.0, 1.0);
@@ -198,7 +186,7 @@ mod tests {
         );
         // The decoded message77 bits should match.
         assert_eq!(
-            results[0].message77(),
+            *results[0].message77(),
             msg,
             "decoded message77 does not match input"
         );
@@ -238,7 +226,7 @@ mod tests {
             assert_eq!(text, expected, "pack/unpack mismatch");
 
             // 3. Full encode → decode with audio
-            let itone = message_to_tones(&msg77);
+            let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg77);
             let pcm_f32 = tones_to_f32(&itone, 1000.0, 1.0);
             let pad = vec![0.0f32; 6000];
             let signal: Vec<f32> = pad.iter().chain(pcm_f32.iter()).cloned().collect();

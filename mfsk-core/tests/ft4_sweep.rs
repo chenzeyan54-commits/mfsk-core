@@ -1471,7 +1471,7 @@ fn ft4_diag_dt_window_reach() {
                                     false,
                                 )
                                 .and_then(|r| {
-                                    let m77: &[u8; 77] = r.message77().try_into().ok()?;
+                                    let m77 = r.message77();
                                     unpack77(m77)
                                 })
                                 .is_some_and(|m| m == GOLDEN_MSG)
