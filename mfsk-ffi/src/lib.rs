@@ -2895,7 +2895,8 @@ pub unsafe extern "C" fn mfsk_jt9_decode_at(
         set_error("mfsk_jt9_decode_at: samples is NULL");
         return MfskStatus::InvalidArg;
     };
-    let rows: Vec<MfskDecode> = mfsk_core::jt9::decode_at(&audio, 12_000, 0, freq_hz)
+    let rows: Vec<MfskDecode> = mfsk_core::jt9::DecodeRequest::sniper(&audio, 12_000, 0, freq_hz)
+        .decode()
         .map(|m| vec![simple_row(MfskMode::Jt9, freq_hz, 0.0, 0.0, &m.to_string())])
         .unwrap_or_default();
     unsafe { emit_rows(&rows, out, cap, out_len) }

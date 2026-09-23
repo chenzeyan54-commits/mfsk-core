@@ -129,7 +129,7 @@ pub use tx::{encode_channel_symbols, synthesize_audio, synthesize_standard};
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 /// Top-level: decode a JT65 signal at a known (start_sample, base_freq)
 /// and return the recovered message if RS succeeds. Mirrors the shape of
-/// `mfsk_core::jt9::decode_at`.
+/// `mfsk_core::jt9::SniperRequest`.
 pub fn decode_at(
     audio: &[f32],
     sample_rate: u32,
@@ -144,7 +144,7 @@ pub fn decode_at(
 /// ([`Jt65Demod::snr_db`]). Used by
 /// [`decode_scan`] to populate [`Jt65Result::snr_db`]; kept private
 /// since [`decode_at`]'s return type is part of the stable surface
-/// mirrored by `jt9::decode_at`.
+/// mirrored by `jt9::SniperRequest`.
 fn decode_at_with_snr(
     audio: &[f32],
     sample_rate: u32,

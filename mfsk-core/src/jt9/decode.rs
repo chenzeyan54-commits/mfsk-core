@@ -86,7 +86,7 @@ impl Jt9Depth {
 /// audio FFT. Returns `None` when the sync gate is missed, Fano fails
 /// to converge, or the message is not `Jt72Message::Standard`.
 ///
-/// `decode_scan`'s production candidate loop calls
+/// The scan's production candidate loop (`super::decode_scan_inner`) calls
 /// [`decode_at_baseband_with_fft_depth`] directly (it always has an
 /// explicit [`Jt9Depth`] to hand); this default-depth convenience is
 /// currently only exercised by tests (`decode_at_baseband` below).

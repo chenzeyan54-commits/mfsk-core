@@ -21,11 +21,11 @@
 //! ## Quick example
 //!
 //! ```no_run
-//! use mfsk_core::jt9::decode_scan_default;
+//! use mfsk_core::jt9::DecodeRequest;
 //!
 //! # let audio: Vec<f32> = vec![];
 //! // `audio` is 720_000 f32 samples at 12 kHz (60 s slot).
-//! for r in decode_scan_default(&audio, 12_000) {
+//! for r in DecodeRequest::new(&audio, 12_000).decode() {
 //!     println!("{:+7.1} Hz  start={:>8} sample  {}",
 //!              r.freq_hz, r.start_sample, r.message);
 //! }
@@ -51,6 +51,8 @@ use crate::msg::Jt72Codec;
 pub mod baseband;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub(crate) mod decode;
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+pub mod decode_request;
 pub mod interleave;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod rx;
@@ -63,6 +65,8 @@ pub mod tx;
 
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub use decode::Jt9Depth;
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+pub use decode_request::{DecodeRequest, SniperRequest};
 pub use interleave::{deinterleave, deinterleave_llrs, interleave};
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub use rx::demodulate_aligned;
@@ -72,9 +76,10 @@ pub use sync_pattern::{JT9_ISYNC, JT9_SYNC_BLOCKS, JT9_SYNC_POSITIONS};
 pub use tx::{encode_channel_symbols, synthesize_audio, synthesize_standard};
 
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-/// Top-level convenience: decode a JT9 signal at a known (start_sample,
-/// base_freq) and return the recovered message if Fano converges.
-pub fn decode_at(
+/// Decode a JT9 signal at a known (start_sample, base_freq) and return
+/// the recovered message if Fano converges. Public through
+/// [`SniperRequest`].
+fn decode_at_inner(
     audio: &[f32],
     sample_rate: u32,
     start_sample: usize,
@@ -124,109 +129,8 @@ pub struct Jt9Result {
 /// search via [`search::coarse_search`] and uses the WSJT-X-faithful
 /// `softsym` pipeline (`downsam9` + `peakdt9` + `symspec2`) on each
 /// candidate in score order, collapsing duplicates that decode to the
-/// same message within ±4 Hz / ±1 symbol.
-pub fn decode_scan(
-    audio: &[f32],
-    sample_rate: u32,
-    nominal_start_sample: usize,
-    params: &search::SearchParams,
-) -> Vec<Jt9Result> {
-    decode_scan_inner(
-        audio,
-        sample_rate,
-        nominal_start_sample,
-        params,
-        Jt9Depth::default(),
-        None,
-    )
-}
-
-#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-/// [`decode_scan`] with an explicit [`Jt9Depth`] instead of the crate
-/// default — trades candidate-loop CPU cost for extra sensitivity on
-/// candidates that don't converge (a real signal converges in
-/// microseconds regardless of depth, so this only costs more on a
-/// busy/noisy band). See [`Jt9Depth`]'s own doc comment for the
-/// measured tradeoff and WSJT-X's own `-d`/"Decode Again" precedent
-/// this mirrors.
-pub fn decode_scan_with_depth(
-    audio: &[f32],
-    sample_rate: u32,
-    nominal_start_sample: usize,
-    params: &search::SearchParams,
-    depth: Jt9Depth,
-) -> Vec<Jt9Result> {
-    decode_scan_inner(
-        audio,
-        sample_rate,
-        nominal_start_sample,
-        params,
-        depth,
-        None,
-    )
-}
-
-#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-/// Streaming variant of [`decode_scan`]: fires `on_result` once per
-/// candidate as it's accepted, *in addition to* (not instead of) the
-/// returned `Vec` — purely additive, same shape as
-/// [`crate::msg::decode_request::DecodeRequest::on_result`] (see that
-/// method's doc comment and `docs/reference/LIBRARY.md`'s "public
-/// decode entry point" section for the full portability rationale).
-///
-/// A `_streaming` sibling rather than a new parameter on
-/// [`decode_scan`] itself, matching
-/// `ft8::decode_block::decode_block_streaming`'s precedent — bolting
-/// a parameter onto an existing plain `pub fn` is a breaking change.
-///
-/// **Delivery order/dedup contract**: `decode_scan`'s candidate loop
-/// is sequential with no early exit and no parallelism (unlike WSPR's
-/// `decode_scan`, which uses `rayon::par_iter()`) — `cb` fires exactly
-/// once per result that ends up in the returned `Vec`, in the same
-/// order. No divergence mechanism exists here. Candidates are tried in
-/// coarse-score-descending order (same `cands.sort_unstable_by`
-/// below), so `cb` also tends to favor stronger signals first, same
-/// correlation-not-guarantee caveat documented on
-/// [`crate::msg::decode_request::DecodeRequest::on_result`].
-pub fn decode_scan_streaming(
-    audio: &[f32],
-    sample_rate: u32,
-    nominal_start_sample: usize,
-    params: &search::SearchParams,
-    on_result: &(dyn Fn(&Jt9Result) + Sync),
-) -> Vec<Jt9Result> {
-    decode_scan_inner(
-        audio,
-        sample_rate,
-        nominal_start_sample,
-        params,
-        Jt9Depth::default(),
-        Some(on_result),
-    )
-}
-
-#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-/// [`decode_scan_streaming`] with an explicit [`Jt9Depth`] — see
-/// [`decode_scan_with_depth`].
-pub fn decode_scan_streaming_with_depth(
-    audio: &[f32],
-    sample_rate: u32,
-    nominal_start_sample: usize,
-    params: &search::SearchParams,
-    depth: Jt9Depth,
-    on_result: &(dyn Fn(&Jt9Result) + Sync),
-) -> Vec<Jt9Result> {
-    decode_scan_inner(
-        audio,
-        sample_rate,
-        nominal_start_sample,
-        params,
-        depth,
-        Some(on_result),
-    )
-}
-
-#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+/// same message within ±4 Hz / ±1 symbol. Public through
+/// [`DecodeRequest`].
 fn decode_scan_inner(
     audio: &[f32],
     sample_rate: u32,
@@ -290,12 +194,6 @@ fn decode_scan_inner(
         }
     }
     seen
-}
-
-#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-/// Convenience: scan using [`search::default_search_params`].
-pub fn decode_scan_default(audio: &[f32], sample_rate: u32) -> Vec<Jt9Result> {
-    decode_scan(audio, sample_rate, 0, &search::default_search_params())
 }
 
 /// JT9 protocol marker.
@@ -381,25 +279,24 @@ mod tests {
         assert_eq!(<<Jt9 as Protocol>::Fec as FecCodec>::K, 72);
     }
 
-    /// `decode_scan_with_depth` wiring sanity — every depth tier must
+    /// `DecodeRequest::depth` wiring sanity — every depth tier must
     /// still recover a clean, strong synthetic signal (a real signal
     /// converges in Fano almost instantly regardless of cycle budget,
     /// see `Jt9Depth`'s own doc comment; this only checks the plumbing
     /// reaches `ConvFano232`, not sensitivity — that's the AWGN
     /// sweep's job).
     #[test]
-    fn decode_scan_with_depth_finds_clean_signal_at_every_tier() {
+    fn depth_finds_clean_signal_at_every_tier() {
         let freq = 1500.0;
         let audio =
             tx::synthesize_standard("CQ", "K1ABC", "FN42", 12_000, freq, 0.3).expect("pack+synth");
-        let params = search::default_search_params();
         for depth in [
             Jt9Depth::Fast,
             Jt9Depth::Normal,
             Jt9Depth::Deep,
             Jt9Depth::Max,
         ] {
-            let decodes = decode_scan_with_depth(&audio, 12_000, 0, &params, depth);
+            let decodes = DecodeRequest::new(&audio, 12_000).depth(depth).decode();
             assert!(
                 !decodes.is_empty(),
                 "depth={depth:?} found no decodes on a clean synthetic signal"
@@ -478,7 +375,7 @@ mod tests {
             let t0 = Instant::now();
             let mut last_len = 0;
             for _ in 0..n {
-                let r = decode_scan_default(&audio, 12000);
+                let r = DecodeRequest::new(&audio, 12000).decode();
                 last_len = r.len();
             }
             let total_elapsed = t0.elapsed();

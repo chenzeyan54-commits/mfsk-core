@@ -2,6 +2,28 @@
 
 ## 0.11.1 — FT4 filters phantoms by default (#383), FT4 on the CoreS3 answers by the reply deadline, one screen for every mode, one boot sequence for the CoreS3's four receivers, WiFi becomes a setting of its own (#381)
 
+- **JT9 decodes through one builder, `jt9::DecodeRequest` (breaking,
+  #403).** The six free functions it replaces — `decode_scan`,
+  `decode_scan_default`, `decode_scan_with_depth`,
+  `decode_scan_streaming`, `decode_scan_streaming_with_depth` and
+  `decode_at` — had names that multiplied with every axis: adding
+  `Jt9Depth` alone cost two new functions. Each axis is a method now:
+
+  ```rust
+  jt9::DecodeRequest::new(&audio, 12_000)
+      .nominal_start(n).params(p).depth(Jt9Depth::Deep).on_result(&cb)
+      .decode()                                   // Vec<Jt9Result>
+  jt9::DecodeRequest::sniper(&audio, 12_000, start, freq_hz).decode()
+                                                  // Option<Jt72Message>
+  ```
+
+  `decode_scan_default(a, r)` is `DecodeRequest::new(a, r).decode()`.
+  Same shape as `q65::DecodeRequest`, and per-mode rather than the
+  generic `msg::decode_request` for the same reason: JT9 decodes `f32`
+  PCM, where the generic builder takes `i16`. Pure re-plumbing — the
+  JT9 sweep's CSV is byte-identical before and after, and the golden
+  test runs in the same 0.28 s. JT65 and WSPR follow in their own PRs.
+
 - **FST4's tier-C gate is 626 lines, not 7 791.** `fst4_sweep.rs` had
   accumulated 46 `#[ignore]`d diagnostic probes from investigations that
   are now closed — #146's AWGN gap, #198's f32-hardcoded `decode_soft`,

@@ -9,8 +9,8 @@
 //!
 //! This lets us decode WAV files where the transmitter's start time
 //! and carrier frequency aren't known — the common real-world case.
-//! The aligned `decode_at` remains available for callers that already
-//! know both.
+//! The aligned [`super::SniperRequest`] remains available for callers
+//! that already know both.
 
 use alloc::vec::Vec;
 #[cfg(not(feature = "std"))]

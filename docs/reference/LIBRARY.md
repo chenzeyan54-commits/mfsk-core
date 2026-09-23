@@ -249,8 +249,8 @@ already deduped.
 
 Every protocol offers the same shape through its own entry point:
 `wspr::decode::{decode_scan_streaming, decode_scan_subtract_streaming}`,
-`jt9::decode_scan_streaming`, `jt65::decode_scan_streaming`, and
-`.on_result(cb)` on `q65::{DecodeRequest, SniperRequest,
+`jt65::decode_scan_streaming`, and `.on_result(cb)` on
+`jt9::DecodeRequest` and `q65::{DecodeRequest, SniperRequest,
 MultiPeriodRequest}`.
 
 ### 2.5 Protocols with their own entry point
@@ -295,7 +295,32 @@ the whole slot. If the frequency and start sample are already known,
 `wspr::decode::decode_at(samples, rate, start_sample, freq_hz)`
 bypasses the scan.
 
-**JT9 and JT65** expose the same scan + point-decode pattern:
+**JT9** has one builder, `jt9::DecodeRequest` (issue #403), in the
+same shape as Q65's below but not generic, since JT9 has one sub-mode.
+`DecodeRequest::new(audio, sample_rate)` scans the whole buffer with
+`jt9::search::default_search_params()`; `.nominal_start()`,
+`.params()`, `.depth(Jt9Depth)` and `.on_result()` adjust it, and
+`DecodeRequest::sniper(audio, rate, start_sample, freq_hz).decode()`
+is the point decode at a known alignment. It returns the
+`Jt72Message` alone: that path has no sync search, AFC or SNR estimate
+to report. The six `decode_scan*` / `decode_at` free functions this
+replaced are gone.
+
+```rust
+# #[cfg(feature = "jt9")] {
+use mfsk_core::jt9::{DecodeRequest, Jt9Depth};
+use mfsk_core::jt9::tx::synthesize_standard;
+
+let audio_f32 = synthesize_standard("CQ", "K1ABC", "FN42", 12_000, 1500.0, 0.3)
+    .expect("pack + synth");
+let decodes = DecodeRequest::new(&audio_f32, 12_000)
+    .depth(Jt9Depth::Deep)
+    .decode();
+assert!(!decodes.is_empty(), "roundtrip must decode");
+# }
+```
+
+**JT65** exposes a scan + point-decode pattern:
 
 ```rust
 # #[cfg(feature = "jt65")] {

@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use mfsk_core::jt9::decode_scan;
+use mfsk_core::jt9::DecodeRequest;
 use mfsk_core::jt9::search::SearchParams;
 
 #[allow(dead_code)]
@@ -40,7 +40,7 @@ const SNR_TOL_DB: f32 = 4.0;
 /// (2026-05-08) without SNR — the CLI run backfills theirs.
 ///
 /// Six source-faithful fixes under issue #19 lifted recall from 1/5
-/// to 5/5 (see `project_jt9_wsjtx_recall.md`); `decode_scan` reaches
+/// to 5/5 (see `project_jt9_wsjtx_recall.md`); `DecodeRequest` reaches
 /// full 7/7 recall with zero phantoms as of 2026-08-14 — so the
 /// budget below is 0, not a looser recall-only floor. The `params`
 /// `freq_max_hz` is 1550 Hz (default `SearchParams` is 1400..1600,
@@ -115,7 +115,9 @@ fn jt9_wsjtx_sample_recall_precision_and_snr() {
 
     let audio = read_wsjtx_wav_f32(Path::new(SAMPLE_PATH));
     // JT9 transmissions start at the top of the slot — `nominal_start_sample = 0`.
-    let decodes = decode_scan(&audio, 12_000, 0, &jt9_search_params());
+    let decodes = DecodeRequest::new(&audio, 12_000)
+        .params(jt9_search_params())
+        .decode();
 
     assert_golden(
         &decodes,
@@ -139,32 +141,34 @@ fn jt9_wsjtx_sample_recall_precision_and_snr() {
     );
 }
 
-/// `decode_scan_streaming`'s `on_result` callback — real-signal
+/// `DecodeRequest::on_result` callback — real-signal
 /// verification, mirroring `tests/ft8_streaming_decode.rs`'s
-/// sequential-exact-match contract. `decode_scan`'s candidate loop is
+/// sequential-exact-match contract. The scan's candidate loop is
 /// sequential with no early exit and no parallelism, so the
 /// callback-delivered set must exactly equal the batch `Vec`.
 #[test]
 fn jt9_scan_streaming_matches_batch_exactly() {
     use mfsk_core::jt9::Jt9Result;
-    use mfsk_core::jt9::decode_scan_streaming;
 
     let audio = read_wsjtx_wav_f32(Path::new(SAMPLE_PATH));
 
     let streamed: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let on_result = |r: &Jt9Result| streamed.lock().unwrap().push(r.message.to_string());
-    let batch = decode_scan_streaming(&audio, 12_000, 0, &jt9_search_params(), &on_result);
+    let batch = DecodeRequest::new(&audio, 12_000)
+        .params(jt9_search_params())
+        .on_result(&on_result)
+        .decode();
 
     let batch_msgs: Vec<String> = batch.iter().map(|d| d.message.to_string()).collect();
     let streamed = streamed.into_inner().unwrap();
     eprintln!(
-        "JT9 decode_scan_streaming: batch={} streamed={}",
+        "JT9 on_result: batch={} streamed={}",
         batch_msgs.len(),
         streamed.len()
     );
     assert_eq!(
         streamed, batch_msgs,
-        "JT9 decode_scan_streaming: streamed callback deliveries must exactly \
+        "JT9 on_result: streamed callback deliveries must exactly \
          match the batch result, same order (sequential, no early exit, no \
          parallelism — no divergence mechanism exists on this path)"
     );

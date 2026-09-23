@@ -133,7 +133,7 @@ fn jt65_window_reaches_reference_late_edge() {
 #[test]
 fn jt9_window_reaches_reference_late_edge() {
     use mfsk_core::jt9::search::{SearchParams, default_search_params};
-    use mfsk_core::jt9::{decode_scan, tx::synthesize_standard};
+    use mfsk_core::jt9::{DecodeRequest, tx::synthesize_standard};
 
     let signal = synthesize_standard("K1ABC", "W9XYZ", "EN37", FS, 1500.0, 0.3)
         .expect("JT9 synth must succeed");
@@ -147,7 +147,10 @@ fn jt9_window_reaches_reference_late_edge() {
     let mut missed: Vec<f32> = Vec::new();
     for &dt in &[0.0f32, 0.25, REFERENCE_JT9_LATE_SEC] {
         let slot = place(&signal, nominal + dt, 60.0);
-        let decodes = decode_scan(&slot, FS, (nominal * FS as f32) as usize, &params);
+        let decodes = DecodeRequest::new(&slot, FS)
+            .nominal_start((nominal * FS as f32) as usize)
+            .params(params)
+            .decode();
         let hit = decodes
             .iter()
             .any(|d| d.message.to_string().contains("W9XYZ"));

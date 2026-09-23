@@ -248,7 +248,7 @@ FT8・FT4・FST4 全サブモードが対応する（C 側に公開されてい�
 
 各プロトコルが同じ形を独自のエントリポイントで提供している:
 `wspr::decode::{decode_scan_streaming, decode_scan_subtract_streaming}`、
-`jt9::decode_scan_streaming`、`jt65::decode_scan_streaming`、および
+`jt65::decode_scan_streaming`、`jt9::DecodeRequest` の `.on_result(cb)`、および
 `q65::{DecodeRequest, SniperRequest, MultiPeriodRequest}` の
 `.on_result(cb)`。
 
@@ -302,7 +302,32 @@ for d in decodes {
 
 
 
-JT9 と JT65 は同じ scan + 単点デコードのパターンを提供する:
+**JT9** のビルダーは `jt9::DecodeRequest` ひとつ（issue #403）。形は
+下の Q65 と同じだが、JT9 はサブモードがひとつなのでジェネリックではない。
+`DecodeRequest::new(audio, sample_rate)` は
+`jt9::search::default_search_params()` でバッファ全体を探索し、
+`.nominal_start()`・`.params()`・`.depth(Jt9Depth)`・`.on_result()` で
+調整する。既知のアラインメントでの単点デコードは
+`DecodeRequest::sniper(audio, rate, start_sample, freq_hz).decode()`。
+こちらは `Jt72Message` だけを返す — この経路には同期探索・AFC・SNR 推定が
+なく、報告できるものがないため。置き換えられた `decode_scan*` /
+`decode_at` の 6 つのフリー関数は削除した。
+
+```rust
+# #[cfg(feature = "jt9")] {
+use mfsk_core::jt9::{DecodeRequest, Jt9Depth};
+use mfsk_core::jt9::tx::synthesize_standard;
+
+let audio_f32 = synthesize_standard("CQ", "K1ABC", "FN42", 12_000, 1500.0, 0.3)
+    .expect("pack + synth");
+let decodes = DecodeRequest::new(&audio_f32, 12_000)
+    .depth(Jt9Depth::Deep)
+    .decode();
+assert!(!decodes.is_empty(), "ラウンドトリップは復号できるはず");
+# }
+```
+
+**JT65** は scan + 単点デコードのパターンを提供する:
 
 ```rust
 # #[cfg(feature = "jt65")] {
