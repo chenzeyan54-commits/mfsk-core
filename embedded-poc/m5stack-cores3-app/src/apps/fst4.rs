@@ -515,7 +515,22 @@ fn capture_loop() -> ! {
                     "fst4_app::capture: slot anchored to UTC — {} ms to the next boundary",
                     remain / 12,
                 );
-                SLOT_SAMPLES_12K.saturating_sub(remain)
+                // `SLOT - remain` is where *now* sits in the slot, but
+                // the audio staged while the previous slot's memory was
+                // released (~1.2 s, see [`SPECTRA_FREE`]) arrived before
+                // now. It is fed first, so the count starts where the
+                // oldest staged sample sits. Staged samples from before
+                // the boundary belong to the previous slot and go.
+                let now_pos = SLOT_SAMPLES_12K.saturating_sub(remain);
+                let mut staging = AUDIO_STAGING.lock().expect("staging poisoned");
+                if staging.len() > now_pos {
+                    let stale = staging.len() - now_pos;
+                    staging.drain(..stale);
+                    log::info!(
+                        "fst4_app::capture: dropped {stale} staged samples from before the boundary"
+                    );
+                }
+                now_pos - staging.len()
             }
             Some(remain) => {
                 log::info!(
@@ -538,8 +553,17 @@ fn capture_loop() -> ! {
         while fed < SLOT_SAMPLES_12K {
             let live = UAC_AUDIO_ACTIVE.load(Ordering::Acquire);
             if live {
-                // Real audio: take whatever has arrived and feed it.
-                let staged = core::mem::take(&mut *AUDIO_STAGING.lock().expect("staging poisoned"));
+                // Real audio: take whatever has arrived, up to the slot
+                // boundary. Taking the whole staging buffer put the
+                // first samples of the next slot at the end of this
+                // one — up to a drain's worth, and the next slot then
+                // started that much late. What is past the boundary
+                // stays staged and opens the next slot.
+                let staged: Vec<i16> = {
+                    let mut staging = AUDIO_STAGING.lock().expect("staging poisoned");
+                    let n = staging.len().min(SLOT_SAMPLES_12K - fed);
+                    staging.drain(..n).collect()
+                };
                 if staged.is_empty() {
                     // A stream that stops mid-slot must not hang the
                     // receiver. The comment this replaces claimed the
