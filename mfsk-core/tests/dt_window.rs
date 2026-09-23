@@ -97,7 +97,7 @@ fn place(signal: &[f32], start_sec: f32, slot_sec: f32) -> Vec<f32> {
 #[test]
 fn jt65_window_reaches_reference_late_edge() {
     use mfsk_core::jt65::search::{SearchParams, default_search_params};
-    use mfsk_core::jt65::{decode_scan, tx::synthesize_standard};
+    use mfsk_core::jt65::{DecodeRequest, tx::synthesize_standard};
 
     let signal = synthesize_standard("K1ABC", "W9XYZ", "EN37", FS, 1500.0, 0.3)
         .expect("JT65 synth must succeed");
@@ -113,7 +113,10 @@ fn jt65_window_reaches_reference_late_edge() {
     let mut dt = 0.0f32;
     while dt <= REFERENCE_JT65_LATE_SEC + 1e-3 {
         let slot = place(&signal, nominal + dt, 60.0);
-        let decodes = decode_scan(&slot, FS, (nominal * FS as f32) as usize, &params);
+        let decodes = DecodeRequest::new(&slot, FS)
+            .nominal_start((nominal * FS as f32) as usize)
+            .params(params)
+            .decode();
         let hit = decodes
             .iter()
             .any(|d| d.message.to_string().contains("W9XYZ"));
@@ -186,7 +189,7 @@ const REFERENCE_Q65_EARLY_SEC: f32 = -1.0;
 #[test]
 fn jt65_decodes_frame_starting_before_the_buffer() {
     use mfsk_core::jt65::search::{SearchParams, default_search_params};
-    use mfsk_core::jt65::{decode_scan, tx::synthesize_standard};
+    use mfsk_core::jt65::{DecodeRequest, tx::synthesize_standard};
 
     let signal = synthesize_standard("K1ABC", "W9XYZ", "EN37", FS, 1500.0, 0.3)
         .expect("JT65 synth must succeed");
@@ -204,7 +207,10 @@ fn jt65_decodes_frame_starting_before_the_buffer() {
     assert!(drop > 0, "test only meaningful when the frame is truncated");
     let slot = place(&signal[drop..], 0.0, 60.0);
 
-    let decodes = decode_scan(&slot, FS, (nominal * FS as f32) as usize, &params);
+    let decodes = DecodeRequest::new(&slot, FS)
+        .nominal_start((nominal * FS as f32) as usize)
+        .params(params)
+        .decode();
     let hit = decodes
         .iter()
         .find(|d| d.message.to_string().contains("W9XYZ"));

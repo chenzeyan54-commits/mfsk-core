@@ -24,6 +24,32 @@
   JT9 sweep's CSV is byte-identical before and after, and the golden
   test runs in the same 0.28 s. JT65 and WSPR follow in their own PRs.
 
+- **JT65 decodes through `jt65::DecodeRequest` / `SniperRequest` too
+  (breaking, #403).** Nine free functions go: `decode_scan`,
+  `_default`, `_streaming`, `decode_scan_chase`, `_chase_default`,
+  `_chase_streaming`, `decode_at`, `decode_at_with_erasures` and
+  `chase::decode_at_with_chase`. The axis JT65 adds is how Reed-Solomon
+  runs, and it is one method on either builder now:
+
+  ```rust
+  jt65::DecodeRequest::new(&audio, 12_000)
+      .chase(ChaseParams::default())              // was decode_scan_chase*
+      .decode()
+  jt65::DecodeRequest::sniper(&audio, 12_000, start, freq_hz)
+      .erasures(&[0, 8, 16, 24, 32])              // was decode_at_with_erasures
+      .decode()
+  ```
+
+  The two scan loops underneath were the same 60 lines apart from the
+  per-candidate decoder call, and are one function now. Both sweep CSVs
+  (`jt65`, `jt65_chase`) are byte-identical before and after.
+
+  `Jt65Result::dt_sec`'s doc still said "from the start of the audio
+  buffer" and told callers to subtract their nominal start. That has
+  been wrong since #397 made it run from the nominal start, and
+  following it would have subtracted the nominal twice. The doc says
+  what the field holds now.
+
 - **FST4's tier-C gate is 626 lines, not 7 791.** `fst4_sweep.rs` had
   accumulated 46 `#[ignore]`d diagnostic probes from investigations that
   are now closed — #146's AWGN gap, #198's f32-hardcoded `decode_soft`,

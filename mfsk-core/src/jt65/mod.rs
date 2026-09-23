@@ -27,11 +27,11 @@
 //! ## Quick example
 //!
 //! ```no_run
-//! use mfsk_core::jt65::decode_scan_default;
+//! use mfsk_core::jt65::DecodeRequest;
 //!
 //! # let audio: Vec<f32> = vec![];
 //! // `audio` is 720_000 f32 samples at 12 kHz (60 s slot).
-//! for r in decode_scan_default(&audio, 12_000) {
+//! for r in DecodeRequest::new(&audio, 12_000).decode() {
 //!     println!("{:+7.1} Hz  start={:>8} sample  {}",
 //!              r.freq_hz, r.start_sample, r.message);
 //! }
@@ -42,25 +42,25 @@
 //! For very weak signals, JT65 benefits from feeding per-symbol
 //! confidence into Reed-Solomon as *erasures*. Each erasure lets RS
 //! correct one more symbol than the hard-error bound
-//! (`2·errors + erasures ≤ 51`). Use [`decode_at_with_erasures`]:
+//! (`2·errors + erasures ≤ 51`). Use [`SniperRequest::erasures`]:
 //!
 //! ```no_run
-//! use mfsk_core::jt65::decode_at_with_erasures;
+//! use mfsk_core::jt65::DecodeRequest;
 //!
 //! # let audio: Vec<f32> = vec![];
 //! # let (start_sample, freq_hz) = (0, 1270.0);
 //! // Try 0 → 8 → 16 → 24 → 32 erasures in order; return the first
 //! // budget that unpacks into a valid message.
-//! let msg = decode_at_with_erasures(
-//!     &audio, 12_000, start_sample, freq_hz,
-//!     &[0, 8, 16, 24, 32],
-//! );
+//! let msg = DecodeRequest::sniper(&audio, 12_000, start_sample, freq_hz)
+//!     .erasures(&[0, 8, 16, 24, 32])
+//!     .decode();
 //! ```
 //!
 //! ## Stochastic Chase decode
 //!
-//! For signals still too weak for [`decode_at_with_erasures`]'s single
-//! deterministic ordering, [`chase::decode_at_with_chase`] is a
+//! For signals still too weak for [`SniperRequest::erasures`]'s single
+//! deterministic ordering, [`DecodeRequest::chase`] /
+//! [`SniperRequest::chase`] is a
 //! faithful port of WSJT-X's `ftrsdap` stochastic Chase decoder
 //! ([issue #169](https://github.com/jl1nie/mfsk-core/issues/169)) —
 //! magic numbers included, not just the algorithmic shape: WSJT-X's
@@ -70,7 +70,7 @@
 //! same day: [`search`]/[`rx`] gained a sub-bin frequency refinement +
 //! NCO correction that eliminates FFT "scalloping loss" — this
 //! benefits *every* decode path in this module, not just
-//! `decode_at_with_chase` (`decode_at_with_erasures` inherits it too,
+//! the chase path (the erasure path inherits it too,
 //! with no code changes of its own). Measured on the AWGN sweep
 //! (`docs/notes/BENCHMARKS.md`), the two fixes together closed the
 //! previously-documented ~7-8 dB sensitivity gap vs. real WSJT-X's
@@ -79,10 +79,10 @@
 //! WSJT-X comparison.
 //!
 //! ```no_run
-//! use mfsk_core::jt65::decode_scan_chase_default;
+//! use mfsk_core::jt65::{ChaseParams, DecodeRequest};
 //!
 //! # let audio: Vec<f32> = vec![];
-//! for r in decode_scan_chase_default(&audio, 12_000) {
+//! for r in DecodeRequest::new(&audio, 12_000).chase(ChaseParams::default()).decode() {
 //!     println!("{:+7.1} Hz  start={:>8} sample  {}",
 //!              r.freq_hz, r.start_sample, r.message);
 //! }
@@ -108,6 +108,8 @@ use crate::msg::Jt72Codec;
 // unconditional, the same split `wspr::mod` uses.
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod chase;
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+pub mod decode_request;
 pub mod gray;
 pub mod interleave;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
@@ -118,7 +120,9 @@ pub mod sync_pattern;
 pub mod tx;
 
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-pub use chase::{ChaseParams, decode_at_with_chase};
+pub use chase::ChaseParams;
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+pub use decode_request::{DecodeRequest, SniperRequest};
 pub use gray::{gray6, inv_gray6};
 pub use interleave::{deinterleave, interleave};
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
@@ -127,24 +131,9 @@ pub use sync_pattern::{JT65_DATA_POSITIONS, JT65_NPRC, JT65_SYNC_BLOCKS, JT65_SY
 pub use tx::{encode_channel_symbols, synthesize_audio, synthesize_standard};
 
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-/// Top-level: decode a JT65 signal at a known (start_sample, base_freq)
-/// and return the recovered message if RS succeeds. Mirrors the shape of
-/// `mfsk_core::jt9::SniperRequest`.
-pub fn decode_at(
-    audio: &[f32],
-    sample_rate: u32,
-    start_sample: usize,
-    base_freq_hz: f32,
-) -> Option<crate::msg::Jt72Message> {
-    decode_at_with_snr(audio, sample_rate, start_sample, base_freq_hz).map(|(msg, _)| msg)
-}
-
-#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-/// Like [`decode_at`] but also returns the decode-side SNR estimate
-/// ([`Jt65Demod::snr_db`]). Used by
-/// [`decode_scan`] to populate [`Jt65Result::snr_db`]; kept private
-/// since [`decode_at`]'s return type is part of the stable surface
-/// mirrored by `jt9::SniperRequest`.
+/// Hard-decision RS decode at a known (start_sample, base_freq), with
+/// the decode-side SNR estimate ([`Jt65Demod::snr_db`]) alongside the
+/// message. Public through [`SniperRequest`].
 fn decode_at_with_snr(
     audio: &[f32],
     sample_rate: u32,
@@ -170,7 +159,7 @@ fn decode_at_with_snr(
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 /// Decode a JT65 signal at a known alignment, trying progressively
 /// larger erasure counts until Reed-Solomon converges or the bound
-/// is exhausted. Unlike [`decode_at`], this method exploits
+/// is exhausted. Unlike plain hard-decision RS, this exploits
 /// per-symbol confidence from the demodulator: symbols with the
 /// smallest (best − runner-up) margin are flagged as erasures, which
 /// doubles the correctable error count compared to the plain
@@ -180,8 +169,9 @@ fn decode_at_with_snr(
 /// reasonable default is `&[0, 8, 16, 24, 32]`: zero-erasure first
 /// (fastest when the channel is clean) and then growing erasure
 /// budgets for lower-SNR signals. Returns the first decode that
-/// unpacks into a valid [`crate::msg::jt72::Jt72Message`].
-pub fn decode_at_with_erasures(
+/// unpacks into a valid [`crate::msg::jt72::Jt72Message`]. Public
+/// through [`SniperRequest::erasures`].
+fn decode_at_with_erasures(
     audio: &[f32],
     sample_rate: u32,
     start_sample: usize,
@@ -259,68 +249,18 @@ pub struct Jt65Result {
     /// index here; use [`Self::dt_sec`], which is signed and always
     /// authoritative.
     pub start_sample: usize,
-    /// Frame start in seconds from the start of the audio buffer —
-    /// the signed form of [`Self::start_sample`], and the only field
-    /// that can express a frame beginning *before* the buffer
-    /// (issue #283), where `start_sample` saturates at 0.
-    ///
-    /// To compare against a reference decoder's DT column, subtract
-    /// your own nominal start: `dt_sec - nominal_start_sample as f32
-    /// / sample_rate as f32`.
+    /// Frame start in seconds from the nominal start
+    /// ([`DecodeRequest::nominal_start`]) — the signed form of
+    /// [`Self::start_sample`], and the only field that can express a
+    /// frame beginning *before* the buffer (issue #283), where
+    /// `start_sample` saturates at 0. Comparable directly with a
+    /// reference decoder's DT column (#397).
     pub dt_sec: f32,
     /// Decode-side SNR estimate in dB (WSJT-X 2500 Hz reference
     /// bandwidth convention) — see
     /// [`Jt65Demod::snr_db`] for the
     /// formula and its calibration caveat.
     pub snr_db: f32,
-}
-
-#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-/// Scan an audio buffer for JT65 frames at any (freq, time) within
-/// the search window: runs [`search::coarse_search`] and tries
-/// [`decode_at`] on each candidate in score order, collapsing
-/// duplicate decodes (same message ±2 Hz / ±1 symbol).
-pub fn decode_scan(
-    audio: &[f32],
-    sample_rate: u32,
-    nominal_start_sample: usize,
-    params: &search::SearchParams,
-) -> Vec<Jt65Result> {
-    decode_scan_inner(audio, sample_rate, nominal_start_sample, params, None)
-}
-
-#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-/// Streaming variant of [`decode_scan`]: fires `on_result` once per
-/// candidate as it's accepted, *in addition to* (not instead of) the
-/// returned `Vec` — purely additive, same shape as
-/// [`crate::msg::decode_request::DecodeRequest::on_result`] (see that
-/// method's doc comment and `docs/reference/LIBRARY.md`'s "public
-/// decode entry point" section for the full portability rationale).
-///
-/// A `_streaming` sibling rather than a new parameter on
-/// [`decode_scan`] itself, matching
-/// `ft8::decode_block::decode_block_streaming`'s precedent — bolting
-/// a parameter onto an existing plain `pub fn` is a breaking change.
-///
-/// **Delivery order/dedup contract**: `decode_scan`'s candidate loop
-/// is sequential with no early exit and no parallelism — `cb` fires
-/// exactly once per result that ends up in the returned `Vec`, in the
-/// same order. No divergence mechanism exists here (unlike WSPR's/
-/// FT8's parallel strategies).
-pub fn decode_scan_streaming(
-    audio: &[f32],
-    sample_rate: u32,
-    nominal_start_sample: usize,
-    params: &search::SearchParams,
-    on_result: &(dyn Fn(&Jt65Result) + Sync),
-) -> Vec<Jt65Result> {
-    decode_scan_inner(
-        audio,
-        sample_rate,
-        nominal_start_sample,
-        params,
-        Some(on_result),
-    )
 }
 
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
@@ -364,11 +304,17 @@ fn pad_for_early_frames(
 }
 
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+/// Scan an audio buffer for JT65 frames at any (freq, time) within
+/// the search window: runs [`search::coarse_search`] and decodes each
+/// candidate in score order — hard-decision RS, or the stochastic
+/// Chase search when `chase` is set — collapsing duplicate decodes
+/// (same message ±2 Hz / ±1 symbol). Public through [`DecodeRequest`].
 fn decode_scan_inner(
     audio: &[f32],
     sample_rate: u32,
     nominal_start_sample: usize,
     params: &search::SearchParams,
+    chase: Option<&chase::ChaseParams>,
     on_result: Option<&(dyn Fn(&Jt65Result) + Sync)>,
 ) -> Vec<Jt65Result> {
     use crate::engine::ModulationParams;
@@ -387,8 +333,13 @@ fn decode_scan_inner(
     let cands = search::coarse_search(audio, sample_rate, nominal_start_sample, params);
     let mut seen: Vec<Jt65Result> = Vec::new();
     for c in cands {
-        let Some((msg, snr_db)) = decode_at_with_snr(audio, sample_rate, c.start_sample, c.freq_hz)
-        else {
+        let decoded = match chase {
+            Some(p) => {
+                chase::decode_at_with_chase(audio, sample_rate, c.start_sample, c.freq_hz, p)
+            }
+            None => decode_at_with_snr(audio, sample_rate, c.start_sample, c.freq_hz),
+        };
+        let Some((msg, snr_db)) = decoded else {
             continue;
         };
         let dup = scan_dedup_match_cross(
@@ -426,146 +377,6 @@ fn decode_scan_inner(
         }
     }
     seen
-}
-
-#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-pub fn decode_scan_default(audio: &[f32], sample_rate: u32) -> Vec<Jt65Result> {
-    decode_scan(audio, sample_rate, 0, &search::default_search_params())
-}
-
-#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-/// Like [`decode_scan`] but decodes each candidate via
-/// [`chase::decode_at_with_chase`]'s randomized multi-trial erasure
-/// search instead of `decode_at_with_snr`'s plain zero-erasure hard
-/// decision — trades decode time for sensitivity on weak signals. See
-/// [`chase`]'s module doc for the algorithm and its relationship to
-/// WSJT-X's `ftrsdap`.
-///
-/// A parallel sibling trio (`decode_scan_chase`/`_streaming`/
-/// `_default`) rather than a parameter on [`decode_scan`] itself, for
-/// the same reason [`decode_scan_streaming`] is its own sibling
-/// (mod.rs's own doc comment above): both the extra [`chase::ChaseParams`]
-/// and the different internal decode engine argue against bolting
-/// onto the existing plain `pub fn`.
-pub fn decode_scan_chase(
-    audio: &[f32],
-    sample_rate: u32,
-    nominal_start_sample: usize,
-    search_params: &search::SearchParams,
-    chase_params: &chase::ChaseParams,
-) -> Vec<Jt65Result> {
-    decode_scan_chase_inner(
-        audio,
-        sample_rate,
-        nominal_start_sample,
-        search_params,
-        chase_params,
-        None,
-    )
-}
-
-#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-/// Streaming variant of [`decode_scan_chase`] — same contract as
-/// [`decode_scan_streaming`] (see that function's doc comment for the
-/// delivery-order/dedup guarantee, which applies identically here).
-pub fn decode_scan_chase_streaming(
-    audio: &[f32],
-    sample_rate: u32,
-    nominal_start_sample: usize,
-    search_params: &search::SearchParams,
-    chase_params: &chase::ChaseParams,
-    on_result: &(dyn Fn(&Jt65Result) + Sync),
-) -> Vec<Jt65Result> {
-    decode_scan_chase_inner(
-        audio,
-        sample_rate,
-        nominal_start_sample,
-        search_params,
-        chase_params,
-        Some(on_result),
-    )
-}
-
-#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-fn decode_scan_chase_inner(
-    audio: &[f32],
-    sample_rate: u32,
-    nominal_start_sample: usize,
-    search_params: &search::SearchParams,
-    chase_params: &chase::ChaseParams,
-    on_result: Option<&(dyn Fn(&Jt65Result) + Sync)>,
-) -> Vec<Jt65Result> {
-    use crate::engine::ModulationParams;
-    let nsps = (sample_rate as f32 * <Jt65 as ModulationParams>::SYMBOL_DT).round() as usize;
-    let padding = pad_for_early_frames(
-        audio,
-        sample_rate,
-        nominal_start_sample,
-        search_params.time_tolerance_early_sec,
-    );
-    let (audio, pad) = match &padding {
-        Some((buf, pad)) => (buf.as_slice(), *pad),
-        None => (audio, 0),
-    };
-    let nominal_start_sample = nominal_start_sample + pad;
-    let cands = search::coarse_search(audio, sample_rate, nominal_start_sample, search_params);
-    let mut seen: Vec<Jt65Result> = Vec::new();
-    for c in cands {
-        let Some((msg, snr_db)) = chase::decode_at_with_chase_and_snr(
-            audio,
-            sample_rate,
-            c.start_sample,
-            c.freq_hz,
-            chase_params,
-        ) else {
-            continue;
-        };
-        let dup = scan_dedup_match_cross(
-            &seen,
-            &(msg.clone(), c.freq_hz, c.start_sample as i64),
-            |r| &r.message,
-            |r| r.freq_hz,
-            |r| r.start_sample as i64,
-            |(m, _, _)| m,
-            |(_, f, _)| *f,
-            |(_, _, t)| *t,
-            2.0,
-            nsps as i64,
-        );
-        if !dup {
-            let result = Jt65Result {
-                message: msg,
-                freq_hz: c.freq_hz,
-                start_sample: c.start_sample.saturating_sub(pad),
-                // dt runs from the nominal start. `start_sample` is a
-                // `usize` and saturates at 0 for an early signal, so
-                // this field is the one that keeps the sign. Both terms
-                // are in padded coordinates — `nominal_start_sample` is
-                // shadowed with `+ pad` above — so the padding cancels
-                // and must not be subtracted again. It used to subtract
-                // `pad` alone and omit the nominal entirely, which was
-                // right only when the nominal was 0 (#397).
-                dt_sec: (c.start_sample as f32 - nominal_start_sample as f32) / sample_rate as f32,
-                snr_db,
-            };
-            if let Some(cb) = on_result {
-                cb(&result);
-            }
-            seen.push(result);
-        }
-    }
-    seen
-}
-
-#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-pub fn decode_scan_chase_default(audio: &[f32], sample_rate: u32) -> Vec<Jt65Result> {
-    decode_scan_chase(
-        audio,
-        sample_rate,
-        0,
-        &search::default_search_params(),
-        &chase::ChaseParams::default(),
-    )
 }
 
 /// JT65A protocol marker.
@@ -644,11 +455,13 @@ mod tests {
 
     #[test]
     fn erasure_assisted_decode_recovers_under_moderate_noise() {
-        // Clean synth gets decoded by plain `decode_at`; erasure path
+        // Clean synth gets decoded by plain hard-decision RS; erasure path
         // is a strict superset so it should also work (trying 0 first).
         let freq = 1270.0;
         let audio = synthesize_standard("CQ", "K1ABC", "FN42", 12_000, freq, 0.3).expect("synth");
-        let msg = decode_at_with_erasures(&audio, 12_000, 0, freq, &[0, 8, 16, 24, 32])
+        let msg = DecodeRequest::sniper(&audio, 12_000, 0, freq)
+            .erasures(&[0, 8, 16, 24, 32])
+            .decode()
             .expect("erasure-aware path must decode clean synth");
         assert!(matches!(
             msg,
@@ -657,38 +470,34 @@ mod tests {
         ));
     }
 
-    /// `decode_scan_streaming`'s `on_result` callback — synthetic
+    /// `DecodeRequest::on_result` callback — synthetic
     /// round-trip verification, matching this module's own existing
     /// synth-test convention (no real-sample WSJT-X recording is
     /// wired for JT65 today — see `tests/jt65_sweep.rs`'s doc comment
-    /// for why, it needs an out-of-tree `jt65sim` build). `decode_scan`
+    /// for why, it needs an out-of-tree `jt65sim` build). The scan
     /// is sequential with no early exit and no parallelism, so the
     /// callback-delivered set must exactly equal the batch `Vec`.
     #[test]
-    fn decode_scan_streaming_matches_batch_exactly() {
+    fn on_result_matches_batch_exactly() {
         use std::sync::Mutex;
 
         let freq = 1500.0;
         let audio = synthesize_standard("CQ", "JL1NIE", "PM95", 12_000, freq, 0.3).expect("synth");
-        // Drop the signal 1 s into a zeroed slot so decode_scan must
+        // Drop the signal 1 s into a zeroed slot so the scan must
         // actually search rather than decode at (start_sample=0).
         let mut slot = vec![0.0f32; 12_000 + audio.len()];
         slot[12_000..12_000 + audio.len()].copy_from_slice(&audio);
 
         let streamed_acc: Mutex<Vec<Jt72Message>> = Mutex::new(Vec::new());
         let on_result = |r: &Jt65Result| streamed_acc.lock().unwrap().push(r.message.clone());
-        let batch = decode_scan_streaming(
-            &slot,
-            12_000,
-            0,
-            &search::default_search_params(),
-            &on_result,
-        );
+        let batch = DecodeRequest::new(&slot, 12_000)
+            .on_result(&on_result)
+            .decode();
         let streamed = streamed_acc.into_inner().unwrap();
         let batch_msgs: Vec<Jt72Message> = batch.iter().map(|d| d.message.clone()).collect();
         assert_eq!(
             streamed, batch_msgs,
-            "JT65 decode_scan_streaming: streamed callback deliveries must \
+            "JT65 on_result: streamed callback deliveries must \
              exactly match the batch result, same order (sequential, no \
              early exit, no parallelism — no divergence mechanism exists)"
         );
@@ -703,19 +512,21 @@ mod tests {
         ));
     }
 
-    /// `decode_scan_chase` end-to-end: proves the scan wiring actually
-    /// reaches `chase::decode_at_with_chase_and_snr` (not just that
+    /// `DecodeRequest::chase` end-to-end: proves the scan wiring actually
+    /// reaches `chase::decode_at_with_chase` (not just that
     /// the function compiles) by requiring a genuine search — same
     /// "signal dropped 1s into a zeroed slot" shape as
-    /// `decode_scan_streaming_matches_batch_exactly` above.
+    /// `on_result_matches_batch_exactly` above.
     #[test]
-    fn decode_scan_chase_finds_signal_via_search() {
+    fn chase_scan_finds_signal_via_search() {
         let freq = 1500.0;
         let audio = synthesize_standard("CQ", "JL1NIE", "PM95", 12_000, freq, 0.3).expect("synth");
         let mut slot = vec![0.0f32; 12_000 + audio.len()];
         slot[12_000..12_000 + audio.len()].copy_from_slice(&audio);
 
-        let results = decode_scan_chase_default(&slot, 12_000);
+        let results = DecodeRequest::new(&slot, 12_000)
+            .chase(chase::ChaseParams::default())
+            .decode();
         assert!(
             !results.is_empty(),
             "expected at least one chase-decoded result on the synth signal"
@@ -736,7 +547,7 @@ mod tests {
     /// the extra end-to-end confidence as an explicit, runnable check.
     #[test]
     #[ignore]
-    fn decode_scan_chase_never_false_decodes_on_noise() {
+    fn chase_scan_never_false_decodes_on_noise() {
         struct NoiseGen(u32);
         impl NoiseGen {
             fn next_u32(&mut self) -> u32 {
@@ -761,10 +572,12 @@ mod tests {
         for seed in 1..=5u32 {
             let mut rng = NoiseGen(seed.wrapping_mul(2_654_435_761) | 1);
             let audio: Vec<f32> = (0..NSAMPLES).map(|_| 0.3 * rng.gaussian()).collect();
-            let results = decode_scan_chase_default(&audio, 12_000);
+            let results = DecodeRequest::new(&audio, 12_000)
+                .chase(chase::ChaseParams::default())
+                .decode();
             assert!(
                 results.is_empty(),
-                "decode_scan_chase must not decode pure noise (seed={seed}), got {results:?}"
+                "the chase scan must not decode pure noise (seed={seed}), got {results:?}"
             );
         }
     }

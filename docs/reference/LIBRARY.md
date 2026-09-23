@@ -249,9 +249,8 @@ already deduped.
 
 Every protocol offers the same shape through its own entry point:
 `wspr::decode::{decode_scan_streaming, decode_scan_subtract_streaming}`,
-`jt65::decode_scan_streaming`, and `.on_result(cb)` on
-`jt9::DecodeRequest` and `q65::{DecodeRequest, SniperRequest,
-MultiPeriodRequest}`.
+and `.on_result(cb)` on `jt9::DecodeRequest`, `jt65::DecodeRequest`
+and `q65::{DecodeRequest, SniperRequest, MultiPeriodRequest}`.
 
 ### 2.5 Protocols with their own entry point
 
@@ -320,16 +319,22 @@ assert!(!decodes.is_empty(), "roundtrip must decode");
 # }
 ```
 
-**JT65** exposes a scan + point-decode pattern:
+**JT65** has the same pair, `jt65::DecodeRequest` and
+`jt65::SniperRequest` (issue #403), replacing nine free functions. The
+axis JT65 adds is how Reed-Solomon runs: hard-decision by default,
+`.chase(ChaseParams)` on either builder for the stochastic Chase
+search, and `.erasures(&[0, 8, 16, 24, 32])` on the sniper for the
+deterministic erasure ladder. On the sniper the last of the two called
+wins.
 
 ```rust
 # #[cfg(feature = "jt65")] {
-use mfsk_core::jt65::decode_scan_default;
+use mfsk_core::jt65::DecodeRequest;
 use mfsk_core::jt65::tx::synthesize_standard;
 
 let audio_f32 = synthesize_standard("CQ", "K1ABC", "FN42", 12_000, 1270.0, 0.3)
     .expect("pack + synth");
-let decodes = decode_scan_default(&audio_f32, 12_000);
+let decodes = DecodeRequest::new(&audio_f32, 12_000).decode();
 assert!(!decodes.is_empty(), "roundtrip must decode");
 for d in decodes {
     println!("{:7.2} Hz  {:+.0} dB  {}", d.freq_hz, d.snr_db, d.message);
@@ -337,11 +342,11 @@ for d in decodes {
 # }
 ```
 
-JT65 additionally offers `decode_at_with_erasures` (RS erasure
-decoding) and, for deeper SNR, `decode_at_with_chase` /
-`decode_scan_chase*` (`jt65::chase`, issue #169) — a faithful port of
+The Chase search (`jt65::chase`, issue #169) is a faithful port of
 WSJT-X's `ftrsdap` stochastic Chase decoder, magic numbers included.
-Same call shape plus a `&ChaseParams` argument.
+On the AWGN sweep it moves the 50% crossing from −22.5 to −23.5 dB, at
+the cost of up to `ChaseParams::max_trials` RS attempts per candidate
+that does not decode at once.
 
 **Q65** has three generic builders in `mfsk_core::q65::decode_request`,
 mirroring `msg::decode_request`'s shape and generic over a sealed

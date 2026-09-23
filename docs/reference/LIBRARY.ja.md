@@ -248,7 +248,7 @@ FT8・FT4・FST4 全サブモードが対応する（C 側に公開されてい�
 
 各プロトコルが同じ形を独自のエントリポイントで提供している:
 `wspr::decode::{decode_scan_streaming, decode_scan_subtract_streaming}`、
-`jt65::decode_scan_streaming`、`jt9::DecodeRequest` の `.on_result(cb)`、および
+`jt9::DecodeRequest`・`jt65::DecodeRequest`・
 `q65::{DecodeRequest, SniperRequest, MultiPeriodRequest}` の
 `.on_result(cb)`。
 
@@ -327,16 +327,21 @@ assert!(!decodes.is_empty(), "ラウンドトリップは復号できるはず")
 # }
 ```
 
-**JT65** は scan + 単点デコードのパターンを提供する:
+**JT65** も同じ組 `jt65::DecodeRequest` と `jt65::SniperRequest` を持ち
+（issue #403）、9 つのフリー関数を置き換えた。JT65 固有の軸は
+Reed-Solomon の走らせ方で、既定は硬判定、どちらのビルダーでも
+`.chase(ChaseParams)` で stochastic Chase 探索、sniper では
+`.erasures(&[0, 8, 16, 24, 32])` で決定的な消失ラダーになる。sniper で
+両方を呼んだ場合は後から呼んだ方が有効。
 
 ```rust
 # #[cfg(feature = "jt65")] {
-use mfsk_core::jt65::decode_scan_default;
+use mfsk_core::jt65::DecodeRequest;
 use mfsk_core::jt65::tx::synthesize_standard;
 
 let audio_f32 = synthesize_standard("CQ", "K1ABC", "FN42", 12_000, 1270.0, 0.3)
     .expect("pack + synth");
-let decodes = decode_scan_default(&audio_f32, 12_000);
+let decodes = DecodeRequest::new(&audio_f32, 12_000).decode();
 assert!(!decodes.is_empty(), "ラウンドトリップは復号できるはず");
 for d in decodes {
     println!("{:7.2} Hz  {:+.0} dB  {}", d.freq_hz, d.snr_db, d.message);
@@ -344,18 +349,16 @@ for d in decodes {
 # }
 ```
 
-JT65 はさらに `decode_at_with_erasures` を提供しており、
-低 SNR 環境で RS 消失復号が通常デコーダでは落とすフレームを
-回復できる。さらに深い SNR 向けに `decode_at_with_chase` /
-`decode_scan_chase*`（`jt65::chase`、issue #169）も用意している —
-WSJT-X の stochastic Chase デコーダ `ftrsdap` の忠実な移植（アルゴリズム
-形状だけでなく、消失確率テーブル・`getpp` スペクトル電力による候補
-ランキング・受理ゲート定数などマジックナンバーも含む）。呼び出し形は
-通常の `decode_scan` 系と同じで `&ChaseParams` 引数が増えるだけ。
+Chase 探索（`jt65::chase`、issue #169）は WSJT-X の stochastic Chase
+デコーダ `ftrsdap` の忠実な移植（アルゴリズム形状だけでなく、消失確率
+テーブル・`getpp` スペクトル電力による候補ランキング・受理ゲート定数など
+マジックナンバーも含む）。AWGN スイープでは 50% 交差を −22.5 dB から
+−23.5 dB に下げ、その代わり即座に復号できない候補ごとに最大
+`ChaseParams::max_trials` 回の RS 試行を払う。
 同日、もう一つ独立した修正も入った：`search`/`rx` に周波数のサブビン
 精緻化 + NCO 補正を追加し、FFT の「scalloping loss」を解消——これは
-`decode_at_with_chase` だけでなく JT65 の全デコード経路に効く
-（`decode_at_with_erasures` 自体もコード変更ゼロのまま同程度に改善）。
+Chase 経路だけでなく JT65 の全デコード経路に効く
+（消失ラダー自体もコード変更ゼロのまま同程度に改善）。
 chase アルゴリズムの詳細は `chase` モジュールの doc コメント、実測結果
 の全体像（この2つの修正を合わせ、従来の ~7-8 dB ギャップをこのcrate の
 AWGN コーパス上でほぼ解消——WSJT-X比較の方法論に関する留保も含めて）は

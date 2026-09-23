@@ -57,7 +57,7 @@ use std::path::{Path, PathBuf};
 mod common;
 use common::load_wav_f32_opt;
 use mfsk_core::jt65::search::{SearchParams, default_search_params};
-use mfsk_core::jt65::{decode_scan_chase_default, decode_scan_default};
+use mfsk_core::jt65::{ChaseParams, DecodeRequest};
 
 const GOLDEN_CALL1: &str = "CQ";
 const GOLDEN_CALL2: &str = "JL1NIE";
@@ -95,13 +95,18 @@ fn is_golden(d: &mfsk_core::jt65::Jt65Result) -> bool {
 }
 
 fn decode_wav_jt65(audio: &[f32]) -> bool {
-    decode_scan_default(audio, 12_000).iter().any(is_golden)
+    DecodeRequest::new(audio, 12_000)
+        .decode()
+        .iter()
+        .any(is_golden)
 }
 
 /// Like [`decode_wav_jt65`] but via the stochastic Chase decoder
-/// (`decode_scan_chase_default`) — see `jt65_chase_awgn_snr_sweep`.
+/// (`DecodeRequest::chase`) — see `jt65_chase_awgn_snr_sweep`.
 fn decode_wav_jt65_chase(audio: &[f32]) -> bool {
-    decode_scan_chase_default(audio, 12_000)
+    DecodeRequest::new(audio, 12_000)
+        .chase(ChaseParams::default())
+        .decode()
         .iter()
         .any(is_golden)
 }
@@ -139,9 +144,9 @@ fn collect_jobs(dir: &Path) -> Option<Vec<Job>> {
 
 /// Runs the AWGN corpus through `decode_wav` and prints a recall
 /// table, `label`-tagged. Shared by [`jt65_awgn_snr_sweep`] (plain
-/// zero-erasure hard decision, via `decode_scan_default`) and
+/// zero-erasure hard decision, via `DecodeRequest`) and
 /// [`jt65_chase_awgn_snr_sweep`] (stochastic Chase decoder, via
-/// `decode_scan_chase_default`) so both run identical methodology
+/// `DecodeRequest::chase`) so both run identical methodology
 /// against the same corpus — the only difference is `decode_wav`.
 /// `csv_env` names the env var (if set) to dump a
 /// `channel,snr_db,trial,pass` summary CSV to — see the FT8/FT4/FST4
@@ -225,7 +230,7 @@ fn run_sweep(label: &str, decode_wav: impl Fn(&[f32]) -> bool + Sync, csv_env: &
 #[ignore]
 fn jt65_awgn_snr_sweep() {
     run_sweep(
-        "JT65A AWGN SNR sweep (decode_scan_default)",
+        "JT65A AWGN SNR sweep (hard-decision RS)",
         decode_wav_jt65,
         "MFSK_JT65_SWEEP_SUMMARY_CSV",
     );
@@ -241,7 +246,7 @@ fn jt65_awgn_snr_sweep() {
 #[ignore]
 fn jt65_chase_awgn_snr_sweep() {
     run_sweep(
-        "JT65A AWGN SNR sweep (decode_scan_chase_default)",
+        "JT65A AWGN SNR sweep (Chase)",
         decode_wav_jt65_chase,
         "MFSK_JT65_CHASE_SWEEP_SUMMARY_CSV",
     );
@@ -309,7 +314,7 @@ fn jt65_reported_snr_tracks_injected() {
         let Some(audio) = load_wav_f32_opt(&job.path) else {
             continue;
         };
-        let decodes = mfsk_core::jt65::decode_scan(&audio, 12_000, 0, &params);
+        let decodes = DecodeRequest::new(&audio, 12_000).params(params).decode();
         if let Some(d) = decodes
             .iter()
             .find(|d| (d.freq_hz - GOLDEN_FREQ_HZ).abs() <= FREQ_TOL_HZ)

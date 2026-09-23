@@ -1,7 +1,7 @@
 //! Stochastic Chase decoder — faithful port of WSJT-X's `ftrsdap`
 //! (`lib/ftrsd/ftrsdap.c`, called from `lib/extract.f90`), issue #169.
 //!
-//! [`super::decode_at_with_erasures`] tries exactly one deterministic,
+//! [`super::SniperRequest::erasures`] tries exactly one deterministic,
 //! increasing-erasure-count ladder over a single confidence ordering.
 //! Real WSJT-X (`jt9 -6`, no `kvasd`) instead runs a *randomized*
 //! multi-trial search: many trials, each marking a different random
@@ -83,12 +83,10 @@ use super::gray::gray6;
 use super::interleave::interleave;
 use super::rx;
 
-/// Tunable parameters for [`decode_at_with_chase`]. Plain public
-/// fields + `Default`, matching [`super::search::SearchParams`]'s
-/// shape — JT65 has no builder-pattern precedent
-/// (`msg::decode_request`'s doc comment explicitly scopes JT65 out of
-/// that redesign, along with Q65/WSPR/JT9/uvpacket, since each keeps
-/// its own bespoke decode entry points). Defaults are WSJT-X's own
+/// Tunable parameters for the Chase search, passed to
+/// [`super::DecodeRequest::chase`] / [`super::SniperRequest::chase`].
+/// Plain public fields + `Default`, matching
+/// [`super::search::SearchParams`]'s shape. Defaults are WSJT-X's own
 /// literal constants (see module doc) — this is a faithful port, not
 /// an approximation left to be tuned.
 #[derive(Clone, Debug)]
@@ -183,7 +181,7 @@ fn build_thresh0(order: &[usize], conf: &[f32; 63]) -> Vec<f32> {
 
 /// Ordering of the 63 symbol positions from least → most confident.
 /// Shared by [`super::decode_at_with_erasures`] and
-/// [`decode_at_with_chase`] so both erasure strategies agree on what
+/// the Chase search so both erasure strategies agree on what
 /// "least reliable" means; also the same rank WSJT-X's own descending
 /// `probs`/`indexes` sort (`ftrsdap.c:75-92`) produces, just read from
 /// the opposite end (their `indexes[62-i]` for `i=0..62` is this
@@ -291,7 +289,7 @@ struct Best {
 /// port of WSJT-X's `ftrsdap`.
 ///
 /// Tries the fast zero-erasure path first (matches
-/// [`super::decode_at`]/[`super::decode_at_with_erasures`]'s `n_eras =
+/// plain hard-decision RS, the erasure ladder's `n_eras =
 /// 0` case and `ftrsdap.c`'s own unconditional first attempt; free, no
 /// RNG spent). If that fails, runs up to `params.max_trials`
 /// randomized erasure trials, tracks the best- and second-best-scoring
@@ -301,22 +299,11 @@ struct Best {
 /// returns `None` rather than guessing, since random erasure trials
 /// can occasionally satisfy the RS syndrome for a *wrong* codeword
 /// (see `chase_never_false_decodes_*` in this module's tests).
-pub fn decode_at_with_chase(
-    audio: &[f32],
-    sample_rate: u32,
-    start_sample: usize,
-    base_freq_hz: f32,
-    params: &ChaseParams,
-) -> Option<Jt72Message> {
-    decode_at_with_chase_and_snr(audio, sample_rate, start_sample, base_freq_hz, params)
-        .map(|(msg, _snr)| msg)
-}
-
-/// Like [`decode_at_with_chase`] but also returns the decode-side SNR
-/// estimate, for [`super::decode_scan_chase`]'s [`super::Jt65Result`]
-/// wiring — mirrors `super::decode_at_with_snr`'s private-sibling
-/// shape.
-pub(super) fn decode_at_with_chase_and_snr(
+///
+/// Returns the decode-side SNR estimate alongside the message, for
+/// [`super::Jt65Result::snr_db`]. Public through
+/// [`super::DecodeRequest::chase`] / [`super::SniperRequest::chase`].
+pub(super) fn decode_at_with_chase(
     audio: &[f32],
     sample_rate: u32,
     start_sample: usize,
@@ -448,6 +435,7 @@ mod tests {
         let freq = 1270.0;
         let audio = synthesize_standard("CQ", "K1ABC", "FN42", 12_000, freq, 0.3).expect("synth");
         let msg = decode_at_with_chase(&audio, 12_000, 0, freq, &ChaseParams::default())
+            .map(|(m, _)| m)
             .expect("chase decoder must decode clean synth via the fast zero-erasure path");
         assert!(matches!(
             msg,
@@ -486,7 +474,7 @@ mod tests {
     }
 
     /// New false-decode risk surface specific to this module: unlike
-    /// [`super::super::decode_at_with_erasures`]'s single deterministic
+    /// the erasure ladder's single deterministic
     /// erasure ordering (which can only ever explore one nested
     /// prefix sequence), a randomized multi-trial search can in
     /// principle satisfy the RS syndrome for a *wrong* codeword on
@@ -494,7 +482,7 @@ mod tests {
     /// `ntotal`/`pp2/pp1` acceptance gate exists to catch; this test
     /// verifies the ported gate actually catches it too. Deliberately
     /// bounded to `decode_at_with_chase` at a fixed (start_sample,
-    /// freq_hz) rather than the full `decode_scan_chase` — a
+    /// freq_hz) rather than the full chase scan — a
     /// coarse-search-driven scan over noise can turn up many spurious
     /// candidates, each burning up to `max_trials` RS-decode attempts,
     /// which would make the default (non-`--ignored`) test suite slow.
@@ -505,7 +493,8 @@ mod tests {
             let mut rng = NoiseGen(seed.wrapping_mul(2_654_435_761) | 1);
             let mut audio = vec![0.0f32; NSAMPLES];
             rng.fill_noise(&mut audio, 0.3);
-            let msg = decode_at_with_chase(&audio, 12_000, 0, 1270.0, &ChaseParams::default());
+            let msg = decode_at_with_chase(&audio, 12_000, 0, 1270.0, &ChaseParams::default())
+                .map(|(m, _)| m);
             assert!(
                 msg.is_none(),
                 "chase decoder must not decode pure noise (seed={seed}), got {msg:?}"
@@ -537,7 +526,8 @@ mod tests {
             for (s, n) in audio.iter_mut().zip(noise.iter()) {
                 *s += n;
             }
-            let msg = decode_at_with_chase(&audio, 12_000, 0, freq, &ChaseParams::default());
+            let msg = decode_at_with_chase(&audio, 12_000, 0, freq, &ChaseParams::default())
+                .map(|(m, _)| m);
             assert!(
                 msg.is_none(),
                 "chase decoder must not decode a signal this deep below the floor (seed={seed}), got {msg:?}"
