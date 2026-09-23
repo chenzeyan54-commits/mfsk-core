@@ -22,21 +22,6 @@ pub const FT4_GFSK: GfskCfg = GfskCfg {
     ramp_samples: 576 / 8,
 };
 
-/// Append CRC-14 to the 77-bit message, producing 91 info bits.
-fn append_crc14(message77: &[u8; 77]) -> [u8; 91] {
-    let mut bytes = [0u8; 12];
-    for (i, &bit) in message77.iter().enumerate() {
-        bytes[i / 8] |= (bit & 1) << (7 - i % 8);
-    }
-    let crc = crate::fec::ldpc::crc14(&bytes);
-    let mut info = [0u8; 91];
-    info[..77].copy_from_slice(message77);
-    for i in 0..14 {
-        info[77 + i] = ((crc >> (13 - i)) & 1) as u8;
-    }
-    info
-}
-
 /// Encode a 77-bit message into the 103-symbol FT4 tone sequence.
 ///
 /// XORs the input with [`super::FT4_RVEC`] before CRC + LDPC, matching
@@ -48,7 +33,7 @@ pub fn message_to_tones(message77: &[u8; 77]) -> Vec<u8> {
     for (b, &r) in scrambled.iter_mut().zip(super::FT4_RVEC.iter()) {
         *b = (*b ^ r) & 1;
     }
-    let info = append_crc14(&scrambled);
+    let info = crate::fec::ldpc::append_crc14(&scrambled);
     let codec = Ldpc174_91;
     let mut cw = [0u8; 174];
     codec.encode(&info, &mut cw);

@@ -2,6 +2,31 @@
 
 ## 0.11.1 — FT4 filters phantoms by default (#383), FT4 on the CoreS3 answers by the reply deadline, one screen for every mode, one boot sequence for the CoreS3's four receivers, WiFi becomes a setting of its own (#381)
 
+- **One CPFSK synthesiser, one CRC-14 append, one top-K pick.** Code that
+  several modes had each copied now lives in one place. None of it changes
+  output.
+  - WSJT-X's plain continuous-phase FSK transmit loop (its
+    positive-`toneSpacing` path) was repeated in `wspr::tx`, `jt9::tx`,
+    `jt65::tx` and `q65::tx`. It is now `engine::dsp::cpfsk`. Each mode
+    keeps its own tone-range assertion and its public signature.
+    Fingerprinted before and after over all four modes at 12 and 48 kHz,
+    Q65-60C and WSPR's no-allocation `synthesize_audio_into`: the output
+    is bit-identical.
+  - FT8 and FT4 each carried a private `append_crc14`. It is now
+    `fec::ldpc::append_crc14`, beside `crc14` / `check_crc14`.
+    `ft8::wave_gen::message_to_tones` still takes a slice and panics on
+    one that is not 77 bits long, as it did before.
+  - `engine::sync`'s three DT estimators (`bootstrap_dt_median` and the
+    two circular ones) each partitioned out their top-K candidates with
+    the same block. They now share one private helper.
+  - Other candidates from the same survey were measured and left alone.
+    The parabolic-peak and percentile sites across FT8, uvpacket, MSK144
+    and Q65 are not copies of each other: the clamp ranges, the
+    epsilons and the WSJT-X index-rounding rules all differ, so merging
+    them would change decodes. A shared Gray-code helper is deferred to
+    #391: it only pays off once the public `jt65::{gray6, inv_gray6}`
+    can go, which is a breaking change.
+
 - **`pack77` packs `/P` and `/R` callsigns.** It refused them: the
   suffixed call went straight to `pack28`, which takes six characters
   at most, and the whole message came back `None` — so a portable

@@ -14,10 +14,8 @@
 //!    sync, so data symbols `0..=63` map to tones `1..=64`).
 //! 4. Synthesise plain FSK (no GFSK shaping) at the Q65-30A baud.
 
-use core::f32::consts::TAU;
-
 use crate::engine::ModulationParams;
-use crate::engine::dsp::envelope;
+use crate::engine::dsp::cpfsk;
 use crate::fec::qra::Q65Codec;
 use crate::fec::qra15_65_64::QRA15_65_64_IRR_E23;
 use crate::msg::q65::pack77_to_symbols;
@@ -79,32 +77,20 @@ pub fn synthesize_audio_for<P: ModulationParams>(
     base_freq_hz: f32,
     amplitude: f32,
 ) -> Vec<f32> {
-    let nsps = (sample_rate as f32 * P::SYMBOL_DT).round() as usize;
-    let tone_spacing = P::TONE_SPACING_HZ;
-    let mut out: Vec<f32> = Vec::with_capacity(nsps * 85);
-    let mut phase = 0.0_f32;
     for &sym in tones {
         assert!(sym <= 64, "Q65 tone must be in 0..=64, got {sym}");
-        let freq = base_freq_hz + sym as f32 * tone_spacing;
-        let dphi = TAU * freq / sample_rate as f32;
-        for _ in 0..nsps {
-            out.push(amplitude * phase.cos());
-            phase += dphi;
-            if phase > TAU {
-                phase -= TAU;
-            } else if phase < -TAU {
-                phase += TAU;
-            }
-        }
     }
-
-    // Transmit-envelope ramp (issue #259): without it the burst starts
-    // and ends on a step discontinuity — a broadband click at both
-    // edges. WSJT-X's modulator fades this path out; see
-    // `engine::dsp::envelope` for why both ends are ramped here and
-    // why this protocol deliberately gets no symbol shaping.
-    envelope::apply_ramp(&mut out, envelope::ramp_samples(sample_rate, nsps));
-    out
+    // Plain CPFSK plus the transmit-envelope ramp (issue #259); see
+    // `engine::dsp::envelope` for why this protocol deliberately gets
+    // no symbol shaping.
+    cpfsk::synth_f32(
+        tones,
+        cpfsk::nsps(sample_rate, P::SYMBOL_DT),
+        base_freq_hz,
+        P::TONE_SPACING_HZ,
+        sample_rate,
+        amplitude,
+    )
 }
 
 /// Q65-30A convenience wrapper for [`synthesize_audio_for`] — kept
