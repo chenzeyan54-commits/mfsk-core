@@ -172,7 +172,8 @@ points and carries its own Quick example:
 - [`mfsk_core::wspr`](https://docs.rs/mfsk-core/latest/mfsk_core/wspr/)
   — `decode::decode_scan_default`
 - [`mfsk_core::jt9`](https://docs.rs/mfsk-core/latest/mfsk_core/jt9/)
-  — `decode_scan_default`
+  — `DecodeRequest` (scan; `.depth()` for the Fano budget) /
+  `DecodeRequest::sniper` (known alignment)
 - [`mfsk_core::jt65`](https://docs.rs/mfsk-core/latest/mfsk_core/jt65/)
   — `decode_scan_default` + `decode_at_with_erasures` (for low SNR)
 - [`mfsk_core::q65`](https://docs.rs/mfsk-core/latest/mfsk_core/q65/)
