@@ -247,24 +247,25 @@ FT8・FT4・FST4 全サブモードが対応する（C 側に公開されてい�
 見えることがある。
 
 各プロトコルが同じ形を独自のエントリポイントで提供している:
-`wspr::decode::{decode_scan_streaming, decode_scan_subtract_streaming}`、
-`jt9::DecodeRequest`・`jt65::DecodeRequest`・
+`wspr::DecodeRequest`・`jt9::DecodeRequest`・`jt65::DecodeRequest`・
 `q65::{DecodeRequest, SniperRequest, MultiPeriodRequest}` の
-`.on_result(cb)`。
+`.on_result(cb)`。WSPR は完全一致ではなく並列側の契約になる ——
+[`STREAMING.ja.md`](STREAMING.ja.md) §3b を参照。
 
 ### 2.5 独自エントリポイントを持つプロトコル
 
 
-WSPR は 12 kHz で直接シンボル長 (8192 サンプル) の FFT を取る方式で、
-FT 系の「ダウンサンプリングしてからシンボル同期」という流れと
-ステージ構成が異なる。そのため `wspr` モジュールが独自のエントリ
-ポイントを用意している。ただし内部で使っている FEC (`ConvFano`) と
+WSPR はスロットを wsprd と同じ 375 Hz ベースバンドにデシメートし、
+そこで wsprd 自身の粗探索と 3 回のデコードパスを走らせる。共有の FT 系
+パイプラインとはステージ構成が異なるため、`wspr` モジュールが独自の
+エントリポイント `wspr::DecodeRequest` / `wspr::SniperRequest`
+（issue #403、14 個のフリー関数を置き換えた）を用意している。ただし内部で使っている FEC (`ConvFano`) と
 メッセージコーデック (`Wspr50Message`) は `Wspr: Protocol` の
 関連型として宣言済みで、抽象の枠組みからは外れていない。
 
 ```rust
 # #[cfg(feature = "wspr")] {
-use mfsk_core::wspr::decode::decode_scan_default;
+use mfsk_core::wspr::DecodeRequest;
 use mfsk_core::wspr::tx::synthesize_type1;
 use mfsk_core::msg::WsprMessage;
 
@@ -272,7 +273,7 @@ use mfsk_core::msg::WsprMessage;
 let samples_f32 = synthesize_type1("K1ABC", "FN42", 37, 12_000, 1500.0, 0.3)
     .expect("valid message");
 
-let decodes = decode_scan_default(&samples_f32, /*sample_rate*/ 12_000);
+let decodes = DecodeRequest::new(&samples_f32, /*sample_rate*/ 12_000).decode();
 assert!(!decodes.is_empty(), "ラウンドトリップは復号できるはず");
 for d in decodes {
     match d.message {
@@ -295,10 +296,20 @@ for d in decodes {
 `snr_db` は粗同期の段階で計算済みの wsprd 準拠 SNR (dB, 2500 Hz
 基準) — wsprd 自身がスポットに添えて報告する値と同じもの。
 
-`decode_scan_default` が粗同期 (周波数×時刻探索) を込みでスロット全体を
-スキャンする。周波数・開始サンプルが既知の場合は
-`wspr::decode::decode_at(samples, rate, start_sample, freq_hz)` を
-直接呼べば粗同期を省略できる。
+`DecodeRequest::new` が粗同期 (周波数×時刻×ドリフト探索) を込みで
+スロット全体をスキャンする。`.nominal_start()`・`.params()`・
+`.on_result()`・`.table(&mut WsprCallsignTable)` も取る。スロットを
+またいで持ち回したテーブルがあると、前のスロットの Fano デコードで
+確認済みの局を OSD が再発見できる —— wsprd が自身のサンプルファイルで
+W3BI を −25 dB で拾えるのはこの仕組みによる。
+
+周波数・開始サンプルが既知の場合は
+`DecodeRequest::sniper(samples, rate, start_sample, freq_hz).decode()`
+で粗同期を省略できる。`SniperRequest::baseband(idat, qdat, …)` は
+呼び出し側でデシメート済みのベースバンドに対して同じことを行い、
+`.drift()`・`.nblocks()`・`.confirmed()`・`.refine_drift()` ——
+スキャン自身の各パスが候補ごとに設定するつまみ —— を取る。CoreS3 の
+WSPR 受信機は自前の候補ループからこれを駆動している。
 
 
 
@@ -1038,8 +1049,8 @@ const WSPR_SYNC_VECTOR: [u8; 162] = [0u8; 162];
 ```
 
 呼び出し側のパイプラインは `DecodeRequest::<Ft4>::new(...).decode()`
-（[§1](#1-クイックスタート)）または WSPR 専用の
-`wspr::decode::decode_scan_default(...)` のように型引数でプロトコルを
+（[§1](#1-クイックスタート)）のように型引数で、あるいは WSPR 専用の
+`wspr::DecodeRequest::new(...)` のようにモジュールでプロトコルを
 指定するだけで済み、合成の結果として選ばれた FEC・メッセージ
 コーデック・同期方式が自動的に使われる。
 

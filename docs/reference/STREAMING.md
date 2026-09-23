@@ -77,22 +77,24 @@ each protocol's own API family), not one trait to abstract over.
 |----------------------|------------------------------------------------------------------------|----------------------------------------|
 | FT8 / FT4 / FST4     | `DecodeRequest<P>` / `SniperRequest<P>` — `.on_result(cb)`             | `&(dyn Fn(&DecodeResult) + Sync)`      |
 | Q65                  | `DecodeRequest`/`SniperRequest`/`MultiPeriodRequest` — `.on_result(cb)` | `&(dyn Fn(&Q65Result) + Sync)`         |
-| WSPR                 | `decode_scan_streaming` / `decode_scan_subtract_streaming`             | `&(dyn Fn(&WsprResult) + Sync)`        |
-| JT65                 | `decode_scan_streaming`                                                | `&(dyn Fn(&Jt65Result) + Sync)`        |
-| JT9                  | `decode_scan_streaming`                                                | `&(dyn Fn(&Jt9Result) + Sync)`         |
+| WSPR                 | `wspr::DecodeRequest` — `.on_result(cb)`                               | `&(dyn Fn(&WsprResult) + Sync)`        |
+| JT65                 | `jt65::DecodeRequest` — `.on_result(cb)`                               | `&(dyn Fn(&Jt65Result) + Sync)`        |
+| JT9                  | `jt9::DecodeRequest` — `.on_result(cb)`                                | `&(dyn Fn(&Jt9Result) + Sync)`         |
 | FT8 (`ft8::decode_block`) | `ft8::decode_block::decode_block_streaming`                       | `&mut dyn FnMut(&DecodeResult)`        |
 
 Notes:
 
-- **Builders (FT8/FT4/FST4/Q65)** carry `.on_result(cb)` as one more
-  chainable method; the returned `DecodeOutcome` still holds the full
+- **Every builder** carries `.on_result(cb)` as one more chainable
+  method; the returned `DecodeOutcome` / `Vec` still holds the full
   batch.
-- **WSPR/JT65/JT9 have no builder**, so each gained a
-  `decode_scan_streaming` *sibling* alongside its existing
-  `decode_scan` (WSPR also has `decode_scan_subtract_streaming` next to
-  `decode_scan_subtract`). The sibling takes the same arguments plus a
-  trailing `on_result` reference and returns the same `Vec` the
-  non-streaming version does.
+- **WSPR/JT65/JT9 used to have no builder**, and each grew a
+  `decode_scan_streaming` *sibling* free function instead — the
+  pattern that, one axis at a time, left those three modes with 32
+  public `decode_*` functions. Issue #403 replaced them with per-mode
+  `DecodeRequest`s, where streaming is one method like everywhere
+  else. On the scan they only take `.on_result()`; their
+  `SniperRequest`s return a single `Option` and have nothing to
+  stream.
 - **`ft8::decode_block::decode_block_streaming`** takes `&mut dyn
   FnMut` rather than `&dyn Fn + Sync` in *both* its feature-gated
   variants: the embedded (`not(fft-rustfft)`) single-pass pipeline is
@@ -130,10 +132,8 @@ what the batch return holds.
 
 Covers: `.sic_rounds(n)` and `.sic_early()` (FT8/FT4 SIC strategies);
 `ft8::decode_block::decode_block_streaming` (both the embedded and host
-`fft-rustfft` variants, since issue #243); JT65 and JT9
-`decode_scan_streaming`; every Q65 builder; WSPR's
-`decode_scan_subtract_streaming` (fires only at its own outer SIC-pass
-accept point). Q65's `MultiPeriodRequest` is a variant of the
+`fft-rustfft` variants, since issue #243); the JT65 and JT9
+`DecodeRequest`s; every Q65 builder. Q65's `MultiPeriodRequest` is a variant of the
 sequential shape: it fires once **per slot** that yields an accepted
 decode (its natural streaming unit for multi-period EME / ionoscatter
 averaging), not once per candidate.
@@ -149,8 +149,8 @@ parity should dedup by `.message77()` on their side — the same key the
 crate's own dedup uses.
 
 Covers: the default single-pass strategy and `SniperRequest`
-(FT8/FT4); WSPR's `decode_scan_streaming` (both coarse-search passes
-run under `rayon::par_iter()`).
+(FT8/FT4); `wspr::DecodeRequest` (its pass-1 and pass-2 candidate
+loops run under `rayon::par_iter()`).
 
 **This is why the parallel-path callback must be `Sync`** — it may be
 called concurrently from multiple rayon worker threads.
@@ -230,12 +230,12 @@ committed set after its callback has already fired.
 | FT8 `decode_sniper_inner` (parallel/sequential sniper) | `ft8/decode.rs:996,1016` |
 | FT4/FST4 `decode_frame` (parallel/sequential single-pass, generic engine) | `engine/pipeline.rs:994,1014` |
 | FT4/FST4 `decode_frame_subtract` (`.sic_rounds()`, generic engine) | `engine/pipeline.rs:1239` |
-| WSPR `decode_scan_streaming` (parallel/sequential) / `decode_scan_subtract_streaming` | `wspr/decode.rs:493,566,717` |
+| WSPR `DecodeRequest` (`decode_scan_inner`, pass 1 / pass 2) | `wspr/decode.rs` |
 | Q65 `DecodeRequest`/`SniperRequest` | `q65/decode_request.rs:374` |
 | Q65 `MultiPeriodRequest` (`decode_multi_period_for`) | `q65/rx.rs:1345` |
 | Q65 internal scan helpers (`decode_scan_fading_for`, `decode_scan_with_ap_list_for`, `decode_scan_inner`) | `q65/rx.rs:511,610,700` |
-| JT65 `decode_scan_streaming` (parallel/sequential) | `jt65/mod.rs:328,426` |
-| JT9 `decode_scan_streaming` | `jt9/mod.rs:243` |
+| JT65 `DecodeRequest` (`decode_scan_inner`, one loop for plain and Chase since #403) | `jt65/mod.rs` |
+| JT9 `DecodeRequest` (`decode_scan_inner`) | `jt9/mod.rs` |
 
 If you're adding a new `_streaming` sibling or `.on_result(cb)`
 builder method to a protocol that also has (or gains) a `.known(...)`-
@@ -473,12 +473,11 @@ while let Some(msg) = stream.next().await {
   `.sic_rounds(3)` or `.sic_early()` on FT8 — instead of the default
   wide-band pass. The bridge code is identical; only the builder method
   changes.
-- **Other protocols.** For WSPR/JT65/JT9, call the free function
-  `decode_scan_streaming(&audio, sample_rate, nominal_start_sample,
-  &params, &on_result)` inside the same `spawn_blocking` shell; the
-  closure captures the same `Sender`. For Q65, use its
-  `DecodeRequest`/`SniperRequest`/`MultiPeriodRequest` builder exactly
-  as FT8 above.
+- **Other protocols.** WSPR, JT65, JT9 and Q65 each have their own
+  `DecodeRequest` (Q65 also `SniperRequest`/`MultiPeriodRequest`);
+  chain `.on_result(&on_result)` on it inside the same
+  `spawn_blocking` shell, exactly as FT8 above. The closure captures
+  the same `Sender`.
 - **Cancellation.** Dropping the `Receiver` makes the next
   `blocking_send` in the closure return `Err`, which you can use to stop
   early — but note the decode itself has no interior cancellation point,
@@ -500,9 +499,8 @@ while let Some(msg) = stream.next().await {
   `decode_block_streaming` exact-match test.
 - `mfsk-core/tests/ft8_decode_block_streaming_host.rs` — the host
   `fft-rustfft` `decode_block_streaming` exact-match test (issue #243).
-- `mfsk-core/tests/wspr_wsjtx_samples.rs` — WSPR
-  `decode_scan_streaming` / `decode_scan_subtract_streaming` against
-  real signals.
+- `mfsk-core/tests/wspr_wsjtx_samples.rs` — WSPR's
+  `DecodeRequest::on_result` against real signals.
 - [BINDINGS.md](BINDINGS.md) — the same streaming idea across the C
   boundary: the `mfsk_stream_*` ring and `mfsk_session_set_on_decode`,
   callback-based for the same portability reasons.

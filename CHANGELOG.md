@@ -50,6 +50,48 @@
   following it would have subtracted the nominal twice. The doc says
   what the field holds now.
 
+- **WSPR decodes through `wspr::DecodeRequest` / `SniperRequest`
+  (breaking, #403) — the last of the three.** Fourteen public
+  functions go. The point decode was the worst of them: `decode_at` →
+  `decode_at_with_drift` → `decode_at_baseband` → `_nblocks` →
+  `_nblocks_gated` → `_nblocks_gated_drift`, each wrapper passing one
+  more argument to the next. It is one builder now, from 12 kHz audio
+  or from a baseband the caller already decimated:
+
+  ```rust
+  wspr::DecodeRequest::new(&audio, 12_000)
+      .table(&mut table)              // was decode_scan_with_table
+      .on_result(&cb)                 // was decode_scan_streaming
+      .decode()
+  wspr::SniperRequest::baseband(&idat, &qdat, 12_000, start, freq_hz)
+      .drift(d).nblocks(&[1, 2, 3, 0]).confirmed(&table).refine_drift(false)
+      .decode()                       // was decode_at_baseband_nblocks_gated_drift
+  ```
+
+  `decode` takes `&mut self` on the scan, because a table is written
+  back to; it still chains on a temporary.
+
+  **`decode_scan_subtract` and `_streaming` leave the public API.**
+  Both were already `#[deprecated]`, and their own doc said they were
+  kept only because removing them was a breaking change. They wrap a
+  second SIC layer around the scan that wsprd has no counterpart for,
+  measured at 3.3× the cost for zero extra recall on the WSJT-X golden.
+  One `decode_scan_subtract(…, on_result: Option<_>)` remains behind
+  `internal-testing`, because the ablation that produced the 3.3× figure
+  runs through it.
+
+  Still public, deliberately: `WsprCallsignTable`, and the pass-2 stages
+  `rank_pass2_candidates` / `deep_decode_pass2_candidate` (feature
+  `wspr-pass2-topn`) that the CoreS3 receiver composes its dual-core
+  pipeline from. Those are pipeline stages, not a cross product of
+  conveniences. The two `embedded-shared` modules that called
+  `decode_at_baseband` are ported and `cargo check` clean on the Xtensa
+  toolchain with the board's `wspr` feature on.
+
+  The WSPR sweep CSV is byte-identical before and after.
+  `STREAMING.md` (and `.ja.md`) now names the builders for all three
+  modes; #404 and #405 had left its table on the old functions.
+
 - **FST4's tier-C gate is 626 lines, not 7 791.** `fst4_sweep.rs` had
   accumulated 46 `#[ignore]`d diagnostic probes from investigations that
   are now closed — #146's AWGN gap, #198's f32-hardcoded `decode_soft`,

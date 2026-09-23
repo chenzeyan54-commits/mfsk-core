@@ -2855,7 +2855,8 @@ pub unsafe extern "C" fn mfsk_wspr_decode(
         set_error("mfsk_wspr_decode: samples is NULL");
         return MfskStatus::InvalidArg;
     };
-    let rows: Vec<MfskDecode> = mfsk_core::wspr::decode::decode_scan_default(&audio, 12_000)
+    let rows: Vec<MfskDecode> = mfsk_core::wspr::DecodeRequest::new(&audio, 12_000)
+        .decode()
         .iter()
         .map(|d| {
             simple_row(

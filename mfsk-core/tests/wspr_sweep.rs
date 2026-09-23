@@ -46,9 +46,8 @@ use std::path::{Path, PathBuf};
 #[allow(dead_code)]
 mod common;
 use common::load_wav_f32_opt;
-use mfsk_core::wspr::decode::decode_scan_default;
 #[cfg(feature = "internal-testing")]
-use mfsk_core::wspr::decode::{WsprCallsignTable, decode_scan_with_table};
+use mfsk_core::wspr::{DecodeRequest, SniperRequest, WsprCallsignTable};
 
 const GOLDEN_MSG: &str = "JL1NIE PM95 37";
 const GOLDEN_FREQ_HZ: f32 = 1500.0;
@@ -87,7 +86,7 @@ fn parse_snr_tag(tag: &str) -> Option<i32> {
 /// decodes). A recall-only sweep reports that as a *win* right up
 /// until recall itself collapses.
 fn decode_wav_wspr(audio: &[f32]) -> (bool, u32) {
-    let decodes = decode_scan_default(audio, 12_000);
+    let decodes = DecodeRequest::new(audio, 12_000).decode();
     let mut hit = false;
     let mut phantoms = 0;
     for d in &decodes {
@@ -321,7 +320,10 @@ fn harvest_osd_inputs() -> Option<std::collections::BTreeMap<i32, (u32, u32, u32
             power_dbm: 37,
         });
         let before = mfsk_core::wspr::osd::capture::snapshot().len();
-        let results = decode_scan_with_table(&audio, 12_000, 0, &params, &mut table);
+        let results = DecodeRequest::new(&audio, 12_000)
+            .params(params)
+            .table(&mut table)
+            .decode();
         let after = mfsk_core::wspr::osd::capture::snapshot().len();
         let fano_hit = results.iter().any(|d| d.message.to_string() == GOLDEN_MSG);
 
@@ -430,9 +432,7 @@ fn wspr_rank_sweep() {
     use mfsk_core::msg::WsprMessage;
     use mfsk_core::wspr::baseband::decimate_to_baseband;
     use mfsk_core::wspr::coarse_baseband::coarse_baseband;
-    use mfsk_core::wspr::decode::{
-        WsprCallsignTable, debug_refined_sync, decode_at_baseband_nblocks_gated_drift,
-    };
+    use mfsk_core::wspr::decode::debug_refined_sync;
     use mfsk_core::wspr::instrument;
 
     let dir = sweep_dir();
@@ -514,18 +514,13 @@ fn wspr_rank_sweep() {
                 debug_refined_sync(&idat, &qdat, c.start_sample, c.freq_hz, c.drift_hz, false);
             let kept = sync > MINSYNC2_FINAL;
             let before = instrument::snapshot();
-            let msg = decode_at_baseband_nblocks_gated_drift(
-                &idat,
-                &qdat,
-                sample_rate,
-                c.start_sample,
-                c.freq_hz,
-                c.drift_hz,
-                &[1, 2, 3, 0],
-                Some(&table),
-                false,
-            )
-            .filter(|d| d.message.to_string() == GOLDEN_MSG);
+            let msg = SniperRequest::baseband(&idat, &qdat, sample_rate, c.start_sample, c.freq_hz)
+                .drift(c.drift_hz)
+                .nblocks(&[1, 2, 3, 0])
+                .confirmed(&table)
+                .refine_drift(false)
+                .decode()
+                .filter(|d| d.message.to_string() == GOLDEN_MSG);
             let after = instrument::snapshot();
             let via = if msg.is_none() {
                 "none"

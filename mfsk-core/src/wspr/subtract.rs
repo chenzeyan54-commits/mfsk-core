@@ -506,7 +506,9 @@ mod tests {
         // Round-trip through the test recovers the same symbols
         // synthesize_type1 produced. Decode the synth audio, then
         // re-encode the recovered info_bits to channel symbols.
-        let r = crate::wspr::decode_at(&audio, 12_000, 0, 1500.0).expect("decode synth");
+        let r = crate::wspr::DecodeRequest::sniper(&audio, 12_000, 0, 1500.0)
+            .decode()
+            .expect("decode synth");
         let symbols = crate::wspr::encode_channel_symbols(&r.info_bits);
         // Synth has tone-0 = 1500 Hz, so signal centre = 1500 + 2.197;
         // shift_baseband = 0 (synth starts at sample 0).

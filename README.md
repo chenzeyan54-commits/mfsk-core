@@ -170,7 +170,9 @@ points and carries its own Quick example:
   — `DecodeRequest::<Fst4s60>` (FST4-60A); other sub-modes via
   `DecodeRequest::<Fst4s120>` etc.
 - [`mfsk_core::wspr`](https://docs.rs/mfsk-core/latest/mfsk_core/wspr/)
-  — `decode::decode_scan_default`
+  — `DecodeRequest` (scan; `.table()` to carry confirmed callsigns
+  across slots) / `DecodeRequest::sniper` / `SniperRequest::baseband`
+  (known alignment)
 - [`mfsk_core::jt9`](https://docs.rs/mfsk-core/latest/mfsk_core/jt9/)
   — `DecodeRequest` (scan; `.depth()` for the Fano budget) /
   `DecodeRequest::sniper` (known alignment)

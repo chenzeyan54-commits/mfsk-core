@@ -3,7 +3,7 @@
 //! Written for `docs/notes/WSPR_EMBEDDED_MEASUREMENT_PLAN.md` Phase 1,
 //! whose highest-value single number is the `minsync1` pass rate: the
 //! refine cascade in
-//! [`decode::decode_at_baseband_nblocks_gated_drift`](super::decode::decode_at_baseband_nblocks_gated_drift)
+//! the point decode ([`SniperRequest`](super::SniperRequest))
 //! runs 1 + 4 + 4 evaluations, then **8 more** only when
 //! `best_sync > MINSYNC1`, and each evaluation reads
 //! 162 × 256 × 2 × 4 B = 324 KiB of baseband. Whether a candidate costs

@@ -4,7 +4,7 @@
 //! FT8's `dual_core.rs`: WSPR's per-candidate stack need is an order
 //! of magnitude bigger than FT8's (100+ KB vs 16 KB) and differs
 //! sharply between pass 0/1 (never reach OSD — no confirmed-callsign
-//! table exists yet, so `decode_at_baseband`'s `.and_then` gate on
+//! table exists yet, so the point decode's `.and_then` gate on
 //! `osd_decode_packed` short-circuits — ~93-103 KB peak) and pass 2
 //! (does reach it, ~112 KB peak). A single worker sized for the worst
 //! case across all three passes and kept alive the whole scan doesn't
@@ -75,9 +75,9 @@ use esp_idf_svc::sys::{
 
 use mfsk_core::wspr::coarse_baseband::BasebandCandidate;
 use mfsk_core::wspr::decode::{
-    decode_at_baseband, deep_decode_pass2_candidate, WsprCallsignTable, WsprPass2Candidate,
-    WsprResult,
+    deep_decode_pass2_candidate, WsprCallsignTable, WsprPass2Candidate, WsprResult,
 };
+use mfsk_core::wspr::SniperRequest;
 
 const PD_PASS: i32 = 1;
 const QUEUE_SEND_TO_BACK: i32 = 0;
@@ -295,7 +295,7 @@ unsafe impl Send for Pass01Job {}
 
 /// Pop candidates from the shared atomic-indexed slot array and
 /// decode them one at a time. Mirrors `wspr_bench`'s own pass-0/1
-/// inner loop (`decode_at_baseband` + the same `dt_sec`/`start_sample`/
+/// inner loop (`SniperRequest::baseband` + the same `dt_sec`/`start_sample`/
 /// `snr_db` fixups) so dual-core and sequential produce identical
 /// per-candidate results — only the dispatch differs.
 ///
@@ -322,14 +322,11 @@ unsafe fn drain_pass01_queue(
         // ownership of slot `i` for the duration of this iteration.
         let cand = unsafe { (*slots_ptr.add(i)).take() };
         let Some(c) = cand else { continue };
-        if let Some(mut d) = decode_at_baseband(
-            idat,
-            qdat,
-            sample_rate,
-            c.start_sample,
-            c.freq_hz,
-            c.drift_hz,
-        ) {
+        if let Some(mut d) =
+            SniperRequest::baseband(idat, qdat, sample_rate, c.start_sample, c.freq_hz)
+                .drift(c.drift_hz)
+                .decode()
+        {
             let start_refined = d.start_sample;
             d.dt_sec = (start_refined as i64 - pad as i64) as f32 / sample_rate as f32 - 1.0;
             d.start_sample = start_refined.saturating_sub(pad);

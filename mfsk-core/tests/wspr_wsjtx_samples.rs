@@ -10,13 +10,13 @@ use std::path::PathBuf;
 
 use mfsk_core::wspr::SearchParams;
 use mfsk_core::wspr::WsprResult;
-use mfsk_core::wspr::decode::{decode_scan, decode_scan_streaming};
 use mfsk_core::wspr::search::default_search_params;
+use mfsk_core::wspr::{DecodeRequest, SniperRequest};
 // The deprecated double-SIC wrappers are still exercised here on
 // purpose: two diagnostics measure them, and one test guards their
 // streaming parity. See `decode_scan_subtract`'s doc comment.
 #[allow(deprecated)]
-use mfsk_core::wspr::decode::{decode_scan_subtract, decode_scan_subtract_streaming};
+use mfsk_core::wspr::decode::decode_scan_subtract;
 
 #[allow(dead_code)]
 mod common;
@@ -185,7 +185,7 @@ fn wspr_golden_recall_and_precision() {
         ..default_search_params()
     };
 
-    let decodes = decode_scan(&audio, 12_000, 0, &params);
+    let decodes = DecodeRequest::new(&audio, 12_000).params(params).decode();
 
     eprintln!("WSPR sample decoded {} message(s):", decodes.len());
     for d in &decodes {
@@ -279,7 +279,7 @@ fn wspr_cascade_ddc_golden_recall_and_precision() {
         ..default_search_params()
     };
 
-    let decodes = decode_scan(&audio, 12_000, 0, &params);
+    let decodes = DecodeRequest::new(&audio, 12_000).params(params).decode();
 
     eprintln!(
         "WSPR sample (cascade DDC) decoded {} message(s):",
@@ -342,13 +342,15 @@ fn wspr_cascade_ddc_golden_recall_and_precision() {
 /// depend on any particular recording having an OSD-only signal in it.
 #[test]
 fn wspr_carried_table_does_not_perturb_a_fully_fano_slot() {
-    use mfsk_core::wspr::decode::{WsprCallsignTable, decode_scan_with_table};
+    use mfsk_core::wspr::WsprCallsignTable;
 
     let Some((audio, params)) = sample_and_params() else {
         return;
     };
 
-    let baseline: Vec<String> = mfsk_core::wspr::decode::decode_scan(&audio, 12_000, 0, &params)
+    let baseline: Vec<String> = DecodeRequest::new(&audio, 12_000)
+        .params(params)
+        .decode()
         .iter()
         .map(|d| d.message.to_string())
         .collect();
@@ -361,7 +363,10 @@ fn wspr_carried_table_does_not_perturb_a_fully_fano_slot() {
         grid: "AA00".into(),
         power_dbm: 30,
     });
-    let with_bogus: Vec<String> = decode_scan_with_table(&audio, 12_000, 0, &params, &mut bogus)
+    let with_bogus: Vec<String> = DecodeRequest::new(&audio, 12_000)
+        .params(params)
+        .table(&mut bogus)
+        .decode()
         .iter()
         .map(|d| d.message.to_string())
         .collect();
@@ -374,7 +379,10 @@ fn wspr_carried_table_does_not_perturb_a_fully_fano_slot() {
         grid: "FN20".into(),
         power_dbm: 30,
     });
-    let with_known: Vec<String> = decode_scan_with_table(&audio, 12_000, 0, &params, &mut known)
+    let with_known: Vec<String> = DecodeRequest::new(&audio, 12_000)
+        .params(params)
+        .table(&mut known)
+        .decode()
         .iter()
         .map(|d| d.message.to_string())
         .collect();
@@ -431,7 +439,7 @@ fn wspr_scan_subtract_streaming_matches_batch_exactly() {
     let on_result = |r: &WsprResult| {
         streamed.lock().unwrap().push(r.message.to_string());
     };
-    let batch = decode_scan_subtract_streaming(&audio, 12_000, 0, &params, &on_result);
+    let batch = decode_scan_subtract(&audio, 12_000, 0, &params, Some(&on_result));
 
     let batch_msgs: Vec<String> = batch.iter().map(|d| d.message.to_string()).collect();
     let streamed = streamed.into_inner().unwrap();
@@ -483,7 +491,10 @@ fn wspr_scan_streaming_superset_of_batch() {
     let on_result = |r: &WsprResult| {
         streamed.lock().unwrap().push(r.message.to_string());
     };
-    let batch = decode_scan_streaming(&audio, 12_000, 0, &params, &on_result);
+    let batch = DecodeRequest::new(&audio, 12_000)
+        .params(params)
+        .on_result(&on_result)
+        .decode();
 
     let batch_msgs: std::collections::BTreeSet<String> =
         batch.iter().map(|d| d.message.to_string()).collect();
@@ -513,7 +524,7 @@ fn wspr_scan_streaming_superset_of_batch() {
 
     // Also confirm decode_scan_streaming's own return matches plain
     // decode_scan's (the streaming sibling must not change behavior).
-    let plain = decode_scan(&audio, 12_000, 0, &params);
+    let plain = DecodeRequest::new(&audio, 12_000).params(params).decode();
     let plain_msgs: std::collections::BTreeSet<String> =
         plain.iter().map(|d| d.message.to_string()).collect();
     assert_eq!(
@@ -553,14 +564,14 @@ fn wspr_speed_diag() {
     };
 
     // Warm-up (page faults, allocator, etc.) — excluded from timing.
-    let n = decode_scan_subtract(&audio, 12_000, 0, &params).len();
+    let n = decode_scan_subtract(&audio, 12_000, 0, &params, None).len();
     eprintln!("warm-up: {n} decodes");
 
     const N_ITERS: usize = 5;
     let mut times = Vec::with_capacity(N_ITERS);
     for i in 0..N_ITERS {
         let t0 = Instant::now();
-        let r = decode_scan_subtract(&audio, 12_000, 0, &params);
+        let r = decode_scan_subtract(&audio, 12_000, 0, &params, None);
         let dt = t0.elapsed();
         eprintln!(
             "iter {i:2}: {:8.3} ms  ({} decodes)",
@@ -598,7 +609,6 @@ fn wspr_diag_candidate_cost_split() {
 
     use mfsk_core::wspr::baseband::decimate_to_baseband;
     use mfsk_core::wspr::coarse_baseband::coarse_baseband;
-    use mfsk_core::wspr::decode::{decode_at_baseband, decode_at_baseband_nblocks};
     use mfsk_core::wspr::encode_channel_symbols;
     use mfsk_core::wspr::subtract::subtract_signal_baseband;
 
@@ -639,7 +649,7 @@ fn wspr_diag_candidate_cost_split() {
     let mut pass1: Vec<(mfsk_core::wspr::WsprResult, usize)> = Vec::new();
     for c in &cands1 {
         if let Some(mut d) =
-            decode_at_baseband(&idat, &qdat, sample_rate, c.start_sample, c.freq_hz, 0.0)
+            SniperRequest::baseband(&idat, &qdat, sample_rate, c.start_sample, c.freq_hz).decode()
         {
             let start_refined = d.start_sample;
             d.start_sample = start_refined.saturating_sub(pad);
@@ -673,16 +683,11 @@ fn wspr_diag_candidate_cost_split() {
     let t0 = Instant::now();
     let mut n_pass2_decoded = 0;
     for c in &cands2 {
-        if decode_at_baseband_nblocks(
-            &idat,
-            &qdat,
-            sample_rate,
-            c.start_sample,
-            c.freq_hz,
-            c.drift_hz,
-            &[1, 2, 3],
-        )
-        .is_some()
+        if SniperRequest::baseband(&idat, &qdat, sample_rate, c.start_sample, c.freq_hz)
+            .drift(c.drift_hz)
+            .nblocks(&[1, 2, 3])
+            .decode()
+            .is_some()
         {
             n_pass2_decoded += 1;
         }
@@ -753,7 +758,6 @@ fn wspr_diag_pass_ablation() {
     use mfsk_core::wspr::WsprResult;
     use mfsk_core::wspr::baseband::decimate_to_baseband;
     use mfsk_core::wspr::coarse_baseband::coarse_baseband;
-    use mfsk_core::wspr::decode::{decode_at_baseband, decode_scan, decode_scan_subtract};
 
     let Some(path) = sample_path() else {
         eprintln!(
@@ -788,7 +792,7 @@ fn wspr_diag_pass_ablation() {
     let mut a_results: Vec<WsprResult> = Vec::new();
     for c in &cands {
         let Some(mut d) =
-            decode_at_baseband(&idat, &qdat, sample_rate, c.start_sample, c.freq_hz, 0.0)
+            SniperRequest::baseband(&idat, &qdat, sample_rate, c.start_sample, c.freq_hz).decode()
         else {
             continue;
         };
@@ -809,12 +813,14 @@ fn wspr_diag_pass_ablation() {
 
     // Condition B: inner pass-1+2, outer=1.
     let t0 = Instant::now();
-    let b_results = decode_scan(&audio, sample_rate, 0, &params);
+    let b_results = DecodeRequest::new(&audio, sample_rate)
+        .params(params)
+        .decode();
     let t_b = t0.elapsed();
 
     // Condition D: inner pass-1+2, outer=2 (production default).
     let t0 = Instant::now();
-    let d_results = decode_scan_subtract(&audio, sample_rate, 0, &params);
+    let d_results = decode_scan_subtract(&audio, sample_rate, 0, &params, None);
     let t_d = t0.elapsed();
 
     let hits = |results: &[WsprResult]| -> Vec<&'static str> {
@@ -905,7 +911,7 @@ fn wspr_diag_pass_ablation() {
 /// mistaken for an untried idea.)
 #[test]
 fn wspr_carried_table_across_slots_adds_no_phantoms() {
-    use mfsk_core::wspr::decode::{WsprCallsignTable, decode_scan_with_table};
+    use mfsk_core::wspr::WsprCallsignTable;
 
     let Some((audio, params)) = sample_and_params() else {
         return;
@@ -916,7 +922,10 @@ fn wspr_carried_table_across_slots_adds_no_phantoms() {
 
     // Five slots of the same beacons, table fed forward each time.
     for slot in 0..5 {
-        let d = decode_scan_with_table(&audio, 12_000, 0, &params, &mut table);
+        let d = DecodeRequest::new(&audio, 12_000)
+            .params(params)
+            .table(&mut table)
+            .decode();
         let msgs: Vec<String> = d.iter().map(|r| r.message.to_string()).collect();
         let phantoms: Vec<&String> = msgs
             .iter()
@@ -1075,7 +1084,7 @@ fn wspr_diag_list_all_decodes() {
         return;
     };
     #[allow(deprecated)]
-    let decodes = decode_scan_subtract(&audio, 12_000, 0, &params);
+    let decodes = decode_scan_subtract(&audio, 12_000, 0, &params, None);
     for d in &decodes {
         let golden = GOLDEN.iter().any(|g| g.msg == d.message.to_string());
         eprintln!(
@@ -1102,10 +1111,7 @@ fn wspr_diag_g8vdq_rank_after_minsync2() {
     use mfsk_core::wspr::WsprResult;
     use mfsk_core::wspr::baseband::decimate_to_baseband;
     use mfsk_core::wspr::coarse_baseband::coarse_baseband;
-    use mfsk_core::wspr::decode::{
-        WsprCallsignTable, debug_refined_sync, decode_at_baseband,
-        decode_at_baseband_nblocks_gated_drift,
-    };
+    use mfsk_core::wspr::decode::{WsprCallsignTable, debug_refined_sync};
     use mfsk_core::wspr::encode_channel_symbols;
     use mfsk_core::wspr::subtract::subtract_signal_baseband;
 
@@ -1140,14 +1146,11 @@ fn wspr_diag_g8vdq_rank_after_minsync2() {
         cands.truncate(params.max_candidates);
         let mut this_pass: Vec<(WsprResult, usize)> = Vec::new();
         for c in &cands {
-            let Some(mut d) = decode_at_baseband(
-                &idat,
-                &qdat,
-                sample_rate,
-                c.start_sample,
-                c.freq_hz,
-                c.drift_hz,
-            ) else {
+            let Some(mut d) =
+                SniperRequest::baseband(&idat, &qdat, sample_rate, c.start_sample, c.freq_hz)
+                    .drift(c.drift_hz)
+                    .decode()
+            else {
                 continue;
             };
             let start_refined = d.start_sample;
@@ -1205,18 +1208,13 @@ fn wspr_diag_g8vdq_rank_after_minsync2() {
     for (i, c) in cands2.iter().enumerate() {
         let refined_sync =
             debug_refined_sync(&idat, &qdat, c.start_sample, c.freq_hz, c.drift_hz, false);
-        let message = decode_at_baseband_nblocks_gated_drift(
-            &idat,
-            &qdat,
-            sample_rate,
-            c.start_sample,
-            c.freq_hz,
-            c.drift_hz,
-            &[1, 2, 3, 0],
-            Some(&confirmed),
-            false,
-        )
-        .map(|d| d.message.to_string());
+        let message = SniperRequest::baseband(&idat, &qdat, sample_rate, c.start_sample, c.freq_hz)
+            .drift(c.drift_hz)
+            .nblocks(&[1, 2, 3, 0])
+            .confirmed(&confirmed)
+            .refine_drift(false)
+            .decode()
+            .map(|d| d.message.to_string());
         rows.push(Row {
             rank_by_coarse: i,
             refined_sync,
@@ -1326,10 +1324,7 @@ fn wspr_diag_rank_by_pass() {
     use mfsk_core::wspr::WsprResult;
     use mfsk_core::wspr::baseband::decimate_to_baseband;
     use mfsk_core::wspr::coarse_baseband::coarse_baseband;
-    use mfsk_core::wspr::decode::{
-        WsprCallsignTable, debug_refined_sync, decode_at_baseband,
-        decode_at_baseband_nblocks_gated_drift,
-    };
+    use mfsk_core::wspr::decode::{WsprCallsignTable, debug_refined_sync};
     use mfsk_core::wspr::encode_channel_symbols;
     use mfsk_core::wspr::subtract::subtract_signal_baseband;
 
@@ -1369,14 +1364,11 @@ fn wspr_diag_rank_by_pass() {
             let refined_sync =
                 debug_refined_sync(&idat, &qdat, c.start_sample, c.freq_hz, c.drift_hz, true);
             let kept = refined_sync > MINSYNC2_EARLY;
-            let Some(mut d) = decode_at_baseband(
-                &idat,
-                &qdat,
-                sample_rate,
-                c.start_sample,
-                c.freq_hz,
-                c.drift_hz,
-            ) else {
+            let Some(mut d) =
+                SniperRequest::baseband(&idat, &qdat, sample_rate, c.start_sample, c.freq_hz)
+                    .drift(c.drift_hz)
+                    .decode()
+            else {
                 ranked.push((refined_sync, kept, None));
                 continue;
             };
@@ -1431,18 +1423,13 @@ fn wspr_diag_rank_by_pass() {
         let refined_sync =
             debug_refined_sync(&idat, &qdat, c.start_sample, c.freq_hz, c.drift_hz, false);
         let kept = refined_sync > MINSYNC2_FINAL;
-        let msg = decode_at_baseband_nblocks_gated_drift(
-            &idat,
-            &qdat,
-            sample_rate,
-            c.start_sample,
-            c.freq_hz,
-            c.drift_hz,
-            &[1, 2, 3, 0],
-            Some(&confirmed),
-            false,
-        )
-        .map(|d| d.message.to_string());
+        let msg = SniperRequest::baseband(&idat, &qdat, sample_rate, c.start_sample, c.freq_hz)
+            .drift(c.drift_hz)
+            .nblocks(&[1, 2, 3, 0])
+            .confirmed(&confirmed)
+            .refine_drift(false)
+            .decode()
+            .map(|d| d.message.to_string());
         ranked2.push((refined_sync, kept, msg));
     }
     ranked2.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
@@ -1487,7 +1474,7 @@ fn wspr_ladder_budget_cuts_off_the_failing_candidate_without_losing_the_real_one
     use mfsk_core::wspr::baseband::decimate_to_baseband;
     use mfsk_core::wspr::coarse_baseband::coarse_baseband;
     use mfsk_core::wspr::decode::{
-        WsprCallsignTable, decode_at_baseband, deep_decode_pass2_candidate, rank_pass2_candidates,
+        WsprCallsignTable, deep_decode_pass2_candidate, rank_pass2_candidates,
     };
     use mfsk_core::wspr::encode_channel_symbols;
     use mfsk_core::wspr::instrument;
@@ -1524,14 +1511,11 @@ fn wspr_ladder_budget_cuts_off_the_failing_candidate_without_losing_the_real_one
         cands.truncate(params.max_candidates);
         let mut this_pass: Vec<(WsprResult, usize)> = Vec::new();
         for c in &cands {
-            let Some(mut d) = decode_at_baseband(
-                &idat,
-                &qdat,
-                sample_rate,
-                c.start_sample,
-                c.freq_hz,
-                c.drift_hz,
-            ) else {
+            let Some(mut d) =
+                SniperRequest::baseband(&idat, &qdat, sample_rate, c.start_sample, c.freq_hz)
+                    .drift(c.drift_hz)
+                    .decode()
+            else {
                 continue;
             };
             let start_refined = d.start_sample;
