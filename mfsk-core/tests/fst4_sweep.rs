@@ -911,14 +911,19 @@ fn fst4_60_diag_candidate_cost_split() {
         buckets.len()
     }
 
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    let golden_path = Path::new(&manifest).join("../../WSJT-X/samples/FST4+FST4W/210115_0058.wav");
+    let golden_path = match common::corpus::golden_path_or_upstream(
+        "fst4/210115_0058.wav",
+        Some("FST4+FST4W/210115_0058.wav"),
+    ) {
+        Some(p) => p,
+        None => return,
+    };
     let Ok(golden_path) = golden_path.canonicalize() else {
-        eprintln!("skipping: WSJT-X FST4 sample not found (sibling checkout)");
+        common::skip_or_fail("WSJT-X FST4 sample not found (sibling checkout)");
         return;
     };
     let Some(audio) = load_wav_i16_opt(&golden_path) else {
-        eprintln!("skipping: WAV not 12 kHz mono PCM-16");
+        common::skip_or_fail("WAV not 12 kHz mono PCM-16");
         return;
     };
 
@@ -1043,14 +1048,17 @@ fn fst4_300_diag_candidate_cost_split() {
         buckets.len()
     }
 
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    let golden_path = Path::new(&manifest).join("../../WSJT-X/samples/FST4+FST4W/201230_0300.wav");
+    let Some(golden_path) = common::corpus::upstream_sample_path("FST4+FST4W/201230_0300.wav")
+    else {
+        common::corpus::missing_upstream("fst4_sweep", "FST4+FST4W/201230_0300.wav");
+        return;
+    };
     let Ok(golden_path) = golden_path.canonicalize() else {
-        eprintln!("skipping: WSJT-X FST4 sample not found (sibling checkout)");
+        common::skip_or_fail("WSJT-X FST4 sample not found (sibling checkout)");
         return;
     };
     let Some(full) = load_wav_i16_opt(&golden_path) else {
-        eprintln!("skipping: WAV not 12 kHz mono PCM-16");
+        common::skip_or_fail("WAV not 12 kHz mono PCM-16");
         return;
     };
     let audio: Vec<i16> = full.iter().take(300 * 12_000).copied().collect();
@@ -1160,14 +1168,19 @@ fn fst4_60_diag_osd_escalation() {
 
     const BP_MAX_ITER: u32 = 30;
 
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    let golden_path = Path::new(&manifest).join("../../WSJT-X/samples/FST4+FST4W/210115_0058.wav");
+    let golden_path = match common::corpus::golden_path_or_upstream(
+        "fst4/210115_0058.wav",
+        Some("FST4+FST4W/210115_0058.wav"),
+    ) {
+        Some(p) => p,
+        None => return,
+    };
     let Ok(golden_path) = golden_path.canonicalize() else {
-        eprintln!("skipping: WSJT-X FST4 sample not found (sibling checkout)");
+        common::skip_or_fail("WSJT-X FST4 sample not found (sibling checkout)");
         return;
     };
     let Some(audio) = load_wav_i16_opt(&golden_path) else {
-        eprintln!("skipping: WAV not 12 kHz mono PCM-16");
+        common::skip_or_fail("WAV not 12 kHz mono PCM-16");
         return;
     };
 
@@ -1327,14 +1340,19 @@ fn fst4_60_diag_npre1_pattern_counts() {
     // `osd_decode_generic` currently walks per candidate for FST4.
     const COMBINATORIAL_ORDER3: u64 = 101 * 100 * 99 / 6;
 
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    let golden_path = Path::new(&manifest).join("../../WSJT-X/samples/FST4+FST4W/210115_0058.wav");
+    let golden_path = match common::corpus::golden_path_or_upstream(
+        "fst4/210115_0058.wav",
+        Some("FST4+FST4W/210115_0058.wav"),
+    ) {
+        Some(p) => p,
+        None => return,
+    };
     let Ok(golden_path) = golden_path.canonicalize() else {
-        eprintln!("skipping: WSJT-X FST4 sample not found (sibling checkout)");
+        common::skip_or_fail("WSJT-X FST4 sample not found (sibling checkout)");
         return;
     };
     let Some(audio) = load_wav_i16_opt(&golden_path) else {
-        eprintln!("skipping: WAV not 12 kHz mono PCM-16");
+        common::skip_or_fail("WAV not 12 kHz mono PCM-16");
         return;
     };
 
@@ -1414,7 +1432,7 @@ fn fst4_60_diag_npre1_pattern_counts() {
     }
 
     if totals.is_empty() {
-        eprintln!("no candidates reached the OSD gate on this file — nothing to report");
+        common::skip_or_fail("no candidates reached the OSD gate on this file — nothing to report");
         return;
     }
     let mean_total = totals.iter().sum::<u32>() as f64 / totals.len() as f64;
@@ -2813,7 +2831,7 @@ fn fst4_60_diag_rung_major_scheduling() {
         "fst4/210115_0058.wav",
         Some("FST4+FST4W/210115_0058.wav"),
     ) else {
-        eprintln!("skip: real FST4-60 golden WAV not vendored/found");
+        common::skip_or_fail("skip: real FST4-60 golden WAV not vendored/found");
         return;
     };
     let audio = load_wav_i16_opt(&path).expect("golden WAV must load");
@@ -3337,7 +3355,7 @@ fn fst4_60_diag_decode_rung_major_correctness() {
         "fst4/210115_0058.wav",
         Some("FST4+FST4W/210115_0058.wav"),
     ) else {
-        eprintln!("skip: real FST4-60 golden WAV not vendored/found");
+        common::skip_or_fail("skip: real FST4-60 golden WAV not vendored/found");
         return;
     };
     let audio = load_wav_i16_opt(&path).expect("golden WAV must load");
@@ -3489,7 +3507,7 @@ fn fst4_60_diag_rung_major_nsync_gate_count() {
         "fst4/210115_0058.wav",
         Some("FST4+FST4W/210115_0058.wav"),
     ) else {
-        eprintln!("skip: real FST4-60 golden WAV not vendored/found");
+        common::skip_or_fail("skip: real FST4-60 golden WAV not vendored/found");
         return;
     };
     let audio = load_wav_i16_opt(&path).expect("golden WAV must load");
@@ -3672,7 +3690,7 @@ fn fst4_60_diag_sniper_gate_width_sweep() {
         "fst4/210115_0058.wav",
         Some("FST4+FST4W/210115_0058.wav"),
     ) else {
-        eprintln!("skip: real FST4-60 golden WAV not vendored/found");
+        common::skip_or_fail("skip: real FST4-60 golden WAV not vendored/found");
         return;
     };
     let audio = load_wav_i16_opt(&path).expect("golden WAV must load");
@@ -3836,7 +3854,7 @@ fn fst4_60_diag_rung_major_stage_timing_probe() {
         "fst4/210115_0058.wav",
         Some("FST4+FST4W/210115_0058.wav"),
     ) else {
-        eprintln!("skip: real FST4-60 golden WAV not vendored/found");
+        common::skip_or_fail("skip: real FST4-60 golden WAV not vendored/found");
         return;
     };
     let audio = load_wav_i16_opt(&path).expect("golden WAV must load");
@@ -4275,7 +4293,7 @@ fn fst4_60_diag_i0_offset_host_timing() {
         "fst4/210115_0058.wav",
         Some("FST4+FST4W/210115_0058.wav"),
     ) else {
-        eprintln!("skip: real FST4-60 golden WAV not vendored/found");
+        common::skip_or_fail("skip: real FST4-60 golden WAV not vendored/found");
         return;
     };
     let audio = load_wav_i16_opt(&path).expect("golden WAV must load");
@@ -5802,7 +5820,7 @@ fn fst4_60_diag_dedup_zero_score_readmission() {
     }
 
     if audits.is_empty() {
-        eprintln!("skip: neither golden nor sweep corpus available");
+        common::skip_or_fail("skip: neither golden nor sweep corpus available");
         return;
     }
 
@@ -7597,7 +7615,7 @@ fn fst4_coarse_sync_output_has_no_deduped_candidates() {
         "fst4/210115_0058.wav",
         Some("FST4+FST4W/210115_0058.wav"),
     ) else {
-        eprintln!("skip: FST4-60 golden not vendored");
+        common::skip_or_fail("skip: FST4-60 golden not vendored");
         return;
     };
     let audio = load_wav_i16_opt(&path).expect("golden WAV must load");
@@ -7709,7 +7727,7 @@ fn fst4_phase_split_matches_rung_major_without_a_budget() {
         "fst4/210115_0058.wav",
         Some("FST4+FST4W/210115_0058.wav"),
     ) else {
-        eprintln!("skip: real FST4-60 golden WAV not vendored/found");
+        common::skip_or_fail("skip: real FST4-60 golden WAV not vendored/found");
         return;
     };
     let audio = load_wav_i16_opt(&path).expect("golden WAV must load");

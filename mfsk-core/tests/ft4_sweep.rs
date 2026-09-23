@@ -1078,9 +1078,11 @@ fn ft4_diag_candidate_cost_split() {
     }
 
     // ── Golden WAV (matches `ft4_wsjtx_samples.rs`'s exact search params) ──
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    let golden_path = Path::new(&manifest).join("../../WSJT-X/samples/FT4/000000_000002.wav");
-    if let Ok(golden_path) = golden_path.canonicalize() {
+    let golden = common::corpus::golden_path_or_upstream(
+        "ft4/000000_000002.wav",
+        Some("FT4/000000_000002.wav"),
+    );
+    if let Some(golden_path) = golden {
         if let Some(raw) = load_wav_i16_opt(&golden_path) {
             const SLOT_SAMPLES: usize = 90_000;
             let mut audio = vec![0i16; SLOT_SAMPLES];
@@ -1124,7 +1126,7 @@ fn ft4_diag_candidate_cost_split() {
             );
         }
     } else {
-        eprintln!("skipping golden WAV: WSJT-X sample not found (sibling checkout)");
+        common::skip_or_fail("the WSJT-X FT4 golden sample (sibling checkout)");
     }
 
     // ── Representative sweep cells (near the measured 50%-crossing SNRs,
@@ -1386,7 +1388,7 @@ fn ft4_diag_dt_window_reach() {
     }
 
     let Ok(dir) = std::env::var("MFSK_FT4_DT_DIR") else {
-        eprintln!("MFSK_FT4_DT_DIR unset — skipping (see this test's doc comment)");
+        common::skip_or_fail("MFSK_FT4_DT_DIR unset — skipping (see this test's doc comment)");
         return;
     };
     let dir = PathBuf::from(dir);
@@ -1524,7 +1526,7 @@ fn ft4_phantom_rate() {
     let dir = sweep_dir();
     let all_wavs = collect_wavs(&dir);
     if all_wavs.is_empty() {
-        eprintln!("No WAVs in {dir:?} — run scripts/gen_ft4_sweep_wavs.sh");
+        common::skip_or_fail("No WAVs in {dir:?} — run scripts/gen_ft4_sweep_wavs.sh");
         return;
     }
     let snr_min: Option<i32> = std::env::var("MFSK_FT4_SWEEP_SNR_MIN")

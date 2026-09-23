@@ -11,7 +11,7 @@ use std::f32::consts::TAU;
 #[allow(dead_code)]
 mod common;
 use common::load_wav_f32_opt as read_wsjtx_wav;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use mfsk_core::fec::qra::Q65Codec;
 use mfsk_core::fec::qra15_65_64::QRA15_65_64_IRR_E23;
@@ -246,13 +246,7 @@ fn samples_dir(rel: &str) -> Option<PathBuf> {
     if vendored.is_dir() {
         return Some(vendored);
     }
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").ok()?;
-    let dir = Path::new(&manifest)
-        .join("../../WSJT-X/samples/Q65")
-        .join(rel)
-        .canonicalize()
-        .ok()?;
-    if dir.is_dir() { Some(dir) } else { None }
+    common::corpus::upstream_sample_dir(&format!("Q65/{rel}"))
 }
 
 #[test]
@@ -264,7 +258,7 @@ fn ap_list_decodes_eme_6m_w7gj_exchanges() {
     // exchanges (e.g. "W7GJ W1VD FN31") with no BP at all.
     let _ = synthesize_standard_for::<Q65a60>; // keep the symbol live for clarity
     let Some(dir) = samples_dir("60A_EME_6m") else {
-        eprintln!("skipping: WSJT-X 6 m EME sample tree not found");
+        common::corpus::missing_upstream("q65_ap_list", "WSJT-X 6 m EME sample tree");
         return;
     };
     let entries: Vec<_> = std::fs::read_dir(&dir)
@@ -274,7 +268,7 @@ fn ap_list_decodes_eme_6m_w7gj_exchanges() {
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("wav"))
         .collect();
     if entries.is_empty() {
-        eprintln!("skipping: 6 m EME sample dir empty");
+        common::skip_or_fail("6 m EME sample dir empty");
         return;
     }
 
