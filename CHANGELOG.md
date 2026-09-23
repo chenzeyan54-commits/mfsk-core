@@ -105,19 +105,6 @@
   tick woke it, and it hands a block over after the block's time has
   passed, as a radio does, instead of before.
 
-- **CoreS3 FST4: the slot ends at its boundary, not at the end of the
-  last staging drain.** The capture task took the whole staging buffer
-  each time, so a slot's last drain carried the first samples of the
-  next slot into this one. The anchor, meanwhile, counted from where
-  *now* sits in the slot, although the audio staged while the previous
-  slot's memory was released (~1.2 s, `SPECTRA_FREE`) arrived before
-  now and was fed first. So each slot opened with audio from before its
-  boundary and closed short of it. This is the class of error FT8 fixed
-  in `2a10112`. The drain now stops at the boundary and leaves the rest
-  staged for the next slot. The anchor counts from the oldest staged
-  sample and drops any staged audio from before the boundary. Found by
-  reading the code; not compiled or run in the session that made it.
-  Needs `cargo check` and an FST4 run on the board.
 - **CoreS3: no task-list walk while a radio's USB audio streams.**
   The panel printed a per-task CPU line every 10 s and a stack
   high-water table every 30 s, both through `uxTaskGetSystemState`,
