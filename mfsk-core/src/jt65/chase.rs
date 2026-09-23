@@ -79,9 +79,9 @@ use crate::engine::{DecodeContext, MessageCodec};
 use crate::fec::Rs63_12;
 use crate::msg::{Jt72Codec, Jt72Message};
 
-use super::gray::gray6;
 use super::interleave::interleave;
 use super::rx;
+use crate::engine::gray::gray;
 
 /// Tunable parameters for the Chase search, passed to
 /// [`super::DecodeRequest::chase`] / [`super::SniperRequest::chase`].
@@ -258,7 +258,7 @@ fn getpp(cand_sent: &[u8; 63], raw_pwr: &[[f32; 64]; 63]) -> f32 {
     let mut a = *cand_sent;
     interleave(&mut a);
     for x in a.iter_mut() {
-        *x = gray6(*x);
+        *x = gray(*x, 6);
     }
     let mut psum = 0.0f32;
     for (j, &tone) in a.iter().enumerate() {

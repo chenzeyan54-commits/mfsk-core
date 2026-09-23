@@ -2,6 +2,31 @@
 
 ## 0.11.1 — FT4 filters phantoms by default (#383), FT4 on the CoreS3 answers by the reply deadline, one screen for every mode, one boot sequence for the CoreS3's four receivers, WiFi becomes a setting of its own (#381)
 
+- **One Gray code, `engine::gray` (breaking, #391).** JT65 exposed
+  `jt65::{gray6, inv_gray6}` and JT9 kept private `gray3` / `inv_gray3`
+  copies, plus a third pair as closures in a test. They are one
+  width-parameterised port of WSJT-X `igray.c` now:
+
+  ```rust
+  jt65::gray6(n)        →  engine::gray::gray(n, 6)
+  jt65::inv_gray6(g)    →  engine::gray::inv_gray(g, 6)
+  ```
+
+  Writing it as a literal port of the C loop surfaced something the
+  copies had avoided by accident: `igray.c` shifts an `int`, and the
+  shift reaches 8 for any 4-bit-or-wider value, which overflows a `u8`
+  — a panic in debug, and in release a shift by 0 that XORs the value
+  with itself and returns 0. The shared version computes in `u32` for
+  that reason, and its tests cover every width from 1 to 8 bits.
+
+  `fst4::encode`'s private `append_crc24` moves to
+  `fec::ldpc240_101::append_crc24`, next to `crc24` / `check_crc24` and
+  the CRC-24 twin of #389's `fec::ldpc::append_crc14`.
+
+  Output is unchanged: 130 TX fingerprints (every mode's Rust and C
+  entry points, both sample rates, every FST4 and Q65 sub-mode) are
+  identical before and after.
+
 - **JT9 decodes through one builder, `jt9::DecodeRequest` (breaking,
   #403).** The six free functions it replaces — `decode_scan`,
   `decode_scan_default`, `decode_scan_with_depth`,

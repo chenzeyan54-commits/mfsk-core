@@ -17,9 +17,9 @@ use crate::engine::dsp::cpfsk;
 use crate::fec::Rs63_12;
 
 use super::Jt65;
-use super::gray::gray6;
 use super::interleave::interleave;
 use super::sync_pattern::JT65_NPRC;
+use crate::engine::gray::gray;
 
 /// Encode a 12-symbol info payload into 126 channel tones
 /// (values 0 or 2..=65 where 0 = sync, 2..=65 = data + 2).
@@ -28,7 +28,7 @@ pub fn encode_channel_symbols(info: &[u8; 12]) -> [u8; 126] {
     let mut sent = rs.encode_jt65(info);
     interleave(&mut sent);
     for s in sent.iter_mut() {
-        *s = gray6(*s);
+        *s = gray(*s, 6);
     }
     let mut tones = [0u8; 126];
     let mut k = 0usize;

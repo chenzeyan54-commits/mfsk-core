@@ -71,22 +71,6 @@ pub const FST4_300_GFSK: GfskCfg = GfskCfg {
     ramp_samples: 21_504 / 8,
 };
 
-/// Append the 24-bit CRC used by FST4 (see `mfsk_core::fec::ldpc240_101::crc24`)
-/// to a 77-bit message, producing 101 info bits.
-fn append_crc24(message77: &[u8; 77]) -> [u8; 101] {
-    let mut info = [0u8; 101];
-    info[..77].copy_from_slice(message77);
-    // CRC over the 101-bit word with CRC slot zeroed — matches
-    // WSJT-X `get_crc24` convention (same scheme as check_crc24).
-    let mut with_zero = [0u8; 101];
-    with_zero[..77].copy_from_slice(message77);
-    let crc = crate::fec::ldpc240_101::crc24(&with_zero);
-    for i in 0..24 {
-        info[77 + i] = ((crc >> (23 - i)) & 1) as u8;
-    }
-    info
-}
-
 /// Encode a 77-bit message into the 160-symbol FST4 tone sequence.
 ///
 /// Period-independent: the tone sequence only depends on `NTONES` /
@@ -105,7 +89,7 @@ pub fn message_to_tones(message77: &[u8; 77]) -> Vec<u8> {
     for (b, &r) in scrambled.iter_mut().zip(super::FST4_RVEC.iter()) {
         *b = (*b ^ r) & 1;
     }
-    let info = append_crc24(&scrambled);
+    let info = crate::fec::ldpc240_101::append_crc24(&scrambled);
     let codec = Ldpc240_101;
     let mut cw = [0u8; 240];
     codec.encode(&info, &mut cw);

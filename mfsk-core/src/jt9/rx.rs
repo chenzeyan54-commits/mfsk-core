@@ -28,15 +28,7 @@ use crate::engine::dsp::symbol_fft::SymbolFft;
 use super::Jt9;
 use super::interleave::deinterleave_llrs;
 use super::sync_pattern::JT9_ISYNC;
-
-/// Inverse Gray code on 3-bit values.
-#[inline]
-fn inv_gray3(g: u8) -> u8 {
-    let mut n = g & 0x7;
-    n ^= n >> 1;
-    n ^= n >> 2;
-    n & 0x7
-}
+use crate::engine::gray::inv_gray;
 
 /// LLR clamp, mirroring WSPR's `mags_to_llrs`. Keeps integer-metric
 /// Fano decoder in range.
@@ -96,7 +88,7 @@ pub fn demodulate_aligned(
         // Max-log-MAP bit LLRs. For each of 3 bits, the LLR is
         // max |a|² over tones where bit == 0  —  max |a|² over bit == 1.
         // Tone index post-Gray is 0..=7; the pre-Gray 3-bit payload
-        // is `inv_gray3(tone_index)`. Bit order: MSB first (to match
+        // is `inv_gray(tone_index, 3)`. Bit order: MSB first (to match
         // the TX `packbits(...,3,...)` layout).
         let mut llr3 = [0f32; 3];
         for bit_pos in 0..3 {
@@ -104,7 +96,7 @@ pub fn demodulate_aligned(
             let mut max0 = f32::NEG_INFINITY;
             let mut max1 = f32::NEG_INFINITY;
             for tone in 0u8..8 {
-                let data_bits = inv_gray3(tone);
+                let data_bits = inv_gray(tone, 3);
                 let p = mags[tone as usize] * mags[tone as usize];
                 if data_bits & mask == 0 {
                     if p > max0 {
@@ -153,14 +145,6 @@ mod tests {
     use crate::engine::{DecodeContext, FecOpts, MessageCodec};
     use crate::fec::{ConvFano232, FecCodec};
     use crate::msg::{Jt72Codec, Jt72Message};
-
-    #[test]
-    fn inv_gray_roundtrip() {
-        for n in 0u8..8 {
-            let g = n ^ (n >> 1);
-            assert_eq!(inv_gray3(g), n, "n={n} → gray={g} → inv={}", inv_gray3(g));
-        }
-    }
 
     #[test]
     fn synth_decode_roundtrip_cq_k1abc_fn42() {
