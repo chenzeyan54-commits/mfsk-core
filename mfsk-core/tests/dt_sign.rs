@@ -93,7 +93,7 @@ fn q65_early_signal_reports_negative_dt() {
 /// is what brings it back.
 #[test]
 fn jt65_early_signal_reports_negative_dt() {
-    use mfsk_core::jt65::{decode_scan, search::default_search_params, tx::synthesize_standard};
+    use mfsk_core::jt65::{DecodeRequest, tx::synthesize_standard};
 
     let signal = synthesize_standard("CQ", "JL1NIE", "PM95", FS, 1270.0, 0.5).expect("JT65 synth");
 
@@ -103,7 +103,9 @@ fn jt65_early_signal_reports_negative_dt() {
     let slot = place(&signal, early_sec, 60.0);
     let nominal_start = (nominal_sec * FS as f32) as usize;
 
-    let out = decode_scan(&slot, FS, nominal_start, &default_search_params());
+    let out = DecodeRequest::new(&slot, FS)
+        .nominal_start(nominal_start)
+        .decode();
     let Some(r) = out.first() else {
         panic!("JT65 must decode its own clean synthesis placed 0.5 s early");
     };

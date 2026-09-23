@@ -49,7 +49,7 @@ collaborators), which remains the reference implementation — see
   own long-disclosed ~7-8 dB gap vs. WSJT-X's stochastic `ftrsdap`
   decoder was closed 2026-08-08
   ([#169](https://github.com/jl1nie/mfsk-core/issues/169)): a faithful
-  port of `ftrsdap` itself (`jt65::decode_at_with_chase`, magic numbers
+  port of `ftrsdap` itself (`jt65::DecodeRequest::chase`, magic numbers
   included) plus an FFT bin-alignment fix that turned out to be the
   bigger factor (affecting every JT65 decode path, not just the new
   one). Full numbers, per protocol, including the honest caveats on
@@ -175,7 +175,8 @@ points and carries its own Quick example:
   — `DecodeRequest` (scan; `.depth()` for the Fano budget) /
   `DecodeRequest::sniper` (known alignment)
 - [`mfsk_core::jt65`](https://docs.rs/mfsk-core/latest/mfsk_core/jt65/)
-  — `decode_scan_default` + `decode_at_with_erasures` (for low SNR)
+  — `DecodeRequest` (scan; `.chase()` for low SNR) /
+  `DecodeRequest::sniper` (known alignment; `.erasures()` or `.chase()`)
 - [`mfsk_core::q65`](https://docs.rs/mfsk-core/latest/mfsk_core/q65/)
   — `DecodeRequest::<P>` (wide-band scan) / `SniperRequest::<P>`
   (narrow-band, known alignment) for any wired sub-mode including the
