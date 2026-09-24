@@ -245,7 +245,6 @@ pub fn demodulate_aligned(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tx::synthesize_audio;
     use super::*;
 
     #[test]
@@ -258,7 +257,8 @@ mod tests {
             let sync = WSPR_SYNC_VECTOR[i];
             symbols[i] = 2 * data_bit + sync;
         }
-        let audio = synthesize_audio(&symbols, 12_000, 1500.0, 0.3);
+        let audio =
+            crate::engine::tx::synthesize::<crate::wspr::Wspr>(&symbols, 12_000, 1500.0, 0.3);
         let llrs = demodulate_aligned(&audio, 12_000, 0, 1500.0);
 
         // Each LLR's sign should match the data bit: bit=0 → positive.

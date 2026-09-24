@@ -1907,12 +1907,12 @@ mod tests {
     /// perfect signal still succeeds" invariant.
     #[test]
     fn ap_hint_round_trips_clean_signal() {
-        use crate::ft8::wave_gen::tones_to_i16;
         use crate::msg::wsjt77::pack77;
 
         let m77 = pack77("CQ", "K1ABC", "FN42").expect("pack77");
         let tones = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&m77);
-        let samples = tones_to_i16(&tones, 1500.0, 20_000);
+        let samples =
+            crate::engine::tx::synthesize_i16::<crate::ft8::Ft8>(&tones, 12_000, 1500.0, 20_000);
 
         // 15 s slot, signal at 0.5 s offset.
         let mut audio = vec![0i16; 15 * 12_000];
@@ -2033,7 +2033,6 @@ mod tests {
     /// `SupportsSicEarly::__staged_sic` uses (see its doc comment).
     #[test]
     fn sic_early_subtracts_known_before_checkpoint_a() {
-        use crate::ft8::wave_gen::tones_to_i16;
         use crate::msg::wsjt77::pack77;
 
         let m_known = pack77("CQ", "K1ABC", "FN42").expect("pack77 known");
@@ -2043,7 +2042,8 @@ mod tests {
         let f0 = 1500.0_f32;
         let mut audio = vec![0i16; 15 * 12_000];
         let off = 6_000usize;
-        let buf = tones_to_i16(&tones_known, f0, 20_000);
+        let buf =
+            crate::engine::tx::synthesize_i16::<crate::ft8::Ft8>(&tones_known, 12_000, f0, 20_000);
         let n_sig = buf.len().min(audio.len() - off);
         audio[off..off + n_sig].copy_from_slice(&buf[..n_sig]);
 
@@ -2260,7 +2260,6 @@ mod tests {
     /// just that the builder method compiles.
     #[test]
     fn sic_early_eq_mode_reaches_sic_engine() {
-        use crate::ft8::wave_gen::tones_to_f32;
         use crate::msg::wsjt77::pack77;
 
         // splitmix64 + Box-Muller — deterministic, dependency-free AWGN.
@@ -2295,7 +2294,7 @@ mod tests {
         let tones = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&m77);
         let snr_linear = 10.0_f32.powf(TARGET_SNR_DB / 10.0);
         let amplitude = (4.0 * snr_linear * REF_BW / FS).sqrt();
-        let sig = tones_to_f32(&tones, F0, amplitude);
+        let sig = crate::engine::tx::synthesize::<crate::ft8::Ft8>(&tones, 12_000, F0, amplitude);
 
         let n = 15 * 12_000;
         let mut mix = vec![0.0f32; n];
@@ -2374,11 +2373,10 @@ mod tests {
     #[test]
     fn dt_accuracy_at_nominal_start() {
         use super::super::message::pack77_type1;
-        use super::super::wave_gen::tones_to_f32;
 
         let msg = pack77_type1("CQ", "JA1ABC", "PM95").unwrap();
         let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg);
-        let pcm = tones_to_f32(&itone, 1000.0, 1.0);
+        let pcm = crate::engine::tx::synthesize::<crate::ft8::Ft8>(&itone, 12_000, 1000.0, 1.0);
 
         let mut audio_f32 = vec![0.0f32; 180_000];
         let start = (0.5 * 12000.0) as usize; // 6000 samples

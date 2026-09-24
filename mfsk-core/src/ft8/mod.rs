@@ -108,6 +108,11 @@ impl ModulationParams for Ft8 {
     const NDOWN: u32 = 60; // 12 000 / 60 = 200 Hz baseband
 }
 
+impl crate::engine::tx::FskWaveform for Ft8 {
+    const WAVEFORM: crate::engine::tx::Waveform =
+        crate::engine::tx::Waveform::Gfsk(wave_gen::FT8_GFSK);
+}
+
 impl FrameLayout for Ft8 {
     const N_DATA: u32 = params::ND as u32;
     const N_SYNC: u32 = params::NS as u32;

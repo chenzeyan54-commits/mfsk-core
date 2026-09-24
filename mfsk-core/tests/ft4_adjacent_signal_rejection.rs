@@ -47,7 +47,6 @@
 ))]
 
 use mfsk_core::engine::{MessageCodec, MessageFields};
-use mfsk_core::ft4::encode;
 
 #[allow(dead_code)]
 mod common;
@@ -95,7 +94,8 @@ fn pack(call1: &str, call2: &str, grid: &str) -> [u8; 77] {
 
 fn add_signal(mix: &mut [f32], msg: &[u8; 77], freq_hz: f32, amp: f32) {
     let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft4::Ft4>(msg);
-    let pcm = encode::tones_to_f32(&itone, freq_hz, amp);
+    let pcm =
+        mfsk_core::engine::tx::synthesize::<mfsk_core::ft4::Ft4>(&itone, 12_000, freq_hz, amp);
     let start = (START_S * FS) as usize;
     for (i, &s) in pcm.iter().enumerate() {
         if start + i < mix.len() {

@@ -279,12 +279,13 @@ mod tests {
     ///
     #[test]
     fn synth_decode_roundtrip_cq_ja1abc() {
-        use super::super::encode::tones_to_i16;
         use crate::msg::wsjt77::{pack77, unpack77};
 
         let msg77 = pack77("CQ", "JA1ABC", "PM95").expect("pack77");
         let tones = crate::engine::tx::message_to_tones::<crate::fst4::Fst4s60>(&msg77);
-        let audio = tones_to_i16(&tones, 1500.0, 10_000);
+        let audio = crate::engine::tx::synthesize_i16::<crate::fst4::Fst4s60>(
+            &tones, 12_000, 1500.0, 10_000,
+        );
 
         // Pad to a full 60-second slot with 1 s of leading silence.
         let mut slot = vec![0i16; 60 * 12_000];
@@ -354,21 +355,23 @@ mod tests {
     /// `fst4::tests::all_submodes_match_wsjtx_fst4_decode_f90`), which
     /// is the strongest available check without either a real
     /// recording or a WSJT-X `fst4sim`-generated reference WAV.
-    fn synth_roundtrip_for<P>(
-        gfsk: &crate::engine::dsp::gfsk::GfskCfg,
-        freq_min: f32,
-        freq_max: f32,
-    ) where
+    fn synth_roundtrip_for<P>(freq_min: f32, freq_max: f32)
+    where
         P: crate::engine::Protocol
             + crate::engine::FrameLayout
+            + crate::engine::tx::FskWaveform
             + FrameDecodable<DecodeResult = DecodeResult>,
     {
-        use super::super::encode::tones_to_i16_with_gfsk;
         use crate::msg::wsjt77::{pack77, unpack77};
 
         let msg77 = pack77("CQ", "JA1ABC", "PM95").expect("pack77");
         let tones = crate::engine::tx::message_to_tones::<crate::fst4::Fst4s60>(&msg77);
-        let audio = tones_to_i16_with_gfsk(&tones, (freq_min + freq_max) / 2.0, 10_000, gfsk);
+        let audio = crate::engine::tx::synthesize_i16::<P>(
+            &tones,
+            12_000,
+            (freq_min + freq_max) / 2.0,
+            10_000,
+        );
 
         // Pad to a full slot with 1 s of leading silence.
         let slot_len = (P::T_SLOT_S * 12_000.0).round() as usize;
@@ -402,37 +405,21 @@ mod tests {
 
     #[test]
     fn synth_decode_roundtrip_fst4_15() {
-        synth_roundtrip_for::<super::super::Fst4s15>(
-            &super::super::encode::FST4_15_GFSK,
-            1000.0,
-            2000.0,
-        );
+        synth_roundtrip_for::<super::super::Fst4s15>(1000.0, 2000.0);
     }
 
     #[test]
     fn synth_decode_roundtrip_fst4_30() {
-        synth_roundtrip_for::<super::super::Fst4s30>(
-            &super::super::encode::FST4_30_GFSK,
-            1000.0,
-            2000.0,
-        );
+        synth_roundtrip_for::<super::super::Fst4s30>(1000.0, 2000.0);
     }
 
     #[test]
     fn synth_decode_roundtrip_fst4_120() {
-        synth_roundtrip_for::<super::super::Fst4s120>(
-            &super::super::encode::FST4_120_GFSK,
-            1000.0,
-            2000.0,
-        );
+        synth_roundtrip_for::<super::super::Fst4s120>(1000.0, 2000.0);
     }
 
     #[test]
     fn synth_decode_roundtrip_fst4_300() {
-        synth_roundtrip_for::<super::super::Fst4s300>(
-            &super::super::encode::FST4_300_GFSK,
-            1000.0,
-            2000.0,
-        );
+        synth_roundtrip_for::<super::super::Fst4s300>(1000.0, 2000.0);
     }
 }

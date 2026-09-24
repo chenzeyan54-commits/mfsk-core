@@ -32,7 +32,6 @@ use esp_idf_hal::{
 };
 use mfsk_core::ft8::message::pack77;
 use mfsk_core::ft8::params::{NN, NSPS};
-use mfsk_core::ft8::wave_gen::tones_to_i16_into;
 
 /// FT8 12 kHz mono sample rate (canonical).
 const TX_SAMPLE_RATE_HZ: u32 = 12_000;
@@ -58,7 +57,7 @@ pub fn synthesize_cq(callsign: &str, grid: &str, f0_hz: f32) -> Result<Vec<i16>>
 pub fn synthesize_message77(msg77: &[u8; 77], f0_hz: f32) -> Result<Vec<i16>> {
     let tones = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft8::Ft8>(msg77);
     let mut samples = vec![0i16; TX_SAMPLES_12K];
-    tones_to_i16_into(&mut samples, &tones, f0_hz, TX_AMPLITUDE);
+    mfsk_core::engine::tx::synthesize_i16_into::<mfsk_core::ft8::Ft8>(&mut samples, &tones, 12_000, f0_hz, TX_AMPLITUDE);
     Ok(samples)
 }
 

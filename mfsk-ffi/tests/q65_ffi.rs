@@ -285,11 +285,11 @@ fn q65_decode_with_ap_list_returns_decode_failed_on_bad_calls() {
 fn q65_decode_hash_table_resolves_hashed_callsign() {
     use mfsk_core::msg::wsjt77::pack77_type4;
     use mfsk_core::q65::Q65a30;
-    use mfsk_core::q65::tx::{encode_channel_symbols, synthesize_audio_for};
+    use mfsk_core::q65::tx::encode_channel_symbols;
 
     let bits77 = pack77_type4("JL1NIE/1", "JA1ABC", "", false).expect("pack77_type4 failed");
     let tones = encode_channel_symbols(&bits77);
-    let audio = synthesize_audio_for::<Q65a30>(&tones, 12_000, 1500.0, 0.3);
+    let audio = mfsk_core::engine::tx::synthesize::<Q65a30>(&tones, 12_000, 1500.0, 0.3);
 
     // Without a hash table: unresolved placeholder.
     let mut rows = vec![blank_row(); 16];

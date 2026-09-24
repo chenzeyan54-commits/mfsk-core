@@ -73,7 +73,7 @@ fn ctx_from_hash_table(hash_table: Option<&Arc<CallsignHashTable>>) -> DecodeCon
 /// frame shape; a marker (rather than bounding directly on
 /// `ModulationParams`) stops a non-Q65 `Protocol` impl from compiling
 /// against these builders and silently producing garbage.
-pub trait Q65SubMode: Protocol {}
+pub trait Q65SubMode: Protocol + crate::engine::tx::FskWaveform {}
 
 impl Q65SubMode for super::Q65a15 {}
 impl Q65SubMode for super::Q65a30 {}

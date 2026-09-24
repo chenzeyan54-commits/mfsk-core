@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! FT8 waveform generator.
-//!
-//! Encodes a 77-bit message into an 8-FSK baseband waveform at 12 000 Hz.
-//! The pipeline mirrors WSJT-X `genft8.f90` / `encode174_91.f90`:
+//! FT8's GFSK configuration — what `Ft8`'s
+//! [`crate::engine::tx::FskWaveform`] impl points at. The transmit chain
+//! itself is generic since #391 ([`crate::engine::tx::message_to_tones`],
+//! [`crate::engine::tx::synthesize`]) and mirrors WSJT-X
+//! `genft8.f90` / `encode174_91.f90`:
 //!
 //! ```text
 //! message77  →  CRC-14  →  info91
@@ -20,19 +21,16 @@
 //!
 //! ```
 //! # #[cfg(feature = "ft8")] {
-//! use mfsk_core::engine::tx::message_to_tones;
-//! use mfsk_core::ft8::{Ft8, wave_gen::tones_to_i16};
+//! use mfsk_core::engine::tx::{message_to_tones, synthesize_i16};
+//! use mfsk_core::ft8::Ft8;
 //! use mfsk_core::msg::wsjt77::pack77;
 //!
 //! let msg77 = pack77("CQ", "JA1ABC", "PM95").expect("pack");
 //! let tones = message_to_tones::<Ft8>(&msg77); // 79 Costas + data symbols
-//! let pcm = tones_to_i16(&tones, /* freq */ 1500.0, /* amp */ 20_000);
+//! let pcm = synthesize_i16::<Ft8>(&tones, 12_000, /* freq */ 1500.0, /* amp */ 20_000);
 //! assert_eq!(pcm.len(), tones.len() * 1920); // NSPS samples/symbol @ 12 kHz
 //! # }
 //! ```
-use alloc::vec::Vec;
-
-use super::params::NN;
 
 /// FT8 GFSK configuration: 12 kHz sample rate, 1920 samples/symbol (= 6.25 Hz
 /// tone spacing), BT=2.0, modulation index 1.0, 240-sample raised-cosine ramp.
@@ -49,58 +47,11 @@ pub const FT8_GFSK: crate::engine::dsp::gfsk::GfskCfg = crate::engine::dsp::gfsk
     ramp_samples: 1920 / 8,
 };
 
-/// Output sample count for FT8 waveform synthesis (79 × 1920 = 151 680).
-pub const TONES_OUTPUT_LEN: usize = NN * 1920;
-
-/// Synthesise a 12 000 Hz f32 PCM waveform from an FT8 tone sequence
-/// into a caller-provided buffer. **No allocation of the output**;
-/// `out` must have length [`TONES_OUTPUT_LEN`].
-///
-/// Matches WSJT-X `gen_ft8wave.f90`: 3-symbol Gaussian pulse shape with
-/// BT=2.0, dummy ramp-in/out symbols, and a half-cosine envelope on the
-/// outermost `nsps/8` samples.
-///
-/// # Panics
-///
-/// Panics if `out.len() != TONES_OUTPUT_LEN`.
-#[inline]
-pub fn tones_to_f32_into(out: &mut [f32], itone: &[u8], f0: f32, amplitude: f32) {
-    assert_eq!(itone.len(), NN, "FT8 takes {NN} tones");
-    crate::engine::dsp::gfsk::synth_f32_into(out, itone, f0, amplitude, &FT8_GFSK)
-}
-
-/// Synthesise a 12 000 Hz f32 PCM waveform from an FT8 tone sequence.
-/// Vec-returning convenience wrapper for [`tones_to_f32_into`].
-#[inline]
-pub fn tones_to_f32(itone: &[u8], f0: f32, amplitude: f32) -> Vec<f32> {
-    assert_eq!(itone.len(), NN, "FT8 takes {NN} tones");
-    crate::engine::dsp::gfsk::synth_f32(itone, f0, amplitude, &FT8_GFSK)
-}
-
-/// Synthesise into a caller-provided i16 PCM buffer. Peak value
-/// written equals `amplitude_i16` (0..32767). `out.len()` must equal
-/// [`TONES_OUTPUT_LEN`].
-#[inline]
-pub fn tones_to_i16_into(out: &mut [i16], itone: &[u8], f0: f32, amplitude_i16: i16) {
-    assert_eq!(itone.len(), NN, "FT8 takes {NN} tones");
-    crate::engine::dsp::gfsk::synth_i16_into(out, itone, f0, amplitude_i16, &FT8_GFSK)
-}
-
-/// Synthesise and return a 16-bit PCM waveform. Peak value of the returned
-/// signal equals `amplitude_i16` (0..32767). Vec-returning convenience
-/// wrapper for [`tones_to_i16_into`].
-#[inline]
-pub fn tones_to_i16(itone: &[u8], f0: f32, amplitude_i16: i16) -> Vec<i16> {
-    assert_eq!(itone.len(), NN, "FT8 takes {NN} tones");
-    crate::engine::dsp::gfsk::synth_i16(itone, f0, amplitude_i16, &FT8_GFSK)
-}
-
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::super::params::NSPS;
-    use super::*;
 
     /// Round-trip: generate a waveform and verify it decodes back to the same
     /// tone sequence (structural smoke-test only — no full decode).
@@ -108,7 +59,7 @@ mod tests {
     fn tone_sequence_length() {
         let msg = [0u8; 77];
         let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg);
-        assert_eq!(itone.len(), NN);
+        assert_eq!(itone.len(), super::super::params::NN);
     }
 
     #[test]
@@ -141,8 +92,8 @@ mod tests {
     fn waveform_length() {
         let msg = [0u8; 77];
         let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg);
-        let pcm = tones_to_f32(&itone, 1000.0, 1.0);
-        assert_eq!(pcm.len(), NN * NSPS);
+        let pcm = crate::engine::tx::synthesize::<crate::ft8::Ft8>(&itone, 12_000, 1000.0, 1.0);
+        assert_eq!(pcm.len(), super::super::params::NN * NSPS);
     }
 
     /// Encode → decode round-trip via the full ft8-core pipeline (raw bits).
@@ -164,7 +115,7 @@ mod tests {
         let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg);
 
         // Strong noiseless signal at 1000 Hz.
-        let pcm_f32 = tones_to_f32(&itone, 1000.0, 1.0);
+        let pcm_f32 = crate::engine::tx::synthesize::<crate::ft8::Ft8>(&itone, 12_000, 1000.0, 1.0);
 
         // Start at nominal 0.5 s into the frame — pad with 0.5 s of silence.
         let pad = vec![0.0f32; 6000];
@@ -195,7 +146,7 @@ mod tests {
     /// Full encode → decode round-trip with real FT8 callsigns.
     ///
     /// Tests the complete pipeline:
-    ///   pack77 → message_to_tones → tones_to_f32 → decode_frame → unpack77
+    ///   pack77 → message_to_tones → synthesize → decode_frame → unpack77
     ///
     /// Catches bugs in pack77/unpack77 that the raw-bit round-trip test misses,
     /// and verifies WSJT-X CRC compatibility (77-bit CRC, not 96-bit).
@@ -227,7 +178,8 @@ mod tests {
 
             // 3. Full encode → decode with audio
             let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg77);
-            let pcm_f32 = tones_to_f32(&itone, 1000.0, 1.0);
+            let pcm_f32 =
+                crate::engine::tx::synthesize::<crate::ft8::Ft8>(&itone, 12_000, 1000.0, 1.0);
             let pad = vec![0.0f32; 6000];
             let signal: Vec<f32> = pad.iter().chain(pcm_f32.iter()).cloned().collect();
             let samples: Vec<i16> = signal.iter().map(|&s| (s * 20000.0) as i16).collect();

@@ -14,11 +14,9 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::engine::dsp::cpfsk;
-use crate::engine::{FecCodec, ModulationParams};
+use crate::engine::FecCodec;
 use crate::fec::ConvFano232;
 
-use super::Jt9;
 use super::interleave::interleave;
 use super::sync_pattern::JT9_ISYNC;
 use crate::engine::gray::gray;
@@ -67,31 +65,6 @@ pub fn encode_channel_symbols(info_bits: &[u8; 72]) -> [u8; 85] {
     tones
 }
 
-/// Synthesize JT9 audio: one CPFSK tone per symbol at
-/// `base_freq + tone * 1.7361 Hz`. `base_freq` is the frequency of
-/// tone 0 (the sync tone, i.e. the low end of the 9-tone set).
-pub fn synthesize_audio(
-    tones: &[u8; 85],
-    sample_rate: u32,
-    base_freq_hz: f32,
-    amplitude: f32,
-) -> Vec<f32> {
-    for &sym in tones {
-        assert!(sym < 9, "JT9 tone must be in 0..=8");
-    }
-    // Plain CPFSK plus the transmit-envelope ramp (issue #259); see
-    // `engine::dsp::envelope` for why this protocol deliberately gets
-    // no symbol shaping.
-    cpfsk::synth_f32(
-        tones,
-        cpfsk::nsps(sample_rate, <Jt9 as ModulationParams>::SYMBOL_DT),
-        base_freq_hz,
-        <Jt9 as ModulationParams>::TONE_SPACING_HZ,
-        sample_rate,
-        amplitude,
-    )
-}
-
 /// Convenience: pack a standard message via `Jt72` and synthesize.
 pub fn synthesize_standard(
     call1: &str,
@@ -110,7 +83,7 @@ pub fn synthesize_standard(
         *bit = (word >> bit_in_word) & 1;
     }
     let tones = encode_channel_symbols(&info_bits);
-    Some(synthesize_audio(
+    Some(crate::engine::tx::synthesize::<crate::jt9::Jt9>(
         &tones,
         sample_rate,
         base_freq_hz,
@@ -152,7 +125,7 @@ mod tests {
     #[test]
     fn synthesize_produces_expected_length() {
         let tones = [0u8; 85];
-        let audio = synthesize_audio(&tones, 12_000, 1500.0, 0.3);
+        let audio = crate::engine::tx::synthesize::<crate::jt9::Jt9>(&tones, 12_000, 1500.0, 0.3);
         assert_eq!(audio.len(), 6912 * 85);
     }
 

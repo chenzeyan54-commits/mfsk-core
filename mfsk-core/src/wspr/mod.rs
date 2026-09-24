@@ -94,7 +94,7 @@ pub use rx::demodulate_aligned;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub use search::{SearchParams, SyncCandidate, coarse_search};
 pub use sync_vector::WSPR_SYNC_VECTOR;
-pub use tx::{synthesize_audio, synthesize_type1};
+pub use tx::synthesize_type1;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Protocol ZST
@@ -127,6 +127,10 @@ impl ModulationParams for Wspr {
     const NFFT_PER_SYMBOL_FACTOR: u32 = 1; // sync correlation windows = 1 symbol
     const NSTEP_PER_SYMBOL: u32 = 16; // WSJT-X scans 16 sub-symbol offsets
     const NDOWN: u32 = 32; // 12000 / 32 = 375 Hz baseband
+}
+
+impl crate::engine::tx::FskWaveform for Wspr {
+    const WAVEFORM: crate::engine::tx::Waveform = crate::engine::tx::Waveform::Cpfsk;
 }
 
 impl FrameLayout for Wspr {

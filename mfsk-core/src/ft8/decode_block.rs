@@ -127,7 +127,6 @@ mod tests {
     use super::*;
     use crate::engine::scalar::Cmplx;
     use crate::engine::{MessageCodec, MessageFields};
-    use crate::ft8::wave_gen::tones_to_f32;
     use crate::msg::Wsjt77Message;
 
     fn pack_cq() -> [u8; 77] {
@@ -146,7 +145,7 @@ mod tests {
 
     fn synth_clean(msg77: &[u8; 77], freq_hz: f32) -> Vec<i16> {
         let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(msg77);
-        let pcm = tones_to_f32(&itone, freq_hz, 0.5);
+        let pcm = crate::engine::tx::synthesize::<crate::ft8::Ft8>(&itone, 12_000, freq_hz, 0.5);
         let mut slot = vec![0.0f32; NMAX];
         let start = (TX_START_OFFSET_S * SAMPLE_RATE_HZ) as usize;
         let n = pcm.len().min(NMAX - start);
@@ -259,7 +258,7 @@ mod tests {
         let mut mix = vec![0.0f32; NMAX];
         for (i, &f) in freqs.iter().enumerate() {
             let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg);
-            let pcm = tones_to_f32(&itone, f, 0.5);
+            let pcm = crate::engine::tx::synthesize::<crate::ft8::Ft8>(&itone, 12_000, f, 0.5);
             let start = (TX_START_OFFSET_S * SAMPLE_RATE_HZ) as usize + i * 100;
             let n = pcm.len().min(NMAX - start);
             for k in 0..n {
@@ -317,7 +316,7 @@ mod tests {
         let mut mix = vec![0.0f32; NMAX];
         for (i, &f) in freqs.iter().enumerate() {
             let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg);
-            let pcm = tones_to_f32(&itone, f, 0.5);
+            let pcm = crate::engine::tx::synthesize::<crate::ft8::Ft8>(&itone, 12_000, f, 0.5);
             let start = (TX_START_OFFSET_S * SAMPLE_RATE_HZ) as usize + i * 100;
             let n = pcm.len().min(NMAX - start);
             for k in 0..n {

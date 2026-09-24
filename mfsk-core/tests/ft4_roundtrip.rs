@@ -24,7 +24,7 @@
 //! own narrow footprint.
 
 use mfsk_core::engine::{FrameLayout, MessageCodec, MessageFields, ModulationParams};
-use mfsk_core::ft4::{Ft4, encode};
+use mfsk_core::ft4::Ft4;
 
 const NSPS: usize = <Ft4 as ModulationParams>::NSPS as usize; // 576
 const NN: usize = <Ft4 as FrameLayout>::N_SYMBOLS as usize; // 103
@@ -52,7 +52,9 @@ fn pack_cq(call: &str, grid: &str) -> [u8; 77] {
 fn build_slot(msg77: &[u8; 77], freq_hz: f32, peak_i16: i16) -> Vec<i16> {
     let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft4::Ft4>(msg77);
     assert_eq!(itone.len(), NN);
-    let pcm = encode::tones_to_i16(&itone, freq_hz, peak_i16);
+    let pcm = mfsk_core::engine::tx::synthesize_i16::<mfsk_core::ft4::Ft4>(
+        &itone, 12_000, freq_hz, peak_i16,
+    );
     assert_eq!(pcm.len(), NN * NSPS);
 
     // Place at the nominal 0.5 s frame-start offset inside a 7.5 s slot.
