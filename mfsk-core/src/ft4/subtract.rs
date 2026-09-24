@@ -152,7 +152,6 @@ pub fn refine_signal_freq(audio: &[i16], result: &DecodeResult) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::encode::tones_to_i16;
     use super::*;
 
     /// Build a synthetic `DecodeResult` for testing. The `info` field
@@ -184,7 +183,8 @@ mod tests {
         let itone = crate::engine::tx::message_to_tones::<crate::ft4::Ft4>(&msg);
         // FT4 frame: 103 active symbols × 576 samples = 59_328.
         // Target buffer: 7.5 s × 12 kHz = 90_000.
-        let samples = tones_to_i16(&itone, 1500.0, 20_000);
+        let samples =
+            crate::engine::tx::synthesize_i16::<crate::ft4::Ft4>(&itone, 12_000, 1500.0, 20_000);
 
         let mut audio = vec![0i16; 90_000];
         let offset = 6_000usize; // 0.5 s start offset
@@ -212,7 +212,8 @@ mod tests {
     fn subtract_reduces_power() {
         let msg = [0u8; 77];
         let itone = crate::engine::tx::message_to_tones::<crate::ft4::Ft4>(&msg);
-        let samples = tones_to_i16(&itone, 1500.0, 15_000);
+        let samples =
+            crate::engine::tx::synthesize_i16::<crate::ft4::Ft4>(&itone, 12_000, 1500.0, 15_000);
 
         let mut audio = vec![0i16; 90_000];
         let offset = 6_000usize;

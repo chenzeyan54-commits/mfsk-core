@@ -31,7 +31,7 @@
 //!    "are".
 #![cfg(all(feature = "ft4", feature = "fft-rustfft"))]
 
-use mfsk_core::ft4::{Ft4, encode};
+use mfsk_core::ft4::Ft4;
 use mfsk_core::msg::ap::ApHint;
 use mfsk_core::msg::decode_request::DecodeRequest;
 use mfsk_core::msg::wsjt77::{pack77, unpack77};
@@ -68,7 +68,8 @@ fn make_slot(msg77: &[u8; 77], freq_hz: f32, snr_db: f32, seed: u64) -> Vec<i16>
     let mut mix = vec![0.0f32; SLOT];
     let amp = (4.0 * 10f32.powf(snr_db / 10.0) * REF_BW / FS).sqrt();
     let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft4::Ft4>(msg77);
-    let pcm = encode::tones_to_f32(&itone, freq_hz, amp);
+    let pcm =
+        mfsk_core::engine::tx::synthesize::<mfsk_core::ft4::Ft4>(&itone, 12_000, freq_hz, amp);
     let start = (0.5 * FS) as usize;
     for (i, s) in pcm.iter().take(SLOT - start).enumerate() {
         mix[start + i] += s;

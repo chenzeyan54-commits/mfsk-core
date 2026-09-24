@@ -11,7 +11,6 @@ use std::time::Instant;
 use mfsk_core::engine::{MessageCodec, MessageFields};
 use mfsk_core::ft4::Ft4;
 use mfsk_core::ft4::decode::ApHint;
-use mfsk_core::ft4::encode;
 use mfsk_core::msg::decode_request::DecodeRequest;
 
 const FS: f32 = 12_000.0;
@@ -63,7 +62,7 @@ fn make_slot(msg: &[u8; 77], snr_db: f32, seed: u64) -> Vec<i16> {
     let snr_lin = 10f32.powf(snr_db / 10.0);
     let amp = (4.0 * snr_lin * REF_BW / FS).sqrt();
     let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft4::Ft4>(msg);
-    let pcm = encode::tones_to_f32(&itone, 1000.0, amp);
+    let pcm = mfsk_core::engine::tx::synthesize::<mfsk_core::ft4::Ft4>(&itone, 12_000, 1000.0, amp);
     let mut mix = vec![0.0f32; SLOT];
     let start = (0.5 * FS) as usize;
     for i in 0..pcm.len().min(SLOT - start) {

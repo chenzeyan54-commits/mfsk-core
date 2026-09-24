@@ -521,7 +521,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
     // radio. `MFSK_CORES3_TX_SYNTH_BENCH=1` at build time.
     if option_env!("MFSK_CORES3_TX_SYNTH_BENCH").is_some() {
         use mfsk_core::engine::tx::message_to_tones;
-        use mfsk_core::ft8::{wave_gen::tones_to_i16_into, Ft8};
+        use mfsk_core::ft8::Ft8;
         // 79 symbols x 1920 samples at 12 kHz — the 12.64 s frame.
         const TX_SAMPLES_12K: usize = 79 * 1920;
         let t_pack0 = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
@@ -543,7 +543,7 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                         buf = alloc::vec![0i16; TX_SAMPLES_12K];
                     }
                     let tones = message_to_tones::<Ft8>(&msg77);
-                    tones_to_i16_into(&mut buf, &tones, 1_500.0, 20_000);
+                    mfsk_core::engine::tx::synthesize_i16_into::<mfsk_core::ft8::Ft8>(&mut buf, &tones, 12_000, 1_500.0, 20_000);
                     let dt = unsafe { esp_idf_svc::sys::esp_timer_get_time() } - t0;
                     if run == 0 {
                         first = dt;
@@ -560,19 +560,19 @@ pub fn run_with_source<F: FnOnce(QueueHandle_t)>(source: &'static str, source_sp
                 //
                 //  * `message_to_tones` is LDPC encode + Costas, once
                 //    per message and nothing to do with sample rate.
-                //  * `tones_to_f32_into` is the whole cost except the
+                //  * `synthesize_into` is the whole cost except the
                 //    i16 round trip: `synth_i16_into` allocates a
                 //    second 607 KB f32 buffer and converts, on top of
                 //    the 622 KB `dphi` the f32 path allocates itself.
                 //    Both live in PSRAM.
-                //  * what is left of `tones_to_i16_into` after that is
+                //  * what is left of `synthesize_i16_into` after that is
                 //    exactly that round trip.
                 let t_a = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
                 let tones = message_to_tones::<Ft8>(&msg77);
                 let t_b = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
                 let mut f32buf = alloc::vec![0f32; TX_SAMPLES_12K];
                 let t_c = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
-                mfsk_core::ft8::wave_gen::tones_to_f32_into(&mut f32buf, &tones, 1_500.0, 1.0);
+                mfsk_core::engine::tx::synthesize_into::<mfsk_core::ft8::Ft8>(&mut f32buf, &tones, 12_000, 1_500.0, 1.0);
                 let t_d = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
                 log::warn!(
                     "tx-synth split: message_to_tones {} us | alloc 607 KB f32 {} ms | \

@@ -108,7 +108,6 @@ pub fn refine_signal_freq(audio: &[i16], result: &DecodeResult) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::super::decode::DecodeStrictness;
-    use super::super::wave_gen::tones_to_i16;
     use super::*;
 
     /// Build a 91-bit `info` (K for LDPC174_91) from a 77-bit message,
@@ -125,7 +124,8 @@ mod tests {
     fn subtract_reduces_power() {
         let msg = [0u8; 77];
         let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg);
-        let samples = tones_to_i16(&itone, 1000.0, 20_000);
+        let samples =
+            crate::engine::tx::synthesize_i16::<crate::ft8::Ft8>(&itone, 12_000, 1000.0, 20_000);
 
         let mut audio = vec![0i16; 180_000];
         let offset = 6_000usize;
@@ -161,7 +161,8 @@ mod tests {
     fn subtract_with_exact_timing_near_zero() {
         let msg = [1u8; 77];
         let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg);
-        let samples = tones_to_i16(&itone, 1000.0, 20_000);
+        let samples =
+            crate::engine::tx::synthesize_i16::<crate::ft8::Ft8>(&itone, 12_000, 1000.0, 20_000);
 
         let mut audio = vec![0i16; 180_000];
         let offset = 6_000usize;
@@ -201,11 +202,13 @@ mod tests {
         // the inner inherits embedded's strictness).
         let msg_strong = pack77("CQ", "JA1ABC", "PM95").expect("pack77 strong");
         let itone_s = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg_strong);
-        let strong = tones_to_i16(&itone_s, 1000.0, 20_000);
+        let strong =
+            crate::engine::tx::synthesize_i16::<crate::ft8::Ft8>(&itone_s, 12_000, 1000.0, 20_000);
 
         let msg_weak = pack77("W1AW", "JA1ABC", "73").expect("pack77 weak");
         let itone_w = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg_weak);
-        let weak = tones_to_i16(&itone_w, 1500.0, 3_000);
+        let weak =
+            crate::engine::tx::synthesize_i16::<crate::ft8::Ft8>(&itone_w, 12_000, 1500.0, 3_000);
 
         let mut audio = vec![0i16; 180_000];
         let off = 6_000usize;

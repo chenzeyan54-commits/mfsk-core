@@ -16,8 +16,6 @@
 
 use alloc::vec::Vec;
 
-use crate::engine::ModulationParams;
-use crate::engine::dsp::cpfsk;
 use crate::fec::qra::Q65Codec;
 use crate::fec::qra15_65_64::QRA15_65_64_IRR_E23;
 use crate::msg::q65::pack77_to_symbols;
@@ -64,51 +62,9 @@ pub fn encode_channel_symbols(bits77: &[u8; 77]) -> [u8; 85] {
     tones
 }
 
-/// Synthesise Q65 audio from the 85-tone vector for sub-mode `P`.
-///
-/// `base_freq_hz` is the frequency of tone 0 (the sync tone). Each
-/// tone is emitted as a continuous-phase sinusoid for one symbol
-/// duration. Plain FSK — no GFSK shaping, matching `q65sim.f90`.
-///
-/// The sub-mode type parameter controls `NSPS` (T/R period) and
-/// `TONE_SPACING_HZ`; everything else (sync layout, tone numbering,
-/// FEC) is shared across all Q65 sub-modes.
-pub fn synthesize_audio_for<P: ModulationParams>(
-    tones: &[u8; 85],
-    sample_rate: u32,
-    base_freq_hz: f32,
-    amplitude: f32,
-) -> Vec<f32> {
-    for &sym in tones {
-        assert!(sym <= 64, "Q65 tone must be in 0..=64, got {sym}");
-    }
-    // Plain CPFSK plus the transmit-envelope ramp (issue #259); see
-    // `engine::dsp::envelope` for why this protocol deliberately gets
-    // no symbol shaping.
-    cpfsk::synth_f32(
-        tones,
-        cpfsk::nsps(sample_rate, P::SYMBOL_DT),
-        base_freq_hz,
-        P::TONE_SPACING_HZ,
-        sample_rate,
-        amplitude,
-    )
-}
-
-/// Q65-30A convenience wrapper for [`synthesize_audio_for`] — kept
-/// as the simplest API for the most common terrestrial Q65 sub-mode.
-pub fn synthesize_audio(
-    tones: &[u8; 85],
-    sample_rate: u32,
-    base_freq_hz: f32,
-    amplitude: f32,
-) -> Vec<f32> {
-    synthesize_audio_for::<Q65a30>(tones, sample_rate, base_freq_hz, amplitude)
-}
-
 /// Pack a standard `<call1> <call2> <grid_or_report>` Wsjt77 message
 /// and synthesise the Q65 audio for sub-mode `P`.
-pub fn synthesize_standard_for<P: ModulationParams>(
+pub fn synthesize_standard_for<P: crate::engine::tx::FskWaveform>(
     call1: &str,
     call2: &str,
     grid_or_report: &str,
@@ -118,7 +74,7 @@ pub fn synthesize_standard_for<P: ModulationParams>(
 ) -> Option<Vec<f32>> {
     let bits = wsjt77::pack77(call1, call2, grid_or_report)?;
     let tones = encode_channel_symbols(&bits);
-    Some(synthesize_audio_for::<P>(
+    Some(crate::engine::tx::synthesize::<P>(
         &tones,
         sample_rate,
         base_freq_hz,
@@ -172,9 +128,10 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_audio_length_matches_85_symbols() {
+    fn synthesized_length_matches_85_symbols() {
         let tones = [0u8; 85];
-        let audio = synthesize_audio(&tones, 12_000, 1500.0, 0.3);
+        let audio =
+            crate::engine::tx::synthesize::<crate::q65::Q65a30>(&tones, 12_000, 1500.0, 0.3);
         assert_eq!(
             audio.len(),
             3600 * 85,

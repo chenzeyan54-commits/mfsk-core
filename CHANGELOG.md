@@ -2,6 +2,57 @@
 
 ## 0.11.1 — FT4 filters phantoms by default (#383), FT4 on the CoreS3 answers by the reply deadline, one screen for every mode, one boot sequence for the CoreS3's four receivers, WiFi becomes a setting of its own (#381)
 
+- **One synthesis entry point, `engine::tx::synthesize::<P>` (breaking,
+  #391).** Each mode had its own family: `tones_to_f32` / `_i16` /
+  `_into` in `ft8::wave_gen` and `ft4::encode`, the same plus
+  `_with_gfsk` and `synth_sample_count` in `fst4::encode`,
+  `synthesize_audio` / `_into` / `_len` in `wspr::tx`,
+  `synthesize_audio` in `jt9` / `jt65`, `synthesize_audio` / `_for` in
+  `q65`. Which waveform a mode transmits is a property of the protocol,
+  so it is one now: a new `engine::tx::FskWaveform` trait carries
+  `Waveform::Gfsk(cfg)` (FT8, FT4, every FST4 sub-mode) or
+  `Waveform::Cpfsk` (WSPR, JT9, JT65, every Q65 sub-mode), and five
+  functions cover them all:
+
+  ```rust
+  ft8::wave_gen::tones_to_f32(&t, f, a)          →  engine::tx::synthesize::<Ft8>(&t, 12_000, f, a)
+  ft4::encode::tones_to_i16_into(o, &t, f, a)    →  engine::tx::synthesize_i16_into::<Ft4>(o, &t, 12_000, f, a)
+  fst4::encode::tones_to_f32_with_gfsk(&t, f, a, &FST4_120_GFSK)
+                                                 →  engine::tx::synthesize::<Fst4s120>(&t, 12_000, f, a)
+  fst4::encode::synth_sample_count(&cfg)         →  engine::tx::synth_len::<Fst4s…>(12_000)
+  ft8::wave_gen::TONES_OUTPUT_LEN                →  engine::tx::synth_len::<Ft8>(12_000)
+  wspr::tx::synthesize_audio(&s, sr, f, a)       →  engine::tx::synthesize::<Wspr>(&s, sr, f, a)
+  q65::synthesize_audio_for::<P>(&t, sr, f, a)   →  engine::tx::synthesize::<P>(&t, sr, f, a)
+  ```
+
+  The message-level helpers stay: `wspr::synthesize_type1`, and
+  `synthesize_standard` in `jt9` / `jt65` / `q65` (plus `q65`'s
+  `synthesize_standard_for`), each now a pack-then-`synthesize` over the
+  shared path. The `FT8_GFSK` / `FT4_GFSK` / `FST4_*_GFSK` constants stay
+  as well, since each protocol's `FskWaveform` points at one and a
+  streaming transmitter (`GfskStream`) names it.
+
+  FST4's un-suffixed `tones_to_f32` silently meant FST4-60A, a trap its
+  own doc comment warned about. `synthesize::<P>` cannot be called
+  without naming a sub-mode, so the trap is gone rather than documented.
+  A test helper that took a sub-mode type *and* a `GfskCfg` beside it
+  now takes the type alone for the same reason.
+
+  Two capabilities are new, not moved: the CPFSK modes gain `i16`
+  output, with the conversion the GFSK path has always used, and the
+  GFSK modes can synthesise at other sample rates. Their symbol length
+  follows `SYMBOL_DT` exactly as CPFSK's does. At 48 kHz, FT8 lands
+  within 0.016 of full scale of the 12 kHz waveform at every shared
+  instant, and a test pins that. A second test checks each GFSK config
+  against its protocol's own `NSPS`, `GFSK_BT` and `GFSK_HMOD`.
+
+  Output is unchanged at every rate it was previously produced: the
+  same 130 TX fingerprints match. The C ABI is unchanged too, and
+  `mfsk.h` regenerates byte-identical. Internally, the FFI's
+  `mfsk_tones_to_*` and `mfsk_synth_output_len` now dispatch through
+  one `with_tone_mode!` table instead of a per-mode `GfskCfg` lookup.
+  The three board crates are ported and `cargo check` clean on Xtensa.
+
 - **One `message_to_tones`, generic over the protocol (breaking,
   #391).** `ft8::wave_gen`, `ft4::encode` and `fst4::encode` each had
   their own, differing only in data the trait already carries: whether

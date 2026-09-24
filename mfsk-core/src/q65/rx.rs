@@ -1547,7 +1547,7 @@ mod tests {
     /// outcomes.
     #[test]
     fn sniper_hash_table_resolves_hashed_callsign() {
-        use super::super::tx::{encode_channel_symbols, synthesize_audio_for};
+        use super::super::tx::encode_channel_symbols;
         use crate::msg::hash_table::CallsignHashTable;
         use crate::msg::wsjt77::pack77_type4;
         use alloc::sync::Arc;
@@ -1559,7 +1559,7 @@ mod tests {
         let bits77 = pack77_type4("JL1NIE/1", "JA1ABC", "", false).expect("pack77_type4 failed");
         let tones = encode_channel_symbols(&bits77);
         let freq = 1500.0;
-        let audio = synthesize_audio_for::<Q65a30>(&tones, 12_000, freq, 0.3);
+        let audio = crate::engine::tx::synthesize::<Q65a30>(&tones, 12_000, freq, 0.3);
 
         // Without a hash table: unresolved placeholder.
         let no_ht = DecodeRequest::<Q65a30>::sniper(&audio, 12_000, 0, freq)

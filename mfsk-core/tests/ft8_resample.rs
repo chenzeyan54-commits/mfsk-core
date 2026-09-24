@@ -8,7 +8,6 @@
 use mfsk_core::ft8::Ft8;
 use mfsk_core::ft8::params::{MSG_BITS, NMAX};
 use mfsk_core::ft8::resample::{resample_f32_to_12k, resample_to_12k};
-use mfsk_core::ft8::wave_gen::tones_to_f32;
 use mfsk_core::msg::decode_request::DecodeRequest;
 use mfsk_core::msg::wsjt77::pack77;
 
@@ -25,7 +24,7 @@ fn test_msg() -> [u8; 77] {
 fn make_noisy_frame(msg: &[u8; 77], freq: f32, snr_db: f32) -> Vec<i16> {
     let _ = MSG_BITS;
     let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft8::Ft8>(msg);
-    let pcm = tones_to_f32(&itone, freq, 1.0);
+    let pcm = mfsk_core::engine::tx::synthesize::<mfsk_core::ft8::Ft8>(&itone, 12_000, freq, 1.0);
 
     let pad = 6000usize;
     let mut audio = vec![0.0f32; NMAX];

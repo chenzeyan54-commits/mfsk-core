@@ -266,7 +266,6 @@ mod tests {
     use super::*;
     use crate::ft8::downsample::downsample;
     use crate::ft8::params::COSTAS;
-    use crate::ft8::wave_gen::tones_to_f32;
     use alloc::vec;
     use alloc::vec::Vec;
 
@@ -320,7 +319,8 @@ mod tests {
 
         let signal_slot = {
             let tones = costas_only_tones();
-            let pcm_f32 = tones_to_f32(&tones, 1500.0, 0.5);
+            let pcm_f32 =
+                crate::engine::tx::synthesize::<crate::ft8::Ft8>(&tones, 12_000, 1500.0, 0.5);
             let mut slot = vec![0i16; 15 * 12_000];
             let start = (0.5_f32 * 12_000.0).round() as usize;
             for (i, &s) in pcm_f32.iter().enumerate() {
@@ -392,7 +392,7 @@ mod tests {
         let ref_table = build_costas_ref_table();
 
         let tones = costas_only_tones();
-        let pcm_f32 = tones_to_f32(&tones, 1500.0, 0.5);
+        let pcm_f32 = crate::engine::tx::synthesize::<crate::ft8::Ft8>(&tones, 12_000, 1500.0, 0.5);
         let mut slot = vec![0i16; 15 * 12_000];
         let start = (0.5_f32 * 12_000.0).round() as usize;
         for (i, &s) in pcm_f32.iter().enumerate() {
@@ -441,7 +441,8 @@ mod tests {
     /// Output is 15 s × 12 kHz = 180_000 samples i16.
     fn synth_slot(freq_hz: f32, dt_sec: f32) -> Vec<i16> {
         let tones = costas_only_tones();
-        let pcm_f32 = tones_to_f32(&tones, freq_hz, 0.5);
+        let pcm_f32 =
+            crate::engine::tx::synthesize::<crate::ft8::Ft8>(&tones, 12_000, freq_hz, 0.5);
         let mut slot = vec![0i16; 15 * 12_000];
         // TX start offset = 0.5 s + dt_sec, in samples at 12 kHz.
         let start = ((0.5 + dt_sec) * 12_000.0).round() as isize;

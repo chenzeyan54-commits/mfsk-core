@@ -13,11 +13,8 @@
 //!
 //! ```
 //! # #[cfg(all(feature = "ft4", any(feature = "fft-rustfft", feature = "fft-extern")))] {
-//! use mfsk_core::engine::tx::message_to_tones;
-//! use mfsk_core::ft4::{
-//!     Ft4,
-//!     encode::tones_to_i16,
-//! };
+//! use mfsk_core::engine::tx::{message_to_tones, synthesize_i16};
+//! use mfsk_core::ft4::Ft4;
 //! use mfsk_core::msg::decode_request::DecodeRequest;
 //! use mfsk_core::msg::wsjt77::{pack77, unpack77};
 //!
@@ -26,7 +23,7 @@
 //! //    7.5 s slot with the signal starting at 0.5 s.
 //! let msg77 = pack77("CQ", "JA1ABC", "PM95").expect("pack");
 //! let tones = message_to_tones::<Ft4>(&msg77);
-//! let frame = tones_to_i16(&tones, /* freq */ 1500.0, /* amp */ 20_000);
+//! let frame = synthesize_i16::<Ft4>(&tones, 12_000, /* freq */ 1500.0, /* amp */ 20_000);
 //!
 //! let mut audio = vec![0i16; 90_000]; // 7.5 s @ 12 kHz
 //! let start = (0.5 * 12_000.0) as usize;
@@ -106,6 +103,11 @@ impl ModulationParams for Ft4 {
 
     // 77-bit pre-LDPC scrambler (WSJT-X `genft4.f90:64`).
     const INFO_SCRAMBLE_RVEC: Option<&'static [u8]> = Some(&FT4_RVEC);
+}
+
+impl crate::engine::tx::FskWaveform for Ft4 {
+    const WAVEFORM: crate::engine::tx::Waveform =
+        crate::engine::tx::Waveform::Gfsk(encode::FT4_GFSK);
 }
 
 impl FrameLayout for Ft4 {

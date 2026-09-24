@@ -59,15 +59,14 @@ mfsk-core = { version = "0.11", features = ["ft8", "ft4", "wspr"] }
 
 ```rust
 use mfsk_core::ft8::Ft8;
-use mfsk_core::engine::tx::message_to_tones;
-use mfsk_core::ft8::wave_gen::tones_to_i16;
+use mfsk_core::engine::tx::{message_to_tones, synthesize_i16};
 use mfsk_core::msg::decode_request::DecodeRequest;
 use mfsk_core::msg::wsjt77::{pack77, unpack77};
 
 // 1. FT8 フレームを合成し、15 秒スロットに詰める。
 let msg77 = pack77("CQ", "JA1ABC", "PM95").unwrap();
 let tones = message_to_tones::<Ft8>(&msg77);
-let frame = tones_to_i16(&tones, /* freq */ 1500.0, /* amp */ 20_000);
+let frame = synthesize_i16::<Ft8>(&tones, 12_000, /* freq */ 1500.0, /* amp */ 20_000);
 
 let mut audio = vec![0i16; 180_000]; // 15 s @ 12 kHz
 let start = (0.5 * 12_000.0) as usize;
@@ -155,14 +154,13 @@ DecodeRequest::<P>::new(audio, freq_min, freq_max, sync_min, max_cand)
 ```rust
 use mfsk_core::ft8::Ft8;
 use mfsk_core::ft8::decode::{EqMode, ApHint};
-use mfsk_core::engine::tx::message_to_tones;
-use mfsk_core::ft8::wave_gen::tones_to_i16;
+use mfsk_core::engine::tx::{message_to_tones, synthesize_i16};
 use mfsk_core::msg::decode_request::SniperRequest;
 use mfsk_core::msg::wsjt77::{pack77, unpack77};
 
 let msg77 = pack77("CQ", "JA1ABC", "PM95").unwrap();
 let tones = message_to_tones::<Ft8>(&msg77);
-let frame = tones_to_i16(&tones, /* freq */ 1000.0, /* amp */ 20_000);
+let frame = synthesize_i16::<Ft8>(&tones, 12_000, /* freq */ 1000.0, /* amp */ 20_000);
 let mut audio = vec![0i16; 180_000]; // 15 秒 @ 12 kHz
 let start = (0.5 * 12_000.0) as usize;
 audio[start..start + frame.len()].copy_from_slice(&frame);
@@ -1049,6 +1047,31 @@ impl Protocol for Wspr {
 // `wspr::decode` 内部の非公開 sync テーブルにある。
 const WSPR_SYNC_VECTOR: [u8; 162] = [0u8; 162];
 ```
+
+### 送信：`FskWaveform`
+
+FSK で送信するプロトコルは `engine::tx::FskWaveform` も実装する。
+WSJT-X の2つの送信方式のどちらに属するかを示す定数が1つあるだけ（#391）:
+
+```rust,ignore
+impl FskWaveform for Wspr {
+    const WAVEFORM: Waveform = Waveform::Cpfsk;          // WSPR, JT9, JT65, Q65
+}
+impl FskWaveform for Ft8 {
+    const WAVEFORM: Waveform = Waveform::Gfsk(FT8_GFSK); // FT8, FT4, FST4
+}
+```
+
+`engine::tx` に必要なのはこれだけで、`message_to_tones::<P>` が 77 bit
+メッセージをトーン列にし（FT8 / FT4 / FST4）、`synthesize::<P>` /
+`synthesize_into` / `synthesize_i16` / `synth_len` が上の全モードについて
+任意のサンプルレートでトーン列を音声にする。`Cpfsk` は
+`TONE_SPACING_HZ` と `SYMBOL_DT` による素の連続位相 FSK で、WSJT-X が
+変調器の中で生成するもの。`Gfsk` は `gen_ft8wave.f90` などが事前計算する
+整形済み波形。各 `Gfsk` 設定はテストでプロトコル自身の `NSPS`・`GFSK_BT`・
+`GFSK_HMOD` と照合しているので、両者がずれることはない。送信が FSK で
+ないプロトコル（例として置いている `uvpacket` は π/4-DQPSK）は単に
+実装しない。
 
 呼び出し側のパイプラインは `DecodeRequest::<Ft4>::new(...).decode()`
 （[§1](#1-クイックスタート)）のように型引数で、あるいは WSPR 専用の

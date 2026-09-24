@@ -9,7 +9,6 @@ use std::f32::consts::PI;
 use mfsk_core::engine::{MessageCodec, MessageFields};
 use mfsk_core::ft4::Ft4;
 use mfsk_core::ft4::decode::{ApHint, DecodeResult};
-use mfsk_core::ft4::encode;
 use mfsk_core::msg::decode_request::DecodeRequest;
 
 const FS: f32 = 12_000.0;
@@ -73,7 +72,8 @@ fn make_slot(msg77: &[u8; 77], freq_hz: f32, snr_db: f32, seed: u64) -> Vec<i16>
     // the requested SNR — reinterpret old labels as +3 dB of the true SNR.
     let amp = (4.0 * snr_lin * REF_BW / FS).sqrt();
     let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft4::Ft4>(msg77);
-    let pcm = encode::tones_to_f32(&itone, freq_hz, amp);
+    let pcm =
+        mfsk_core::engine::tx::synthesize::<mfsk_core::ft4::Ft4>(&itone, 12_000, freq_hz, amp);
     let start = (0.5 * FS) as usize;
     let n = pcm.len().min(SLOT - start);
     for i in 0..n {

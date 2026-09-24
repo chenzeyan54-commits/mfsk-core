@@ -84,6 +84,10 @@ macro_rules! q65_submode {
             const NDOWN: u32 = 3;
         }
 
+        impl crate::engine::tx::FskWaveform for $name {
+            const WAVEFORM: crate::engine::tx::Waveform = crate::engine::tx::Waveform::Cpfsk;
+        }
+
         impl FrameLayout for $name {
             const N_DATA: u32 = 63;
             const N_SYNC: u32 = 22;

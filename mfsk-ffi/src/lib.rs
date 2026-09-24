@@ -698,7 +698,8 @@ pub unsafe extern "C" fn mfsk_encode_ft8(
         return MfskStatus::InvalidArg;
     };
     let tones = message_to_tones::<mfsk_core::ft8::Ft8>(&msg77);
-    let pcm = mfsk_core::ft8::wave_gen::tones_to_f32(&tones, freq_hz, 1.0);
+    let pcm =
+        mfsk_core::engine::tx::synthesize::<mfsk_core::ft8::Ft8>(&tones, 12_000, freq_hz, 1.0);
     unsafe { emit_pcm(&pcm, out, cap, out_len, "encode") }
 }
 
@@ -731,7 +732,8 @@ pub unsafe extern "C" fn mfsk_encode_ft4(
         return MfskStatus::InvalidArg;
     };
     let tones = message_to_tones::<mfsk_core::ft4::Ft4>(&msg77);
-    let pcm = mfsk_core::ft4::encode::tones_to_f32(&tones, freq_hz, 1.0);
+    let pcm =
+        mfsk_core::engine::tx::synthesize::<mfsk_core::ft4::Ft4>(&tones, 12_000, freq_hz, 1.0);
     unsafe { emit_pcm(&pcm, out, cap, out_len, "encode") }
 }
 
@@ -764,7 +766,8 @@ pub unsafe extern "C" fn mfsk_encode_fst4s60(
         return MfskStatus::InvalidArg;
     };
     let tones = message_to_tones::<mfsk_core::fst4::Fst4s60>(&msg77);
-    let pcm = mfsk_core::fst4::encode::tones_to_f32(&tones, freq_hz, 1.0);
+    let pcm =
+        mfsk_core::engine::tx::synthesize::<mfsk_core::fst4::Fst4s60>(&tones, 12_000, freq_hz, 1.0);
     unsafe { emit_pcm(&pcm, out, cap, out_len, "encode") }
 }
 
@@ -3002,17 +3005,45 @@ fn q65_rows(sub: MfskQ65SubMode, ds: &[mfsk_core::q65::Q65Result]) -> Vec<MfskDe
 // how a caller asks.
 // ──────────────────────────────────────────────────────────────────────────
 
-/// The GFSK shaping a mode synthesises with, for the FST4 family.
-fn fst4_gfsk(mode: MfskMode) -> Option<&'static mfsk_core::engine::dsp::gfsk::GfskCfg> {
-    use mfsk_core::fst4::encode as f;
-    Some(match mode {
-        MfskMode::Fst4s15 => &f::FST4_15_GFSK,
-        MfskMode::Fst4s30 => &f::FST4_30_GFSK,
-        MfskMode::Fst4s60 => &f::FST4_60A_GFSK,
-        MfskMode::Fst4s120 => &f::FST4_120_GFSK,
-        MfskMode::Fst4s300 => &f::FST4_300_GFSK,
-        _ => return None,
-    })
+/// Evaluate `$body` with `$P` bound to the transmit type `$mode` names —
+/// the FFI's one bridge from a runtime `MfskMode` to the compile-time
+/// `P` that `engine::tx::synthesize` is generic over. Modes with a tone
+/// stage (FT8, FT4, every FST4 sub-mode) only; anything else is `$none`.
+macro_rules! with_tone_mode {
+    ($mode:expr, $P:ident => $body:expr, else $none:expr) => {{
+        use mfsk_core::fst4::{Fst4s15, Fst4s30, Fst4s60, Fst4s120, Fst4s300};
+        match $mode {
+            MfskMode::Ft8 => {
+                type $P = mfsk_core::ft8::Ft8;
+                $body
+            }
+            MfskMode::Ft4 => {
+                type $P = mfsk_core::ft4::Ft4;
+                $body
+            }
+            MfskMode::Fst4s15 => {
+                type $P = Fst4s15;
+                $body
+            }
+            MfskMode::Fst4s30 => {
+                type $P = Fst4s30;
+                $body
+            }
+            MfskMode::Fst4s60 => {
+                type $P = Fst4s60;
+                $body
+            }
+            MfskMode::Fst4s120 => {
+                type $P = Fst4s120;
+                $body
+            }
+            MfskMode::Fst4s300 => {
+                type $P = Fst4s300;
+                $body
+            }
+            _ => $none,
+        }
+    }};
 }
 
 /// Channel symbols per frame, or 0 for a mode with no exposed tone
@@ -3057,14 +3088,7 @@ pub extern "C" fn mfsk_synth_output_len(mode: u32) -> usize {
     let Some(mode) = mode_of(mode) else {
         return 0;
     };
-    match mode {
-        MfskMode::Ft8 => mfsk_core::ft8::wave_gen::TONES_OUTPUT_LEN,
-        MfskMode::Ft4 => mfsk_core::ft4::encode::TONES_OUTPUT_LEN,
-        _ => match fst4_gfsk(mode) {
-            Some(cfg) => mfsk_core::fst4::encode::synth_sample_count(cfg),
-            None => 0,
-        },
-    }
+    with_tone_mode!(mode, P => mfsk_core::engine::tx::synth_len::<P>(12_000), else 0)
 }
 
 /// Copy a packed 77-bit message into caller memory.
@@ -3409,21 +3433,11 @@ pub unsafe extern "C" fn mfsk_tones_to_i16(
     };
     let tones = unsafe { slice::from_raw_parts(itone, n_tones) };
     let dst = unsafe { slice::from_raw_parts_mut(out, need) };
-    match mode_of(mode).expect("checked") {
-        MfskMode::Ft8 => {
-            let mut fixed = [0u8; 79]; // FT8 N_SYMBOLS, pinned by synth_check
-            fixed.copy_from_slice(tones);
-            mfsk_core::ft8::wave_gen::tones_to_i16_into(dst, &fixed, freq_hz, amplitude);
-        }
-        MfskMode::Ft4 => mfsk_core::ft4::encode::tones_to_i16_into(dst, tones, freq_hz, amplitude),
-        m => mfsk_core::fst4::encode::tones_to_i16_into(
-            dst,
-            tones,
-            freq_hz,
-            amplitude,
-            fst4_gfsk(m).expect("checked"),
-        ),
-    }
+    with_tone_mode!(
+        mode_of(mode).expect("checked"),
+        P => mfsk_core::engine::tx::synthesize_i16_into::<P>(dst, tones, 12_000, freq_hz, amplitude),
+        else unreachable!("synth_check admits tone-stage modes only")
+    );
     MfskStatus::Ok
 }
 
@@ -3455,21 +3469,11 @@ pub unsafe extern "C" fn mfsk_tones_to_f32(
     };
     let tones = unsafe { slice::from_raw_parts(itone, n_tones) };
     let dst = unsafe { slice::from_raw_parts_mut(out, need) };
-    match mode_of(mode).expect("checked") {
-        MfskMode::Ft8 => {
-            let mut fixed = [0u8; 79];
-            fixed.copy_from_slice(tones);
-            mfsk_core::ft8::wave_gen::tones_to_f32_into(dst, &fixed, freq_hz, amplitude);
-        }
-        MfskMode::Ft4 => mfsk_core::ft4::encode::tones_to_f32_into(dst, tones, freq_hz, amplitude),
-        m => mfsk_core::fst4::encode::tones_to_f32_into(
-            dst,
-            tones,
-            freq_hz,
-            amplitude,
-            fst4_gfsk(m).expect("checked"),
-        ),
-    }
+    with_tone_mode!(
+        mode_of(mode).expect("checked"),
+        P => mfsk_core::engine::tx::synthesize_into::<P>(dst, tones, 12_000, freq_hz, amplitude),
+        else unreachable!("synth_check admits tone-stage modes only")
+    );
     MfskStatus::Ok
 }
 

@@ -12,11 +12,8 @@
 
 use alloc::vec::Vec;
 
-use crate::engine::ModulationParams;
-use crate::engine::dsp::cpfsk;
 use crate::fec::Rs63_12;
 
-use super::Jt65;
 use super::interleave::interleave;
 use super::sync_pattern::JT65_NPRC;
 use crate::engine::gray::gray;
@@ -46,31 +43,6 @@ pub fn encode_channel_symbols(info: &[u8; 12]) -> [u8; 126] {
     tones
 }
 
-/// Synthesize JT65A audio: one CPFSK tone per symbol at
-/// `base_freq + tone * 2.69 Hz`. `base_freq` is the frequency of
-/// tone 0 (the sync tone).
-pub fn synthesize_audio(
-    tones: &[u8; 126],
-    sample_rate: u32,
-    base_freq_hz: f32,
-    amplitude: f32,
-) -> Vec<f32> {
-    for &sym in tones {
-        assert!(sym <= 65, "JT65 tone must be in 0..=65");
-    }
-    // Plain CPFSK plus the transmit-envelope ramp (issue #259); see
-    // `engine::dsp::envelope` for why this protocol deliberately gets
-    // no symbol shaping.
-    cpfsk::synth_f32(
-        tones,
-        cpfsk::nsps(sample_rate, <Jt65 as ModulationParams>::SYMBOL_DT),
-        base_freq_hz,
-        <Jt65 as ModulationParams>::TONE_SPACING_HZ,
-        sample_rate,
-        amplitude,
-    )
-}
-
 /// Convenience: pack a standard message via `Jt72` and synthesize.
 pub fn synthesize_standard(
     call1: &str,
@@ -82,7 +54,7 @@ pub fn synthesize_standard(
 ) -> Option<Vec<f32>> {
     let words = crate::msg::jt72::pack_standard(call1, call2, grid_or_report)?;
     let tones = encode_channel_symbols(&words);
-    Some(synthesize_audio(
+    Some(crate::engine::tx::synthesize::<crate::jt65::Jt65>(
         &tones,
         sample_rate,
         base_freq_hz,
@@ -107,7 +79,7 @@ mod tests {
     #[test]
     fn synthesize_produces_expected_length() {
         let tones = [0u8; 126];
-        let audio = synthesize_audio(&tones, 12_000, 1270.0, 0.3);
+        let audio = crate::engine::tx::synthesize::<crate::jt65::Jt65>(&tones, 12_000, 1270.0, 0.3);
         assert_eq!(audio.len(), 4460 * 126);
     }
 

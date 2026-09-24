@@ -96,7 +96,8 @@ fn decode(dec: *mut MfskDecodeSession, audio: &[i16]) -> Vec<String> {
 fn ft8_slot(msg: &[u8; 77], f0: f32) -> Vec<i16> {
     let mut slot = vec![0i16; 15 * FS as usize];
     let tones = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft8::Ft8>(msg);
-    let wave = mfsk_core::ft8::wave_gen::tones_to_i16(&tones, f0, 8_000);
+    let wave =
+        mfsk_core::engine::tx::synthesize_i16::<mfsk_core::ft8::Ft8>(&tones, 12_000, f0, 8_000);
     let start = (0.5 * FS as f32) as usize;
     for (i, s) in wave.iter().enumerate() {
         if let Some(d) = slot.get_mut(start + i) {

@@ -11,7 +11,8 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::{FecCodec, MessageCodec, ModulationParams, Protocol};
+use super::dsp::{cpfsk, gfsk::GfskCfg};
+use super::{FecCodec, FrameLayout, MessageCodec, ModulationParams, Protocol};
 
 /// Ordered list of `(first_data_symbol, chunk_len_in_symbols)` covering
 /// every data slot in the frame — leading slots before the first sync
@@ -168,4 +169,219 @@ pub fn info_to_tones<P: Protocol>(info: &[u8]) -> Vec<u8> {
     let mut cw = vec![0u8; P::Fec::N];
     P::Fec::default().encode(info, &mut cw);
     codeword_to_itone::<P>(&cw)
+}
+
+/// How a protocol's tone sequence becomes audio — the one thing that
+/// separates the two transmit families WSJT-X has.
+///
+/// WSJT-X picks the family by the sign of the `toneSpacing` it hands
+/// `Modulator::start` (see [`super::dsp::envelope`]'s module doc):
+/// FT8, FT4 and FST4 transmit a pre-computed GFSK waveform with a
+/// raised-cosine ramp (`gen_ft8wave.f90`, `gen_ft4wave.f90`,
+/// `gen_fst4wave.f90`); WSPR, JT9, JT65 and Q65 are plain continuous-phase
+/// FSK generated in the modulator.
+#[derive(Clone, Copy, Debug)]
+pub enum Waveform {
+    /// Gaussian-shaped FSK with this configuration, defined at its own
+    /// `sample_rate` (12 kHz for every WSJT mode).
+    Gfsk(GfskCfg),
+    /// Plain continuous-phase FSK at `ModulationParams::TONE_SPACING_HZ`
+    /// and `SYMBOL_DT`, with [`super::dsp::envelope`]'s ramp.
+    Cpfsk,
+}
+
+/// A protocol [`synthesize`] can turn into audio. Implemented by the
+/// WSJT-family modes; a protocol with a transmit chain that is not FSK
+/// at all simply does not implement it.
+pub trait FskWaveform: ModulationParams + FrameLayout {
+    const WAVEFORM: Waveform;
+}
+
+/// The GFSK configuration at `sample_rate`: samples per symbol follow
+/// `SYMBOL_DT` exactly as CPFSK's do, and the ramp keeps its fraction of
+/// a symbol. At the configuration's own rate it is returned unchanged,
+/// so 12 kHz output is exactly what the per-mode functions produced.
+fn gfsk_at<P: FskWaveform>(cfg: &GfskCfg, sample_rate: u32) -> GfskCfg {
+    if sample_rate as f32 == cfg.sample_rate {
+        return *cfg;
+    }
+    let sps = cpfsk::nsps(sample_rate, P::SYMBOL_DT);
+    GfskCfg {
+        sample_rate: sample_rate as f32,
+        samples_per_symbol: sps,
+        ramp_samples: cfg.ramp_samples * sps / cfg.samples_per_symbol,
+        ..*cfg
+    }
+}
+
+/// Samples per symbol `P` transmits at `sample_rate`.
+fn samples_per_symbol<P: FskWaveform>(sample_rate: u32) -> usize {
+    match P::WAVEFORM {
+        Waveform::Gfsk(cfg) => gfsk_at::<P>(&cfg, sample_rate).samples_per_symbol,
+        Waveform::Cpfsk => cpfsk::nsps(sample_rate, P::SYMBOL_DT),
+    }
+}
+
+/// Output length of [`synthesize`] / [`synthesize_into`] for one full
+/// frame of `P` at `sample_rate` — what to size a buffer to before the
+/// tones exist, which the `_into` forms and a C caller both need.
+pub fn synth_len<P: FskWaveform>(sample_rate: u32) -> usize {
+    P::N_SYMBOLS as usize * samples_per_symbol::<P>(sample_rate)
+}
+
+/// Synthesise one frame of `P`'s tones at `f0_hz` into `out`. No
+/// allocation on the CPFSK path; the GFSK path allocates its phase
+/// increments internally, as it always has.
+///
+/// One entry point where each mode used to have its own family
+/// (`tones_to_f32` / `_into` / `_with_gfsk`, `synthesize_audio` /
+/// `_into` / `_for`) — #391. The waveform is [`FskWaveform::WAVEFORM`].
+///
+/// # Panics
+///
+/// If `tones.len() != P::N_SYMBOLS`, a tone is `>= P::NTONES`, or
+/// `out.len() != synth_len::<P>(sample_rate)`.
+pub fn synthesize_into<P: FskWaveform>(
+    out: &mut [f32],
+    tones: &[u8],
+    sample_rate: u32,
+    f0_hz: f32,
+    amplitude: f32,
+) {
+    check_tones::<P>(tones);
+    match P::WAVEFORM {
+        Waveform::Gfsk(cfg) => super::dsp::gfsk::synth_f32_into(
+            out,
+            tones,
+            f0_hz,
+            amplitude,
+            &gfsk_at::<P>(&cfg, sample_rate),
+        ),
+        Waveform::Cpfsk => cpfsk::synth_f32_into(
+            out,
+            tones,
+            cpfsk::nsps(sample_rate, P::SYMBOL_DT),
+            f0_hz,
+            P::TONE_SPACING_HZ,
+            sample_rate,
+            amplitude,
+        ),
+    }
+}
+
+/// Allocating form of [`synthesize_into`].
+pub fn synthesize<P: FskWaveform>(
+    tones: &[u8],
+    sample_rate: u32,
+    f0_hz: f32,
+    amplitude: f32,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; synth_len::<P>(sample_rate)];
+    synthesize_into::<P>(&mut out, tones, sample_rate, f0_hz, amplitude);
+    out
+}
+
+/// 16-bit form of [`synthesize_into`]: the waveform at unit amplitude,
+/// scaled so its peak is `amplitude_i16` and truncated toward zero —
+/// the conversion the GFSK `i16` path has always used, now available
+/// for the CPFSK modes too.
+pub fn synthesize_i16_into<P: FskWaveform>(
+    out: &mut [i16],
+    tones: &[u8],
+    sample_rate: u32,
+    f0_hz: f32,
+    amplitude_i16: i16,
+) {
+    let n = synth_len::<P>(sample_rate);
+    assert_eq!(
+        out.len(),
+        n,
+        "synthesize_i16_into: out.len() must equal synth_len"
+    );
+    let mut tmp = vec![0.0f32; n];
+    synthesize_into::<P>(&mut tmp, tones, sample_rate, f0_hz, 1.0);
+    let scale = amplitude_i16 as f32;
+    for (dst, &src) in out.iter_mut().zip(tmp.iter()) {
+        *dst = (src * scale) as i16;
+    }
+}
+
+/// Allocating form of [`synthesize_i16_into`].
+pub fn synthesize_i16<P: FskWaveform>(
+    tones: &[u8],
+    sample_rate: u32,
+    f0_hz: f32,
+    amplitude_i16: i16,
+) -> Vec<i16> {
+    let mut out = vec![0i16; synth_len::<P>(sample_rate)];
+    synthesize_i16_into::<P>(&mut out, tones, sample_rate, f0_hz, amplitude_i16);
+    out
+}
+
+fn check_tones<P: FskWaveform>(tones: &[u8]) {
+    assert_eq!(
+        tones.len(),
+        P::N_SYMBOLS as usize,
+        "synthesize: expected one tone per frame symbol"
+    );
+    assert!(
+        tones.iter().all(|&t| u32::from(t) < P::NTONES),
+        "synthesize: tone out of range 0..{}",
+        P::NTONES
+    );
+}
+
+#[cfg(test)]
+mod waveform_tests {
+    use super::*;
+
+    /// A GFSK configuration must describe its own protocol: symbol length,
+    /// shaping and modulation index are also trait constants, and the two
+    /// must not drift apart. This is what catches an FST4 sub-mode wired
+    /// to another sub-mode's `FST4_*_GFSK`.
+    fn gfsk_matches_trait<P: FskWaveform>() {
+        let Waveform::Gfsk(cfg) = P::WAVEFORM else {
+            panic!("expected a GFSK protocol");
+        };
+        assert_eq!(cfg.sample_rate, 12_000.0);
+        assert_eq!(cfg.samples_per_symbol, P::NSPS as usize);
+        assert_eq!(cfg.bt, P::GFSK_BT);
+        assert_eq!(cfg.hmod, P::GFSK_HMOD);
+    }
+
+    #[test]
+    #[cfg(all(feature = "ft8", feature = "ft4", feature = "fst4"))]
+    fn gfsk_configs_match_their_protocols() {
+        gfsk_matches_trait::<crate::ft8::Ft8>();
+        gfsk_matches_trait::<crate::ft4::Ft4>();
+        gfsk_matches_trait::<crate::fst4::Fst4s15>();
+        gfsk_matches_trait::<crate::fst4::Fst4s30>();
+        gfsk_matches_trait::<crate::fst4::Fst4s60>();
+        gfsk_matches_trait::<crate::fst4::Fst4s120>();
+        gfsk_matches_trait::<crate::fst4::Fst4s300>();
+    }
+
+    /// GFSK away from 12 kHz: the symbol grid scales like CPFSK's, and
+    /// every 4th sample at 48 kHz lands on the same instant as a 12 kHz
+    /// sample, where the two waveforms must agree closely — same tone
+    /// frequencies and phase track, the pulse only sampled finer.
+    #[test]
+    #[cfg(feature = "ft8")]
+    fn gfsk_at_48k_tracks_the_12k_waveform() {
+        use crate::ft8::Ft8;
+        let m = crate::msg::wsjt77::pack77("CQ", "K1ABC", "FN42").unwrap();
+        let tones = message_to_tones::<Ft8>(&m);
+        let a = synthesize::<Ft8>(&tones, 12_000, 1500.0, 1.0);
+        let b = synthesize::<Ft8>(&tones, 48_000, 1500.0, 1.0);
+        assert_eq!(b.len(), 4 * a.len());
+        let worst = a
+            .iter()
+            .zip(b.iter().step_by(4))
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        // Measured 0.0157 of full scale (FT8, this message); the bound
+        // leaves 3x for float noise, far below a wrong tone or a phase
+        // slip, either of which reaches ~2.0.
+        assert!(worst < 0.05, "48 kHz diverges from 12 kHz by {worst}");
+    }
 }

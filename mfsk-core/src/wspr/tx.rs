@@ -13,83 +13,11 @@
 //! different waveform than the reference implementation. See
 //! `engine::dsp::envelope`'s module doc for the full comparison.
 //!
-//! The burst envelope *is* ramped — see [`synthesize_audio_into`].
+//! The burst envelope *is* ramped — see [`crate::engine::dsp::envelope`].
+//! Synthesis itself is [`crate::engine::tx::synthesize`]`::<Wspr>` since
+//! #391; what stays here is the message-level convenience.
 
 use alloc::vec::Vec;
-
-use crate::engine::ModulationParams;
-use crate::engine::dsp::cpfsk;
-
-use super::Wspr;
-
-/// Output sample count for [`synthesize_audio`] /
-/// [`synthesize_audio_into`] at the given sample rate. Embedded callers
-/// allocate (or claim from a pool) `synthesize_audio_len(sample_rate)`
-/// samples and pass them as `out`.
-#[inline]
-pub fn synthesize_audio_len(sample_rate: u32) -> usize {
-    let nsps = cpfsk::nsps(sample_rate, <Wspr as ModulationParams>::SYMBOL_DT);
-    nsps * 162
-}
-
-/// Synthesize a WSPR transmission into a caller-provided `f32` buffer.
-/// **No allocation** — `out` must be sized to
-/// [`synthesize_audio_len`]`(sample_rate)`.
-///
-/// `symbols` must be 162 values in `0..=3`. `base_freq_hz` is the
-/// frequency of tone 0; the remaining tones sit at
-/// `base_freq_hz + tone * WSPR::TONE_SPACING_HZ`. Phase is continuous
-/// across symbol boundaries so the receiver's FFT window can land on
-/// any 683 ms stretch without picking up transient spectral spread.
-///
-/// # Panics
-///
-/// Panics if `out.len() != synthesize_audio_len(sample_rate)` or if any
-/// symbol is `>= 4`.
-pub fn synthesize_audio_into(
-    out: &mut [f32],
-    symbols: &[u8; 162],
-    sample_rate: u32,
-    base_freq_hz: f32,
-    amplitude: f32,
-) {
-    // NSPS scales by the sample rate — the trait constant is for 12 kHz.
-    let nsps = cpfsk::nsps(sample_rate, <Wspr as ModulationParams>::SYMBOL_DT);
-    assert_eq!(
-        out.len(),
-        nsps * 162,
-        "synthesize_audio_into: out.len() must equal synthesize_audio_len()"
-    );
-    for &sym in symbols {
-        assert!(sym < 4, "WSPR channel symbol must be in 0..=3");
-    }
-    // Plain CPFSK plus the transmit-envelope ramp (issue #259). See
-    // `engine::dsp::envelope` for why WSPR gets an envelope ramp but
-    // deliberately no GFSK symbol shaping.
-    cpfsk::synth_f32_into(
-        out,
-        symbols,
-        nsps,
-        base_freq_hz,
-        <Wspr as ModulationParams>::TONE_SPACING_HZ,
-        sample_rate,
-        amplitude,
-    );
-}
-
-/// Synthesize a WSPR transmission as mono `f32` audio samples.
-/// Vec-returning convenience wrapper for [`synthesize_audio_into`].
-#[inline]
-pub fn synthesize_audio(
-    symbols: &[u8; 162],
-    sample_rate: u32,
-    base_freq_hz: f32,
-    amplitude: f32,
-) -> Vec<f32> {
-    let mut out = alloc::vec![0.0f32; synthesize_audio_len(sample_rate)];
-    synthesize_audio_into(&mut out, symbols, sample_rate, base_freq_hz, amplitude);
-    out
-}
 
 /// Convenience wrapper that packs a message and synthesises in one step.
 /// Returns `None` if the message can't fit the Type 1 layout.
@@ -103,7 +31,7 @@ pub fn synthesize_type1(
 ) -> Option<Vec<f32>> {
     let info = crate::msg::wspr::pack_type1(callsign, grid, power_dbm)?;
     let symbols = super::encode_channel_symbols(&info);
-    Some(synthesize_audio(
+    Some(crate::engine::tx::synthesize::<crate::wspr::Wspr>(
         &symbols,
         sample_rate,
         base_freq_hz,
@@ -118,7 +46,8 @@ mod tests {
     #[test]
     fn synthesizes_162_symbol_buffer_at_12k() {
         let symbols = [0u8; 162];
-        let audio = synthesize_audio(&symbols, 12_000, 1500.0, 0.5);
+        let audio =
+            crate::engine::tx::synthesize::<crate::wspr::Wspr>(&symbols, 12_000, 1500.0, 0.5);
         // 8192 samples/symbol × 162 symbols = 1_327_104 samples
         assert_eq!(audio.len(), 8192 * 162);
     }

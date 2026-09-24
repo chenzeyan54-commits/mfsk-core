@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Every transmit path must ramp its burst envelope (issue #259).
 //!
-//! Without a ramp, `synthesize_audio` writes `amplitude · cos(phase)`
+//! Without a ramp, the CPFSK synthesiser writes `amplitude · cos(phase)`
 //! from the first sample to the last, so a transmission begins and
 //! ends on a step discontinuity in the envelope — a broadband click at
 //! both edges, entirely separate from symbol-transition shaping.
@@ -84,7 +84,8 @@ fn nsps_at_12k(symbol_dt: f32) -> usize {
 fn wspr_tx_envelope_is_ramped() {
     use mfsk_core::engine::ModulationParams;
     let symbols = [1u8; 162];
-    let audio = mfsk_core::wspr::tx::synthesize_audio(&symbols, 12_000, 1500.0, 0.5);
+    let audio =
+        mfsk_core::engine::tx::synthesize::<mfsk_core::wspr::Wspr>(&symbols, 12_000, 1500.0, 0.5);
     assert_ramped(
         "WSPR",
         &audio,
@@ -97,7 +98,8 @@ fn wspr_tx_envelope_is_ramped() {
 fn jt65_tx_envelope_is_ramped() {
     use mfsk_core::engine::ModulationParams;
     let tones = [1u8; 126];
-    let audio = mfsk_core::jt65::tx::synthesize_audio(&tones, 12_000, 1000.0, 0.5);
+    let audio =
+        mfsk_core::engine::tx::synthesize::<mfsk_core::jt65::Jt65>(&tones, 12_000, 1000.0, 0.5);
     assert_ramped(
         "JT65",
         &audio,
@@ -110,7 +112,8 @@ fn jt65_tx_envelope_is_ramped() {
 fn jt9_tx_envelope_is_ramped() {
     use mfsk_core::engine::ModulationParams;
     let tones = [1u8; 85];
-    let audio = mfsk_core::jt9::tx::synthesize_audio(&tones, 12_000, 1000.0, 0.5);
+    let audio =
+        mfsk_core::engine::tx::synthesize::<mfsk_core::jt9::Jt9>(&tones, 12_000, 1000.0, 0.5);
     assert_ramped(
         "JT9",
         &audio,
@@ -123,7 +126,8 @@ fn jt9_tx_envelope_is_ramped() {
 fn q65_tx_envelope_is_ramped() {
     use mfsk_core::engine::ModulationParams;
     let tones = [1u8; 85];
-    let audio = mfsk_core::q65::tx::synthesize_audio(&tones, 12_000, 1000.0, 0.5);
+    let audio =
+        mfsk_core::engine::tx::synthesize::<mfsk_core::q65::Q65a30>(&tones, 12_000, 1000.0, 0.5);
     assert_ramped(
         "Q65",
         &audio,
@@ -139,12 +143,15 @@ fn q65_tx_envelope_is_ramped() {
 #[test]
 fn wspr_no_alloc_path_ramps_identically() {
     let symbols = [2u8; 162];
-    let owned = mfsk_core::wspr::tx::synthesize_audio(&symbols, 12_000, 1500.0, 0.5);
-    let mut buf = vec![0.0f32; mfsk_core::wspr::tx::synthesize_audio_len(12_000)];
-    mfsk_core::wspr::tx::synthesize_audio_into(&mut buf, &symbols, 12_000, 1500.0, 0.5);
+    let owned =
+        mfsk_core::engine::tx::synthesize::<mfsk_core::wspr::Wspr>(&symbols, 12_000, 1500.0, 0.5);
+    let mut buf = vec![0.0f32; mfsk_core::engine::tx::synth_len::<mfsk_core::wspr::Wspr>(12_000)];
+    mfsk_core::engine::tx::synthesize_into::<mfsk_core::wspr::Wspr>(
+        &mut buf, &symbols, 12_000, 1500.0, 0.5,
+    );
     assert_eq!(
         buf, owned,
-        "synthesize_audio_into must produce the same samples as synthesize_audio"
+        "synthesize_into must produce the same samples as synthesize"
     );
 }
 

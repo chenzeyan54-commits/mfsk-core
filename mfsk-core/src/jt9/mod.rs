@@ -73,7 +73,7 @@ pub use rx::demodulate_aligned;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub use search::{SearchParams, SyncCandidate, coarse_search};
 pub use sync_pattern::{JT9_ISYNC, JT9_SYNC_BLOCKS, JT9_SYNC_POSITIONS};
-pub use tx::{encode_channel_symbols, synthesize_audio, synthesize_standard};
+pub use tx::{encode_channel_symbols, synthesize_standard};
 
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 /// Decode a JT9 signal at a known (start_sample, base_freq) and return
@@ -223,6 +223,10 @@ impl ModulationParams for Jt9 {
     /// 12 000 / 8 = 1500 Hz baseband. Adequate for the 9-tone
     /// constellation (9 × 1.736 ≈ 15.6 Hz occupied) plus guard.
     const NDOWN: u32 = 8;
+}
+
+impl crate::engine::tx::FskWaveform for Jt9 {
+    const WAVEFORM: crate::engine::tx::Waveform = crate::engine::tx::Waveform::Cpfsk;
 }
 
 impl FrameLayout for Jt9 {

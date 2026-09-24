@@ -58,15 +58,14 @@ several for illustration.
 
 ```rust
 use mfsk_core::ft8::Ft8;
-use mfsk_core::engine::tx::message_to_tones;
-use mfsk_core::ft8::wave_gen::tones_to_i16;
+use mfsk_core::engine::tx::{message_to_tones, synthesize_i16};
 use mfsk_core::msg::decode_request::DecodeRequest;
 use mfsk_core::msg::wsjt77::{pack77, unpack77};
 
 // 1. Synthesise an FT8 frame and pad it into a 15-second slot.
 let msg77 = pack77("CQ", "JA1ABC", "PM95").unwrap();
 let tones = message_to_tones::<Ft8>(&msg77);
-let frame = tones_to_i16(&tones, /* freq */ 1500.0, /* amp */ 20_000);
+let frame = synthesize_i16::<Ft8>(&tones, 12_000, /* freq */ 1500.0, /* amp */ 20_000);
 
 let mut audio = vec![0i16; 180_000]; // 15 s @ 12 kHz
 let start = (0.5 * 12_000.0) as usize;
@@ -153,14 +152,13 @@ Narrow-band, single-target search, gated on `SupportsSniper` and
 ```rust
 use mfsk_core::ft8::Ft8;
 use mfsk_core::ft8::decode::{EqMode, ApHint};
-use mfsk_core::engine::tx::message_to_tones;
-use mfsk_core::ft8::wave_gen::tones_to_i16;
+use mfsk_core::engine::tx::{message_to_tones, synthesize_i16};
 use mfsk_core::msg::decode_request::SniperRequest;
 use mfsk_core::msg::wsjt77::{pack77, unpack77};
 
 let msg77 = pack77("CQ", "JA1ABC", "PM95").unwrap();
 let tones = message_to_tones::<Ft8>(&msg77);
-let frame = tones_to_i16(&tones, /* freq */ 1000.0, /* amp */ 20_000);
+let frame = synthesize_i16::<Ft8>(&tones, 12_000, /* freq */ 1000.0, /* amp */ 20_000);
 let mut audio = vec![0i16; 180_000]; // 15 s @ 12 kHz
 let start = (0.5 * 12_000.0) as usize;
 audio[start..start + frame.len()].copy_from_slice(&frame);
@@ -988,6 +986,32 @@ impl Protocol for Wspr {
 // `wspr::decode`'s private sync table.
 const WSPR_SYNC_VECTOR: [u8; 162] = [0u8; 162];
 ```
+
+### Transmitting: `FskWaveform`
+
+A protocol that transmits FSK also implements
+`engine::tx::FskWaveform`, one constant saying which of WSJT-X's two
+transmit families it belongs to (#391):
+
+```rust,ignore
+impl FskWaveform for Wspr {
+    const WAVEFORM: Waveform = Waveform::Cpfsk;          // WSPR, JT9, JT65, Q65
+}
+impl FskWaveform for Ft8 {
+    const WAVEFORM: Waveform = Waveform::Gfsk(FT8_GFSK); // FT8, FT4, FST4
+}
+```
+
+That is all `engine::tx` needs: `message_to_tones::<P>` turns a 77-bit
+message into tones (FT8 / FT4 / FST4), and `synthesize::<P>` /
+`synthesize_into` / `synthesize_i16` / `synth_len` turn tones into audio
+at any sample rate, for every mode above. `Cpfsk` is plain
+continuous-phase FSK at `TONE_SPACING_HZ` and `SYMBOL_DT`, which WSJT-X
+generates in its modulator; `Gfsk` is the pre-computed shaped waveform
+of `gen_ft8wave.f90` and friends. A test checks each `Gfsk` config
+against its protocol's own `NSPS`, `GFSK_BT` and `GFSK_HMOD`, so the two
+cannot drift apart. A protocol whose transmit chain is not FSK — the
+`uvpacket` example is π/4-DQPSK — just doesn't implement it.
 
 ### Monomorphisation is why this is free
 

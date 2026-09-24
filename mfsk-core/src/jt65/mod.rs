@@ -126,7 +126,7 @@ pub use interleave::{deinterleave, interleave};
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub use rx::{Jt65Demod, demodulate_aligned};
 pub use sync_pattern::{JT65_DATA_POSITIONS, JT65_NPRC, JT65_SYNC_BLOCKS, JT65_SYNC_POSITIONS};
-pub use tx::{encode_channel_symbols, synthesize_audio, synthesize_standard};
+pub use tx::{encode_channel_symbols, synthesize_standard};
 
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 /// Hard-decision RS decode at a known (start_sample, base_freq), with
@@ -409,6 +409,10 @@ impl ModulationParams for Jt65 {
     const NSTEP_PER_SYMBOL: u32 = 2;
     /// 12 000 / 4 = 3000 Hz baseband (enough for the 65-tone span).
     const NDOWN: u32 = 4;
+}
+
+impl crate::engine::tx::FskWaveform for Jt65 {
+    const WAVEFORM: crate::engine::tx::Waveform = crate::engine::tx::Waveform::Cpfsk;
 }
 
 const IDENTITY_66: [u8; 66] = {

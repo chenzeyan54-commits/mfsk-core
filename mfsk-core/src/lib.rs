@@ -252,11 +252,8 @@
 //!
 //! ```
 //! # #[cfg(feature = "ft8")] {
-//! use mfsk_core::engine::tx::message_to_tones;
-//! use mfsk_core::ft8::{
-//!     Ft8,
-//!     wave_gen::tones_to_i16,
-//! };
+//! use mfsk_core::engine::tx::{message_to_tones, synthesize_i16};
+//! use mfsk_core::ft8::Ft8;
 //! use mfsk_core::msg::decode_request::DecodeRequest;
 //! use mfsk_core::msg::wsjt77::{pack77, unpack77};
 //!
@@ -265,7 +262,7 @@
 //! //    pad to the full 15 s slot with the signal starting at 0.5 s.
 //! let msg77 = pack77("CQ", "JA1ABC", "PM95").expect("pack");
 //! let tones = message_to_tones::<Ft8>(&msg77);
-//! let frame = tones_to_i16(&tones, /* freq */ 1500.0, /* amp */ 20_000);
+//! let frame = synthesize_i16::<Ft8>(&tones, 12_000, /* freq */ 1500.0, /* amp */ 20_000);
 //!
 //! let mut audio = vec![0i16; 180_000]; // 15 s @ 12 kHz
 //! let start = (0.5 * 12_000.0) as usize;
@@ -297,7 +294,7 @@
 //! mfsk-core = { version = "0.8", default-features = false, features = ["alloc", "ft8"] }
 //! ```
 //!
-//! Encoding (`message_to_tones` / `tones_to_i16`) never touches `std` — no
+//! Encoding (`message_to_tones` / `synthesize_i16`) never touches `std` — no
 //! FFT, no heap-backed collections beyond `alloc::vec::Vec`. This is the
 //! same call as the [`ft8::wave_gen`] encoder-only example above; the
 //! `alloc ft8` and `alloc ft8 fft-extern` legs of CI's feature-matrix build
@@ -309,13 +306,13 @@
 //!
 //! ```
 //! # #[cfg(feature = "ft8")] {
-//! use mfsk_core::engine::tx::message_to_tones;
-//! use mfsk_core::ft8::{Ft8, wave_gen::tones_to_i16};
+//! use mfsk_core::engine::tx::{message_to_tones, synthesize_i16};
+//! use mfsk_core::ft8::Ft8;
 //! use mfsk_core::msg::wsjt77::pack77;
 //!
 //! let msg77 = pack77("CQ", "JA1ABC", "PM95").expect("pack");
 //! let tones = message_to_tones::<Ft8>(&msg77);
-//! let pcm = tones_to_i16(&tones, /* freq */ 1500.0, /* amp */ 20_000);
+//! let pcm = synthesize_i16::<Ft8>(&tones, 12_000, /* freq */ 1500.0, /* amp */ 20_000);
 //! assert!(!pcm.is_empty());
 //! # }
 //! ```

@@ -30,7 +30,7 @@
 use std::collections::BTreeSet;
 
 use mfsk_core::engine::{FrameLayout, MessageCodec, MessageFields, ModulationParams};
-use mfsk_core::ft4::{Ft4, encode};
+use mfsk_core::ft4::Ft4;
 use mfsk_core::msg::Wsjt77Message;
 use mfsk_core::msg::decode_request::DecodeRequest;
 use mfsk_core::msg::wsjt77::unpack77;
@@ -59,7 +59,8 @@ fn pack(call1: &str, call2: &str, grid: &str) -> [u8; 77] {
 fn mix_i16(audio: &mut [i16], msg77: &[u8; 77], freq_hz: f32, amp: i16, pad: usize) {
     let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft4::Ft4>(msg77);
     assert_eq!(itone.len(), NN);
-    let pcm = encode::tones_to_i16(&itone, freq_hz, amp);
+    let pcm =
+        mfsk_core::engine::tx::synthesize_i16::<mfsk_core::ft4::Ft4>(&itone, 12_000, freq_hz, amp);
     assert_eq!(pcm.len(), NN * NSPS);
     for (i, &s) in pcm.iter().enumerate() {
         let idx = pad + i;

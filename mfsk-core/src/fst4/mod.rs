@@ -136,6 +136,7 @@ macro_rules! fst4_submode {
         tx_start_offset_s = $tx_start:literal,
         snr_calfac = $snr_calfac:literal,
         decode_fft1_size = $fft1:literal,
+        gfsk = $gfsk:path,
     ) => {
         $(#[$attr])*
         #[derive(Copy, Clone, Debug, Default)]
@@ -187,6 +188,10 @@ macro_rules! fst4_submode {
             const LLR_NSYM_MID: Option<u32> = Some(4);
         }
 
+        impl crate::engine::tx::FskWaveform for $name {
+            const WAVEFORM: crate::engine::tx::Waveform = crate::engine::tx::Waveform::Gfsk($gfsk);
+        }
+
         impl FrameLayout for $name {
             const N_DATA: u32 = 120;
             const N_SYNC: u32 = 40; // 5 × 8
@@ -227,6 +232,7 @@ fst4_submode! {
     tx_start_offset_s = 0.5,
     snr_calfac = 800.0,
     decode_fft1_size = 180_000,
+    gfsk = encode::FST4_15_GFSK,
 }
 
 fst4_submode! {
@@ -240,6 +246,7 @@ fst4_submode! {
     tx_start_offset_s = 1.0,
     snr_calfac = 600.0,
     decode_fft1_size = 362_880,
+    gfsk = encode::FST4_30_GFSK,
 }
 
 fst4_submode! {
@@ -254,6 +261,7 @@ fst4_submode! {
     tx_start_offset_s = 1.0,
     snr_calfac = 430.0,
     decode_fft1_size = 746_496,
+    gfsk = encode::FST4_60A_GFSK,
 }
 
 fst4_submode! {
@@ -267,6 +275,7 @@ fst4_submode! {
     tx_start_offset_s = 1.0,
     snr_calfac = 390.0,
     decode_fft1_size = 1_443_200,
+    gfsk = encode::FST4_120_GFSK,
 }
 
 fst4_submode! {
@@ -281,6 +290,7 @@ fst4_submode! {
     tx_start_offset_s = 1.0,
     snr_calfac = 340.0,
     decode_fft1_size = 4_194_304,
+    gfsk = encode::FST4_300_GFSK,
 }
 
 #[cfg(test)]

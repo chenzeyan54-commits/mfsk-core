@@ -383,7 +383,7 @@ pub(super) fn decode_at_baseband_inner(
     confirmed: Option<&WsprCallsignTable>,
     refine_drift: bool,
 ) -> Option<WsprResult> {
-    // `freq_hz` follows our tone-0 convention (matches `synthesize_audio`
+    // `freq_hz` follows our tone-0 convention (matches `engine::tx::synthesize`
     // and `coarse_search.freq_hz`); wsprd's `noncoherent_sequence_detection`
     // takes the signal CENTER, so we add 1.5·tone_spacing here and sweep
     // around that point.
