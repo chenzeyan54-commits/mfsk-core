@@ -313,11 +313,11 @@ mod tests {
         use crate::engine::dsp::ddc::ddc_block;
         use crate::engine::sync::{AudioSource, RxGrid, coarse_sync};
         use crate::fst4::Fst4s60;
-        use crate::fst4::encode::{message_to_tones, tones_to_i16};
+        use crate::fst4::encode::tones_to_i16;
         use crate::msg::wsjt77::pack77;
 
         let msg77 = pack77("CQ", "JA1ABC", "PM95").expect("pack77");
-        let tones = message_to_tones(&msg77);
+        let tones = crate::engine::tx::message_to_tones::<crate::fst4::Fst4s60>(&msg77);
         let target_freq = 1500.0f32;
         let audio = tones_to_i16(&tones, target_freq, 10_000);
 
@@ -489,11 +489,11 @@ mod tests {
         use crate::engine::sync::{SyncCandidate, refine_candidate};
         use crate::fst4::Fst4s60;
         use crate::fst4::decode::FST4_60A_DOWNSAMPLE;
-        use crate::fst4::encode::{message_to_tones, tones_to_i16};
+        use crate::fst4::encode::tones_to_i16;
         use crate::msg::wsjt77::pack77;
 
         let msg77 = pack77("CQ", "JA1ABC", "PM95").expect("pack77");
-        let tones = message_to_tones(&msg77);
+        let tones = crate::engine::tx::message_to_tones::<crate::fst4::Fst4s60>(&msg77);
         let target_freq = 1500.0f32;
         let audio = tones_to_i16(&tones, target_freq, 10_000);
 

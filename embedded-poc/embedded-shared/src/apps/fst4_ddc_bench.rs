@@ -675,11 +675,7 @@ pub fn run(audio_bin: &[u8]) {
             decoded: decoded.is_some(),
         });
         if let Some(res) = decoded {
-            let text = res
-                .message77()
-                .try_into()
-                .ok()
-                .and_then(|m77: &[u8; 77]| unpack77(m77));
+            let text = unpack77(res.message77());
             results.push((res.freq_hz, res.dt_sec, text));
         }
     }

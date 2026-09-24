@@ -269,8 +269,7 @@ fn decode_candidate(
     // everything the tail allocated on the way there, and those are
     // the majority on a real band.
     charge(2, t);
-    let m77: [u8; 77] = r?.message77().try_into().ok()?;
-    mfsk_core::msg::wsjt77::unpack77(&m77)
+    mfsk_core::msg::wsjt77::unpack77(r?.message77())
 }
 
 fn require_corpus() -> bool {

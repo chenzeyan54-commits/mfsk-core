@@ -254,7 +254,7 @@ fn refine_one<S: AudioSample>(audio: &[S], c: &SyncCandidate, sc: &mut Scratch) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ft8::wave_gen::{message_to_tones, tones_to_i16};
+    use crate::ft8::wave_gen::tones_to_i16;
     use alloc::vec;
 
     /// A signal placed off the coarse grid in both axes comes back to
@@ -264,7 +264,9 @@ mod tests {
         const F_TRUE: f32 = 1501.2;
         const DT_TRUE: f32 = 0.137;
         let msg: Vec<u8> = (0..77).map(|i| ((i * 7 + 3) % 5 == 0) as u8).collect();
-        let itone = message_to_tones(&msg);
+        let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(
+            msg.as_slice().try_into().unwrap(),
+        );
         let sig = tones_to_i16(&itone, F_TRUE, 2_000);
         let mut audio = vec![0i16; 180_000];
         let start = ((TX_START_OFFSET_S + DT_TRUE) * SAMPLE_RATE_HZ).round() as usize;

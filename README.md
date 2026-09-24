@@ -125,13 +125,14 @@ Synthesise an FT8 frame and decode it back:
 
 ```rust
 use mfsk_core::ft8::Ft8;
-use mfsk_core::ft8::wave_gen::{message_to_tones, tones_to_i16};
+use mfsk_core::engine::tx::message_to_tones;
+use mfsk_core::ft8::wave_gen::tones_to_i16;
 use mfsk_core::msg::decode_request::DecodeRequest;
 use mfsk_core::msg::wsjt77::{pack77, unpack77};
 
 // 1. Synthesise an FT8 frame and pad it into a 15-second slot.
 let msg77 = pack77("CQ", "JA1ABC", "PM95").unwrap();
-let tones = message_to_tones(&msg77);
+let tones = message_to_tones::<Ft8>(&msg77);
 let frame = tones_to_i16(&tones, /* freq */ 1500.0, /* amp */ 20_000);
 
 let mut audio = vec![0i16; 180_000]; // 15 s @ 12 kHz

@@ -22,9 +22,9 @@
 
 use mfsk_core::engine::dsp::gfsk::GfskCfg;
 use mfsk_core::fst4::encode::{
-    FST4_15_GFSK, FST4_30_GFSK, FST4_60A_GFSK, FST4_120_GFSK, FST4_300_GFSK, message_to_tones,
-    synth_sample_count, tones_to_f32, tones_to_f32_into, tones_to_f32_with_gfsk, tones_to_i16,
-    tones_to_i16_into, tones_to_i16_with_gfsk,
+    FST4_15_GFSK, FST4_30_GFSK, FST4_60A_GFSK, FST4_120_GFSK, FST4_300_GFSK, synth_sample_count,
+    tones_to_f32, tones_to_f32_into, tones_to_f32_with_gfsk, tones_to_i16, tones_to_i16_into,
+    tones_to_i16_with_gfsk,
 };
 use mfsk_core::msg::wsjt77::pack77;
 
@@ -38,7 +38,7 @@ const SUBMODES: [(&str, &GfskCfg, usize); 5] = [
 
 fn tones() -> Vec<u8> {
     let msg = pack77("JA1ABC", "VK3NV", "PM95").expect("pack77");
-    message_to_tones(&msg)
+    mfsk_core::engine::tx::message_to_tones::<mfsk_core::fst4::Fst4s60>(&msg)
 }
 
 #[test]

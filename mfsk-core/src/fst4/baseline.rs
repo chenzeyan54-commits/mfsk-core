@@ -211,7 +211,7 @@ pub(crate) fn fst4_baseline_lin(
 /// amplitude) at the decoded tone, summed across every symbol
 /// (sync + data, `NN=160`). `cs`/`itone` are
 /// [`crate::engine::llr::symbol_spectra`]`::<P>` /
-/// `encode_tones_for_snr::<P>` output — the same already-computed
+/// `engine::tx::info_to_tones::<P>` output — the same already-computed
 /// per-symbol spectra and reconstructed full tone sequence every
 /// other `GenericPipelineProtocol::snr_db` override reads from
 /// [`crate::engine::pipeline::SnrCtx`].
@@ -316,7 +316,7 @@ fn fst4_raw_cs<P: crate::engine::Protocol>(
 /// baseline at all (candidate too close to a band edge for this
 /// module's local-window simplification — see its own doc comment).
 ///
-/// `itone` (from `encode_tones_for_snr::<P>`, same as every other
+/// `itone` (from `engine::tx::info_to_tones::<P>`, same as every other
 /// `GenericPipelineProtocol::snr_db` override reads via `SnrCtx`) is
 /// the only piece of `SnrCtx` this function still needs — `cs` itself
 /// is *not* used; [`fst4_raw_cs`] rebuilds the version this formula

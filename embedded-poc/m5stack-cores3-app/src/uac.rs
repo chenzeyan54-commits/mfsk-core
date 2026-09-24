@@ -2191,7 +2191,7 @@ fn write_ft8_frame(
     // 192 B/frame against a 128 B periodic-OUT FIFO limit.
     channels: u8,
 ) -> (u32, i64, i64) {
-    let tones = mfsk_core::ft8::wave_gen::message_to_tones(msg77);
+    let tones = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft8::Ft8>(msg77);
     let mut stream = mfsk_core::engine::dsp::gfsk::GfskStream::new(
         &tones,
         df_hz,

@@ -57,7 +57,7 @@ fn pack(call1: &str, call2: &str, grid: &str) -> [u8; 77] {
 }
 
 fn mix_i16(audio: &mut [i16], msg77: &[u8; 77], freq_hz: f32, amp: i16, pad: usize) {
-    let itone = encode::message_to_tones(msg77);
+    let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft4::Ft4>(msg77);
     assert_eq!(itone.len(), NN);
     let pcm = encode::tones_to_i16(&itone, freq_hz, amp);
     assert_eq!(pcm.len(), NN * NSPS);

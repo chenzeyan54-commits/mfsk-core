@@ -76,6 +76,7 @@
 //! and reading the message, and would otherwise find NULL.
 //! [`mfsk_last_error`] remains for the handle-less calls.
 
+use mfsk_core::engine::tx::message_to_tones;
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::os::raw::c_void;
 use std::ptr;
@@ -696,7 +697,7 @@ pub unsafe extern "C" fn mfsk_encode_ft8(
         set_error("FT8 pack77 failed");
         return MfskStatus::InvalidArg;
     };
-    let tones = mfsk_core::ft8::wave_gen::message_to_tones(&msg77);
+    let tones = message_to_tones::<mfsk_core::ft8::Ft8>(&msg77);
     let pcm = mfsk_core::ft8::wave_gen::tones_to_f32(&tones, freq_hz, 1.0);
     unsafe { emit_pcm(&pcm, out, cap, out_len, "encode") }
 }
@@ -729,7 +730,7 @@ pub unsafe extern "C" fn mfsk_encode_ft4(
         set_error("FT4 pack77 failed");
         return MfskStatus::InvalidArg;
     };
-    let tones = mfsk_core::ft4::encode::message_to_tones(&msg77);
+    let tones = message_to_tones::<mfsk_core::ft4::Ft4>(&msg77);
     let pcm = mfsk_core::ft4::encode::tones_to_f32(&tones, freq_hz, 1.0);
     unsafe { emit_pcm(&pcm, out, cap, out_len, "encode") }
 }
@@ -762,7 +763,7 @@ pub unsafe extern "C" fn mfsk_encode_fst4s60(
         set_error("FST4 pack77 failed");
         return MfskStatus::InvalidArg;
     };
-    let tones = mfsk_core::fst4::encode::message_to_tones(&msg77);
+    let tones = message_to_tones::<mfsk_core::fst4::Fst4s60>(&msg77);
     let pcm = mfsk_core::fst4::encode::tones_to_f32(&tones, freq_hz, 1.0);
     unsafe { emit_pcm(&pcm, out, cap, out_len, "encode") }
 }
@@ -3323,9 +3324,10 @@ pub unsafe extern "C" fn mfsk_message_to_tones(
     msg.copy_from_slice(bits);
 
     let tones: Vec<u8> = match m {
-        MfskMode::Ft8 => mfsk_core::ft8::wave_gen::message_to_tones(&msg).to_vec(),
-        MfskMode::Ft4 => mfsk_core::ft4::encode::message_to_tones(&msg),
-        _ => mfsk_core::fst4::encode::message_to_tones(&msg),
+        MfskMode::Ft8 => message_to_tones::<mfsk_core::ft8::Ft8>(&msg),
+        MfskMode::Ft4 => message_to_tones::<mfsk_core::ft4::Ft4>(&msg),
+        // Every FST4 sub-mode shares one 160-symbol layout.
+        _ => message_to_tones::<mfsk_core::fst4::Fst4s60>(&msg),
     };
     if !out_len.is_null() {
         unsafe { *out_len = tones.len() };

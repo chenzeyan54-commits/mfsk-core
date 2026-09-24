@@ -1907,11 +1907,11 @@ mod tests {
     /// perfect signal still succeeds" invariant.
     #[test]
     fn ap_hint_round_trips_clean_signal() {
-        use crate::ft8::wave_gen::{message_to_tones, tones_to_i16};
+        use crate::ft8::wave_gen::tones_to_i16;
         use crate::msg::wsjt77::pack77;
 
         let m77 = pack77("CQ", "K1ABC", "FN42").expect("pack77");
-        let tones = message_to_tones(&m77);
+        let tones = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&m77);
         let samples = tones_to_i16(&tones, 1500.0, 20_000);
 
         // 15 s slot, signal at 0.5 s offset.
@@ -1927,7 +1927,7 @@ mod tests {
             .decode()
             .results;
         assert!(
-            results.iter().any(|r| r.message77() == m77),
+            results.iter().any(|r| *r.message77() == m77),
             "expected to decode the self-synthesized signal with matching AP hint"
         );
     }
@@ -2033,11 +2033,11 @@ mod tests {
     /// `SupportsSicEarly::__staged_sic` uses (see its doc comment).
     #[test]
     fn sic_early_subtracts_known_before_checkpoint_a() {
-        use crate::ft8::wave_gen::{message_to_tones, tones_to_i16};
+        use crate::ft8::wave_gen::tones_to_i16;
         use crate::msg::wsjt77::pack77;
 
         let m_known = pack77("CQ", "K1ABC", "FN42").expect("pack77 known");
-        let tones_known = message_to_tones(&m_known);
+        let tones_known = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&m_known);
 
         // Strong, clean signal at 1500 Hz.
         let f0 = 1500.0_f32;
@@ -2054,7 +2054,7 @@ mod tests {
             .results;
         let known_results: Vec<DecodeResult> = phase1
             .iter()
-            .filter(|r| r.message77() == m_known)
+            .filter(|r| *r.message77() == m_known)
             .cloned()
             .collect();
         assert!(
@@ -2260,7 +2260,7 @@ mod tests {
     /// just that the builder method compiles.
     #[test]
     fn sic_early_eq_mode_reaches_sic_engine() {
-        use crate::ft8::wave_gen::{message_to_tones, tones_to_f32};
+        use crate::ft8::wave_gen::tones_to_f32;
         use crate::msg::wsjt77::pack77;
 
         // splitmix64 + Box-Muller — deterministic, dependency-free AWGN.
@@ -2292,7 +2292,7 @@ mod tests {
         const TARGET_SNR_DB: f32 = -22.0;
 
         let m77 = pack77("CQ", "K1ABC", "FN42").expect("pack77");
-        let tones = message_to_tones(&m77);
+        let tones = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&m77);
         let snr_linear = 10.0_f32.powf(TARGET_SNR_DB / 10.0);
         let amplitude = (4.0 * snr_linear * REF_BW / FS).sqrt();
         let sig = tones_to_f32(&tones, F0, amplitude);
@@ -2331,7 +2331,7 @@ mod tests {
             .sic_early()
             .decode()
             .results;
-            results.into_iter().find(|r| r.message77() == m77)
+            results.into_iter().find(|r| *r.message77() == m77)
         };
 
         assert!(
@@ -2374,10 +2374,10 @@ mod tests {
     #[test]
     fn dt_accuracy_at_nominal_start() {
         use super::super::message::pack77_type1;
-        use super::super::wave_gen::{message_to_tones, tones_to_f32};
+        use super::super::wave_gen::tones_to_f32;
 
         let msg = pack77_type1("CQ", "JA1ABC", "PM95").unwrap();
-        let itone = message_to_tones(&msg);
+        let itone = crate::engine::tx::message_to_tones::<crate::ft8::Ft8>(&msg);
         let pcm = tones_to_f32(&itone, 1000.0, 1.0);
 
         let mut audio_f32 = vec![0.0f32; 180_000];

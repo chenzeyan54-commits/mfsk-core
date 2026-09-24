@@ -30,7 +30,7 @@
 
 use alloc::vec::Vec;
 
-use super::{decode::DecodeResult, encode::message_to_tones};
+use super::decode::DecodeResult;
 use crate::engine::dsp::subtract::{subtract_tones, subtract_tones_lpf};
 
 // Reuse the configuration `decode_frame_subtract` already uses, so any
@@ -39,12 +39,12 @@ use super::decode::FT4_SUBTRACT;
 
 /// Reconstruct the 4-GFSK channel symbols for a decoded FT4 result.
 ///
-/// Returns `None` if `result.message77()` is shorter than 77 bits, which
-/// shouldn't happen for an FT4 decode but is handled defensively so the
-/// public subtract APIs become no-ops rather than panicking.
+/// Always `Some` since #391 made `message77()` a `&[u8; 77]`; the
+/// `Option` is kept so the subtract APIs' early-return shape is unchanged.
 fn get_tones(result: &DecodeResult) -> Option<Vec<u8>> {
-    let m77 = <[u8; 77]>::try_from(result.message77()).ok()?;
-    Some(message_to_tones(&m77))
+    Some(crate::engine::tx::message_to_tones::<crate::ft4::Ft4>(
+        result.message77(),
+    ))
 }
 
 /// LPF half-window for [`subtract_signal_lpf`], matching WSJT-X
@@ -152,7 +152,7 @@ pub fn refine_signal_freq(audio: &[i16], result: &DecodeResult) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::encode::{message_to_tones, tones_to_i16};
+    use super::super::encode::tones_to_i16;
     use super::*;
 
     /// Build a synthetic `DecodeResult` for testing. The `info` field
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn subtract_with_exact_timing_near_zero() {
         let msg = [1u8; 77];
-        let itone = message_to_tones(&msg);
+        let itone = crate::engine::tx::message_to_tones::<crate::ft4::Ft4>(&msg);
         // FT4 frame: 103 active symbols × 576 samples = 59_328.
         // Target buffer: 7.5 s × 12 kHz = 90_000.
         let samples = tones_to_i16(&itone, 1500.0, 20_000);
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn subtract_reduces_power() {
         let msg = [0u8; 77];
-        let itone = message_to_tones(&msg);
+        let itone = crate::engine::tx::message_to_tones::<crate::ft4::Ft4>(&msg);
         let samples = tones_to_i16(&itone, 1500.0, 15_000);
 
         let mut audio = vec![0i16; 90_000];

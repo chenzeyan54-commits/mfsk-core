@@ -388,7 +388,7 @@ fn fst4_bake_golden_precomputed() {
     let mut baked_msgs: Vec<String> = baked_results
         .iter()
         .filter_map(|r| {
-            let m77: &[u8; 77] = r.message77().try_into().ok()?;
+            let m77 = r.message77();
             unpack77(m77)
         })
         .collect();
@@ -605,7 +605,7 @@ fn fst4_bake_golden_refined_candidates() {
     let mut baked_msgs: Vec<String> = baked_results
         .iter()
         .filter_map(|r| {
-            let m77: &[u8; 77] = r.message77().try_into().ok()?;
+            let m77 = r.message77();
             unpack77(m77)
         })
         .collect();

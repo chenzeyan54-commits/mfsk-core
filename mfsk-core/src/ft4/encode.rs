@@ -8,8 +8,7 @@ use alloc::vec::Vec;
 
 use super::Ft4;
 use crate::engine::dsp::gfsk::{GfskCfg, synth_f32, synth_f32_into, synth_i16, synth_i16_into};
-use crate::engine::{FecCodec, FrameLayout, ModulationParams};
-use crate::fec::Ldpc174_91;
+use crate::engine::{FrameLayout, ModulationParams};
 
 /// FT4 GFSK configuration: 12 kHz, 576 samples/symbol, BT=1.0, hmod=1.0,
 /// 72-sample (NSPS/8) cosine ramp. BT=1.0 matches WSJT-X
@@ -21,24 +20,6 @@ pub const FT4_GFSK: GfskCfg = GfskCfg {
     hmod: 1.0,
     ramp_samples: 576 / 8,
 };
-
-/// Encode a 77-bit message into the 103-symbol FT4 tone sequence.
-///
-/// XORs the input with [`super::FT4_RVEC`] before CRC + LDPC, matching
-/// WSJT-X `genft4.f90:64`. The CRC-14 is then computed over the
-/// **scrambled** message bits — same as WSJT-X, so the receive-side
-/// CRC verification stays correct.
-pub fn message_to_tones(message77: &[u8; 77]) -> Vec<u8> {
-    let mut scrambled = *message77;
-    for (b, &r) in scrambled.iter_mut().zip(super::FT4_RVEC.iter()) {
-        *b = (*b ^ r) & 1;
-    }
-    let info = crate::fec::ldpc::append_crc14(&scrambled);
-    let codec = Ldpc174_91;
-    let mut cw = [0u8; 174];
-    codec.encode(&info, &mut cw);
-    crate::engine::tx::codeword_to_itone::<Ft4>(&cw)
-}
 
 /// Output sample count for FT4 waveform synthesis (103 × 576 = 59 328).
 pub const TONES_OUTPUT_LEN: usize = (<Ft4 as FrameLayout>::N_SYMBOLS as usize) * 576;

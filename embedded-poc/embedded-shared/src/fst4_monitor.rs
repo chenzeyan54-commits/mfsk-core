@@ -610,8 +610,7 @@ fn monitor_candidate(ctx: &MonitorCtx, i: usize) -> Option<MonitorHit> {
     let decode_us = now_us() - t_d;
 
     let msg = result.as_ref().and_then(|r| {
-        let m: &[u8; 77] = r.message77().try_into().ok()?;
-        unpack77(m)
+        unpack77(r.message77())
     });
 
     Some(MonitorHit {

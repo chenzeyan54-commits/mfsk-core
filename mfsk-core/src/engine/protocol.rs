@@ -667,6 +667,19 @@ pub trait MessageCodec: Default + 'static {
         true
     }
 
+    /// The transmit-side twin of [`Self::verify_info`]: `info` holds the
+    /// `PAYLOAD_BITS` message bits followed by room for the integrity
+    /// field (`info.len()` is the FEC's `K`); fill that room so
+    /// [`Self::verify_info`] accepts the result. Returns `false` if this
+    /// codec has no integrity field of that width.
+    ///
+    /// Default: nothing to fill, so succeed exactly when there is no
+    /// room — the counterpart of `verify_info`'s accept-everything
+    /// default.
+    fn append_crc(info: &mut [u8]) -> bool {
+        info.len() == Self::PAYLOAD_BITS as usize
+    }
+
     /// Judge a message this codec already unpacked.
     ///
     /// The layer below this one is the CRC, and a CRC false positive is

@@ -252,9 +252,10 @@
 //!
 //! ```
 //! # #[cfg(feature = "ft8")] {
+//! use mfsk_core::engine::tx::message_to_tones;
 //! use mfsk_core::ft8::{
 //!     Ft8,
-//!     wave_gen::{message_to_tones, tones_to_i16},
+//!     wave_gen::tones_to_i16,
 //! };
 //! use mfsk_core::msg::decode_request::DecodeRequest;
 //! use mfsk_core::msg::wsjt77::{pack77, unpack77};
@@ -263,7 +264,7 @@
 //! //    The synth produces just the transmitted frame (~12.64 s);
 //! //    pad to the full 15 s slot with the signal starting at 0.5 s.
 //! let msg77 = pack77("CQ", "JA1ABC", "PM95").expect("pack");
-//! let tones = message_to_tones(&msg77);
+//! let tones = message_to_tones::<Ft8>(&msg77);
 //! let frame = tones_to_i16(&tones, /* freq */ 1500.0, /* amp */ 20_000);
 //!
 //! let mut audio = vec![0i16; 180_000]; // 15 s @ 12 kHz
@@ -308,11 +309,12 @@
 //!
 //! ```
 //! # #[cfg(feature = "ft8")] {
-//! use mfsk_core::ft8::wave_gen::{message_to_tones, tones_to_i16};
+//! use mfsk_core::engine::tx::message_to_tones;
+//! use mfsk_core::ft8::{Ft8, wave_gen::tones_to_i16};
 //! use mfsk_core::msg::wsjt77::pack77;
 //!
 //! let msg77 = pack77("CQ", "JA1ABC", "PM95").expect("pack");
-//! let tones = message_to_tones(&msg77);
+//! let tones = message_to_tones::<Ft8>(&msg77);
 //! let pcm = tones_to_i16(&tones, /* freq */ 1500.0, /* amp */ 20_000);
 //! assert!(!pcm.is_empty());
 //! # }

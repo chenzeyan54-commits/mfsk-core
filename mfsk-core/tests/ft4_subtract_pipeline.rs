@@ -37,7 +37,7 @@ fn pack(call1: &str, call2: &str, grid: &str) -> [u8; 77] {
 }
 
 fn lay_signal(audio: &mut [i16], msg77: &[u8; 77], freq_hz: f32, peak_i16: i16) {
-    let itone = encode::message_to_tones(msg77);
+    let itone = mfsk_core::engine::tx::message_to_tones::<mfsk_core::ft4::Ft4>(msg77);
     assert_eq!(itone.len(), NN);
     let pcm = encode::tones_to_i16(&itone, freq_hz, peak_i16);
     assert_eq!(pcm.len(), NN * NSPS);
@@ -74,7 +74,7 @@ fn subtract_reveals_hidden_ft4_signal() {
         .results;
     let strong_hit = pass1
         .iter()
-        .find(|r| r.message77() == strong)
+        .find(|r| r.message77()[..] == strong[..])
         .expect("strong signal must decode in pass 1");
 
     // Refine the strong-signal carrier (real-WAV best practice per
@@ -89,8 +89,8 @@ fn subtract_reveals_hidden_ft4_signal() {
     let pass2 = DecodeRequest::<Ft4>::new(&residual, 100.0, 3000.0, 0.5, 5)
         .decode()
         .results;
-    let saw_weak = pass2.iter().any(|r| r.message77() == weak);
-    let pass1_saw_weak = pass1.iter().any(|r| r.message77() == weak);
+    let saw_weak = pass2.iter().any(|r| r.message77()[..] == weak[..]);
+    let pass1_saw_weak = pass1.iter().any(|r| r.message77()[..] == weak[..]);
     assert!(
         saw_weak || pass1_saw_weak,
         "weak signal never surfaced — pass1 results: {:?}, pass2 results: {:?}",

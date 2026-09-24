@@ -11,7 +11,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::Protocol;
+use super::{FecCodec, MessageCodec, ModulationParams, Protocol};
 
 /// Ordered list of `(first_data_symbol, chunk_len_in_symbols)` covering
 /// every data slot in the frame — leading slots before the first sync
@@ -114,4 +114,58 @@ pub fn codeword_to_itone<P: Protocol>(cw: &[u8]) -> Vec<u8> {
     }
 
     itone
+}
+
+/// Encode a 77-bit message into `P`'s tone sequence — the whole transmit
+/// chain up to the waveform, for any protocol whose FEC takes the message
+/// plus a CRC (FT8, FT4 and every FST4 sub-mode):
+///
+/// ```text
+/// message77 ─(INFO_SCRAMBLE_RVEC)→ scrambled ─(Msg::append_crc)→ info[K]
+///           ─(Fec::encode)→ codeword[N] ─(codeword_to_itone)→ tones
+/// ```
+///
+/// One function where there used to be three, `ft8::wave_gen`,
+/// `ft4::encode` and `fst4::encode` each carrying its own copy (#391).
+/// They differed only in data the trait already carries: FT4 and FST4
+/// XOR the message with an RVEC first (WSJT-X `genft4.f90:64`,
+/// `genfst4.f90:63`) and FT8 does not; FST4's LDPC(240, 101) wants a
+/// CRC-24 where the others want a CRC-14, which is the message codec's
+/// length dispatch.
+///
+/// The CRC is computed over the **scrambled** bits, as WSJT-X does, so
+/// the receiver's CRC check runs before it unscrambles.
+///
+/// Panics if `P::Msg` is not a 77-bit codec with a CRC matching
+/// `P::Fec::K` — a programming error, not a runtime condition.
+pub fn message_to_tones<P: Protocol>(message77: &[u8; 77]) -> Vec<u8> {
+    assert_eq!(
+        <P::Msg as MessageCodec>::PAYLOAD_BITS,
+        77,
+        "message_to_tones: not a 77-bit message codec"
+    );
+    let mut info = vec![0u8; P::Fec::K];
+    info[..77].copy_from_slice(message77);
+    if let Some(rvec) = <P as ModulationParams>::INFO_SCRAMBLE_RVEC {
+        for (b, &r) in info[..77].iter_mut().zip(rvec) {
+            *b = (*b ^ r) & 1;
+        }
+    }
+    assert!(
+        <P::Msg as MessageCodec>::append_crc(&mut info),
+        "message_to_tones: the message codec has no CRC for K = {}",
+        P::Fec::K
+    );
+    info_to_tones::<P>(&info)
+}
+
+/// FEC-encode `P::Fec::K` info bits (message plus CRC, already
+/// scrambled) and map the codeword to tones. The tail of
+/// [`message_to_tones`], and what the receiver uses to rebuild a decoded
+/// signal's tones for SNR estimation and subtraction: a decode's info
+/// bits passed the CRC, so they are already in this form.
+pub fn info_to_tones<P: Protocol>(info: &[u8]) -> Vec<u8> {
+    let mut cw = vec![0u8; P::Fec::N];
+    P::Fec::default().encode(info, &mut cw);
+    codeword_to_itone::<P>(&cw)
 }

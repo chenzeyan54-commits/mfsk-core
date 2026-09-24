@@ -433,10 +433,7 @@ fn ship_tail(
         false,
         false,
     )?;
-    r.message77()
-        .try_into()
-        .ok()
-        .and_then(|m77: &[u8; 77]| unpack77(m77))
+    unpack77(r.message77())
 }
 
 /// Both halves, as the receiver runs them.
@@ -1717,11 +1714,7 @@ fn decode_pass(
             ),
         };
         if let Some(r) = r {
-            if let Some(text) = r
-                .message77()
-                .try_into()
-                .ok()
-                .and_then(|m77: &[u8; 77]| unpack77(m77))
+            if let Some(text) = unpack77(r.message77())
             {
                 log::info!(
                     "    {text} | {:.1} Hz | dt {:.2} s | {:.0} dB",

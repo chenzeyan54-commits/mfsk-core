@@ -27,8 +27,7 @@ use super::llr::{
 };
 use super::protocol::BpPooledFec;
 use super::sync::{AudioSource, RxGrid, SyncCandidate, coarse_sync, fine_sync_power_per_block};
-use super::tx::codeword_to_itone;
-use super::{FecCodec, FecOpts, MessageCodec, Protocol};
+use super::{FecOpts, MessageCodec, Protocol};
 
 // ── Stage-timing trace (host diagnostic only) ───────────────────────────────
 //
@@ -526,8 +525,13 @@ impl DecodeResult {
     /// uvpacket-specific (length code + bytes + CRC fragment).
     ///
     /// Panics if `info` is shorter than 77 bits.
-    pub fn message77(&self) -> &[u8] {
-        &self.info[..77]
+    ///
+    /// A `&[u8; 77]` rather than a slice since #391: it is always 77 bits,
+    /// and [`crate::engine::tx::message_to_tones`] takes it as one.
+    pub fn message77(&self) -> &[u8; 77] {
+        self.info[..77]
+            .try_into()
+            .expect("DecodeResult::info holds at least 77 bits")
     }
 }
 
@@ -557,7 +561,7 @@ impl DecodeResult {
 pub struct SnrCtx<'a> {
     /// [`symbol_spectra`]`::<P>` output, `/1000`-scaled.
     pub cs: &'a [Complex<f32>],
-    /// [`encode_tones_for_snr`]`::<P>` output.
+    /// [`crate::engine::tx::info_to_tones`]`::<P>` output.
     pub itone: &'a [u8],
     /// The refined baseband the symbol spectra were built from, and
     /// its sample rate.
@@ -618,7 +622,7 @@ pub struct SnrCtx<'a> {
 pub(crate) struct SnrCtx<'a> {
     /// [`symbol_spectra`]`::<P>` output, `/1000`-scaled.
     pub cs: &'a [Complex<f32>],
-    /// [`encode_tones_for_snr`]`::<P>` output.
+    /// [`crate::engine::tx::info_to_tones`]`::<P>` output.
     pub itone: &'a [u8],
     /// The refined baseband the symbol spectra were built from, and
     /// its sample rate.
@@ -1143,7 +1147,7 @@ where
                 let snr_db = if skip_snr {
                     f32::NAN
                 } else {
-                    let itone = encode_tones_for_snr::<P>(&r.info, &fec);
+                    let itone = crate::engine::tx::info_to_tones::<P>(&r.info);
                     P::snr_db(SnrCtx {
                         cs,
                         itone: &itone,
@@ -1317,7 +1321,7 @@ where
                             if !is_fst4 && r.hard_errors >= strictness.osd_max_errors(osd_depth) {
                                 continue;
                             }
-                            let itone = encode_tones_for_snr::<P>(&r.info, &fec);
+                            let itone = crate::engine::tx::info_to_tones::<P>(&r.info);
                             let snr_db = P::snr_db(SnrCtx {
                                 cs,
                                 itone: &itone,
@@ -1365,7 +1369,7 @@ where
                                 if !is_fst4 && r.hard_errors >= strictness.osd_max_errors(4) {
                                     continue;
                                 }
-                                let itone = encode_tones_for_snr::<P>(&r.info, &fec);
+                                let itone = crate::engine::tx::info_to_tones::<P>(&r.info);
                                 let snr_db = P::snr_db(SnrCtx {
                                     cs,
                                     itone: &itone,
@@ -1449,7 +1453,7 @@ where
                     if let Some(mut r) = fec.decode_soft_pooled(llr, &ap_opts, &mut bp_scratch)
                         && r.hard_errors <= max_errors
                     {
-                        let itone = encode_tones_for_snr::<P>(&r.info, &fec);
+                        let itone = crate::engine::tx::info_to_tones::<P>(&r.info);
                         let snr_db = P::snr_db(SnrCtx {
                             cs,
                             itone: &itone,
@@ -1611,21 +1615,6 @@ fn deinterleave_llr_vec(llr: &mut [f32], table: &[u16]) {
     for j in 0..llr.len() {
         llr[table[j] as usize] = original[j];
     }
-}
-
-/// Re-encode FEC info bits back into tones for SNR estimation.
-///
-/// Phase A reduced this to a 3-line helper: `r.info[..]` already
-/// carries the K-bit info the FEC produced, including any CRC bits
-/// that `MessageCodec::verify_info` already accepted. Feeding it
-/// straight back into `fec.encode` reproduces the same codeword as
-/// the previous "extract msg77 → recompute CRC → encode" path —
-/// bit-identical because verifier acceptance enforces
-/// `info[77..K] == crc(info[..77])` at the moment of acceptance.
-fn encode_tones_for_snr<P: Protocol>(info: &[u8], fec: &P::Fec) -> Vec<u8> {
-    let mut cw = vec![0u8; P::Fec::N];
-    fec.encode(info, &mut cw);
-    codeword_to_itone::<P>(&cw)
 }
 
 /// Wrap `cb` so it only forwards results not already present in `known`
@@ -2551,7 +2540,6 @@ where
     let mut residual = audio.to_vec();
     let mut all_results: Vec<DecodeResult> = Vec::new();
     let passes: &[f32] = &[1.0, 0.75, 0.5][..max_rounds];
-    let fec = P::Fec::default();
 
     for (pass_idx, &factor) in passes.iter().enumerate() {
         if let Some(check) = budget
@@ -2684,7 +2672,7 @@ where
             // `descramble_info` here scrambles back to the wire form.
             let mut info_for_tx = r.info.to_vec();
             descramble_info::<P>(&mut info_for_tx);
-            let tones = encode_tones_for_snr::<P>(&info_for_tx, &fec);
+            let tones = crate::engine::tx::info_to_tones::<P>(&info_for_tx);
             // WSJT-X-faithful channel-aware LPF subtract, single shot
             // (issue #177/#178/#179): the old constant-amplitude
             // `subtract_tones` + coarse binary QSB gain (0.5 / 1.0 on
